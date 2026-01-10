@@ -6,7 +6,7 @@ repos:
         entry: python .github/scripts/semantic_leak_scan.py
         language: python
         pass_filenames: false
-        stages: [commit]
+        stages: [pre-commit]
         verbose: true
       
       - id: import-validator
@@ -14,7 +14,7 @@ repos:
         entry: python .github/scripts/import_validator.py
         language: python
         pass_filenames: false
-        stages: [commit]
+        stages: [pre-commit]
         verbose: true
       
       - id: structural-validator
@@ -22,9 +22,9 @@ repos:
         entry: python .github/scripts/structural_validator.py
         language: python
         pass_filenames: false
-        stages: [commit]
+        stages: [pre-commit]
         verbose: true
 
 # Configuration
-default_stages: [commit]
+default_stages: [pre-commit]
 fail_fast: false  # Run all checks even if one fails

@@ -2,13 +2,13 @@ name: Semantic Leak Enforcement
 
 on:
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, develop, master ]
   push:
-    branches: [ main ]
+    branches: [ main, develop, master ]
 
 jobs:
   semantic-enforcement:
-    name: Constitutional Compliance Checks
+    name: semantic-enforcement
     runs-on: ubuntu-latest
     
     steps:

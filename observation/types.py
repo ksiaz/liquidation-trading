@@ -19,7 +19,7 @@ class ObservationStatus(Enum):
 
 @dataclass(frozen=True)
 class SystemCounters:
-    windows_processed: Optional[int]
+    intervals_processed: Optional[int]
     dropped_events: Optional[Dict[str, int]]
     
 @dataclass(frozen=True)

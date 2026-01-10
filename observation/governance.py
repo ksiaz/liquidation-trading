@@ -123,7 +123,7 @@ class ObservationSystem:
             timestamp=self._system_time,
             symbols_active=sorted(self._allowed_symbols),
             counters=SystemCounters(
-                windows_processed=None,
+                intervals_processed=None,
                 dropped_events=None
             ),
             promoted_events=None

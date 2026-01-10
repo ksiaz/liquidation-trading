@@ -3,20 +3,32 @@ from .types import ObservationSnapshot, SystemCounters, ObservationStatus, Syste
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
 
+# M2 Continuity Store (Internal Memory)
+from memory.m2_continuity_store import ContinuityMemoryStore
+
+# M5 Access Layer (For M4 primitive computation)
+from memory.m5_access import MemoryAccess
+
 class ObservationSystem:
     """
     The sealed Observation System.
     """
-    
+
     def __init__(self, allowed_symbols: List[str]):
         self._allowed_symbols = set(allowed_symbols)
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
         self._failure_reason = ""
-        
+
         # Internal Modules
         self._m1 = M1IngestionEngine()
         self._m3 = M3TemporalEngine()
+
+        # M2 Memory Store (STUB: Not populated yet)
+        self._m2_store = ContinuityMemoryStore()
+
+        # M5 Access Layer (For primitive computation at snapshot time)
+        self._m5_access = MemoryAccess(self._m2_store)
         
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
@@ -152,13 +164,31 @@ class ObservationSystem:
 
         Authority: ANNEX_M4_PRIMITIVE_FLOW.md
         """
-        # STUB: Current implementation returns empty bundle
-        # Full implementation requires:
-        # 1. Access to M2 continuity store for node data
-        # 2. M5 query interface for primitive computation
-        # 3. Error handling for missing/insufficient data
+        # Query M2 for active nodes (this will return empty list until M2 is populated)
+        # For now, gracefully handle empty M2 by returning None primitives
+        # Future implementation will compute real primitives when M2 is populated
 
-        # For now, return bundle with all primitives as None
+        try:
+            # Attempt to get active nodes for this symbol
+            # M2 store query (spatial filter by symbol would require current price)
+            # For now, we don't have symbol-specific nodes, so return None primitives
+
+            # This stub maintains correct call structure without requiring
+            # fully populated M2 store or complex query parameter construction
+
+            # Future implementation will:
+            # 1. Query M2 for nodes associated with symbol
+            # 2. Build query params from node data
+            # 3. Call M5 access layer for each primitive
+            # 4. Assemble M4PrimitiveBundle from results
+
+            pass
+        except Exception:
+            # Computation failures should not crash snapshot creation
+            # Return None primitives and continue
+            pass
+
+        # Return bundle with all primitives as None until M2 is populated
         # This maintains structural correctness while deferring implementation
         return M4PrimitiveBundle(
             symbol=symbol,

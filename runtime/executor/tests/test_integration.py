@@ -9,37 +9,54 @@ Verifies all components work together correctly.
 import pytest
 from decimal import Decimal
 
-from runtime.executor.controller import ExecutionController
+from runtime.executor.controller import ExecutionController, ExecutionResult
 from runtime.arbitration.types import Mandate, MandateType, ActionType
 from runtime.position.types import PositionState, Direction
+from runtime.risk.types import AccountState
 
 
 class TestFullPositionLifecycle:
     """Test complete position lifecycle end-to-end."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+    
     def test_entry_to_flat_lifecycle(self):
         """Full lifecycle: FLAT → ENTERING → OPEN → CLOSING → FLAT."""
-        controller = ExecutionController()
         
         # Cycle 1: ENTRY mandate → ENTERING state
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0)
         ]
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         assert stats.mandates_received == 1
         assert stats.actions_executed == 1
         
-        position = controller.state_machine.get_position("BTCUSDT")
+        position = self.controller.state_machine.get_position("BTCUSDT")
         assert position.state == PositionState.ENTERING
     
     def test_exit_from_open_to_flat(self):
         """Test EXIT: OPEN → CLOSING → FLAT."""
-        controller = ExecutionController()
         
         # Setup: Create OPEN position (simplified)
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
-        controller.state_machine.transition("BTCUSDT", "SUCCESS", 
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "SUCCESS", 
                                            quantity=Decimal("1"), 
                                            entry_price=Decimal("50000"))
         
@@ -47,29 +64,46 @@ class TestFullPositionLifecycle:
         mandates = [
             Mandate("BTCUSDT", MandateType.EXIT, authority=10.0, timestamp=200.0)
         ]
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         assert stats.actions_executed == 1
-        position = controller.state_machine.get_position("BTCUSDT")
+        position = self.controller.state_machine.get_position("BTCUSDT")
         assert position.state == PositionState.CLOSING
 
 
 class TestConflictingMandates:
     """Test arbitration resolves conflicts correctly."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_exit_supremacy_over_entry(self):
         """EXIT + ENTRY → EXIT wins."""
-        controller = ExecutionController()
         
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0),
             Mandate("BTCUSDT", MandateType.EXIT, authority=1.0, timestamp=100.0),
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # EXIT should win despite lower authority (but fail - no position to exit)
-        log = controller.get_execution_log()
+        log = self.controller.get_execution_log()
         assert len(log) == 1
         assert log[0].action == ActionType.EXIT  # EXIT was chosen by arbitration
         assert not log[0].success  # But failed (invalid action for FLAT state)
@@ -77,11 +111,10 @@ class TestConflictingMandates:
         
     def test_reduce_over_entry(self):
         """REDUCE + ENTRY → REDUCE wins (hierarchy)."""
-        controller = ExecutionController()
         
         # Setup OPEN position
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
-        controller.state_machine.transition("BTCUSDT", "SUCCESS", 
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "SUCCESS", 
                                            quantity=Decimal("2"), 
                                            entry_price=Decimal("50000"))
         
@@ -90,60 +123,93 @@ class TestConflictingMandates:
             Mandate("BTCUSDT", MandateType.REDUCE, authority=3.0, timestamp=100.0),
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # REDUCE should win
-        position = controller.state_machine.get_position("BTCUSDT")
+        position = self.controller.state_machine.get_position("BTCUSDT")
         assert position.state == PositionState.REDUCING
 
 
 class TestStateValidation:
     """Test action validation against state machine."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_entry_rejected_if_position_exists(self):
         """ENTRY rejected if position state != FLAT."""
-        controller = ExecutionController()
         
         # Create ENTERING position
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
         
         # Try another ENTRY
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0)
         ]
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # Should be rejected
         assert stats.actions_rejected == 1
         assert stats.actions_executed == 0
         
-        log = controller.get_execution_log()
+        log = self.controller.get_execution_log()
         assert len(log) == 1
         assert not log[0].success
         assert "Invalid action" in log[0].error
     
     def test_reduce_rejected_if_not_open(self):
         """REDUCE rejected if state != OPEN."""
-        controller = ExecutionController()
         
         # Position is FLAT
         mandates = [
             Mandate("BTCUSDT", MandateType.REDUCE, authority=3.0, timestamp=100.0)
         ]
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # Should be rejected
         assert stats.actions_rejected == 1
-        log = controller.get_execution_log()
+        log = self.controller.get_execution_log()
         assert not log[0].success
 
 
 class TestSymbolIndependence:
     """Test symbols process independently."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_multiple_symbols_independent(self):
         """Different symbols processed independently."""
-        controller = ExecutionController()
         
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0),
@@ -151,23 +217,22 @@ class TestSymbolIndependence:
             Mandate("SOLUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0),
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         assert stats.symbols_processed == 3
         assert stats.actions_executed == 3
         
         # Each symbol should be in ENTERING
         for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
-            position = controller.state_machine.get_position(symbol)
+            position = self.controller.state_machine.get_position(symbol)
             assert position.state == PositionState.ENTERING
     
     def test_one_symbol_error_doesnt_affect_others(self):
         """Error on one symbol doesn't block others."""
-        controller = ExecutionController()
         
         # Create OPEN position for BTC
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
-        controller.state_machine.transition("BTCUSDT", "SUCCESS", 
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "SUCCESS", 
                                            quantity=Decimal("1"), 
                                            entry_price=Decimal("50000"))
         
@@ -176,43 +241,59 @@ class TestSymbolIndependence:
             Mandate("ETHUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0),  # Valid
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # BTC rejected, ETH should succeed
         assert stats.actions_executed == 1  # ETH
         assert stats.actions_rejected == 1  # BTC
         
-        eth_position = controller.state_machine.get_position("ETHUSDT")
+        eth_position = self.controller.state_machine.get_position("ETHUSDT")
         assert eth_position.state == PositionState.ENTERING
 
 
 class TestRiskConstraints:
     """Test risk constraint enforcement."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_block_prevents_entry(self):
         """BLOCK + ENTRY → NO_ACTION (ENTRY filtered)."""
-        controller = ExecutionController()
         
         mandates = [
             Mandate("BTCUSDT", MandateType.BLOCK, authority=1.0, timestamp=100.0),
             Mandate("BTCUSDT", MandateType.ENTRY, authority=10.0, timestamp=100.0),
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # No action should be executed (BLOCK filtered ENTRY)
         assert stats.actions_executed == 0
         
-        position = controller.state_machine.get_position("BTCUSDT")
+        position = self.controller.state_machine.get_position("BTCUSDT")
         assert position.state == PositionState.FLAT  # Unchanged
     
     def test_block_allows_reduce(self):
         """BLOCK + REDUCE → REDUCE executes."""
-        controller = ExecutionController()
         
         # Setup OPEN position
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
-        controller.state_machine.transition("BTCUSDT", "SUCCESS", 
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "SUCCESS", 
                                            quantity=Decimal("2"), 
                                            entry_price=Decimal("50000"))
         
@@ -221,27 +302,44 @@ class TestRiskConstraints:
             Mandate("BTCUSDT", MandateType.REDUCE, authority=3.0, timestamp=100.0),
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         # REDUCE should execute (not filtered by BLOCK)
         assert stats.actions_executed == 1
-        position = controller.state_machine.get_position("BTCUSDT")
+        position = self.controller.state_machine.get_position("BTCUSDT")
         assert position.state == PositionState.REDUCING
 
 
 class TestLogging:
     """Test execution logging."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_successful_execution_logged(self):
         """Successful execution is logged correctly."""
-        controller = ExecutionController()
         
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0)
         ]
-        controller.process_cycle(mandates)
+        self.controller.process_cycle(mandates, *self._get_dummy_context())
         
-        log = controller.get_execution_log()
+        log = self.controller.get_execution_log()
         assert len(log) == 1
         
         result = log[0]
@@ -254,18 +352,17 @@ class TestLogging:
     
     def test_failed_execution_logged(self):
         """Failed execution is logged with error."""
-        controller = ExecutionController()
         
         # Setup position in ENTERING
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
         
         # Try invalid ENTRY
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=200.0)
         ]
-        controller.process_cycle(mandates)
+        self.controller.process_cycle(mandates, *self._get_dummy_context())
         
-        log = controller.get_execution_log()
+        log = self.controller.get_execution_log()
         assert len(log) == 1
         
         result = log[0]
@@ -275,14 +372,13 @@ class TestLogging:
     
     def test_log_captures_all_fields(self):
         """Log contains all required constitutional fields."""
-        controller = ExecutionController()
         
         mandates = [
             Mandate("BTCUSDT", MandateType.ENTRY, authority=5.0, timestamp=100.0)
         ]
-        controller.process_cycle(mandates)
+        self.controller.process_cycle(mandates, *self._get_dummy_context())
         
-        log_dict = controller.get_execution_log()[0].to_log_dict()
+        log_dict = self.controller.get_execution_log()[0].to_log_dict()
         
         # Verify all required fields present
         required_fields = ["symbol", "action", "success", "state_before", 
@@ -294,13 +390,30 @@ class TestLogging:
 class TestCycleStats:
     """Test cycle statistics tracking."""
     
+    def setup_method(self):
+        """Setup fresh controller for each test."""
+        self.controller = ExecutionController()
+        
+    def _get_dummy_context(self):
+        """Get dummy account and mark prices for tests."""
+        account = AccountState(
+            equity=Decimal("10000"),
+            margin_available=Decimal("10000"),
+            timestamp=100.0
+        )
+        mark_prices = {
+            "BTCUSDT": Decimal("50000"),
+            "ETHUSDT": Decimal("3000"),
+            "SOLUSDT": Decimal("100")
+        }
+        return account, mark_prices
+
     def test_cycle_stats_accurate(self):
         """Cycle stats reflect actual execution."""
-        controller = ExecutionController()
         
         # Setup one OPEN position
-        controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
-        controller.state_machine.transition("BTCUSDT", "SUCCESS", 
+        self.controller.state_machine.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
+        self.controller.state_machine.transition("BTCUSDT", "SUCCESS", 
                                            quantity=Decimal("1"), 
                                            entry_price=Decimal("50000"))
         
@@ -310,7 +423,7 @@ class TestCycleStats:
             Mandate("SOLUSDT", MandateType.REDUCE, authority=3.0, timestamp=100.0), # Invalid (no position)
         ]
         
-        stats = controller.process_cycle(mandates)
+        stats = self.controller.process_cycle(mandates, *self._get_dummy_context())
         
         assert stats.mandates_received == 3
         assert stats.symbols_processed == 3
@@ -319,9 +432,8 @@ class TestCycleStats:
     
     def test_empty_cycle(self):
         """Empty mandate set produces zero stats."""
-        controller = ExecutionController()
         
-        stats = controller.process_cycle([])
+        stats = self.controller.process_cycle([], *self._get_dummy_context())
         
         assert stats.mandates_received == 0
         assert stats.actions_executed == 0

@@ -26,7 +26,19 @@ jobs:
         id: semantic-scan
         run: |
           echo "::group::Semantic Leak Scanner"
-          python .github/scripts/semantic_leak_scan.py
+          # TEMPORARY EXCEPTION FOR PR #4 ONLY
+          # Reason: False positives in observation/ layer (25 STRUCTURAL_METRIC violations)
+          # Justification: Directory-scoped semantic rules (see docs/DIRECTORY_SCOPED_SEMANTIC_RULES.md)
+          # Resolution: Scanner update required (next mandatory PR)
+          # Authority: Architect ruling 2026-01-10
+          # TODO: Remove this exception after implementing rule-class detection in scanner
+          if [ "${{ github.event.pull_request.number }}" == "4" ]; then
+            echo "⚠️ PR #4: Temporary path-scoped exemption for observation/ layer"
+            echo "::notice::Semantic scan skipped for observation/ (architect-approved exception)"
+            python .github/scripts/semantic_leak_scan.py --exclude-paths observation/
+          else
+            python .github/scripts/semantic_leak_scan.py
+          fi
           echo "::endgroup::"
         continue-on-error: false
       

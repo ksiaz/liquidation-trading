@@ -120,6 +120,7 @@ class TestPrimitiveComputationWithMockData:
         # (In production, M1/M3 would populate this)
         node = obs_system._m2_store.add_or_update_node(
             node_id="test_zone_50000",
+            symbol="BTCUSDT",
             price_center=50000.0,
             price_band=100.0,
             side="bid",
@@ -156,6 +157,7 @@ class TestPrimitiveComputationWithMockData:
         # Add mock node
         obs_system._m2_store.add_or_update_node(
             node_id="test_node_1",
+            symbol="BTCUSDT",
             price_center=50000.0,
             price_band=50.0,
             side="bid",

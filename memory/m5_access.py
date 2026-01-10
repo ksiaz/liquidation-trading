@@ -289,6 +289,8 @@ class MemoryAccess:
                 candidates.extend(self._store._dormant_nodes.values())
                 
             for node in candidates:
+                if query.symbol and node.symbol != query.symbol:
+                     continue
                 if query.min_price <= node.price_center <= query.max_price:
                     results.append({
                         "node_id": node.id,
@@ -300,12 +302,22 @@ class MemoryAccess:
             return results
 
         elif isinstance(query, StateDistributionQuery):
-            counts = {
-                "ACTIVE": len(self._store._active_nodes),
-                "DORMANT": len(self._store._dormant_nodes),
-                "ARCHIVED": len(self._store._archived_nodes),
-                "total_count": 0
-            }
+            if query.symbol:
+                 # Filtered count (O(N))
+                 counts = {
+                     "ACTIVE": sum(1 for n in self._store._active_nodes.values() if n.symbol == query.symbol),
+                     "DORMANT": sum(1 for n in self._store._dormant_nodes.values() if n.symbol == query.symbol),
+                     "ARCHIVED": sum(1 for n in self._store._archived_nodes.values() if n.symbol == query.symbol),
+                     "total_count": 0
+                 }
+            else:
+                 # Global count (O(1))
+                 counts = {
+                    "ACTIVE": len(self._store._active_nodes),
+                    "DORMANT": len(self._store._dormant_nodes),
+                    "ARCHIVED": len(self._store._archived_nodes),
+                    "total_count": 0
+                 }
             counts["total_count"] = counts["ACTIVE"] + counts["DORMANT"] + counts["ARCHIVED"]
             return counts
 
@@ -319,6 +331,9 @@ class MemoryAccess:
             
             results = []
             for node in candidates:
+                if query.symbol and node.symbol != query.symbol:
+                    continue
+                
                 dist = abs(node.price_center - center)
                 if dist <= radius:
                     results.append({

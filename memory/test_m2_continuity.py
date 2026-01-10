@@ -27,6 +27,7 @@ def test_three_state_model():
     # Create active node with low strength
     node = store.add_or_update_node(
         node_id="test_state",
+        symbol="TEST",
         price_center=2.05,
         price_band=0.002,
         side="bid",
@@ -77,6 +78,7 @@ def test_historical_evidence_retention():
     # Create node with rich evidence
     node = store.add_or_update_node(
         node_id="test_history",
+        symbol="TEST",
         price_center=2.05,
         price_band=0.002,
         side="bid",
@@ -124,6 +126,7 @@ def test_dormant_revival():
     # Create and populate node
     node = store.add_or_update_node(
         node_id="test_revival",
+        symbol="TEST",
         price_center=2.05,
         price_band=0.002,
         side="bid",
@@ -142,6 +145,7 @@ def test_dormant_revival():
     # Revival with new evidence
     revived = store.add_or_update_node(
         node_id="test_revival",
+        symbol="TEST",
         price_center=2.05,
         price_band=0.002,
         side="bid",

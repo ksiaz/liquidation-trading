@@ -8,7 +8,7 @@ on:
 
 jobs:
   semantic-enforcement:
-    name: Constitutional Compliance Checks
+    name: semantic-enforcement
     runs-on: ubuntu-latest
     
     steps:

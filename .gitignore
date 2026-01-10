@@ -70,3 +70,14 @@ ui/node_modules/
 
 # Auto Claude data directory
 .auto-claude/
+.claude/
+.claude_settings.json
+
+# Archived systems and documentation (large)
+_ARCHIVED_90DAY_SYSTEM/
+constitutional-clean/
+
+# Session documentation (temporary)
+ARCHIVAL_COMPLETE.md
+PROJECT_UNDERSTANDING.md
+SECURITY_AUDIT_REPORT.md

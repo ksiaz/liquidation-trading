@@ -13,10 +13,33 @@ from decimal import Decimal
 from observation.types import (
     ObservationSnapshot,
     ObservationStatus,
-    SystemCounters
+    SystemCounters,
+    M4PrimitiveBundle
 )
 from runtime.policy_adapter import PolicyAdapter, AdapterConfig
 from runtime.arbitration.types import MandateType
+
+
+# ==============================================================================
+# Test Helpers
+# ==============================================================================
+
+def make_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
+    """Create M4PrimitiveBundle with all primitives as None.
+
+    Used for testing when primitives are not relevant to test scenario.
+    """
+    return M4PrimitiveBundle(
+        symbol=symbol,
+        zone_penetration=None,
+        displacement_origin_anchor=None,
+        price_traversal_velocity=None,
+        traversal_compactness=None,
+        central_tendency_deviation=None,
+        structural_absence_duration=None,
+        traversal_void_span=None,
+        event_non_occurrence_counter=None
+    )
 
 
 class TestPolicyAdapterObservationStatus:
@@ -31,7 +54,8 @@ class TestPolicyAdapterObservationStatus:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=None, dropped_events=None),
-            promoted_events=None
+            promoted_events=None,
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -50,7 +74,8 @@ class TestPolicyAdapterObservationStatus:
             timestamp=0.0,
             symbols_active=[],
             counters=SystemCounters(intervals_processed=None, dropped_events=None),
-            promoted_events=None
+            promoted_events=None,
+            primitives={}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -70,7 +95,8 @@ class TestPolicyAdapterWiring:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=0, dropped_events={}),
-            promoted_events=[]
+            promoted_events=[],
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         # Call twice with identical inputs
@@ -91,7 +117,8 @@ class TestPolicyAdapterWiring:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=0, dropped_events={}),
-            promoted_events=[]
+            promoted_events=[],
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -113,7 +140,8 @@ class TestPolicyAdapterWiring:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=0, dropped_events={}),
-            promoted_events=[]
+            promoted_events=[],
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -138,7 +166,8 @@ class TestPolicyAdapterSemanticLeakage:
                 intervals_processed=100,
                 dropped_events={"TRADE": 50}
             ),
-            promoted_events=[{"type": "PEAK_PRESSURE"}]
+            promoted_events=[{"type": "PEAK_PRESSURE"}],
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -158,7 +187,8 @@ class TestPolicyAdapterSemanticLeakage:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=None, dropped_events=None),
-            promoted_events=None
+            promoted_events=None,
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         mandates = adapter.generate_mandates(snapshot, "BTCUSDT", 1000.0)
@@ -194,7 +224,8 @@ class TestPolicyAdapterIntegration:
             timestamp=1000.0,
             symbols_active=["BTCUSDT"],
             counters=SystemCounters(intervals_processed=0, dropped_events={}),
-            promoted_events=[]
+            promoted_events=[],
+            primitives={"BTCUSDT": make_empty_primitive_bundle("BTCUSDT")}
         )
 
         # Generate mandates via adapter

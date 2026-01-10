@@ -174,31 +174,47 @@ class PolicyAdapter:
     ) -> Dict[str, Any]:
         """Extract M4 primitives from observation snapshot.
 
-        NOTE: This is a stub implementation.
-        Real implementation needs M5 query interface to pull specific primitives.
+        Reads pre-computed primitives - does NOT query M5.
+
+        Per ANNEX_M4_PRIMITIVE_FLOW.md:
+        - Primitives are pre-computed at snapshot creation
+        - PolicyAdapter (M6) never queries M5 directly
+        - Primitives flow via ObservationSnapshot only
 
         Args:
-            observation_snapshot: Observation state
+            observation_snapshot: Snapshot with pre-computed primitives
             symbol: Symbol to extract primitives for
 
         Returns:
             Dictionary of primitive name -> primitive object
         """
-        # STUB: In real implementation, this would:
-        # 1. Use M5 governance layer to query M4 primitives
-        # 2. Return actual primitive dataclasses
-        # 3. Handle missing/None primitives explicitly
+        # Get pre-computed bundle for symbol
+        bundle = observation_snapshot.primitives.get(symbol)
 
-        # For now, return empty dict (all None primitives)
+        if bundle is None:
+            # Symbol not in snapshot (should not happen if symbol in symbols_active)
+            # Return empty dict with all None primitives
+            return {
+                "zone_penetration": None,
+                "traversal_compactness": None,
+                "central_tendency_deviation": None,
+                "price_traversal_velocity": None,
+                "displacement_origin_anchor": None,
+                "structural_absence_duration": None,
+                "traversal_void_span": None,
+                "event_non_occurrence_counter": None,
+            }
+
+        # Extract primitives from bundle (read-only access)
         return {
-            "zone_penetration": None,
-            "traversal_compactness": None,
-            "central_tendency_deviation": None,
-            "price_traversal_velocity": None,
-            "displacement_origin_anchor": None,
-            "structural_absence_duration": None,
-            "traversal_void_span": None,
-            "event_non_occurrence_counter": None,
+            "zone_penetration": bundle.zone_penetration,
+            "traversal_compactness": bundle.traversal_compactness,
+            "central_tendency_deviation": bundle.central_tendency_deviation,
+            "price_traversal_velocity": bundle.price_traversal_velocity,
+            "displacement_origin_anchor": bundle.displacement_origin_anchor,
+            "structural_absence_duration": bundle.structural_absence_duration,
+            "traversal_void_span": bundle.traversal_void_span,
+            "event_non_occurrence_counter": bundle.event_non_occurrence_counter,
         }
 
     def _proposals_to_mandates(

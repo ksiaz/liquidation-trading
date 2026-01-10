@@ -1,5 +1,5 @@
 from typing import Dict, List, Any, Optional
-from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException
+from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
 
@@ -116,8 +116,17 @@ class ObservationSystem:
         pass
 
     def _get_snapshot(self) -> ObservationSnapshot:
-        """Construct public snapshot from internal states."""
-        
+        """Construct public snapshot from internal states.
+
+        Computes M4 primitives exactly once via M5.
+
+        Amendment 2026-01-10: Added primitive computation per ANNEX_M4_PRIMITIVE_FLOW.md
+        """
+        # Compute primitives for all active symbols
+        primitives = {}
+        for symbol in sorted(self._allowed_symbols):
+            primitives[symbol] = self._compute_primitives_for_symbol(symbol)
+
         return ObservationSnapshot(
             status=self._status,
             timestamp=self._system_time,
@@ -126,5 +135,39 @@ class ObservationSystem:
                 intervals_processed=None,
                 dropped_events=None
             ),
-            promoted_events=None
+            promoted_events=None,
+            primitives=primitives  # Pre-computed M4 primitives
+        )
+
+    def _compute_primitives_for_symbol(self, symbol: str) -> M4PrimitiveBundle:
+        """Compute M4 primitives for a single symbol.
+
+        This is the ONLY place M4 primitives are computed for external exposure.
+        Called exactly once per symbol per snapshot.
+
+        Returns bundle with fields set to None if:
+        - Insufficient data for computation
+        - No structural condition detected
+        - Computation validation failed
+
+        Authority: ANNEX_M4_PRIMITIVE_FLOW.md
+        """
+        # STUB: Current implementation returns empty bundle
+        # Full implementation requires:
+        # 1. Access to M2 continuity store for node data
+        # 2. M5 query interface for primitive computation
+        # 3. Error handling for missing/insufficient data
+
+        # For now, return bundle with all primitives as None
+        # This maintains structural correctness while deferring implementation
+        return M4PrimitiveBundle(
+            symbol=symbol,
+            zone_penetration=None,
+            displacement_origin_anchor=None,
+            price_traversal_velocity=None,
+            traversal_compactness=None,
+            central_tendency_deviation=None,
+            structural_absence_duration=None,
+            traversal_void_span=None,
+            event_non_occurrence_counter=None
         )

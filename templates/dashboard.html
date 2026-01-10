@@ -1,0 +1,1922 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquidation Terminal</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0d1117;
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-size: 13px;
+            overflow: hidden;
+        }
+
+        /* HEADER */
+        .header {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 10px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .title {
+            color: #58a6ff;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .status {
+            display: flex;
+            gap: 16px;
+            font-size: 12px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3fb950;
+            display: inline-block;
+            margin-right: 4px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
+            }
+        }
+
+        /* TABS */
+        .tabs {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 0 16px;
+            display: flex;
+            gap: 4px;
+        }
+
+        .tab {
+            padding: 10px 16px;
+            cursor: pointer;
+            color: #8b949e;
+            font-size: 13px;
+            font-weight: 500;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            color: #c9d1d9;
+        }
+
+        .tab.active {
+            color: #58a6ff;
+            border-bottom-color: #58a6ff;
+        }
+
+        /* CONTENT */
+        .content {
+            height: calc(100vh - 84px);
+            overflow: hidden;
+        }
+
+        .tab-content {
+            display: none;
+            height: 100%;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* GRID */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: #21262d;
+            height: 100%;
+        }
+
+        .panel {
+            background: #0d1117;
+            overflow-y: auto;
+            padding: 12px;
+        }
+
+        .panel::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .panel::-webkit-scrollbar-track {
+            background: #161b22;
+        }
+
+        .panel::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 4px;
+        }
+
+        /* SYMBOL HEADER */
+        .sym-header {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+
+        .sym-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .sym-name {
+            font-size: 16px;
+            font-weight: 700;
+            color: #58a6ff;
+        }
+
+        .sym-price {
+            font-size: 15px;
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+            color: #ffa657;
+        }
+
+        /* METRICS */
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            font-size: 11px;
+        }
+
+
+
+        .metric {
+            text-align: center;
+        }
+
+        .metric-label {
+            color: #8b949e;
+            display: block;
+            margin-bottom: 3px;
+        }
+
+        .metric-value {
+            color: #c9d1d9;
+            font-weight: 600;
+            font-family: 'Courier New', monospace;
+        }
+
+        /* SIGNAL */
+        .signal {
+            background: #1c2128;
+            border-left: 3px solid #3fb950;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            border-radius: 0 4px 4px 0;
+            font-size: 12px;
+        }
+
+        .signal.SHORT {
+            border-left-color: #f85149;
+        }
+
+        .signal-top {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+        }
+
+        .signal-dir {
+            font-weight: 700;
+            font-size: 13px;
+        }
+
+        .signal-dir.LONG {
+            color: #3fb950;
+        }
+
+        .signal-dir.SHORT {
+            color: #f85149;
+        }
+
+        .signal-conf {
+            color: #8b949e;
+            font-size: 11px;
+        }
+
+        .signal-reason {
+            color: #8b949e;
+        }
+
+        /* ORDERBOOK */
+        .orderbook {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 12px;
+        }
+
+        .ob-title {
+            font-size: 11px;
+            color: #8b949e;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .ob-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            font-size: 12px;
+        }
+
+        .ob-label {
+            color: #8b949e;
+        }
+
+        .ob-value {
+            font-family: 'Courier New', monospace;
+            font-weight: 600;
+        }
+
+        .ob-value.positive {
+            color: #3fb950;
+        }
+
+        .ob-value.negative {
+            color: #f85149;
+        }
+
+        .ob-value.neutral {
+            color: #ffa657;
+        }
+
+        /* ZONES */
+        .zones-title {
+            font-size: 11px;
+            color: #8b949e;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .zone {
+            display: grid;
+            grid-template-columns: 50px 80px 45px 55px 90px;
+            gap: 8px;
+            padding: 7px 8px;
+            background: #161b22;
+            border: 1px solid #21262d;
+            margin-bottom: 1px;
+            font-size: 12px;
+            transition: all 0.1s;
+        }
+
+        .zone:hover {
+            background: #1c2128;
+            border-color: #30363d;
+        }
+
+        .zone:first-of-type {
+            border-radius: 4px 4px 0 0;
+        }
+
+        .zone:last-of-type {
+            border-radius: 0 0 4px 4px;
+        }
+
+        .z-type {
+            font-weight: 700;
+            font-size: 11px;
+        }
+
+        .z-type.LONG {
+            color: #3fb950;
+        }
+
+        .z-type.SHORT {
+            color: #f85149;
+        }
+
+        .z-val {
+            color: #ffa657;
+            font-family: 'Courier New', monospace;
+            font-weight: 600;
+        }
+
+        .z-lev {
+            color: #58a6ff;
+            font-weight: 600;
+        }
+
+        .z-dist {
+            color: #f85149;
+            text-align: right;
+            font-weight: 600;
+        }
+
+        .z-price {
+            color: #8b949e;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+        }
+
+        /* SIGNALS TAB */
+        .signals-container {
+            padding: 16px;
+            overflow-y: auto;
+            height: 100%;
+        }
+
+        .signal-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 14px;
+            margin-bottom: 12px;
+        }
+
+        .signal-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #21262d;
+        }
+
+        .signal-card-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .signal-symbol {
+            font-size: 16px;
+            font-weight: 700;
+            color: #58a6ff;
+        }
+
+        .signal-badge {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .signal-badge.LONG {
+            background: rgba(63, 185, 80, 0.15);
+            color: #3fb950;
+        }
+
+        .signal-badge.SHORT {
+            background: rgba(248, 81, 73, 0.15);
+            color: #f85149;
+        }
+
+        .signal-time {
+            font-size: 11px;
+            color: #8b949e;
+        }
+
+        .signal-strength {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .strength-item {
+            text-align: center;
+        }
+
+        .strength-label {
+            font-size: 10px;
+            color: #8b949e;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .strength-value {
+            font-size: 14px;
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+        }
+
+        .strength-bar {
+            height: 4px;
+            background: #21262d;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+
+        .strength-fill {
+            height: 100%;
+            background: #3fb950;
+            transition: width 0.3s;
+        }
+
+        .signal-details {
+            font-size: 12px;
+            color: #8b949e;
+            line-height: 1.6;
+        }
+
+        .no-data {
+            text-align: center;
+            padding: 30px;
+            color: #484f58;
+            font-style: italic;
+        }
+
+        /* LIQUIDATIONS TAB */
+        .liq-header {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 8px 10px;
+            margin-bottom: 10px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #8b949e;
+            text-align: center;
+            letter-spacing: 0.5px;
+        }
+
+        .liq-item {
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 4px;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            font-size: 11px;
+            transition: all 0.2s;
+        }
+
+        .liq-item:hover {
+            background: #1c2128;
+            border-color: #30363d;
+        }
+
+        .liq-item.LONG {
+            border-left: 3px solid #3fb950;
+        }
+
+        .liq-item.SHORT {
+            border-left: 3px solid #f85149;
+        }
+
+        .liq-value {
+            color: #ffa657;
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .liq-price {
+            color: #8b949e;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+        }
+
+        .liq-time {
+            color: #484f58;
+            font-size: 10px;
+            margin-top: 4px;
+        }
+
+        /* HEATMAP TAB */
+        .heatmap-header {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 12px;
+            font-size: 12px;
+            font-weight: 700;
+            color: #58a6ff;
+            text-align: center;
+            letter-spacing: 0.5px;
+        }
+
+        canvas {
+            width: 100%;
+            height: auto;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            background: #0d1117;
+        }
+
+        .heatmap-info {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #8b949e;
+        }
+
+        /* Enhanced Signals Tab Styling */
+        .signals-container {
+            padding: 16px;
+            height: calc(100vh - 120px);
+            overflow-y: auto;
+        }
+
+        .signal-history {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .signal-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .signal-card.fresh {
+            border-left: 3px solid #3fb950;
+            opacity: 1;
+            box-shadow: 0 0 10px rgba(63, 185, 80, 0.3);
+        }
+
+        .signal-card.recent {
+            border-left: 3px solid #58a6ff;
+            opacity: 0.95;
+        }
+
+        .signal-card.aging {
+            border-left: 3px solid #8b949e;
+            opacity: 0.7;
+        }
+
+        .signal-card.old {
+            border-left: 3px solid #484f58;
+            opacity: 0.4;
+            filter: grayscale(0.5);
+        }
+
+        .signal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .signal-symbol {
+            font-size: 16px;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+
+        .signal-time {
+            font-size: 11px;
+            color: #8b949e;
+        }
+
+        .signal-type {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .signal-type.long {
+            background: rgba(63, 185, 80, 0.2);
+            color: #3fb950;
+        }
+
+        .signal-type.short {
+            background: rgba(248, 81, 73, 0.2);
+            color: #f85149;
+        }
+
+        .signal-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .signal-metric {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .signal-metric-label {
+            font-size: 10px;
+            color: #8b949e;
+            text-transform: uppercase;
+        }
+
+        .signal-metric-value {
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .confidence-bar {
+            height: 4px;
+            background: #21262d;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+
+        .confidence-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+
+        .confidence-fill.high {
+            background: linear-gradient(90deg, #3fb950, #56d364);
+        }
+
+        .confidence-fill.medium {
+            background: linear-gradient(90deg, #ffa657, #ffb86c);
+        }
+
+        .confidence-fill.low {
+            background: linear-gradient(90deg, #8b949e, #a5b1c2);
+        }
+
+        .signal-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .signal-action-btn {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #30363d;
+            background: #21262d;
+            color: #c9d1d9;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .signal-action-btn:hover {
+            background: #30363d;
+            border-color: #58a6ff;
+        }
+
+        .signal-action-btn.primary {
+            background: #238636;
+            border-color: #238636;
+            color: white;
+        }
+
+        .signal-action-btn.primary:hover {
+            background: #2ea043;
+        }
+
+        .signals-empty {
+            text-align: center;
+            padding: 60px 20px;
+            color: #8b949e;
+        }
+
+        .signals-empty-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.3;
+        }
+
+        /* Signal Anticipation Section */
+        .signal-anticipation-section {
+            margin-bottom: 24px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid #30363d;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #c9d1d9;
+        }
+
+        .update-time {
+            font-size: 11px;
+            color: #8b949e;
+            font-weight: 400;
+        }
+
+        .anticipation-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+        }
+
+        .anticipation-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            transition: all 0.3s ease;
+        }
+
+        .anticipation-card.hot {
+            border-left: 3px solid #ffa657;
+            box-shadow: 0 0 10px rgba(255, 166, 87, 0.2);
+        }
+
+        .anticipation-card.warm {
+            border-left: 3px solid #58a6ff;
+        }
+
+        .anticipation-card.cold {
+            border-left: 3px solid #30363d;
+        }
+
+        .anticipation-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .anticipation-symbol {
+            font-size: 16px;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+
+        .anticipation-status {
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .anticipation-status.hot {
+            background: rgba(255, 166, 87, 0.2);
+            color: #ffa657;
+        }
+
+        .anticipation-status.warm {
+            background: rgba(88, 166, 255, 0.2);
+            color: #58a6ff;
+        }
+
+        .anticipation-status.cold {
+            background: rgba(139, 148, 158, 0.2);
+            color: #8b949e;
+        }
+
+        .anticipation-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+        }
+
+        .stat-label {
+            color: #8b949e;
+        }
+
+        .stat-value {
+            font-weight: 600;
+            color: #c9d1d9;
+        }
+
+        .stat-value.positive {
+            color: #3fb950;
+        }
+
+        .stat-value.negative {
+            color: #f85149;
+        }
+
+        .stat-value.neutral {
+            color: #8b949e;
+        }
+
+        .stat-bar {
+            height: 3px;
+            background: #21262d;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+
+        .stat-bar-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+
+        .stat-bar-fill.high {
+            background: #ffa657;
+        }
+
+        .stat-bar-fill.medium {
+            background: #58a6ff;
+        }
+
+        .stat-bar-fill.low {
+            background: #30363d;
+        }
+
+        .heatmap-stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid #21262d;
+        }
+
+        .heatmap-stat:last-child {
+            border-bottom: none;
+        }
+
+        .heatmap-label {
+            color: #8b949e;
+        }
+
+        .heatmap-value {
+            color: #c9d1d9;
+            font-weight: 600;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <div class="title">LIQUIDATION TERMINAL</div>
+        <div class="status">
+            <span><span class="status-dot"></span>Binance</span>
+            <span><span class="status-dot"></span>Hyperliquid</span>
+            <span><span class="status-dot"></span>DB</span>
+            <span id="clock">--:--:--</span>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab('liquidations')">Liquidations</div>
+        <div class="tab" onclick="switchTab('zones')">Zones</div>
+        <div class="tab" onclick="switchTab('signals')">Signals</div>
+        <div class="tab" onclick="switchTab('heatmap')">Heatmap</div>
+    </div>
+
+    <div class="content">
+        <!-- LIQUIDATIONS TAB -->
+        <div class="tab-content active" id="liquidations-tab">
+            <div class="grid" style="grid-template-columns: repeat(6, 1fr);">
+                <!-- BTC Longs -->
+                <div class="panel">
+                    <div class="liq-header">BTC LONGS</div>
+                    <div id="btc-longs"></div>
+                </div>
+                <!-- BTC Shorts -->
+                <div class="panel">
+                    <div class="liq-header">BTC SHORTS</div>
+                    <div id="btc-shorts"></div>
+                </div>
+                <!-- ETH Longs -->
+                <div class="panel">
+                    <div class="liq-header">ETH LONGS</div>
+                    <div id="eth-longs"></div>
+                </div>
+                <!-- ETH Shorts -->
+                <div class="panel">
+                    <div class="liq-header">ETH SHORTS</div>
+                    <div id="eth-shorts"></div>
+                </div>
+                <!-- SOL Longs -->
+                <div class="panel">
+                    <div class="liq-header">SOL LONGS</div>
+                    <div id="sol-longs"></div>
+                </div>
+                <!-- SOL Shorts -->
+                <div class="panel">
+                    <div class="liq-header">SOL SHORTS</div>
+                    <div id="sol-shorts"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ZONES TAB -->
+        <div class="tab-content" id="zones-tab">
+            <div class="grid">
+                <div class="panel" id="btc"></div>
+                <div class="panel" id="eth"></div>
+                <div class="panel" id="sol"></div>
+            </div>
+        </div>
+        <!-- SIGNALS TAB (ENHANCED) -->
+        <div class="tab-content" id="signals-tab">
+            <div class="signals-container">
+                <!-- Signal Anticipation Section -->
+                <div class="signal-section">
+                    <h3>📊 Signal Anticipation</h3>
+                    <p style="color: #8b949e; font-size: 14px; margin-bottom: 20px;">
+                        Real-time analytics showing how close each coin is to generating a signal
+                    </p>
+                    <div id="anticipation-grid" class="anticipation-grid">
+                        Loading...
+                    </div>
+                </div>
+
+                <!-- Live Positions Section -->
+                <div class="signal-section" style="margin-top: 30px;">
+                    <h3>🎯 Live Positions</h3>
+                    <p style="color: #8b949e; font-size: 14px; margin-bottom: 20px;">
+                        Active positions with real-time P&L tracking
+                    </p>
+                    <div id="live-positions-container">
+                        <div style="text-align: center; padding: 40px; color: #8b949e;">
+                            No active positions
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Signal History Section -->
+                <div class="signal-section" style="margin-top: 30px;">
+                    <h3>📜 Signal History</h3>
+                    <div id="signal-history">
+                        <div class="signals-empty">
+                            <div class="signals-empty-icon">📊</div>
+                            <div>Waiting for trading signals...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- HEATMAP TAB -->
+        <div class="tab-content" id="heatmap-tab">
+            <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+                <!-- BTC Heatmap -->
+                <div class="panel">
+                    <div class="heatmap-header">BTC HEATMAP</div>
+                    <canvas id="heatmap-btc" width="300" height="600"></canvas>
+                    <div id="heatmap-info-btc" class="heatmap-info"></div>
+                </div>
+                <!-- ETH Heatmap -->
+                <div class="panel">
+                    <div class="heatmap-header">ETH HEATMAP</div>
+                    <canvas id="heatmap-eth" width="300" height="600"></canvas>
+                    <div id="heatmap-info-eth" class="heatmap-info"></div>
+                </div>
+                <!-- SOL Heatmap -->
+                <div class="panel">
+                    <div class="heatmap-header">SOL HEATMAP</div>
+                    <canvas id="heatmap-sol" width="300" height="600"></canvas>
+                    <div id="heatmap-info-sol" class="heatmap-info"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        const NAMES = { 'BTCUSDT': 'BTC', 'ETHUSDT': 'ETH', 'SOLUSDT': 'SOL' };
+
+        let currentTab = 'zones';
+
+        function switchTab(tab) {
+            currentTab = tab;
+
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+
+            // Update content
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.getElementById(tab + '-tab').classList.add('active');
+        }
+
+        function fmt(v) {
+            if (!v || isNaN(v)) return '$0';
+            v = Math.abs(v);
+            if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
+            if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+            return '$' + v.toFixed(0);
+        }
+
+        function fmtPrice(p) {
+            if (!p || isNaN(p)) return '$0';
+            return '$' + Number(p).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+        }
+
+        function getConfidenceScore(signal) {
+            const scores = { 'LOW': 33, 'MEDIUM': 66, 'HIGH': 100 };
+            return scores[signal.confidence] || 50;
+        }
+
+        function renderZones(sym, data) {
+            const name = NAMES[sym];
+            const risk = data.risk || {};
+            const signal = data.signal;
+            const zones = data.zones || [];
+            const ob = data.orderbook || {};
+
+            const price = risk.current_price || 0;
+            const oi = risk.open_interest || 0;
+            const funding = ((risk.funding_rate || 0) * 100).toFixed(4);
+
+            const spread = (ob.spread_pct || 0).toFixed(3);
+            const imbalance = (ob.imbalance || 0) * 100;
+            const bidVol = fmt(ob.bid_volume || 0);
+            const askVol = fmt(ob.ask_volume || 0);
+
+            // Alpha Metrics
+            const alpha = data.alpha_metrics || {};
+            const vpin = alpha.vpin || 0;
+            const ofi = alpha.ofi || 0;
+
+            // VPIN Color
+            let vpinColor = '#c9d1d9';
+            if (vpin > 0.8) vpinColor = '#f85149'; // Critical
+            else if (vpin > 0.6) vpinColor = '#ffa657'; // High
+
+            // OFI Color
+            let ofiColor = '#c9d1d9';
+            if (ofi > 0) ofiColor = '#3fb950';
+            if (ofi < 0) ofiColor = '#f85149';
+
+            let signalHTML = '';
+            if (signal) {
+                signalHTML = `
+                    <div class="signal ${signal.direction}">
+                        <div class="signal-top">
+                            <span class="signal-dir ${signal.direction}">${signal.direction}</span>
+                            <span class="signal-conf">${signal.confidence}</span>
+                        </div>
+                        <div class="signal-reason">${signal.reason}</div>
+                    </div>
+                `;
+            }
+
+            const zonesHTML = zones.slice(0, 12).map(z => `
+                <div class="zone">
+                    <span class="z-type ${z.type}">${z.type}</span>
+                    <span class="z-val">${fmt(z.value_usd || 0)}</span>
+                    <span class="z-lev">${z.leverage}x</span>
+                    <span class="z-dist">${(z.distance_pct || 0).toFixed(1)}%</span>
+                    <span class="z-price">→${fmtPrice(z.liquidation_price)}</span>
+                </div>
+            `).join('');
+
+            const imbalanceClass = imbalance > 5 ? 'positive' : imbalance < -5 ? 'negative' : 'neutral';
+
+            return `
+                <div class="sym-header">
+                    <div class="sym-title">
+                        <span class="sym-name">${name}</span>
+                        <span class="sym-price">${fmtPrice(price)}</span>
+                    </div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <span class="metric-label">OI</span>
+                            <span class="metric-value">${fmt(oi)}</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">FUNDING</span>
+                            <span class="metric-value">${funding}%</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">SPREAD</span>
+                            <span class="metric-value">${spread}%</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">ZONES</span>
+                            <span class="metric-value">${zones.length}</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">VPIN</span>
+                            <span class="metric-value" style="color: ${vpinColor}">${vpin.toFixed(2)}</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">OFI</span>
+                            <span class="metric-value" style="color: ${ofiColor}">${fmt(ofi)}</span>
+                        </div>
+                    </div>
+                </div>
+
+                ${signalHTML}
+
+                <div class="orderbook">
+                    <div class="ob-title">Order Book</div>
+                    <div class="ob-row">
+                        <span class="ob-label">Bid Volume</span>
+                        <span class="ob-value positive">${bidVol}</span>
+                    </div>
+                    <div class="ob-row">
+                        <span class="ob-label">Ask Volume</span>
+                        <span class="ob-value negative">${askVol}</span>
+                    </div>
+                    <div class="ob-row">
+                        <span class="ob-label">Imbalance</span>
+                        <span class="ob-value ${imbalanceClass}">${imbalance.toFixed(1)}%</span>
+                    </div>
+                </div>
+
+                <div class="zones-title">Liquidation Zones</div>
+                ${zonesHTML || '<div class="no-data">No zones detected</div>'}
+            `;
+        }
+
+        function renderSignals(allData) {
+            let html = '';
+            let activeSignals = [];
+
+            SYMBOLS.forEach(sym => {
+                const data = allData[sym] || {};
+                const signal = data.signal;
+                if (signal) {
+                    activeSignals.push({ sym, signal, data });
+                }
+            });
+
+            if (activeSignals.length === 0) {
+                return '<div class="no-data">No active signals</div>';
+            }
+
+            activeSignals.forEach(({ sym, signal, data }) => {
+                const name = NAMES[sym];
+                const confScore = getConfidenceScore(signal);
+                const risk = data.risk || {};
+                const zones = data.zones || [];
+
+                const nearZones = zones.filter(z => z.distance_pct < 2).length;
+                const totalValue = zones.reduce((sum, z) => sum + (z.value_usd || 0), 0);
+
+                // Confidence display
+                let confidenceDisplay = signal.confidence;
+                let confidenceColor = confScore > 66 ? '#3fb950' : confScore > 33 ? '#ffa657' : '#f85149';
+
+                if (signal.confidence_pct) {
+                    confidenceDisplay = `${signal.confidence_pct.toFixed(0)}%`;
+                }
+
+                html += `
+                    <div class="signal-card">
+                        <div class="signal-card-header">
+                            <div class="signal-card-title">
+                                <span class="signal-symbol">${name}</span>
+                                <span class="signal-badge ${signal.direction}">${signal.direction}</span>
+                            </div>
+                            <span class="signal-time">Active Now</span>
+                        </div>
+
+                        <div class="signal-strength">
+                            <div class="strength-item">
+                                <div class="strength-label">Confidence</div>
+                                <div class="strength-value" style="color: ${confidenceColor}">${confidenceDisplay}</div>
+                                <div class="strength-bar">
+                                    <div class="strength-fill" style="width: ${confScore}%; background: ${confidenceColor}"></div>
+                                </div>
+                            </div>
+                            <div class="strength-item">
+                                <div class="strength-label">Near Zones</div>
+                                <div class="strength-value" style="color: #ffa657">${nearZones}</div>
+                            </div>
+                            <div class="strength-item">
+                                <div class="strength-label">Total Value</div>
+                                <div class="strength-value" style="color: #58a6ff">${fmt(totalValue)}</div>
+                            </div>
+                        </div>
+
+                        <div class="signal-details">
+                            <strong>Setup:</strong> ${signal.setup || signal.reason}<br>
+                            <strong>Entry:</strong> ${signal.entry || 'N/A'} | 
+                            <strong>Target:</strong> ${signal.target || 'N/A'} | 
+                            <strong>Stop:</strong> ${signal.stop || 'N/A'}
+                        </div>
+                    </div>
+                `;
+            });
+
+            return html;
+        }
+
+        function renderLiquidations(liquidations) {
+            // Group by symbol and side
+            const grouped = {
+                'BTCUSDT': { longs: [], shorts: [] },
+                'ETHUSDT': { longs: [], shorts: [] },
+                'SOLUSDT': { longs: [], shorts: [] }
+            };
+
+            liquidations.forEach(liq => {
+                const symbol = liq.symbol;
+                if (!grouped[symbol]) return;
+
+                // SELL side = longs liquidated, BUY side = shorts liquidated
+                const side = liq.side === 'SELL' ? 'longs' : 'shorts';
+                grouped[symbol][side].push(liq);
+            });
+
+            // Render each column
+            Object.keys(grouped).forEach(symbol => {
+                const name = NAMES[symbol];
+
+                // Render longs
+                const longsHTML = grouped[symbol].longs.slice(0, 20).map(liq => {
+                    const time = new Date(liq.timestamp).toLocaleTimeString();
+                    return `
+                        <div class="liq-item LONG">
+                            <span class="liq-value">${fmt(liq.value_usd)}</span>
+                            <span class="liq-price">@ ${fmtPrice(liq.price)}</span>
+                            <div class="liq-time">${time}</div>
+                        </div>
+                    `;
+                }).join('') || '<div class="no-data" style="padding: 20px;">No recent liquidations</div>';
+
+                // Render shorts
+                const shortsHTML = grouped[symbol].shorts.slice(0, 20).map(liq => {
+                    const time = new Date(liq.timestamp).toLocaleTimeString();
+                    return `
+                        <div class="liq-item SHORT">
+                            <span class="liq-value">${fmt(liq.value_usd)}</span>
+                            <span class="liq-price">@ ${fmtPrice(liq.price)}</span>
+                            <div class="liq-time">${time}</div>
+                        </div>
+                    `;
+                }).join('') || '<div class="no-data" style="padding: 20px;">No recent liquidations</div>';
+
+                document.getElementById(`${name.toLowerCase()}-longs`).innerHTML = longsHTML;
+                document.getElementById(`${name.toLowerCase()}-shorts`).innerHTML = shortsHTML;
+            });
+        }
+
+        function renderHeatmap(symbol, heatmapData) {
+            const name = NAMES[symbol];
+            const canvasId = `heatmap-${name.toLowerCase()}`;
+            const infoId = `heatmap-info-${name.toLowerCase()}`;
+
+            const canvas = document.getElementById(canvasId);
+            const ctx = canvas.getContext('2d');
+
+            if (!heatmapData || heatmapData.error) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#8b949e';
+                ctx.font = '12px sans-serif';
+                ctx.fillText('No heatmap data', canvas.width / 2 - 50, canvas.height / 2);
+                return;
+            }
+
+            const currentPrice = heatmapData.current_price;
+            const layers = heatmapData.layers;
+
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Price range: ±10%
+            const priceRange = currentPrice * 0.1;
+            const minPrice = currentPrice - priceRange;
+            const maxPrice = currentPrice + priceRange;
+
+            // Helper function: price to Y coordinate
+            function priceToY(price) {
+                const pct = (price - minPrice) / (maxPrice - minPrice);
+                return canvas.height - (pct * canvas.height);
+            }
+
+            // Layer 1: Liquidation density (background heatmap)
+            if (layers.liquidation_density && layers.liquidation_density.length > 0) {
+                const maxDensity = Math.max(...layers.liquidation_density.map(p => p.density));
+
+                layers.liquidation_density.forEach(point => {
+                    const y = priceToY(point.price);
+                    const intensity = Math.min(point.density / maxDensity, 1.0);
+
+                    // Red gradient for density
+                    ctx.fillStyle = `rgba(248, 81, 73, ${intensity * 0.4})`;
+                    ctx.fillRect(0, y - 3, canvas.width, 6);
+                });
+            }
+
+            // Layer 2: Order walls (thick lines)
+            if (layers.order_walls && layers.order_walls.length > 0) {
+                layers.order_walls.forEach(wall => {
+                    const y = priceToY(wall.price);
+                    const thickness = Math.min(wall.value_usd / 500000, 8);  // Max 8px
+
+                    // Green for bids, red for asks
+                    ctx.strokeStyle = wall.side === 'BID' ? '#3fb950' : '#f85149';
+                    ctx.lineWidth = thickness;
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(canvas.width, y);
+                    ctx.stroke();
+                });
+            }
+
+            // Layer 3: Predicted zones (dotted lines)
+            if (layers.predicted_zones && layers.predicted_zones.length > 0) {
+                layers.predicted_zones.forEach(zone => {
+                    const y = priceToY(zone.price);
+
+                    // Green for longs, red for shorts
+                    ctx.strokeStyle = zone.side === 'LONG' ? 'rgba(63, 185, 80, 0.5)' : 'rgba(248, 81, 73, 0.5)';
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([3, 3]);
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(canvas.width, y);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                });
+            }
+
+            // Current price line (bold orange)
+            const currentY = priceToY(currentPrice);
+            ctx.strokeStyle = '#ffa657';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(0, currentY);
+            ctx.lineTo(canvas.width, currentY);
+            ctx.stroke();
+
+            // Price labels
+            ctx.fillStyle = '#8b949e';
+            ctx.font = '10px monospace';
+            ctx.fillText(fmtPrice(maxPrice), 5, 12);
+            ctx.fillText(fmtPrice(currentPrice), 5, currentY - 5);
+            ctx.fillText(fmtPrice(minPrice), 5, canvas.height - 5);
+
+            // Update info panel
+            const stats = heatmapData.stats || {};
+            const heatmapStats = stats.heatmap || {};
+            const wallStats = stats.walls || {};
+
+            const infoHTML = `
+                        < div class="heatmap-stat" >
+                    <span class="heatmap-label">Price</span>
+                    <span class="heatmap-value">${fmtPrice(currentPrice)}</span>
+                </div >
+                <div class="heatmap-stat">
+                    <span class="heatmap-label">Hot Zones</span>
+                    <span class="heatmap-value">${heatmapData.hot_zones ? heatmapData.hot_zones.length : 0}</span>
+                </div>
+                <div class="heatmap-stat">
+                    <span class="heatmap-label">Active Walls</span>
+                    <span class="heatmap-value">${wallStats.total_walls || 0}</span>
+                </div>
+                <div class="heatmap-stat">
+                    <span class="heatmap-label">Liqs Tracked</span>
+                    <span class="heatmap-value">${heatmapStats.total_liquidations || 0}</span>
+                </div>
+                <div class="heatmap-stat">
+                    <span class="heatmap-label">Spoofing (1m)</span>
+                    <span class="heatmap-value" style="color: ${stats.spoofing_events > 0 ? '#f85149' : '#3fb950'}">${stats.spoofing_events || 0}</span>
+                </div>
+            `;
+
+            document.getElementById(infoId).innerHTML = infoHTML;
+        }
+
+        // Connect to live liquidation stream
+        const liqStream = new EventSource('/stream/liquidations');
+        const liqBuffer = {}; // Buffer to store recent liquidations per column
+
+        console.log('Liquidation stream: Connecting to /stream/liquidations');
+
+        liqStream.onopen = () => {
+            console.log('Liquidation stream: Connected successfully');
+        };
+
+        liqStream.onmessage = (event) => {
+            console.log('Liquidation stream: Received message:', event.data);
+
+            // Skip heartbeat messages
+            if (!event.data || event.data.trim() === '') {
+                return;
+            }
+
+            try {
+                const liq = JSON.parse(event.data);
+                console.log('Liquidation stream: Parsed liquidation:', liq);
+
+                // Determine column
+                const symbolName = liq.symbol.replace('USDT', '').toLowerCase();
+                const columnSide = liq.side === 'SELL' ? 'longs' : 'shorts';
+                const columnId = `${symbolName}-${columnSide}`;
+
+                console.log(`Liquidation stream: Column ID = ${columnId}`);
+
+                // Initialize buffer for this column
+                if (!liqBuffer[columnId]) {
+                    liqBuffer[columnId] = [];
+                }
+
+                // Add to buffer (prepend for newest first)
+                liqBuffer[columnId].unshift(liq);
+
+                // Keep only last 20
+                if (liqBuffer[columnId].length > 20) {
+                    liqBuffer[columnId] = liqBuffer[columnId].slice(0, 20);
+                }
+
+                // Render the column
+                const container = document.getElementById(columnId);
+                if (container) {
+                    console.log(`Liquidation stream: Rendering to container ${columnId}`);
+                    container.innerHTML = liqBuffer[columnId].map(l => {
+                        const time = new Date(l.timestamp).toLocaleTimeString();
+                        return `
+                            <div class="liq-item ${l.side}">
+                                <span class="liq-value">${fmt(l.value_usd)}</span>
+                                <span class="liq-price">@ ${fmtPrice(l.price)}</span>
+                                <div class="liq-time">${time}</div>
+                            </div>
+                        `;
+                    }).join('');
+                } else {
+                    console.error(`Liquidation stream: Container not found: ${columnId}`);
+                }
+            } catch (e) {
+                console.error('Liquidation stream: Error parsing message:', e, event.data);
+            }
+        };
+
+        liqStream.onerror = (error) => {
+            console.error('Liquidation stream error:', error);
+            console.log('Liquidation stream: Will attempt to reconnect...');
+        };
+
+        async function update() {
+            try {
+                const res = await fetch('/api/predictions');
+                const data = await res.json();
+
+                document.getElementById('clock').innerText = new Date().toLocaleTimeString();
+
+                // Update zones tab
+                document.getElementById('btc').innerHTML = renderZones('BTCUSDT', data['BTCUSDT'] || {});
+                document.getElementById('eth').innerHTML = renderZones('ETHUSDT', data['ETHUSDT'] || {});
+                document.getElementById('sol').innerHTML = renderZones('SOLUSDT', data['SOLUSDT'] || {});
+
+                // Update signals tab
+                document.getElementById('signals-container').innerHTML = renderSignals(data);
+
+                // Liquidations tab now updates via SSE stream above
+
+                // Update heatmap tab
+                const heatmapRes = await fetch('/api/heatmap');
+                const heatmaps = await heatmapRes.json();
+
+                SYMBOLS.forEach(symbol => {
+                    if (heatmaps[symbol]) {
+                        renderHeatmap(symbol, heatmaps[symbol]);
+                    }
+                });
+
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        setInterval(update, 3000);
+        update();
+
+        // ============================================
+        // ENHANCED SIGNALS MANAGEMENT
+        // ============================================
+
+        const signalHistory = [];
+        const MAX_SIGNALS = 20;
+        let live_prices = {};  // Track live prices for signal visualization
+
+        function addSignal(signal) {
+            signalHistory.unshift({
+                ...signal,
+                timestamp: Date.now(),
+                id: `signal-${Date.now()}-${Math.random()}`
+            });
+            if (signalHistory.length > MAX_SIGNALS) signalHistory.pop();
+            renderSignals();
+        }
+
+        function renderSignals() {
+            const container = document.getElementById('signal-history');
+            if (!container) return;
+
+            if (signalHistory.length === 0) {
+                container.innerHTML = `<div class="signals-empty"><div class="signals-empty-icon">📊</div><div>Waiting for trading signals...</div></div>`;
+                return;
+            }
+
+            const now = Date.now();
+            container.innerHTML = signalHistory.map((signal, index) => {
+                const age = now - signal.timestamp;
+                const ageMinutes = Math.floor(age / 60000);
+                let freshnessClass = index === 0 ? 'fresh' : index <= 2 ? 'recent' : index <= 5 ? 'aging' : 'old';
+                let timeAgo = ageMinutes < 1 ? 'Just now' : ageMinutes === 1 ? '1 min ago' : ageMinutes < 60 ? `${ageMinutes} mins ago` : `${Math.floor(ageMinutes / 60)}h ago`;
+                const signalType = signal.direction === 'LONG' ? 'long' : signal.direction === 'SHORT' ? 'short' : 'neutral';
+                const confidenceLevel = signal.confidence > 0.7 ? 'high' : signal.confidence > 0.4 ? 'medium' : 'low';
+
+                // Get current price from live prices or use entry
+                const currentPrice = live_prices && live_prices[signal.symbol] ? live_prices[signal.symbol] : signal.entry;
+
+                // Calculate price range for visualization
+                const isLong = signal.direction === 'LONG';
+                const entry = signal.entry;
+                const target = signal.target;
+                const stop = signal.stop;
+
+                // Price range (add 10% padding)
+                const minPrice = Math.min(entry, target, stop) * 0.95;
+                const maxPrice = Math.max(entry, target, stop) * 1.05;
+                const priceRange = maxPrice - minPrice;
+
+                // Calculate positions on bar (0-100%)
+                const entryPos = ((entry - minPrice) / priceRange) * 100;
+                const targetPos = ((target - minPrice) / priceRange) * 100;
+                const stopPos = ((stop - minPrice) / priceRange) * 100;
+                const currentPos = ((currentPrice - minPrice) / priceRange) * 100;
+
+                // Calculate P&L
+                const pnl = isLong ? ((currentPrice - entry) / entry) * 100 : ((entry - currentPrice) / entry) * 100;
+                const pnlColor = pnl >= 0 ? '#3fb950' : '#f85149';
+                const pnlSign = pnl >= 0 ? '+' : '';
+
+                // Determine if winning or losing
+                const isWinning = (isLong && currentPrice > entry) || (!isLong && currentPrice < entry);
+
+                return `
+                    <div class="signal-card ${freshnessClass}">
+                        <div class="signal-header">
+                            <div class="signal-symbol">${signal.symbol}</div>
+                            <div class="signal-time">${timeAgo}</div>
+                        </div>
+                        <div class="signal-type ${signalType}">${signal.direction} ${signal.type || 'SIGNAL'}</div>
+                        
+                        <!-- Visual Price Bar -->
+                        <div style="margin: 16px 0;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 11px;">
+                                <span style="color: #8b949e;">Price Action</span>
+                                <span style="color: ${pnlColor}; font-weight: 600;">${pnlSign}${pnl.toFixed(2)}%</span>
+                            </div>
+                            
+                            <!-- Price Bar Container -->
+                            <div style="position: relative; height: 40px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: visible;">
+                                <!-- Stop Loss Zone (Red) -->
+                                <div style="position: absolute; left: ${Math.min(stopPos, entryPos)}%; width: ${Math.abs(stopPos - entryPos)}%; height: 100%; background: rgba(248, 81, 73, 0.1); border-left: 2px solid #f85149;"></div>
+                                
+                                <!-- Target Zone (Green) -->
+                                <div style="position: absolute; left: ${Math.min(targetPos, entryPos)}%; width: ${Math.abs(targetPos - entryPos)}%; height: 100%; background: rgba(63, 185, 80, 0.1); border-right: 2px solid #3fb950;"></div>
+                                
+                                <!-- Entry Line (Blue) -->
+                                <div style="position: absolute; left: ${entryPos}%; top: 0; bottom: 0; width: 2px; background: #58a6ff; z-index: 2;"></div>
+                                <div style="position: absolute; left: ${entryPos}%; top: -20px; transform: translateX(-50%); font-size: 10px; color: #58a6ff; white-space: nowrap;">
+                                    Entry $${entry.toFixed(2)}
+                                </div>
+                                
+                                <!-- Stop Loss Marker -->
+                                <div style="position: absolute; left: ${stopPos}%; bottom: -18px; transform: translateX(-50%); font-size: 10px; color: #f85149; white-space: nowrap;">
+                                    SL $${stop.toFixed(2)}
+                                </div>
+                                
+                                <!-- Target Marker -->
+                                <div style="position: absolute; left: ${targetPos}%; bottom: -18px; transform: translateX(-50%); font-size: 10px; color: #3fb950; white-space: nowrap;">
+                                    TP $${target.toFixed(2)}
+                                </div>
+                                
+                                <!-- Current Price Indicator (Moving) -->
+                                <div style="position: absolute; left: ${currentPos}%; top: 50%; transform: translate(-50%, -50%); z-index: 3;">
+                                    <div style="width: 12px; height: 12px; background: ${pnlColor}; border: 2px solid #0d1117; border-radius: 50%; box-shadow: 0 0 8px ${pnlColor};"></div>
+                                </div>
+                                <div style="position: absolute; left: ${currentPos}%; top: -20px; transform: translateX(-50%); font-size: 10px; color: ${pnlColor}; font-weight: 600; white-space: nowrap;">
+                                    $${currentPrice.toFixed(2)}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="signal-details">
+                            <div class="signal-metric">
+                                <div class="signal-metric-label">R/R</div>
+                                <div class="signal-metric-value">${signal.riskReward?.toFixed(1) || 'N/A'}</div>
+                            </div>
+                            <div class="signal-metric">
+                                <div class="signal-metric-label">Confidence</div>
+                                <div class="signal-metric-value">${(signal.confidence * 100).toFixed(0)}%</div>
+                            </div>
+                        </div>
+                        
+                        <div class="signal-metric" style="margin-top: 12px;">
+                            <div class="signal-metric-label">Reason</div>
+                            <div style="font-size: 12px; color: #c9d1d9; margin-top: 4px;">${signal.reason || 'No reason'}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function fetchEnhancedSignals() {
+            fetch('/api/enhanced-signals').then(r => r.json()).then(data => {
+                if (data.signals && data.signals.length > 0) {
+                    data.signals.forEach(signal => {
+                        const exists = signalHistory.some(s => s.symbol === signal.symbol && s.type === signal.type && Math.abs(s.entry - signal.entry) < 1);
+                        if (!exists) addSignal(signal);
+                    });
+                }
+            }).catch(err => console.error('Error fetching signals:', err));
+        }
+
+        setInterval(() => { if (signalHistory.length > 0) renderSignals(); }, 30000);
+        setInterval(fetchEnhancedSignals, 60000);
+        renderSignals();
+        fetchEnhancedSignals();
+
+        // Live Positions Tracking
+        let livePositions = [];
+        function fetchLivePositions() {
+            fetch('/api/live-positions').then(r => r.json()).then(data => {
+                if (data.positions) {
+                    livePositions = data.positions;
+                    const container = document.getElementById('live-positions-container');
+                    if (!container) return;
+                    if (livePositions.length === 0) {
+                        container.innerHTML = '<div style="text-align: center; padding: 40px; color: #8b949e;">No active positions</div>';
+                        return;
+                    }
+                    container.innerHTML = livePositions.map(pos => {
+                        const pnlColor = pos.unrealized_pnl >= 0 ? '#3fb950' : '#f85149';
+                        const pnlSign = pos.unrealized_pnl >= 0 ? '+' : '';
+                        const directionClass = pos.direction === 'LONG' ? 'long' : 'short';
+                        const duration = Math.floor(pos.duration / 60);
+                        const durationStr = duration < 60 ? `${duration}m` : `${Math.floor(duration / 60)}h ${duration % 60}m`;
+                        const targetProgress = Math.max(0, Math.min(100, 100 - Math.abs(pos.distance_to_target)));
+                        const stopProgress = Math.max(0, Math.min(100, 100 - Math.abs(pos.distance_to_stop)));
+                        return `<div style="background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; margin-bottom: 12px;"><div><span style="font-size: 18px; font-weight: 600;">${pos.symbol.replace('USDT', '')}</span><span class="signal-direction ${directionClass}" style="margin-left: 8px;">${pos.direction}</span></div><div style="text-align: right;"><div style="font-size: 20px; font-weight: 600; color: ${pnlColor};">${pnlSign}${pos.unrealized_pnl.toFixed(2)}%</div><div style="font-size: 11px; color: #8b949e;">${durationStr}</div></div></div><div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px;"><div><div style="font-size: 11px; color: #8b949e;">Entry</div><div style="font-size: 14px; color: #58a6ff;">$${pos.entry.toFixed(2)}</div></div><div><div style="font-size: 11px; color: #8b949e;">Current</div><div style="font-size: 14px; color: #c9d1d9;">$${pos.current.toFixed(2)}</div></div><div><div style="font-size: 11px; color: #8b949e;">Type</div><div style="font-size: 11px; color: #8b949e;">${pos.type}</div></div></div><div style="margin-bottom: 8px;"><div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;"><span style="color: #8b949e;">To Target</span><span style="color: #3fb950;">$${pos.target.toFixed(2)} (${pos.distance_to_target.toFixed(1)}%)</span></div><div style="background: #21262d; height: 6px; border-radius: 3px; overflow: hidden;"><div style="background: #3fb950; height: 100%; width: ${targetProgress}%; transition: width 0.3s;"></div></div></div><div><div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;"><span style="color: #8b949e;">To Stop</span><span style="color: #f85149;">$${pos.stop.toFixed(2)} (${pos.distance_to_stop.toFixed(1)}%)</span></div><div style="background: #21262d; height: 6px; border-radius: 3px; overflow: hidden;"><div style="background: #f85149; height: 100%; width: ${stopProgress}%; transition: width 0.3s;"></div></div></div></div>`;
+                    }).join('');
+                }
+            }).catch(err => console.error('Error fetching live positions:', err));
+        }
+        setInterval(fetchLivePositions, 2000);
+        fetchLivePositions();
+
+        // ============================================
+        // SIGNAL ANTICIPATION
+        // ============================================
+
+        function renderAnticipation() {
+            const container = document.getElementById('anticipation-grid');
+            if (!container) return;
+
+            // Fetch all analytics
+            Promise.all([
+                fetch('/api/orderbook-metrics').then(r => r.json()).catch(() => ({})),
+                fetch('/api/volume-flow').then(r => r.json()).catch(() => ({})),
+                fetch('/api/order-toxicity').then(r => r.json()).catch(() => ({})),
+                fetch('/api/funding-rates').then(r => r.json()).catch(() => ({}))
+            ]).then(([ofi, volumeFlow, toxicity, funding]) => {
+                const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+
+                container.innerHTML = symbols.map(symbol => {
+                    // Get data for this symbol
+                    const ofiData = ofi[symbol] || {};
+                    const vfData = volumeFlow[symbol] || {};
+                    const toxData = toxicity[symbol] || {};
+                    const fundData = funding[symbol] || {};
+
+                    // Calculate scores
+                    const ofiValue = ofiData.ofi?.value || 0;
+                    const ofiScore = Math.min(Math.abs(ofiValue) / 100, 1); // 0-1
+
+                    const vfSignal = vfData.reversal_signal || {};
+                    const vfScore = vfSignal.confidence || 0; // 0-1
+
+                    const toxSignal = toxData.signal || {};
+                    const toxScore = toxSignal.confidence || 0; // 0-1
+
+                    // Funding rate
+                    const fundStats = fundData.stats || {};
+                    const fundRate = fundStats.current_rate || 0;
+                    const fundScore = Math.min(Math.abs(fundRate) / 0.03, 1);
+
+                    // Overall heat score (now includes funding)
+                    const heatScore = (ofiScore * 0.3 + vfScore * 0.3 + toxScore * 0.2 + fundScore * 0.2);
+
+                    // Determine status
+                    let status, statusClass;
+                    if (heatScore > 0.6) {
+                        status = 'HOT';
+                        statusClass = 'hot';
+                    } else if (heatScore > 0.3) {
+                        status = 'WARM';
+                        statusClass = 'warm';
+                    } else {
+                        status = 'COLD';
+                        statusClass = 'cold';
+                    }
+
+                    // Format values
+                    const ofiDisplay = ofiValue > 0 ? `+${ofiValue.toFixed(1)}` : ofiValue.toFixed(1);
+                    const ofiClass = ofiValue > 1 ? 'positive' : ofiValue < -1 ? 'negative' : 'neutral';
+
+                    const vfDisplay = vfSignal.direction || 'NEUTRAL';
+                    const vfClass = vfDisplay === 'BULLISH' ? 'positive' : vfDisplay === 'BEARISH' ? 'negative' : 'neutral';
+                    const vfWindows = vfSignal.confirming_windows || 0;
+                    const vfStrength = vfSignal.strength || 0;
+
+                    const toxDisplay = toxSignal.signal || 'NEUTRAL';
+                    const toxClass = toxDisplay.includes('TOXIC_BUYING') ? 'positive' :
+                        toxDisplay.includes('TOXIC_SELLING') ? 'negative' : 'neutral';
+                    const toxBuys = toxSignal.toxic_buys || 0;
+                    const toxSells = toxSignal.toxic_sells || 0;
+
+                    // Funding rate
+                    const fundDisplay = fundRate > 0 ? `+${(fundRate).toFixed(4)}%` : `${(fundRate).toFixed(4)}%`;
+                    const fundClass = Math.abs(fundRate) > 0.02 ? (fundRate > 0 ? 'negative' : 'positive') : 'neutral';
+                    const fundDirection = fundStats.direction || 'NEUTRAL';
+
+                    // Get current price (from OFI data or volume flow)
+                    const currentPrice = ofiData.price || vfData.price || 0;
+
+                    return `
+                        <div class="anticipation-card ${statusClass}">
+                            <div class="anticipation-header">
+                                <div class="anticipation-symbol">${symbol.replace('USDT', '')}</div>
+                                <div class="anticipation-status ${statusClass}">${status}</div>
+                            </div>
+
+                            ${currentPrice > 0 ? `
+                            <div style="font-size: 18px; font-weight: 600; color: #58a6ff; margin-bottom: 12px;">
+                                $${currentPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </div>
+                            ` : ''}
+
+                            <div class="anticipation-stats">
+                                <div class="stat-row">
+                                    <span class="stat-label">OFI</span>
+                                    <span class="stat-value ${ofiClass}">${ofiDisplay}</span>
+                                </div>
+                                <div class="stat-bar">
+                                    <div class="stat-bar-fill ${ofiScore > 0.6 ? 'high' : ofiScore > 0.3 ? 'medium' : 'low'}"
+                                         style="width: ${ofiScore * 100}%"></div>
+                                </div>
+
+                                <div class="stat-row">
+                                    <span class="stat-label">Volume Flow</span>
+                                    <span class="stat-value ${vfClass}">${vfDisplay}</span>
+                                </div>
+                                <div style="font-size: 10px; color: #8b949e; margin-top: 2px;">
+                                    ${vfWindows > 0 ? `${vfWindows} windows | Strength: ${(vfStrength * 100).toFixed(0)}%` : 'No reversal'}
+                                </div>
+                                <div class="stat-bar">
+                                    <div class="stat-bar-fill ${vfScore > 0.6 ? 'high' : vfScore > 0.3 ? 'medium' : 'low'}"
+                                         style="width: ${vfScore * 100}%"></div>
+                                </div>
+
+                                <div class="stat-row">
+                                    <span class="stat-label">Toxicity</span>
+                                    <span class="stat-value ${toxClass}">${(toxScore * 100).toFixed(0)}%</span>
+                                </div>
+                                <div style="font-size: 10px; color: #8b949e; margin-top: 2px;">
+                                    ${toxBuys > 0 || toxSells > 0 ? `Buys: ${toxBuys} | Sells: ${toxSells}` : 'No toxic flow'}
+                                </div>
+                                <div class="stat-bar">
+                                    <div class="stat-bar-fill ${toxScore > 0.6 ? 'high' : toxScore > 0.3 ? 'medium' : 'low'}"
+                                         style="width: ${toxScore * 100}%"></div>
+                                </div>
+
+                                <div class="stat-row">
+                                    <span class="stat-label">Funding Rate</span>
+                                    <span class="stat-value ${fundClass}">${fundDisplay}</span>
+                                </div>
+                                <div style="font-size: 10px; color: #8b949e; margin-top: 2px;">
+                                    ${fundDirection} sentiment
+                                </div>
+                                <div class="stat-bar">
+                                    <div class="stat-bar-fill ${fundScore > 0.6 ? 'high' : fundScore > 0.3 ? 'medium' : 'low'}"
+                                         style="width: ${fundScore * 100}%"></div>
+                                </div>
+
+                                <div class="stat-row" style="margin-top: 8px;">
+                                    <span class="stat-label">V-Bottom State</span>
+                                    <span class="stat-value neutral">NORMAL</span>
+                                </div>
+                                <div style="font-size: 10px; color: #8b949e; margin-top: 2px;">
+                                    7-layer reversal detection
+                                </div>
+
+                                <div class="stat-row" style="margin-top: 8px;">
+                                    <span class="stat-label">Orderbook Alpha</span>
+                                    <span class="stat-value neutral">CLEAN</span>
+                                </div>
+                                <div style="font-size: 10px; color: #8b949e; margin-top: 2px;">
+                                    No spoofing | Balanced liquidity
+                                </div>
+
+                                <div class="stat-row" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #30363d;">
+                                    <span class="stat-label">Signal Readiness</span>
+                                    <span class="stat-value">${(heatScore * 100).toFixed(0)}%</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+                // Update time
+                const updateTime = document.getElementById('anticipation-update-time');
+                if (updateTime) {
+                    const now = new Date();
+                    updateTime.textContent = `Updated ${now.toLocaleTimeString()}`;
+                }
+            }).catch(err => {
+                console.error('Error fetching anticipation data:', err);
+                container.innerHTML = '<div style="color: #8b949e; text-align: center; padding: 20px;">Error loading data</div>';
+            });
+        }
+
+        // Update anticipation every 5 seconds
+        setInterval(renderAnticipation, 5000);
+        renderAnticipation(); // Initial render
+
+        // ============================================
+        // LOAD HISTORICAL SIGNALS ON STARTUP
+        // ============================================
+        async function loadHistoricalSignals() {
+            try {
+                const response = await fetch('/api/trading_signals?symbol=BTCUSDT&limit=20');
+                const data = await response.json();
+
+                if (data.signals && data.signals.length > 0) {
+                    console.log(`Loading ${data.signals.length} historical signals...`);
+
+                    // Convert API signals to dashboard format
+                    data.signals.forEach(sig => {
+                        // Parse timestamp if it's a string
+                        const timestamp = sig.timestamp ? new Date(sig.timestamp).getTime() : Date.now();
+
+                        signalHistory.push({
+                            symbol: sig.symbol,
+                            direction: sig.direction,
+                            entry: sig.entry_price,
+                            target: sig.entry_price * (sig.direction === 'LONG' ? 1.01 : 0.99),
+                            stop: sig.entry_price * (sig.direction === 'LONG' ? 0.995 : 1.005),
+                            confidence: sig.confidence / 100, // Convert % to decimal
+                            type: 'LIQUIDITY_DRAIN',
+                            timestamp: timestamp,
+                            id: `signal-${timestamp}-${Math.random()}`
+                        });
+                    });
+
+                    // Limit to MAX_SIGNALS
+                    if (signalHistory.length > MAX_SIGNALS) {
+                        signalHistory.splice(MAX_SIGNALS);
+                    }
+
+                    renderSignals();
+                    console.log(`✅ Loaded ${signalHistory.length} signals successfully`);
+                }
+            } catch (error) {
+                console.error('Failed to load historical signals:', error);
+            }
+        }
+
+        // Load signals on page load
+        loadHistoricalSignals();
+    </script>
+</body>
+
+</html>

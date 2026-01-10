@@ -19,22 +19,32 @@ FORBIDDEN_IMPORTS = {
     'observation/__init__.py': [
         'observation.internal',
     ],
-    
+
     # observation/*.py (non-internal) must not import from internal
     'observation/*.py': [
         'observation.internal',
     ],
-    
+
     # observation/ must never import from runtime
     'observation/**/*.py': [
         'runtime.m6_executor',
         'runtime.collector',
         'runtime.native_app',
     ],
-    
+
     # runtime/ must not import from observation.internal
     'runtime/**/*.py': [
         'observation.internal',
+    ],
+
+    # M6 (runtime/) must not import M5 (memory/m5_*)
+    # Per ANNEX_M4_PRIMITIVE_FLOW.md: Primitives flow via ObservationSnapshot only
+    'runtime/**/*.py': [
+        'memory.m5_access',
+        'memory.m5_query_schemas',
+        'memory.m5_guards',
+        'memory.m5_defaults',
+        'memory.m5_output_normalizer',
     ],
 }
 

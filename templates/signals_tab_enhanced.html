@@ -1,0 +1,389 @@
+<!-- Enhanced Signals Tab with Full Signal Details -->
+<div class="tab-content" id="signals-tab">
+    <div class="signals-container">
+        <!-- Signal History List (newest on top) -->
+        <div id="signal-history" class="signal-history">
+            <!-- Signals will be added here dynamically -->
+        </div>
+    </div>
+</div>
+
+<style>
+    /* Signals Tab Styling */
+    .signals-container {
+        padding: 16px;
+        height: calc(100vh - 120px);
+        overflow-y: auto;
+    }
+
+    .signal-history {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .signal-card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 16px;
+        transition: all 0.3s ease;
+        position: relative;
+    }
+
+    /* Signal freshness states */
+    .signal-card.fresh {
+        border-left: 3px solid #3fb950;
+        opacity: 1;
+        box-shadow: 0 0 10px rgba(63, 185, 80, 0.3);
+    }
+
+    .signal-card.recent {
+        border-left: 3px solid #58a6ff;
+        opacity: 0.95;
+    }
+
+    .signal-card.aging {
+        border-left: 3px solid #8b949e;
+        opacity: 0.7;
+    }
+
+    .signal-card.old {
+        border-left: 3px solid #484f58;
+        opacity: 0.4;
+        filter: grayscale(0.5);
+    }
+
+    /* Signal Header */
+    .signal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+    }
+
+    .signal-symbol {
+        font-size: 16px;
+        font-weight: 600;
+        color: #58a6ff;
+    }
+
+    .signal-time {
+        font-size: 11px;
+        color: #8b949e;
+    }
+
+    /* Signal Type Badge */
+    .signal-type {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+    }
+
+    .signal-type.long {
+        background: rgba(63, 185, 80, 0.2);
+        color: #3fb950;
+    }
+
+    .signal-type.short {
+        background: rgba(248, 81, 73, 0.2);
+        color: #f85149;
+    }
+
+    /* Signal Details Grid */
+    .signal-details {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 12px;
+        margin-top: 12px;
+    }
+
+    .signal-metric {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .signal-metric-label {
+        font-size: 10px;
+        color: #8b949e;
+        text-transform: uppercase;
+    }
+
+    .signal-metric-value {
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    /* Signal Components */
+    .signal-components {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 8px;
+    }
+
+    .signal-component {
+        padding: 3px 8px;
+        border-radius: 3px;
+        font-size: 10px;
+        background: rgba(88, 166, 255, 0.15);
+        color: #58a6ff;
+    }
+
+    .signal-component.active {
+        background: rgba(63, 185, 80, 0.2);
+        color: #3fb950;
+    }
+
+    /* Confidence Bar */
+    .confidence-bar {
+        height: 4px;
+        background: #21262d;
+        border-radius: 2px;
+        overflow: hidden;
+        margin-top: 8px;
+    }
+
+    .confidence-fill {
+        height: 100%;
+        transition: width 0.3s ease;
+    }
+
+    .confidence-fill.high {
+        background: linear-gradient(90deg, #3fb950, #56d364);
+    }
+
+    .confidence-fill.medium {
+        background: linear-gradient(90deg, #ffa657, #ffb86c);
+    }
+
+    .confidence-fill.low {
+        background: linear-gradient(90deg, #8b949e, #a5b1c2);
+    }
+
+    /* Position Status Badge */
+    .position-status {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+        margin-top: 8px;
+    }
+
+    .position-status.active {
+        background: rgba(63, 185, 80, 0.2);
+        color: #3fb950;
+    }
+
+    .position-status.t1-hit {
+        background: rgba(255, 166, 87, 0.2);
+        color: #ffa657;
+    }
+
+    .position-status.closed {
+        background: rgba(139, 148, 158, 0.2);
+        color: #8b949e;
+    }
+
+    /* Empty State */
+    .signals-empty {
+        text-align: center;
+        padding: 60px 20px;
+        color: #8b949e;
+    }
+
+    .signals-empty-icon {
+        font-size: 48px;
+        margin-bottom: 16px;
+        opacity: 0.3;
+    }
+</style>
+
+<script>
+    // Signal History Management
+    const signalHistory = [];
+    const MAX_SIGNALS = 20;
+
+    function addSignal(signal) {
+        // Add to beginning of array
+        signalHistory.unshift({
+            ...signal,
+            timestamp: Date.now(),
+            id: `signal-${Date.now()}-${Math.random()}`
+        });
+
+        // Keep only last MAX_SIGNALS
+        if (signalHistory.length > MAX_SIGNALS) {
+            signalHistory.pop();
+        }
+
+        renderSignals();
+    }
+
+    function renderSignals() {
+        const container = document.getElementById('signal-history');
+
+        if (signalHistory.length === 0) {
+            container.innerHTML = `
+            <div class="signals-empty">
+                <div class="signals-empty-icon">🎯</div>
+                <div>Waiting for trading signals...</div>
+                <div style="font-size: 11px; margin-top: 8px;">Early Reversal Detector is monitoring orderbook</div>
+            </div>
+        `;
+            return;
+        }
+
+        const now = Date.now();
+
+        container.innerHTML = signalHistory.map((signal, index) => {
+            const age = now - signal.timestamp;
+            const ageMinutes = Math.floor(age / 60000);
+
+            // Determine freshness class
+            let freshnessClass = 'old';
+            if (index === 0) freshnessClass = 'fresh';
+            else if (index <= 2) freshnessClass = 'recent';
+            else if (index <= 5) freshnessClass = 'aging';
+
+            // Format time ago
+            let timeAgo;
+            if (ageMinutes < 1) timeAgo = 'Just now';
+            else if (ageMinutes === 1) timeAgo = '1 min ago';
+            else if (ageMinutes < 60) timeAgo = `${ageMinutes} mins ago`;
+            else timeAgo = `${Math.floor(ageMinutes / 60)}h ago`;
+
+            // Determine signal type
+            const signalType = signal.direction === 'LONG' ? 'long' : 'short';
+
+            // Confidence level
+            const confidence = signal.confidence || 0;
+            const confidenceLevel = confidence > 70 ? 'high' :
+                confidence > 40 ? 'medium' : 'low';
+
+            // SNR level
+            const snr = signal.snr || 0;
+            const snrColor = snr > 1.5 ? '#3fb950' : snr > 0.8 ? '#ffa657' : '#8b949e';
+
+            // Position status
+            const posStatus = signal.position_status || 'ACTIVE';
+            const posStatusClass = posStatus === 'ACTIVE' ? 'active' :
+                signal.t1_hit ? 't1-hit' : 'closed';
+
+            // Signal components
+            const components = signal.signals || {};
+            const activeComponents = Object.entries(components)
+                .filter(([_, active]) => active)
+                .map(([name, _]) => name.replace('_', ' '));
+
+            return `
+            <div class="signal-card ${freshnessClass}" data-id="${signal.id}">
+                <div class="signal-header">
+                    <div class="signal-symbol">${signal.symbol}</div>
+                    <div class="signal-time">${timeAgo}</div>
+                </div>
+                
+                <div class="signal-type ${signalType}">
+                    ${signal.direction} • ${signal.timeframe || 60}s Timeframe
+                </div>
+                
+                <div class="signal-details">
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">Entry</div>
+                        <div class="signal-metric-value" style="color: #58a6ff;">
+                            $${signal.entry_price?.toFixed(2) || 'Market'}
+                        </div>
+                    </div>
+                    
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">T1 (0.25%)</div>
+                        <div class="signal-metric-value" style="color: ${signal.t1_hit ? '#3fb950' : '#ffa657'};">
+                            ${signal.t1_hit ? '✓ HIT' : '$' + (signal.entry_price * (signal.direction === 'LONG' ? 1.0025 : 0.9975)).toFixed(2)}
+                        </div>
+                    </div>
+                    
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">T2 (Signal)</div>
+                        <div class="signal-metric-value" style="color: #8b949e;">
+                            Opposite
+                        </div>
+                    </div>
+                    
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">Stop Loss</div>
+                        <div class="signal-metric-value" style="color: #f85149;">
+                            ${signal.sl_breakeven ? 'Breakeven' : '$' + (signal.entry_price * (signal.direction === 'LONG' ? 0.9975 : 1.0025)).toFixed(2)}
+                        </div>
+                    </div>
+
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">SNR</div>
+                        <div class="signal-metric-value" style="color: ${snrColor};">
+                            ${snr.toFixed(2)}
+                        </div>
+                    </div>
+
+                    <div class="signal-metric">
+                        <div class="signal-metric-label">Confidence</div>
+                        <div class="signal-metric-value">
+                            ${confidence}%
+                        </div>
+                    </div>
+                </div>
+
+                ${activeComponents.length > 0 ? `
+                <div class="signal-metric" style="margin-top: 12px;">
+                    <div class="signal-metric-label">Active Signals (${signal.signals_confirmed || activeComponents.length}/${signal.signals_total || 6})</div>
+                    <div class="signal-components">
+                        ${activeComponents.map(comp => `<div class="signal-component active">${comp}</div>`).join('')}
+                    </div>
+                </div>
+                ` : ''}
+
+                <div class="signal-metric" style="margin-top: 8px;">
+                    <div class="signal-metric-label">Position Status</div>
+                    <div class="position-status ${posStatusClass}">
+                        ${posStatus}${signal.exit_reason ? ` - ${signal.exit_reason}` : ''}
+                    </div>
+                </div>
+
+                ${signal.pnl_total !== undefined ? `
+                <div class="signal-metric" style="margin-top: 8px;">
+                    <div class="signal-metric-label">P&L</div>
+                    <div class="signal-metric-value" style="color: ${signal.pnl_total > 0 ? '#3fb950' : '#f85149'};">
+                        ${signal.pnl_total > 0 ? '+' : ''}${signal.pnl_total.toFixed(3)}%
+                        ${signal.pnl_t1 !== undefined ? `<span style="font-size: 11px; color: #8b949e;"> (T1: ${signal.pnl_t1.toFixed(2)}%, T2: ${signal.pnl_t2.toFixed(2)}%)</span>` : ''}
+                    </div>
+                </div>
+                ` : ''}
+                
+                <div class="confidence-bar">
+                    <div class="confidence-fill ${confidenceLevel}" 
+                         style="width: ${confidence}%"></div>
+                </div>
+            </div>
+        `;
+        }).join('');
+    }
+
+    // Auto-refresh signal ages every 30 seconds
+    setInterval(() => {
+        if (signalHistory.length > 0) {
+            renderSignals();
+        }
+    }, 30000);
+
+    // Listen for signals from SSE or API
+    function onNewSignal(signalData) {
+        addSignal(signalData);
+    }
+
+    // Initialize
+    renderSignals();
+</script>

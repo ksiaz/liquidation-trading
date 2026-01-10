@@ -76,6 +76,7 @@ class SpatialGroupQuery(M5Query):
     max_price: float
     current_ts: float
     include_dormant: bool = False
+    symbol: Optional[str] = None
 
 # ==============================================================================
 # 5. STATE DISTRIBUTION QUERIES
@@ -86,6 +87,7 @@ class SpatialGroupQuery(M5Query):
 class StateDistributionQuery(M5Query):
     query_ts: float
     states: Optional[List[LifecycleState]] = None
+    symbol: Optional[str] = None
 
 # ==============================================================================
 # 6. PROXIMITY QUERIES
@@ -98,6 +100,7 @@ class ProximityQuery(M5Query):
     search_radius: float
     current_ts: float
     include_dormant: bool = False
+    symbol: Optional[str] = None
 
 # ==============================================================================
 # M4 TIER A STRUCTURAL PRIMITIVES (Per M5 Whitelist Spec v1.0)

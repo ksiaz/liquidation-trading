@@ -1,0 +1,4 @@
+            // Get liquidation zones - show 10 per side
+            const zones = data.zones || [];
+            const longZones = zones.filter(z => z.type === 'LONG').slice(0, 10);
+            const shortZones = zones.filter(z => z.type === 'SHORT').slice(0, 10);

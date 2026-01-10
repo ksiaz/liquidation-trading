@@ -7,6 +7,7 @@ Authority: CI_ENFORCEMENT_DESIGN.md, DIRECTORY_SCOPED_EXCEPTION_FRAMEWORK.md
 
 import re
 import sys
+import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -121,6 +122,21 @@ def scan_file(filepath: Path, rules: List[Tuple[str, re.Pattern]]) -> List[Tuple
 
 def main():
     """Main entry point."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Semantic Leak Scanner')
+    parser.add_argument(
+        '--exclude-paths',
+        type=str,
+        help='Comma-separated list of path prefixes to exclude (e.g., observation/,memory/)'
+    )
+    args = parser.parse_args()
+    
+    # Parse exclusions
+    exclude_prefixes = []
+    if args.exclude_paths:
+        exclude_prefixes = [p.strip() for p in args.exclude_paths.split(',')]
+        print(f"Excluding paths: {', '.join(exclude_prefixes)}")
+    
     all_violations = {}
     
     # Get repository root (assume script is in .github/scripts/)
@@ -128,6 +144,10 @@ def main():
     
     # Scan each configured file
     for rel_path, rules in RULES.items():
+        # Check if this path should be excluded
+        if any(rel_path.startswith(prefix) for prefix in exclude_prefixes):
+            continue  # Skip excluded paths
+        
         filepath = repo_root / rel_path
         
         if not filepath.exists():

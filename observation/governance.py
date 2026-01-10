@@ -1,22 +1,34 @@
 from typing import Dict, List, Any, Optional
-from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException
+from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
+
+# M2 Continuity Store (Internal Memory)
+from memory.m2_continuity_store import ContinuityMemoryStore
+
+# M5 Access Layer (For M4 primitive computation)
+from memory.m5_access import MemoryAccess
 
 class ObservationSystem:
     """
     The sealed Observation System.
     """
-    
+
     def __init__(self, allowed_symbols: List[str]):
         self._allowed_symbols = set(allowed_symbols)
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
         self._failure_reason = ""
-        
+
         # Internal Modules
         self._m1 = M1IngestionEngine()
         self._m3 = M3TemporalEngine()
+
+        # M2 Memory Store (STUB: Not populated yet)
+        self._m2_store = ContinuityMemoryStore()
+
+        # M5 Access Layer (For primitive computation at snapshot time)
+        self._m5_access = MemoryAccess(self._m2_store)
         
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
@@ -59,6 +71,26 @@ class ObservationSystem:
                     quantity=normalized_event['quantity'],
                     side=normalized_event['side']
                 )
+                
+                # Phase 5.4: Feed M2 with trade
+                self._m2_store.ingest_trade(
+                    symbol=normalized_event['symbol'],
+                    price=normalized_event['price'],
+                    side=normalized_event['side'],
+                    volume=normalized_event['quantity'],
+                    is_buyer_maker=normalized_event.get('is_buyer_maker', False),
+                    timestamp=normalized_event['timestamp']
+                )
+            
+            # Phase 5.4: Feed M2 with liquidation
+            if normalized_event and event_type == 'LIQUIDATION':
+                self._m2_store.ingest_liquidation(
+                    symbol=normalized_event['symbol'],
+                    price=normalized_event['price'],
+                    side=normalized_event['side'],
+                    volume=normalized_event.get('quantity', 0.0),
+                    timestamp=normalized_event['timestamp']
+                )
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -83,6 +115,12 @@ class ObservationSystem:
             self._m3.advance_time(new_timestamp)
         except Exception as e:
             self._trigger_failure(f"M3 Temporal Failure: {e}")
+        
+        # Phase 5.4: Trigger M2 decay cycle
+        try:
+            self._m2_store.advance_time(new_timestamp)
+        except Exception as e:
+            self._trigger_failure(f"M2 Decay Failure: {e}")
 
     def query(self, query_spec: Dict) -> Any:
         """
@@ -116,8 +154,17 @@ class ObservationSystem:
         pass
 
     def _get_snapshot(self) -> ObservationSnapshot:
-        """Construct public snapshot from internal states."""
-        
+        """Construct public snapshot from internal states.
+
+        Computes M4 primitives exactly once via M5.
+
+        Amendment 2026-01-10: Added primitive computation per ANNEX_M4_PRIMITIVE_FLOW.md
+        """
+        # Compute primitives for all active symbols
+        primitives = {}
+        for symbol in sorted(self._allowed_symbols):
+            primitives[symbol] = self._compute_primitives_for_symbol(symbol)
+
         return ObservationSnapshot(
             status=self._status,
             timestamp=self._system_time,
@@ -126,5 +173,191 @@ class ObservationSystem:
                 intervals_processed=None,
                 dropped_events=None
             ),
-            promoted_events=None
+            promoted_events=None,
+            primitives=primitives  # Pre-computed M4 primitives
         )
+
+    def _compute_primitives_for_symbol(self, symbol: str) -> M4PrimitiveBundle:
+        """Compute M4 primitives for a single symbol.
+
+        This is the ONLY place M4 primitives are computed for external exposure.
+        Called exactly once per symbol per snapshot.
+
+        Returns bundle with fields set to None if:
+        - Insufficient data for computation
+        - No structural condition detected
+        - Computation validation failed
+
+        Authority: ANNEX_M4_PRIMITIVE_FLOW.md
+        """
+        # Phase 6.1, 6.2, 6.3: M4 Primitive Computation (Complete Bundle)
+        try:
+            # Import M4 computation functions
+            from memory.m4_zone_geometry import compute_zone_penetration_depth, identify_displacement_origin_anchor
+            from memory.m4_traversal_kinematics import compute_price_traversal_velocity, compute_traversal_compactness
+            from memory.m4_structural_absence import compute_structural_absence_duration
+            from memory.m4_event_absence import compute_event_non_occurrence_counter
+            from memory.m4_price_distribution import compute_central_tendency_deviation
+            from memory.m4_traversal_voids import compute_traversal_void_span
+            
+            # Query M2 for active nodes (symbol-filtered)
+            active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
+            
+            # Query M3 for recent price history
+            recent_prices = self._m3.get_recent_prices(symbol=symbol, max_count=100)
+            
+            # Initialize primitives
+            zone_penetration = None
+            displacement_origin_anchor = None
+            price_traversal_velocity = None
+            traversal_compactness = None
+            central_tendency_deviation = None
+            structural_absence_duration = None
+            traversal_void_span = None
+            event_non_occurrence_counter = None
+            
+            # 1. ZONE PENETRATION (Phase 6.1)
+            if len(active_nodes) > 0 and len(recent_prices) > 0:
+                max_penetration = 0.0
+                for node in active_nodes:
+                    zone_low = node.price_center - node.price_band / 2
+                    zone_high = node.price_center + node.price_band / 2
+                    
+                    result = compute_zone_penetration_depth(
+                        zone_id=node.id,
+                        zone_low=zone_low,
+                        zone_high=zone_high,
+                        traversal_prices=recent_prices
+                    )
+                    
+                    if result is not None:
+                        max_penetration = max(max_penetration, result.penetration_depth)
+                
+                if max_penetration > 0:
+                    zone_penetration = max_penetration
+            
+            # 2. DISPLACEMENT ORIGIN ANCHOR (Phase 6.3)
+            if len(recent_prices) >= 3:
+                # Use pre-traversal window (first 50% of prices)
+                mid_point = len(recent_prices) // 2
+                pre_traversal_prices = recent_prices[:mid_point]
+                # Approximate timestamps (M3 doesn't expose them)
+                pre_traversal_timestamps = [
+                    self._system_time - (len(pre_traversal_prices) - i) * 0.1
+                    for i in range(len(pre_traversal_prices))
+                ]
+                
+                if len(pre_traversal_prices) > 0:
+                    anchor = identify_displacement_origin_anchor(
+                        traversal_id=f"{symbol}_current",
+                        pre_traversal_prices=pre_traversal_prices,
+                        pre_traversal_timestamps=pre_traversal_timestamps
+                    )
+                    displacement_origin_anchor = anchor.anchor_dwell_time
+            
+            # 3. PRICE TRAVERSAL VELOCITY (Phase 6.2)
+            if len(recent_prices) >= 2:
+                # Use first and last price in current window
+                # Timestamps would require M3 to expose them, so we approximate with system time
+                # For now, assume 1 second window (M3 default)
+                velocity_result = compute_price_traversal_velocity(
+                    traversal_id=f"{symbol}_current",
+                    price_start=recent_prices[0],
+                    price_end=recent_prices[-1],
+                    ts_start=self._system_time - 1.0,  # Approximate window
+                    ts_end=self._system_time
+                )
+                price_traversal_velocity = velocity_result.velocity
+            
+            # 4. TRAVERSAL COMPACTNESS (Phase 6.3)
+            if len(recent_prices) >= 2:
+                compactness_result = compute_traversal_compactness(
+                    traversal_id=f"{symbol}_current",
+                    ordered_prices=recent_prices
+                )
+                traversal_compactness = compactness_result.compactness_ratio
+            
+            # 5. CENTRAL TENDENCY DEVIATION (Phase 6.3)
+            if len(recent_prices) > 0 and len(active_nodes) > 0:
+                # Central tendency = average of node centers
+                central_tendency = sum(node.price_center for node in active_nodes) / len(active_nodes)
+                current_price = recent_prices[-1]
+                
+                deviation_result = compute_central_tendency_deviation(
+                    price=current_price,
+                    central_tendency=central_tendency
+                )
+                central_tendency_deviation = deviation_result.deviation_value
+            
+            # 6. STRUCTURAL ABSENCE DURATION (Phase 6.2)
+            if len(active_nodes) > 0:
+                # Find most recent interaction across all nodes
+                most_recent_interaction = max(
+                    node.last_interaction_ts for node in active_nodes
+                )
+                absence_duration = self._system_time - most_recent_interaction
+                
+                # Only set if absence > 0
+                if absence_duration > 0:
+                    structural_absence_duration = absence_duration
+            
+            # 7. TRAVERSAL VOID SPAN (Phase 6.3)
+            if len(active_nodes) > 0:
+                # Collect all interaction timestamps from nodes
+                interaction_timestamps = []
+                for node in active_nodes:
+                    interaction_timestamps.extend(node.interaction_timestamps)
+                
+                if len(interaction_timestamps) > 0:
+                    # Define observation window
+                    earliest_interaction = min(interaction_timestamps)
+                    observation_window = (earliest_interaction, self._system_time)
+                    
+                    void_result = compute_traversal_void_span(
+                        observation_start_ts=observation_window[0],
+                        observation_end_ts=observation_window[1],
+                        traversal_timestamps=tuple(interaction_timestamps)
+                    )
+                    traversal_void_span = void_result.max_void_duration
+            
+            # 8. EVENT NON-OCCURRENCE COUNTER (Phase 6.2)
+            # Simplified: Count expected nodes vs observed liquidations
+            # This is a placeholder implementation
+            if len(active_nodes) > 0:
+                # For each active node, we expected reinforcement events
+                # Non-occurrence = nodes that haven't been interacted with recently
+                stale_threshold = 60.0  # 60 seconds
+                stale_count = sum(
+                    1 for node in active_nodes
+                    if (self._system_time - node.last_interaction_ts) > stale_threshold
+                )
+                if stale_count > 0:
+                    event_non_occurrence_counter = stale_count
+            
+            # Return complete bundle
+            return M4PrimitiveBundle(
+                symbol=symbol,
+                zone_penetration=zone_penetration,
+                displacement_origin_anchor=displacement_origin_anchor,
+                price_traversal_velocity=price_traversal_velocity,
+                traversal_compactness=traversal_compactness,
+                central_tendency_deviation=central_tendency_deviation,
+                structural_absence_duration=structural_absence_duration,
+                traversal_void_span=traversal_void_span,
+                event_non_occurrence_counter=event_non_occurrence_counter
+            )
+            
+        except Exception as e:
+            # Computation failures should not crash snapshot creation
+            # Return None primitives and continue
+            return M4PrimitiveBundle(
+                symbol=symbol,
+                zone_penetration=None,
+                displacement_origin_anchor=None,
+                price_traversal_velocity=None,
+                traversal_compactness=None,
+                central_tendency_deviation=None,
+                structural_absence_duration=None,
+                traversal_void_span=None,
+                event_non_occurrence_counter=None
+            )

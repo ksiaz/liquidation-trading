@@ -201,3 +201,26 @@ class M3TemporalEngine:
     
     def get_promoted_events(self) -> List[PromotedEventInternal]:
         return list(self._promoted_events) # Shallow copy
+    
+    def get_recent_prices(self, symbol: str, max_count: int = 100) -> List[float]:
+        """
+        Get recent trade prices for a symbol from current window.
+        
+        Used by M4 primitive computation (zone penetration, traversal velocity).
+        Returns empty list if no trades in current window.
+        
+        Args:
+            symbol: Symbol to query
+            max_count: Maximum number of prices to return (most recent)
+        
+        Returns:
+            List of prices in chronological order
+        """
+        if symbol not in self._current_windows:
+            return []
+        
+        trades = self._current_windows[symbol]
+        prices = [t['price'] for t in trades]
+        
+        # Return most recent max_count prices
+        return prices[-max_count:]

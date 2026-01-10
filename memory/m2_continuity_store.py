@@ -49,6 +49,7 @@ class ContinuityMemoryStore:
     def add_or_update_node(
         self,
         node_id: str,
+        symbol: str,
         price_center: float,
         price_band: float,
         side: str,
@@ -60,6 +61,9 @@ class ContinuityMemoryStore:
     ) -> EnrichedLiquidityMemoryNode:
         """
         Add new or update existing node (handles revival from dormant).
+
+        Args:
+            symbol: Symbol partitioning key (e.g., "BTCUSDT")
         """
         # Check active nodes
         if node_id in self._active_nodes:
@@ -67,20 +71,21 @@ class ContinuityMemoryStore:
             node.strength = min(1.0, node.strength + 0.1)
             self._total_interactions += 1
             return node
-        
+
         # Check dormant nodes (REVIVAL)
         if node_id in self._dormant_nodes:
             return self._revive_dormant_node(node_id, timestamp, volume)
-        
+
         # Check archived (no auto-revival)
         if node_id in self._archived_nodes:
             # Archived nodes do NOT auto-revive
             # Must create new node with new ID
             pass
-        
+
         # Create new node
         node = EnrichedLiquidityMemoryNode(
             id=node_id,
+            symbol=symbol,
             price_center=price_center,
             price_band=price_band,
             side=side,
@@ -92,7 +97,7 @@ class ContinuityMemoryStore:
             decay_rate=MemoryStateThresholds.ACTIVE_DECAY_RATE,
             active=True
         )
-        
+
         self._active_nodes[node_id] = node
         self._total_nodes_created += 1
         self._total_interactions += 1
@@ -155,6 +160,134 @@ class ContinuityMemoryStore:
         """Update active node with liquidation evidence."""
         if node_id in self._active_nodes:
             self._active_nodes[node_id].record_liquidation(timestamp, side)
+    
+    def ingest_liquidation(
+        self,
+        symbol: str,
+        price: float,
+        side: str,
+        volume: float,
+        timestamp: float
+    ) -> Optional[EnrichedLiquidityMemoryNode]:
+        """
+        Ingest liquidation event and create/update memory node.
+        
+        Constitutional Rule (Phase 5 Canon):
+        - Nodes are created ONLY on liquidation events.
+        - Spatial matching: Check overlap with existing nodes.
+        - If overlap exists: Reinforce existing node.
+        - If no overlap: Create new node.
+        
+        Args:
+            symbol: Symbol partitioning key (e.g., "BTCUSDT")
+            price: Liquidation price
+            side: "BUY" or "SELL"
+            volume: Liquidation volume
+            timestamp: Event timestamp
+            
+        Returns:
+            Created or updated node, or None if rejected
+        """
+        # Define spatial matching parameters
+        PRICE_BAND_DEFAULT = 100.0  # Default band width
+        OVERLAP_TOLERANCE = 0.5  # 50% overlap threshold
+        
+        # Search for overlapping nodes (symbol-partitioned)
+        active_candidates = self.get_active_nodes(symbol=symbol)
+        
+        for candidate in active_candidates:
+            # Check spatial overlap
+            if candidate.overlaps(price):
+                # Reinforce existing node
+                candidate.record_liquidation(timestamp, side)
+                candidate.strength = min(1.0, candidate.strength + 0.15)
+                self._total_interactions += 1
+                return candidate
+        
+        # No overlap found - Create new node
+        node_id = f"{symbol}_{int(price)}_{int(timestamp)}"
+        
+        # Determine side from liquidation
+        # Liquidation BUY = Long got liquidated (price fell) -> bid zone
+        # Liquidation SELL = Short got liquidated (price rose) -> ask zone
+        node_side = "bid" if side == "BUY" else "ask"
+        
+        node = self.add_or_update_node(
+            node_id=node_id,
+            symbol=symbol,
+            price_center=price,
+            price_band=PRICE_BAND_DEFAULT,
+            side=node_side,
+            timestamp=timestamp,
+            creation_reason=f"liquidation_{side}",
+            initial_strength=0.6,
+            initial_confidence=0.7,
+            volume=volume
+        )
+        
+        # Record the liquidation evidence
+        node.record_liquidation(timestamp, side)
+        
+        return node
+    
+    def ingest_trade(
+        self,
+        symbol: str,
+        price: float,
+        side: str,
+        volume: float,
+        is_buyer_maker: bool,
+        timestamp: float
+    ) -> Optional[EnrichedLiquidityMemoryNode]:
+        """
+        Ingest trade event and update existing memory nodes.
+        
+        Constitutional Rule (Phase 5 Canon):
+        - Trades ONLY update existing nodes.
+        - Trades DO NOT create new nodes.
+        - Spatial matching required.
+        
+        Args:
+            symbol: Symbol partitioning key
+            price: Trade execution price
+            side: "BUY" or "SELL"
+            volume: Trade volume
+            is_buyer_maker: True if buyer was maker (seller aggressor)
+            timestamp: Event timestamp
+            
+        Returns:
+            Updated node if match found, None otherwise
+        """
+        # Search for overlapping active nodes (symbol-partitioned)
+        active_candidates = self.get_active_nodes(symbol=symbol)
+        
+        for candidate in active_candidates:
+            if candidate.overlaps(price):
+                # Update node with trade evidence
+                candidate.record_trade_execution(timestamp, volume, is_buyer_maker)
+                self._total_interactions += 1
+                return candidate
+        
+        # No match found - Trade is ignored (constitutionally correct)
+        return None
+    
+    def advance_time(self, current_ts: float):
+        """
+        Advance system time and apply decay/lifecycle mechanics.
+        
+        Should be called periodically (e.g., every 1s or every N events).
+        Drives:
+        - Decay accumulation
+        - State transitions (Active -> Dormant -> Archived)
+        
+        Args:
+            current_ts: Current system timestamp
+        """
+        # Apply decay to all nodes
+        self.decay_nodes(current_ts)
+        
+        # Check and update memory states
+        self.update_memory_states(current_ts)
 
     
     def get_node(self, node_id: str) -> Optional[EnrichedLiquidityMemoryNode]:
@@ -171,12 +304,16 @@ class ContinuityMemoryStore:
         self,
         current_price: Optional[float] = None,
         radius: Optional[float] = None,
-        min_strength: float = 0.0
+        min_strength: float = 0.0,
+        symbol: Optional[str] = None
     ) -> List[EnrichedLiquidityMemoryNode]:
-        """Query active nodes only."""
+        """Query active nodes only. Filter by symbol if provided."""
         results = []
         
         for node in self._active_nodes.values():
+            if symbol is not None and node.symbol != symbol:
+                continue
+                
             if node.strength < min_strength:
                 continue
             
@@ -192,12 +329,16 @@ class ContinuityMemoryStore:
     def get_dormant_nodes(
         self,
         current_price: Optional[float] = None,
-        radius: Optional[float] = None
+        radius: Optional[float] = None,
+        symbol: Optional[str] = None
     ) -> List[EnrichedLiquidityMemoryNode]:
-        """Query dormant nodes (historical context)."""
+        """Query dormant nodes (historical context). Filter by symbol if provided."""
         results = []
         
         for node in self._dormant_nodes.values():
+            if symbol is not None and node.symbol != symbol:
+                continue
+
             if current_price is not None and radius is not None:
                 if abs(node.price_center - current_price) > radius:
                     continue
@@ -206,20 +347,22 @@ class ContinuityMemoryStore:
         
         return results
     
-    def get_node_density(self, price_range: Tuple[float, float]) -> Dict[str, float]:
-        """Get node density metrics for price range."""
-        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
+    def get_node_density(self, price_range: Tuple[float, float], symbol: Optional[str] = None) -> Dict[str, float]:
+        """Get node density metrics for price range. Filter by symbol if provided."""
+        all_nodes = [n for n in self._active_nodes.values() if symbol is None or n.symbol == symbol] + \
+                    [n for n in self._dormant_nodes.values() if symbol is None or n.symbol == symbol]
         
         center_price = (price_range[0] + price_range[1]) / 2
         radius = (price_range[1] - price_range[0]) / 2
         
         return self.topology.compute_neighborhood_density(center_price, radius, all_nodes)
     
-    def get_pressure_map(self, price_range: Tuple[float, float]) -> PressureMap:
-        """Get memory pressure map for price range."""
-        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
-        active_nodes = list(self._active_nodes.values())
-        dormant_nodes = list(self._dormant_nodes.values())
+    def get_pressure_map(self, price_range: Tuple[float, float], symbol: Optional[str] = None) -> PressureMap:
+        """Get memory pressure map for price range. Filter by symbol if provided."""
+        all_nodes = [n for n in self._active_nodes.values() if symbol is None or n.symbol == symbol] + \
+                    [n for n in self._dormant_nodes.values() if symbol is None or n.symbol == symbol]
+        active_nodes = [n for n in self._active_nodes.values() if symbol is None or n.symbol == symbol]
+        dormant_nodes = [n for n in self._dormant_nodes.values() if symbol is None or n.symbol == symbol]
         
         return self.pressure_analyzer.compute_local_pressure(
             price_range,
@@ -231,10 +374,12 @@ class ContinuityMemoryStore:
     def get_topological_clusters(
         self,
         price_threshold: float = 0.01,
-        min_cluster_size: int = 2
+        min_cluster_size: int = 2,
+        symbol: Optional[str] = None
     ) -> List[TopologyCluster]:
-        """Get topological clusters (factual grouping only)."""
-        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
+        """Get topological clusters (factual grouping only). Filter by symbol if provided."""
+        all_nodes = [n for n in self._active_nodes.values() if symbol is None or n.symbol == symbol] + \
+                    [n for n in self._dormant_nodes.values() if symbol is None or n.symbol == symbol]
         
         return self.topology.identify_clusters(all_nodes, price_threshold, min_cluster_size)
     

@@ -1,0 +1,701 @@
+"""
+M2 Continuity Memory Store
+
+Extends memory store with three-state model and historical continuity.
+"""
+
+from typing import List, Dict, Optional, Tuple
+from memory.enriched_memory_node import EnrichedLiquidityMemoryNode
+from memory.m2_memory_state import MemoryState, MemoryStateThresholds
+from memory.m2_historical_evidence import (
+    HistoricalEvidence,
+    extract_historical_evidence,
+    compute_revival_strength
+)
+from memory.m2_topology import MemoryTopology, TopologyCluster
+from memory.m2_pressure import MemoryPressureAnalyzer, PressureMap
+
+# M4 View imports (for type hints and integration)
+from memory.m4_evidence_composition import EvidenceCompositionView, get_evidence_composition
+from memory.m4_interaction_density import InteractionDensityView, get_interaction_density
+from memory.m4_stability_transience import StabilityTransienceView, get_stability_metrics
+from memory.m4_temporal_structure import TemporalStructureView, get_temporal_structure
+from memory.m4_cross_node_context import CrossNodeContextView, get_cross_node_context
+
+
+class ContinuityMemoryStore:
+    """
+    M2 Memory store with three-state model and historical continuity.
+    
+    States: ACTIVE → DORMANT → ARCHIVED
+    Historical evidence preserved across state transitions.
+    """
+    
+    def __init__(self):
+        """Initialize store with three collections."""
+        self._active_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
+        self._dormant_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
+        self._dormant_evidence: Dict[str, HistoricalEvidence] = {}
+        self._archived_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
+        
+        self._total_nodes_created = 0
+        self._total_interactions = 0
+        self._last_state_update_ts: Optional[float] = None
+        
+        # Topology and pressure analyzers
+        self.topology = MemoryTopology()
+        self.pressure_analyzer = MemoryPressureAnalyzer()
+    
+    def add_or_update_node(
+        self,
+        node_id: str,
+        price_center: float,
+        price_band: float,
+        side: str,
+        timestamp: float,
+        creation_reason: str,
+        initial_strength: float = 0.5,
+        initial_confidence: float = 0.5,
+        volume: float = 0.0
+    ) -> EnrichedLiquidityMemoryNode:
+        """
+        Add new or update existing node (handles revival from dormant).
+        """
+        # Check active nodes
+        if node_id in self._active_nodes:
+            node = self._active_nodes[node_id]
+            node.strength = min(1.0, node.strength + 0.1)
+            self._total_interactions += 1
+            return node
+        
+        # Check dormant nodes (REVIVAL)
+        if node_id in self._dormant_nodes:
+            return self._revive_dormant_node(node_id, timestamp, volume)
+        
+        # Check archived (no auto-revival)
+        if node_id in self._archived_nodes:
+            # Archived nodes do NOT auto-revive
+            # Must create new node with new ID
+            pass
+        
+        # Create new node
+        node = EnrichedLiquidityMemoryNode(
+            id=node_id,
+            price_center=price_center,
+            price_band=price_band,
+            side=side,
+            first_seen_ts=timestamp,
+            last_interaction_ts=timestamp,
+            strength=initial_strength,
+            confidence=initial_confidence,
+            creation_reason=creation_reason,
+            decay_rate=MemoryStateThresholds.ACTIVE_DECAY_RATE,
+            active=True
+        )
+        
+        self._active_nodes[node_id] = node
+        self._total_nodes_created += 1
+        self._total_interactions += 1
+        return node
+    
+    def update_memory_states(self, current_ts: float):
+        """
+        Update all node states based on thresholds.
+        
+        ACTIVE → DORMANT: Low strength or timeout
+        DORMANT → ARCHIVED: Very low strength or extended timeout
+        """
+        self._last_state_update_ts = current_ts
+        
+        # Check ACTIVE → DORMANT
+        to_dormant = []
+        for node_id, node in self._active_nodes.items():
+            time_idle = current_ts - node.last_interaction_ts
+            
+            if (node.strength < MemoryStateThresholds.DORMANT_STRENGTH_THRESHOLD or
+                time_idle > MemoryStateThresholds.DORMANT_TIMEOUT_SEC):
+                to_dormant.append(node_id)
+        
+        for node_id in to_dormant:
+            self._transition_to_dormant(node_id)
+        
+        # Check DORMANT → ARCHIVED
+        to_archived = []
+        for node_id, node in self._dormant_nodes.items():
+            time_idle = current_ts - node.last_interaction_ts
+            
+            if (node.strength < MemoryStateThresholds.ARCHIVE_STRENGTH_THRESHOLD or
+                time_idle > MemoryStateThresholds.ARCHIVE_TIMEOUT_SEC):
+                to_archived.append(node_id)
+        
+        for node_id in to_archived:
+            self._transition_to_archived(node_id)
+        
+        return {
+            'transitioned_to_dormant': len(to_dormant),
+            'transitioned_to_archived': len(to_archived)
+        }
+    
+    def decay_nodes(self, current_ts: float):
+        """Apply state-aware decay."""
+        # Decay active nodes (normal rate)
+        for node in self._active_nodes.values():
+            node.apply_decay(current_ts)
+        
+        # Decay dormant nodes (reduced rate)
+        for node in self._dormant_nodes.values():
+            node.apply_decay(current_ts)
+    
+    def update_with_trade(self, node_id: str, timestamp: float, volume: float, is_buyer_maker: bool):
+        """Update active node with trade evidence."""
+        if node_id in self._active_nodes:
+            self._active_nodes[node_id].record_trade_execution(timestamp, volume, is_buyer_maker)
+    
+    def update_with_liquidation(self, node_id: str, timestamp: float, side: str):
+        """Update active node with liquidation evidence."""
+        if node_id in self._active_nodes:
+            self._active_nodes[node_id].record_liquidation(timestamp, side)
+
+    
+    def get_node(self, node_id: str) -> Optional[EnrichedLiquidityMemoryNode]:
+        """Get node by ID from any state (Active, Dormant, Archived)."""
+        if node_id in self._active_nodes:
+            return self._active_nodes[node_id]
+        if node_id in self._dormant_nodes:
+            return self._dormant_nodes[node_id]
+        if node_id in self._archived_nodes:
+            return self._archived_nodes[node_id]
+        return None
+
+    def get_active_nodes(
+        self,
+        current_price: Optional[float] = None,
+        radius: Optional[float] = None,
+        min_strength: float = 0.0
+    ) -> List[EnrichedLiquidityMemoryNode]:
+        """Query active nodes only."""
+        results = []
+        
+        for node in self._active_nodes.values():
+            if node.strength < min_strength:
+                continue
+            
+            if current_price is not None and radius is not None:
+                if abs(node.price_center - current_price) > radius:
+                    continue
+            
+            results.append(node)
+        
+        results.sort(key=lambda n: n.strength, reverse=True)
+        return results
+    
+    def get_dormant_nodes(
+        self,
+        current_price: Optional[float] = None,
+        radius: Optional[float] = None
+    ) -> List[EnrichedLiquidityMemoryNode]:
+        """Query dormant nodes (historical context)."""
+        results = []
+        
+        for node in self._dormant_nodes.values():
+            if current_price is not None and radius is not None:
+                if abs(node.price_center - current_price) > radius:
+                    continue
+            
+            results.append(node)
+        
+        return results
+    
+    def get_node_density(self, price_range: Tuple[float, float]) -> Dict[str, float]:
+        """Get node density metrics for price range."""
+        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
+        
+        center_price = (price_range[0] + price_range[1]) / 2
+        radius = (price_range[1] - price_range[0]) / 2
+        
+        return self.topology.compute_neighborhood_density(center_price, radius, all_nodes)
+    
+    def get_pressure_map(self, price_range: Tuple[float, float]) -> PressureMap:
+        """Get memory pressure map for price range."""
+        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
+        active_nodes = list(self._active_nodes.values())
+        dormant_nodes = list(self._dormant_nodes.values())
+        
+        return self.pressure_analyzer.compute_local_pressure(
+            price_range,
+            all_nodes,
+            active_nodes,
+            dormant_nodes
+        )
+    
+    def get_topological_clusters(
+        self,
+        price_threshold: float = 0.01,
+        min_cluster_size: int = 2
+    ) -> List[TopologyCluster]:
+        """Get topological clusters (factual grouping only)."""
+        all_nodes = list(self._active_nodes.values()) + list(self._dormant_nodes.values())
+        
+        return self.topology.identify_clusters(all_nodes, price_threshold, min_cluster_size)
+    
+    def _transition_to_dormant(self, node_id: str):
+        """Transition node from ACTIVE to DORMANT."""
+        node = self._active_nodes.pop(node_id)
+        
+        # Extract and preserve historical evidence
+        evidence = extract_historical_evidence(node)
+        self._dormant_evidence[node_id] = evidence
+        
+        # Reduce decay rate
+        node.decay_rate = MemoryStateThresholds.DORMANT_DECAY_RATE
+        
+        self._dormant_nodes[node_id] = node
+    
+    def _transition_to_archived(self, node_id: str):
+        """Transition node from DORMANT to ARCHIVED."""
+        node = self._dormant_nodes.pop(node_id)
+        
+        # Keep evidence for potential future analysis
+        # (does not enable auto-revival)
+        
+        self._archived_nodes[node_id] = node
+    
+    def _revive_dormant_node(
+        self,
+        node_id: str,
+        timestamp: float,
+        volume: float
+    ) -> EnrichedLiquidityMemoryNode:
+        """
+        Revive dormant node with historical context.
+        
+        CRITICAL: Revival requires NEW evidence (not automatic).
+        Historical evidence contributes to new strength.
+        """
+        node = self._dormant_nodes.pop(node_id)
+        historical = self._dormant_evidence.get(node_id)
+        
+        # Compute revival strength from historical + new evidence
+        new_evidence_strength = min(0.4, volume / 10000.0)
+        
+        if historical:
+            node.strength = compute_revival_strength(historical, new_evidence_strength)
+        else:
+            node.strength = new_evidence_strength + MemoryStateThresholds.DORMANT_REVIVAL_STRENGTH_BOOST
+        
+        # Restore active decay rate
+        node.decay_rate = MemoryStateThresholds.ACTIVE_DECAY_RATE
+        node.last_interaction_ts = timestamp
+        
+        self._active_nodes[node_id] = node
+        self._total_interactions += 1
+        
+        return node
+    
+    def get_metrics(self) -> dict:
+        """Get store metrics including state distribution."""
+        return {
+            'total_nodes_created': self._total_nodes_created,
+            'active_nodes': len(self._active_nodes),
+            'dormant_nodes': len(self._dormant_nodes),
+            'archived_nodes': len(self._archived_nodes),
+            'total_interactions': self._total_interactions,
+            'last_state_update_ts': self._last_state_update_ts,
+        }
+    
+    # ==================== M3: TEMPORAL EVIDENCE QUERY INTERFACE ====================
+    
+    def get_sequence_buffer(self, node_id: str) -> Optional[List[Tuple]]:
+        """
+        Get complete sequence buffer for a node.
+        
+        Returns chronologically-ordered list of (token, timestamp) tuples.
+        Raw access to temporal event history without interpretation.
+        
+        Args:
+            node_id: Node identifier
+        
+        Returns:
+            List of (EvidenceToken, timestamp) tuples or None if node not found
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None:
+            return None
+        
+        if node.sequence_buffer is None:
+            return []
+        
+        return node.sequence_buffer.get_all()
+    
+    def get_recent_tokens(self, node_id: str, count: int = 10) -> List[Tuple]:
+        """
+        Get N most recent tokens from node's sequence buffer.
+        
+        Returns chronological order (oldest → newest).
+        Count is factual limit, NOT importance threshold.
+        
+        Args:
+            node_id: Node identifier
+            count: Number of recent tokens to return
+        
+        Returns:
+            List of recent (token, timestamp) tuples (may be < count if buffer smaller)
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None or node.sequence_buffer is None:
+            return []
+        
+        return node.sequence_buffer.get_recent(count)
+    
+    def get_motifs_for_node(self, node_id: str, min_count: int = 1) -> List[Dict]:
+        """
+        Get all observed motifs for a node.
+        
+        Returns motifs filtered by minimum occurrence count.
+        NOT sorted by importance - returns in arbitrary order.
+        
+        Args:
+            node_id: Node identifier
+            min_count: Minimum occurrence count (factual filter)
+        
+        Returns:
+            List of motif dictionaries with keys: motif, count, last_seen_ts, strength
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None:
+            return []
+        
+        motifs = []
+        for motif_tuple, count in node.motif_counts.items():
+            if count >= min_count:
+                motifs.append({
+                    'motif': motif_tuple,
+                    'count': count,
+                    'last_seen_ts': node.motif_last_seen.get(motif_tuple, 0.0),
+                    'strength': node.motif_strength.get(motif_tuple, 0.0)
+                })
+        
+        return motifs
+    
+    def get_motif_by_pattern(
+        self,
+        node_id: str,
+        pattern: Tuple
+    ) -> Optional[Dict]:
+        """
+        Get metrics for a specific motif pattern if observed.
+        
+        Factual lookup, NOT prediction.
+        
+        Args:
+            node_id: Node identifier
+            pattern: Motif tuple to look up
+        
+        Returns:
+            Dict with motif metrics or None if not observed
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None:
+            return None
+        
+        if pattern not in node.motif_counts:
+            return None
+        
+        return {
+            'motif': pattern,
+            'count': node.motif_counts[pattern],
+            'last_seen_ts': node.motif_last_seen.get(pattern, 0.0),
+            'strength': node.motif_strength.get(pattern, 0.0)
+        }
+    
+    def get_nodes_with_motif(
+        self,
+        motif: Tuple,
+        min_count: int = 1
+    ) -> List[str]:
+        """
+        Get node IDs that have observed the specified motif.
+        
+        Factual list, NOT ranked by importance.
+        
+        Args:
+            motif: Motif tuple to search for
+            min_count: Minimum occurrence count
+        
+        Returns:
+            List of node IDs (unordered)
+        """
+        node_ids = []
+        
+        for node_id, node in self._active_nodes.items():
+            count = node.motif_counts.get(motif, 0)
+            if count >= min_count:
+                node_ids.append(node_id)
+        
+        return node_ids
+    
+    def get_motif_statistics(self, motif: Tuple) -> Dict:
+        """
+        Get aggregate statistics for motif across all nodes.
+        
+        Returns factual counts, NOT predictions or importance scores.
+        
+        Args:
+            motif: Motif tuple
+        
+        Returns:
+            Dict with keys: total_count, node_count, avg_count_per_node, most_recent_ts
+        """
+        total_count = 0
+        node_count = 0
+        most_recent_ts = 0.0
+        
+        for node in self._active_nodes.values():
+            count = node.motif_counts.get(motif, 0)
+            if count > 0:
+                total_count += count
+                node_count += 1
+                node_ts = node.motif_last_seen.get(motif, 0.0)
+                most_recent_ts = max(most_recent_ts, node_ts)
+        
+        avg_count = total_count / node_count if node_count > 0 else 0.0
+        
+        return {
+            'total_count': total_count,
+            'node_count': node_count,
+            'avg_count_per_node': avg_count,
+            'most_recent_ts': most_recent_ts
+        }
+    
+    def get_tokens_in_time_range(
+        self,
+        node_id: str,
+        start_ts: float,
+        end_ts: float
+    ) -> List[Tuple]:
+        """
+        Get tokens within specified time range.
+        
+        Chronological order maintained.
+        
+        Args:
+            node_id: Node identifier
+            start_ts: Start timestamp (inclusive)
+            end_ts: End timestamp (inclusive)
+        
+        Returns:
+            List of (token, timestamp) tuples within range
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None or node.sequence_buffer is None:
+            return []
+        
+        all_tokens = node.sequence_buffer.get_all()
+        
+        return [
+            (token, ts) for token, ts in all_tokens
+            if start_ts <= ts <= end_ts
+        ]
+    
+    def get_motifs_last_seen_since(
+        self,
+        node_id: str,
+        since_ts: float
+    ) -> List[Dict]:
+        """
+        Get motifs observed since specified timestamp.
+        
+        Factual recency filter, NOT importance ranking.
+        
+        Args:
+            node_id: Node identifier
+            since_ts: Timestamp threshold
+        
+        Returns:
+            List of motif dictionaries observed since timestamp
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None:
+            return []
+        
+        motifs = []
+        for motif_tuple, last_seen in node.motif_last_seen.items():
+            if last_seen >= since_ts:
+                motifs.append({
+                    'motif': motif_tuple,
+                    'count': node.motif_counts.get(motif_tuple, 0),
+                    'last_seen_ts': last_seen,
+                    'strength': node.motif_strength.get(motif_tuple, 0.0)
+                })
+        
+        return motifs
+    
+    def get_sequence_diversity(self, node_id: str) -> Dict:
+        """
+        Get diversity metrics for node's sequence history.
+        
+        Returns factual counts, NOT quality scores.
+        
+        Args:
+            node_id: Node identifier
+        
+        Returns:
+            Dict with keys: unique_bigrams, unique_trigrams, total_tokens, diversity_ratio
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None:
+            return {
+                'unique_bigrams': 0,
+                'unique_trigrams': 0,
+                'total_tokens': 0,
+                'diversity_ratio': 0.0
+            }
+        
+        # Count unique motifs by length
+        unique_bigrams = sum(1 for m in node.motif_counts.keys() if len(m) == 2)
+        unique_trigrams = sum(1 for m in node.motif_counts.keys() if len(m) == 3)
+        
+        total_tokens = node.sequence_buffer.get_size() if node.sequence_buffer else 0
+        
+        # Diversity ratio: unique motifs / possible motifs (approx)
+        # NOT a quality metric
+        total_unique = unique_bigrams + unique_trigrams
+        possible_motifs = max(1, total_tokens - 1)  # Avoid division by zero
+        diversity_ratio = total_unique / possible_motifs if possible_motifs > 0 else 0.0
+        
+        return {
+            'unique_bigrams': unique_bigrams,
+            'unique_trigrams': unique_trigrams,
+            'total_tokens': total_tokens,
+            'diversity_ratio': diversity_ratio
+        }
+    
+    def get_motif_decay_state(
+        self,
+        node_id: str,
+        motif: Tuple
+    ) -> Optional[Dict]:
+        """
+        Get current decay state for a motif.
+        
+        Mechanical calculation, NOT relevance prediction.
+        
+        Args:
+            node_id: Node identifier
+            motif: Motif tuple
+        
+        Returns:
+            Dict with decay state or None if motif not observed
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None or motif not in node.motif_counts:
+            return None
+        
+        from memory.m2_memory_state import MemoryState, MemoryStateAnalyzer
+        
+        # Get node's memory state to determine decay rate
+        node_state_enum = MemoryStateAnalyzer.classify_node_state(node)
+        
+        return {
+            'current_strength': node.motif_strength.get(motif, 0.0),
+            'time_since_seen': 0.0,  # Would need current timestamp
+            'decay_rate': node.decay_rate,
+            'node_state': node_state_enum.value
+        }
+    
+    def get_buffer_metadata(self, node_id: str) -> Dict:
+        """
+        Get metadata about node's sequence buffer.
+        
+        Args:
+            node_id: Node identifier
+        
+        Returns:
+            Dict with buffer metadata
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None or node.sequence_buffer is None:
+            return {
+                'current_size': 0,
+                'max_length': 0,
+                'time_window_sec': 0.0,
+                'oldest_ts': None,
+                'newest_ts': None,
+                'total_observed': 0
+            }
+        
+        buffer = node.sequence_buffer
+        
+        return {
+            'current_size': buffer.get_size(),
+            'max_length': buffer.max_length,
+            'time_window_sec': buffer.time_window_sec,
+            'oldest_ts': buffer.get_oldest_timestamp(),
+            'newest_ts': buffer.get_newest_timestamp(),
+            'total_observed': buffer.total_tokens_observed
+        }
+    
+    def get_token_counts(self, node_id: str) -> Dict:
+        """
+        Get histogram of token types in buffer.
+        
+        All types counted equally (no importance weighting).
+        
+        Args:
+            node_id: Node identifier
+        
+        Returns:
+            Dict mapping EvidenceToken → count
+        """
+        node = self._active_nodes.get(node_id)
+        if node is None or node.sequence_buffer is None:
+            return {}
+        
+        from memory.m3_evidence_token import EvidenceToken
+        
+        # Initialize counts for all token types
+        counts = {token: 0 for token in EvidenceToken}
+        
+        # Count occurrences from buffer
+        all_tokens = node.sequence_buffer.get_all()
+        for token, _ in all_tokens:
+            counts[token] += 1
+        
+        # Return only non-zero counts
+        return {token: count for token, count in counts.items() if count > 0}
+    
+    # ==================== M4: CONTEXTUAL READ MODEL QUERY INTERFACE ====================
+    
+    def get_evidence_composition_view(self, node_id: str) -> Optional[EvidenceCompositionView]:
+        """Get M4 evidence composition view for a node. Thin wrapper - no transformation."""
+        node = self.get_node(node_id)
+        return get_evidence_composition(node) if node else None
+    
+    def get_interaction_density_view(self, node_id: str, current_ts: float) -> Optional[InteractionDensityView]:
+        """Get M4 interaction density view for a node. Thin wrapper - no transformation."""
+        node = self.get_node(node_id)
+        return get_interaction_density(node, current_ts) if node else None
+    
+    def get_stability_metrics_view(self, node_id: str, current_ts: float) -> Optional[StabilityTransienceView]:
+        """Get M4 stability/transience view for a node. Thin wrapper - no transformation."""
+        node = self.get_node(node_id)
+        return get_stability_metrics(node, current_ts) if node else None
+    
+    def get_temporal_structure_view(self, node_id: str, current_ts: float) -> Optional[TemporalStructureView]:
+        """Get M4 temporal structure view for a node. Thin wrapper - no transformation."""
+        node = self.get_node(node_id)
+        return get_temporal_structure(node, current_ts) if node else None
+    
+    def get_cross_node_context_view(
+        self,
+        price_range_start: float,
+        price_range_end: float,
+        current_ts: float
+    ) -> CrossNodeContextView:
+        """Get M4 cross-node context view for a price range. Thin wrapper - no transformation."""
+        all_nodes = (
+            list(self._active_nodes.values()) +
+            list(self._dormant_nodes.values()) +
+            list(self._archived_nodes.values())
+        )
+        return get_cross_node_context(price_range_start, price_range_end, all_nodes, current_ts)

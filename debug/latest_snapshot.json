@@ -1,0 +1,4389 @@
+{
+  "timestamp": 1767701877.3539412,
+  "symbols_active": [
+    "BTCUSDT",
+    "DOGEUSDT",
+    "ETHUSDT",
+    "SUIUSDT",
+    "ZECUSDT",
+    "XRPUSDT",
+    "ALPACAUSDT",
+    "1000PEPEUSDT",
+    "RIVERUSDT",
+    "SOLUSDT"
+  ],
+  "ingestion_health": {
+    "trades_rate": 0.0,
+    "liquidations_rate": 0.0,
+    "klines_rate": 0.0,
+    "oi_rate": 0.0,
+    "degraded": false,
+    "degraded_reason": ""
+  },
+  "baseline_status": {
+    "ready_symbols": 0,
+    "total_symbols": 10
+  },
+  "counters": {
+    "windows_processed": 0,
+    "peak_pressure_events": 0,
+    "dropped_events": {
+      "symbol_not_allowed": 8801,
+      "baseline_not_ready": 0,
+      "window_not_closed": 0,
+      "missing_streams": 0
+    }
+  },
+  "raw_buffers": {
+    "trades": {},
+    "liquidations": {
+      "XRPUSDT": [
+        {
+          "timestamp": 1767695630.2,
+          "symbol": "XRPUSDT",
+          "price": 2.3656,
+          "base_qty": 442.6,
+          "quote_qty": 1047.01456,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767695769.385,
+          "symbol": "XRPUSDT",
+          "price": 2.3413,
+          "base_qty": 109.8,
+          "quote_qty": 257.07473999999996,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767695893.403,
+          "symbol": "XRPUSDT",
+          "price": 2.3696,
+          "base_qty": 42.4,
+          "quote_qty": 100.47104,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767695897.347,
+          "symbol": "XRPUSDT",
+          "price": 2.3697,
+          "base_qty": 169.1,
+          "quote_qty": 400.71626999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696531.212,
+          "symbol": "XRPUSDT",
+          "price": 2.3709,
+          "base_qty": 3608.9,
+          "quote_qty": 8556.34101,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696533.275,
+          "symbol": "XRPUSDT",
+          "price": 2.3713,
+          "base_qty": 282.9,
+          "quote_qty": 670.84077,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696534.552,
+          "symbol": "XRPUSDT",
+          "price": 2.3716,
+          "base_qty": 8041.3,
+          "quote_qty": 19070.74708,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696804.359,
+          "symbol": "XRPUSDT",
+          "price": 2.3736,
+          "base_qty": 938.6,
+          "quote_qty": 2227.86096,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696805.578,
+          "symbol": "XRPUSDT",
+          "price": 2.3739,
+          "base_qty": 85.1,
+          "quote_qty": 202.01888999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696808.642,
+          "symbol": "XRPUSDT",
+          "price": 2.374,
+          "base_qty": 28.1,
+          "quote_qty": 66.7094,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696814.164,
+          "symbol": "XRPUSDT",
+          "price": 2.375,
+          "base_qty": 2132.5,
+          "quote_qty": 5064.6875,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696834.418,
+          "symbol": "XRPUSDT",
+          "price": 2.3504,
+          "base_qty": 855.3,
+          "quote_qty": 2010.29712,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697419.209,
+          "symbol": "XRPUSDT",
+          "price": 2.3754,
+          "base_qty": 17025.8,
+          "quote_qty": 40443.08532,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697420.734,
+          "symbol": "XRPUSDT",
+          "price": 2.3756,
+          "base_qty": 6053.0,
+          "quote_qty": 14379.5068,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697638.437,
+          "symbol": "XRPUSDT",
+          "price": 2.3716,
+          "base_qty": 229.7,
+          "quote_qty": 544.7565199999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697808.131,
+          "symbol": "XRPUSDT",
+          "price": 2.3746,
+          "base_qty": 10281.1,
+          "quote_qty": 24413.500060000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697817.697,
+          "symbol": "XRPUSDT",
+          "price": 2.3751,
+          "base_qty": 41.8,
+          "quote_qty": 99.27918,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697927.722,
+          "symbol": "XRPUSDT",
+          "price": 2.3787,
+          "base_qty": 96.5,
+          "quote_qty": 229.54455,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697940.216,
+          "symbol": "XRPUSDT",
+          "price": 2.3785,
+          "base_qty": 4444.8,
+          "quote_qty": 10571.9568,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698014.312,
+          "symbol": "XRPUSDT",
+          "price": 2.3802,
+          "base_qty": 19.5,
+          "quote_qty": 46.4139,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698021.358,
+          "symbol": "XRPUSDT",
+          "price": 2.3804,
+          "base_qty": 6.3,
+          "quote_qty": 14.996519999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698108.71,
+          "symbol": "XRPUSDT",
+          "price": 2.3809,
+          "base_qty": 3.8,
+          "quote_qty": 9.047419999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698110.328,
+          "symbol": "XRPUSDT",
+          "price": 2.3812,
+          "base_qty": 336.5,
+          "quote_qty": 801.2738,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699255.043,
+          "symbol": "XRPUSDT",
+          "price": 2.3822,
+          "base_qty": 125.2,
+          "quote_qty": 298.25144,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699256.116,
+          "symbol": "XRPUSDT",
+          "price": 2.3824,
+          "base_qty": 211.8,
+          "quote_qty": 504.59232000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699257.757,
+          "symbol": "XRPUSDT",
+          "price": 2.3828,
+          "base_qty": 367.3,
+          "quote_qty": 875.20244,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699269.245,
+          "symbol": "XRPUSDT",
+          "price": 2.3832,
+          "base_qty": 1798.3,
+          "quote_qty": 4285.70856,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699284.156,
+          "symbol": "XRPUSDT",
+          "price": 2.3836,
+          "base_qty": 50.0,
+          "quote_qty": 119.17999999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699287.685,
+          "symbol": "XRPUSDT",
+          "price": 2.3839,
+          "base_qty": 167.6,
+          "quote_qty": 399.54164000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699326.098,
+          "symbol": "XRPUSDT",
+          "price": 2.3844,
+          "base_qty": 1216.8,
+          "quote_qty": 2901.3379199999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699336.507,
+          "symbol": "XRPUSDT",
+          "price": 2.3854,
+          "base_qty": 42.9,
+          "quote_qty": 102.33366000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699539.207,
+          "symbol": "XRPUSDT",
+          "price": 2.3848,
+          "base_qty": 680.4,
+          "quote_qty": 1622.61792,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699606.189,
+          "symbol": "XRPUSDT",
+          "price": 2.3862,
+          "base_qty": 146.9,
+          "quote_qty": 350.53278,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699607.464,
+          "symbol": "XRPUSDT",
+          "price": 2.3869,
+          "base_qty": 146.1,
+          "quote_qty": 348.72608999999994,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699625.564,
+          "symbol": "XRPUSDT",
+          "price": 2.3858,
+          "base_qty": 17.0,
+          "quote_qty": 40.558600000000006,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.118,
+          "symbol": "XRPUSDT",
+          "price": 2.3789,
+          "base_qty": 3.0,
+          "quote_qty": 7.136699999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699775.397,
+          "symbol": "XRPUSDT",
+          "price": 2.3827,
+          "base_qty": 49.9,
+          "quote_qty": 118.89672999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700022.558,
+          "symbol": "XRPUSDT",
+          "price": 2.3847,
+          "base_qty": 293.7,
+          "quote_qty": 700.38639,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700129.68,
+          "symbol": "XRPUSDT",
+          "price": 2.3847,
+          "base_qty": 67.0,
+          "quote_qty": 159.7749,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700343.392,
+          "symbol": "XRPUSDT",
+          "price": 2.3838,
+          "base_qty": 398.5,
+          "quote_qty": 949.9443,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700782.574,
+          "symbol": "XRPUSDT",
+          "price": 2.3878,
+          "base_qty": 53.2,
+          "quote_qty": 127.03096000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700951.121,
+          "symbol": "XRPUSDT",
+          "price": 2.3899,
+          "base_qty": 357.5,
+          "quote_qty": 854.38925,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700952.133,
+          "symbol": "XRPUSDT",
+          "price": 2.3934,
+          "base_qty": 174.0,
+          "quote_qty": 416.45160000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700955.648,
+          "symbol": "XRPUSDT",
+          "price": 2.3951,
+          "base_qty": 42.5,
+          "quote_qty": 101.79175,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700958.255,
+          "symbol": "XRPUSDT",
+          "price": 2.3954,
+          "base_qty": 3.8,
+          "quote_qty": 9.10252,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700959.405,
+          "symbol": "XRPUSDT",
+          "price": 2.3954,
+          "base_qty": 51.5,
+          "quote_qty": 123.3631,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700960.5,
+          "symbol": "XRPUSDT",
+          "price": 2.3956,
+          "base_qty": 2.6,
+          "quote_qty": 6.22856,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700961.575,
+          "symbol": "XRPUSDT",
+          "price": 2.3959,
+          "base_qty": 85.1,
+          "quote_qty": 203.89109,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700967.366,
+          "symbol": "XRPUSDT",
+          "price": 2.3972,
+          "base_qty": 58.7,
+          "quote_qty": 140.71564,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700968.426,
+          "symbol": "XRPUSDT",
+          "price": 2.3975,
+          "base_qty": 10583.1,
+          "quote_qty": 25372.98225,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700969.602,
+          "symbol": "XRPUSDT",
+          "price": 2.3978,
+          "base_qty": 362.1,
+          "quote_qty": 868.2433800000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700971.287,
+          "symbol": "XRPUSDT",
+          "price": 2.3985,
+          "base_qty": 65.0,
+          "quote_qty": 155.9025,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700983.241,
+          "symbol": "XRPUSDT",
+          "price": 2.3979,
+          "base_qty": 25.8,
+          "quote_qty": 61.86582,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701057.199,
+          "symbol": "XRPUSDT",
+          "price": 2.3727,
+          "base_qty": 103.0,
+          "quote_qty": 244.3881,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701166.366,
+          "symbol": "XRPUSDT",
+          "price": 2.3987,
+          "base_qty": 2.4,
+          "quote_qty": 5.75688,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701171.757,
+          "symbol": "XRPUSDT",
+          "price": 2.399,
+          "base_qty": 64.2,
+          "quote_qty": 154.0158,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701173.289,
+          "symbol": "XRPUSDT",
+          "price": 2.4002,
+          "base_qty": 4.6,
+          "quote_qty": 11.040919999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701174.502,
+          "symbol": "XRPUSDT",
+          "price": 2.4007,
+          "base_qty": 14253.4,
+          "quote_qty": 34218.13738,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701177.544,
+          "symbol": "XRPUSDT",
+          "price": 2.4019,
+          "base_qty": 39.8,
+          "quote_qty": 95.59562,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701188.665,
+          "symbol": "XRPUSDT",
+          "price": 2.4025,
+          "base_qty": 12.9,
+          "quote_qty": 30.99225,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701213.275,
+          "symbol": "XRPUSDT",
+          "price": 2.4027,
+          "base_qty": 6778.8,
+          "quote_qty": 16287.42276,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701215.081,
+          "symbol": "XRPUSDT",
+          "price": 2.4036,
+          "base_qty": 440.5,
+          "quote_qty": 1058.7857999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701254.288,
+          "symbol": "XRPUSDT",
+          "price": 2.4047,
+          "base_qty": 13380.6,
+          "quote_qty": 32176.328820000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701266.784,
+          "symbol": "XRPUSDT",
+          "price": 2.4053,
+          "base_qty": 29.2,
+          "quote_qty": 70.23476,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701272.109,
+          "symbol": "XRPUSDT",
+          "price": 2.4059,
+          "base_qty": 86.5,
+          "quote_qty": 208.11034999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701528.327,
+          "symbol": "XRPUSDT",
+          "price": 2.398,
+          "base_qty": 27.2,
+          "quote_qty": 65.2256,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701649.811,
+          "symbol": "XRPUSDT",
+          "price": 2.3989,
+          "base_qty": 38.5,
+          "quote_qty": 92.35764999999999,
+          "side": "BUY"
+        }
+      ],
+      "RIVERUSDT": [
+        {
+          "timestamp": 1767696716.932,
+          "symbol": "RIVERUSDT",
+          "price": 20.987,
+          "base_qty": 54.9,
+          "quote_qty": 1152.1862999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696724.172,
+          "symbol": "RIVERUSDT",
+          "price": 19.177,
+          "base_qty": 55.3,
+          "quote_qty": 1060.4881,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696818.158,
+          "symbol": "RIVERUSDT",
+          "price": 19.01,
+          "base_qty": 1.6,
+          "quote_qty": 30.416000000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696829.456,
+          "symbol": "RIVERUSDT",
+          "price": 18.267,
+          "base_qty": 0.4,
+          "quote_qty": 7.3068,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697054.244,
+          "symbol": "RIVERUSDT",
+          "price": 18.989,
+          "base_qty": 12.6,
+          "quote_qty": 239.2614,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697200.225,
+          "symbol": "RIVERUSDT",
+          "price": 19.018,
+          "base_qty": 20.2,
+          "quote_qty": 384.1636,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697201.379,
+          "symbol": "RIVERUSDT",
+          "price": 19.029,
+          "base_qty": 1.9,
+          "quote_qty": 36.1551,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697271.726,
+          "symbol": "RIVERUSDT",
+          "price": 18.932,
+          "base_qty": 2.9,
+          "quote_qty": 54.90279999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697387.307,
+          "symbol": "RIVERUSDT",
+          "price": 21.019,
+          "base_qty": 7.1,
+          "quote_qty": 149.23489999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697390.072,
+          "symbol": "RIVERUSDT",
+          "price": 19.043,
+          "base_qty": 13.8,
+          "quote_qty": 262.7934,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697396.306,
+          "symbol": "RIVERUSDT",
+          "price": 19.047,
+          "base_qty": 1.1,
+          "quote_qty": 20.951700000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697398.106,
+          "symbol": "RIVERUSDT",
+          "price": 19.068,
+          "base_qty": 5.0,
+          "quote_qty": 95.34,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697399.333,
+          "symbol": "RIVERUSDT",
+          "price": 19.07604,
+          "base_qty": 0.9,
+          "quote_qty": 17.168436,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697400.341,
+          "symbol": "RIVERUSDT",
+          "price": 19.106,
+          "base_qty": 1.3,
+          "quote_qty": 24.8378,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697401.369,
+          "symbol": "RIVERUSDT",
+          "price": 19.167,
+          "base_qty": 4.5,
+          "quote_qty": 86.25150000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697402.372,
+          "symbol": "RIVERUSDT",
+          "price": 19.219,
+          "base_qty": 4.8,
+          "quote_qty": 92.2512,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697403.398,
+          "symbol": "RIVERUSDT",
+          "price": 19.232,
+          "base_qty": 21.3,
+          "quote_qty": 409.6416,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697404.434,
+          "symbol": "RIVERUSDT",
+          "price": 19.242,
+          "base_qty": 157.9,
+          "quote_qty": 3038.3118000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697407.425,
+          "symbol": "RIVERUSDT",
+          "price": 19.525,
+          "base_qty": 352.6,
+          "quote_qty": 6884.515,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697408.451,
+          "symbol": "RIVERUSDT",
+          "price": 19.24944,
+          "base_qty": 59.5,
+          "quote_qty": 1145.34168,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697410.972,
+          "symbol": "RIVERUSDT",
+          "price": 19.511,
+          "base_qty": 250.8,
+          "quote_qty": 4893.3588,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697419.616,
+          "symbol": "RIVERUSDT",
+          "price": 19.187,
+          "base_qty": 263.7,
+          "quote_qty": 5059.6119,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697420.689,
+          "symbol": "RIVERUSDT",
+          "price": 18.532,
+          "base_qty": 257.8,
+          "quote_qty": 4777.5496,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697430.132,
+          "symbol": "RIVERUSDT",
+          "price": 19.192,
+          "base_qty": 216.2,
+          "quote_qty": 4149.310399999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697432.783,
+          "symbol": "RIVERUSDT",
+          "price": 19.752,
+          "base_qty": 15.6,
+          "quote_qty": 308.1312,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697433.8,
+          "symbol": "RIVERUSDT",
+          "price": 21.174,
+          "base_qty": 0.1,
+          "quote_qty": 2.1174,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697434.927,
+          "symbol": "RIVERUSDT",
+          "price": 19.782,
+          "base_qty": 10.4,
+          "quote_qty": 205.7328,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697439.732,
+          "symbol": "RIVERUSDT",
+          "price": 19.097,
+          "base_qty": 274.9,
+          "quote_qty": 5249.7653,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697445.966,
+          "symbol": "RIVERUSDT",
+          "price": 19.354,
+          "base_qty": 10.0,
+          "quote_qty": 193.54,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697453.084,
+          "symbol": "RIVERUSDT",
+          "price": 19.266,
+          "base_qty": 2.0,
+          "quote_qty": 38.532,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697454.491,
+          "symbol": "RIVERUSDT",
+          "price": 19.323,
+          "base_qty": 30.3,
+          "quote_qty": 585.4869,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697455.571,
+          "symbol": "RIVERUSDT",
+          "price": 19.778,
+          "base_qty": 18.7,
+          "quote_qty": 369.8486,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697466.542,
+          "symbol": "RIVERUSDT",
+          "price": 17.695,
+          "base_qty": 443.6,
+          "quote_qty": 7849.502,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697556.342,
+          "symbol": "RIVERUSDT",
+          "price": 19.815,
+          "base_qty": 4.3,
+          "quote_qty": 85.2045,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697577.154,
+          "symbol": "RIVERUSDT",
+          "price": 19.686,
+          "base_qty": 61.3,
+          "quote_qty": 1206.7518,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697580.542,
+          "symbol": "RIVERUSDT",
+          "price": 19.347,
+          "base_qty": 27.5,
+          "quote_qty": 532.0425,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697582.443,
+          "symbol": "RIVERUSDT",
+          "price": 19.271,
+          "base_qty": 156.0,
+          "quote_qty": 3006.2760000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697586.685,
+          "symbol": "RIVERUSDT",
+          "price": 19.421,
+          "base_qty": 0.8,
+          "quote_qty": 15.5368,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697587.948,
+          "symbol": "RIVERUSDT",
+          "price": 19.278,
+          "base_qty": 11.8,
+          "quote_qty": 227.4804,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697593.32,
+          "symbol": "RIVERUSDT",
+          "price": 19.96,
+          "base_qty": 0.6,
+          "quote_qty": 11.976,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697597.06,
+          "symbol": "RIVERUSDT",
+          "price": 19.285,
+          "base_qty": 1.6,
+          "quote_qty": 30.856,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697598.092,
+          "symbol": "RIVERUSDT",
+          "price": 19.3,
+          "base_qty": 23.7,
+          "quote_qty": 457.41,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697600.098,
+          "symbol": "RIVERUSDT",
+          "price": 19.328,
+          "base_qty": 3.0,
+          "quote_qty": 57.983999999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697601.116,
+          "symbol": "RIVERUSDT",
+          "price": 20.748,
+          "base_qty": 94.9,
+          "quote_qty": 1968.9852000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697602.118,
+          "symbol": "RIVERUSDT",
+          "price": 19.349,
+          "base_qty": 0.8,
+          "quote_qty": 15.4792,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697603.193,
+          "symbol": "RIVERUSDT",
+          "price": 19.871,
+          "base_qty": 154.0,
+          "quote_qty": 3060.134,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697604.566,
+          "symbol": "RIVERUSDT",
+          "price": 19.266,
+          "base_qty": 40.7,
+          "quote_qty": 784.1262,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697608.071,
+          "symbol": "RIVERUSDT",
+          "price": 19.389,
+          "base_qty": 1.1,
+          "quote_qty": 21.3279,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697609.189,
+          "symbol": "RIVERUSDT",
+          "price": 19.422,
+          "base_qty": 64.4,
+          "quote_qty": 1250.7768,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697610.607,
+          "symbol": "RIVERUSDT",
+          "price": 19.42386,
+          "base_qty": 1.2,
+          "quote_qty": 23.308632,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697613.49,
+          "symbol": "RIVERUSDT",
+          "price": 19.77,
+          "base_qty": 98.1,
+          "quote_qty": 1939.437,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697617.998,
+          "symbol": "RIVERUSDT",
+          "price": 19.208,
+          "base_qty": 176.0,
+          "quote_qty": 3380.6079999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697620.794,
+          "symbol": "RIVERUSDT",
+          "price": 19.301,
+          "base_qty": 224.1,
+          "quote_qty": 4325.3541,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697623.919,
+          "symbol": "RIVERUSDT",
+          "price": 19.893,
+          "base_qty": 108.4,
+          "quote_qty": 2156.4012000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697635.133,
+          "symbol": "RIVERUSDT",
+          "price": 19.387,
+          "base_qty": 220.6,
+          "quote_qty": 4276.7722,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697637.592,
+          "symbol": "RIVERUSDT",
+          "price": 19.396,
+          "base_qty": 256.4,
+          "quote_qty": 4973.1344,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697638.679,
+          "symbol": "RIVERUSDT",
+          "price": 19.434,
+          "base_qty": 13.6,
+          "quote_qty": 264.30240000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697639.729,
+          "symbol": "RIVERUSDT",
+          "price": 19.483,
+          "base_qty": 135.2,
+          "quote_qty": 2634.1016,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697644.616,
+          "symbol": "RIVERUSDT",
+          "price": 19.98,
+          "base_qty": 56.8,
+          "quote_qty": 1134.864,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697650.108,
+          "symbol": "RIVERUSDT",
+          "price": 19.49,
+          "base_qty": 1.0,
+          "quote_qty": 19.49,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697655.82,
+          "symbol": "RIVERUSDT",
+          "price": 19.384,
+          "base_qty": 337.8,
+          "quote_qty": 6547.9152,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697658.079,
+          "symbol": "RIVERUSDT",
+          "price": 19.575,
+          "base_qty": 22.8,
+          "quote_qty": 446.31,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697659.089,
+          "symbol": "RIVERUSDT",
+          "price": 19.583,
+          "base_qty": 2.6,
+          "quote_qty": 50.9158,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697660.128,
+          "symbol": "RIVERUSDT",
+          "price": 19.593,
+          "base_qty": 46.0,
+          "quote_qty": 901.278,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697661.213,
+          "symbol": "RIVERUSDT",
+          "price": 19.599,
+          "base_qty": 3.2,
+          "quote_qty": 62.716800000000006,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697662.367,
+          "symbol": "RIVERUSDT",
+          "price": 19.614,
+          "base_qty": 23.1,
+          "quote_qty": 453.08340000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697665.273,
+          "symbol": "RIVERUSDT",
+          "price": 19.946,
+          "base_qty": 203.6,
+          "quote_qty": 4061.0056000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697666.301,
+          "symbol": "RIVERUSDT",
+          "price": 19.627,
+          "base_qty": 14.2,
+          "quote_qty": 278.7034,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697667.316,
+          "symbol": "RIVERUSDT",
+          "price": 19.629,
+          "base_qty": 4.7,
+          "quote_qty": 92.25630000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697684.151,
+          "symbol": "RIVERUSDT",
+          "price": 20.159,
+          "base_qty": 5.4,
+          "quote_qty": 108.8586,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697698.557,
+          "symbol": "RIVERUSDT",
+          "price": 19.527,
+          "base_qty": 26.4,
+          "quote_qty": 515.5128,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697702.216,
+          "symbol": "RIVERUSDT",
+          "price": 19.676,
+          "base_qty": 68.3,
+          "quote_qty": 1343.8708,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697704.621,
+          "symbol": "RIVERUSDT",
+          "price": 20.156,
+          "base_qty": 22.5,
+          "quote_qty": 453.51,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697761.29,
+          "symbol": "RIVERUSDT",
+          "price": 19.703,
+          "base_qty": 25.3,
+          "quote_qty": 498.4859,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697772.435,
+          "symbol": "RIVERUSDT",
+          "price": 19.715,
+          "base_qty": 11.2,
+          "quote_qty": 220.808,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697773.556,
+          "symbol": "RIVERUSDT",
+          "price": 19.641,
+          "base_qty": 4.7,
+          "quote_qty": 92.31269999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697785.944,
+          "symbol": "RIVERUSDT",
+          "price": 19.415,
+          "base_qty": 28.5,
+          "quote_qty": 553.3275,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697791.551,
+          "symbol": "RIVERUSDT",
+          "price": 20.205,
+          "base_qty": 6.7,
+          "quote_qty": 135.37349999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697876.736,
+          "symbol": "RIVERUSDT",
+          "price": 20.221,
+          "base_qty": 3.0,
+          "quote_qty": 60.663,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697879.091,
+          "symbol": "RIVERUSDT",
+          "price": 19.656,
+          "base_qty": 7.8,
+          "quote_qty": 153.3168,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697882.628,
+          "symbol": "RIVERUSDT",
+          "price": 19.663,
+          "base_qty": 3.4,
+          "quote_qty": 66.8542,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697897.321,
+          "symbol": "RIVERUSDT",
+          "price": 20.171,
+          "base_qty": 25.4,
+          "quote_qty": 512.3434,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698062.289,
+          "symbol": "RIVERUSDT",
+          "price": 20.224,
+          "base_qty": 2.5,
+          "quote_qty": 50.56,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698067.207,
+          "symbol": "RIVERUSDT",
+          "price": 19.637,
+          "base_qty": 0.5,
+          "quote_qty": 9.8185,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698073.325,
+          "symbol": "RIVERUSDT",
+          "price": 19.655,
+          "base_qty": 1.6,
+          "quote_qty": 31.448000000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698082.922,
+          "symbol": "RIVERUSDT",
+          "price": 20.239,
+          "base_qty": 4.5,
+          "quote_qty": 91.0755,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698088.188,
+          "symbol": "RIVERUSDT",
+          "price": 19.766,
+          "base_qty": 24.3,
+          "quote_qty": 480.31379999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698090.479,
+          "symbol": "RIVERUSDT",
+          "price": 20.375,
+          "base_qty": 0.3,
+          "quote_qty": 6.1125,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698096.078,
+          "symbol": "RIVERUSDT",
+          "price": 19.716,
+          "base_qty": 4.7,
+          "quote_qty": 92.66520000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698103.566,
+          "symbol": "RIVERUSDT",
+          "price": 20.228,
+          "base_qty": 13.7,
+          "quote_qty": 277.1236,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698105.573,
+          "symbol": "RIVERUSDT",
+          "price": 19.691,
+          "base_qty": 148.9,
+          "quote_qty": 2931.9899,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698108.729,
+          "symbol": "RIVERUSDT",
+          "price": 19.589,
+          "base_qty": 487.4,
+          "quote_qty": 9547.6786,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698110.184,
+          "symbol": "RIVERUSDT",
+          "price": 19.74,
+          "base_qty": 8.0,
+          "quote_qty": 157.92,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698111.227,
+          "symbol": "RIVERUSDT",
+          "price": 19.744,
+          "base_qty": 69.9,
+          "quote_qty": 1380.1056,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698112.442,
+          "symbol": "RIVERUSDT",
+          "price": 19.747,
+          "base_qty": 12.5,
+          "quote_qty": 246.8375,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698113.485,
+          "symbol": "RIVERUSDT",
+          "price": 19.759,
+          "base_qty": 21.4,
+          "quote_qty": 422.8426,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698116.164,
+          "symbol": "RIVERUSDT",
+          "price": 19.769,
+          "base_qty": 3.1,
+          "quote_qty": 61.283899999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698117.174,
+          "symbol": "RIVERUSDT",
+          "price": 19.782,
+          "base_qty": 8.9,
+          "quote_qty": 176.0598,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698118.233,
+          "symbol": "RIVERUSDT",
+          "price": 19.797,
+          "base_qty": 0.5,
+          "quote_qty": 9.8985,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698119.236,
+          "symbol": "RIVERUSDT",
+          "price": 19.808,
+          "base_qty": 120.0,
+          "quote_qty": 2376.96,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698120.319,
+          "symbol": "RIVERUSDT",
+          "price": 19.837,
+          "base_qty": 1.5,
+          "quote_qty": 29.755499999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698122.584,
+          "symbol": "RIVERUSDT",
+          "price": 19.847,
+          "base_qty": 0.3,
+          "quote_qty": 5.9541,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698124.21,
+          "symbol": "RIVERUSDT",
+          "price": 19.93,
+          "base_qty": 215.8,
+          "quote_qty": 4300.894,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698130.597,
+          "symbol": "RIVERUSDT",
+          "price": 19.783,
+          "base_qty": 279.2,
+          "quote_qty": 5523.4136,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698134.143,
+          "symbol": "RIVERUSDT",
+          "price": 19.858,
+          "base_qty": 41.1,
+          "quote_qty": 816.1638,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698137.902,
+          "symbol": "RIVERUSDT",
+          "price": 20.424,
+          "base_qty": 1.3,
+          "quote_qty": 26.5512,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698138.909,
+          "symbol": "RIVERUSDT",
+          "price": 19.854,
+          "base_qty": 0.7,
+          "quote_qty": 13.897799999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698148.428,
+          "symbol": "RIVERUSDT",
+          "price": 19.835,
+          "base_qty": 53.2,
+          "quote_qty": 1055.2220000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698150.63,
+          "symbol": "RIVERUSDT",
+          "price": 19.415,
+          "base_qty": 48.9,
+          "quote_qty": 949.3934999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698251.542,
+          "symbol": "RIVERUSDT",
+          "price": 19.776,
+          "base_qty": 259.1,
+          "quote_qty": 5123.9616000000005,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698518.638,
+          "symbol": "RIVERUSDT",
+          "price": 19.621,
+          "base_qty": 1.8,
+          "quote_qty": 35.3178,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698723.157,
+          "symbol": "RIVERUSDT",
+          "price": 19.459,
+          "base_qty": 0.8,
+          "quote_qty": 15.5672,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698757.75,
+          "symbol": "RIVERUSDT",
+          "price": 18.586,
+          "base_qty": 2.3,
+          "quote_qty": 42.74779999999999,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698780.105,
+          "symbol": "RIVERUSDT",
+          "price": 18.502,
+          "base_qty": 259.4,
+          "quote_qty": 4799.4187999999995,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698781.409,
+          "symbol": "RIVERUSDT",
+          "price": 18.499,
+          "base_qty": 66.7,
+          "quote_qty": 1233.8833,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698789.372,
+          "symbol": "RIVERUSDT",
+          "price": 18.468,
+          "base_qty": 2.1,
+          "quote_qty": 38.7828,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698794.059,
+          "symbol": "RIVERUSDT",
+          "price": 18.447,
+          "base_qty": 1.1,
+          "quote_qty": 20.291700000000002,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698821.706,
+          "symbol": "RIVERUSDT",
+          "price": 18.44,
+          "base_qty": 0.9,
+          "quote_qty": 16.596,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698823.089,
+          "symbol": "RIVERUSDT",
+          "price": 18.381,
+          "base_qty": 4.1,
+          "quote_qty": 75.3621,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698824.569,
+          "symbol": "RIVERUSDT",
+          "price": 18.337,
+          "base_qty": 6.1,
+          "quote_qty": 111.8557,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698825.737,
+          "symbol": "RIVERUSDT",
+          "price": 18.311,
+          "base_qty": 4.5,
+          "quote_qty": 82.3995,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698974.067,
+          "symbol": "RIVERUSDT",
+          "price": 19.476,
+          "base_qty": 122.9,
+          "quote_qty": 2393.6004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698981.245,
+          "symbol": "RIVERUSDT",
+          "price": 19.528,
+          "base_qty": 37.6,
+          "quote_qty": 734.2528,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698988.116,
+          "symbol": "RIVERUSDT",
+          "price": 19.607,
+          "base_qty": 17.1,
+          "quote_qty": 335.2797,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698989.559,
+          "symbol": "RIVERUSDT",
+          "price": 19.614,
+          "base_qty": 2.5,
+          "quote_qty": 49.035000000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698993.074,
+          "symbol": "RIVERUSDT",
+          "price": 19.66,
+          "base_qty": 6.3,
+          "quote_qty": 123.858,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698994.539,
+          "symbol": "RIVERUSDT",
+          "price": 19.70215,
+          "base_qty": 2.5,
+          "quote_qty": 49.255375,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699000.712,
+          "symbol": "RIVERUSDT",
+          "price": 19.714,
+          "base_qty": 4.7,
+          "quote_qty": 92.6558,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699045.534,
+          "symbol": "RIVERUSDT",
+          "price": 19.729,
+          "base_qty": 2.1,
+          "quote_qty": 41.4309,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699046.799,
+          "symbol": "RIVERUSDT",
+          "price": 19.731,
+          "base_qty": 29.3,
+          "quote_qty": 578.1183000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699625.564,
+          "symbol": "RIVERUSDT",
+          "price": 19.669,
+          "base_qty": 3.8,
+          "quote_qty": 74.7422,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699741.849,
+          "symbol": "RIVERUSDT",
+          "price": 19.783,
+          "base_qty": 3.5,
+          "quote_qty": 69.2405,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699761.989,
+          "symbol": "RIVERUSDT",
+          "price": 19.705,
+          "base_qty": 172.6,
+          "quote_qty": 3401.0829999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.068,
+          "symbol": "RIVERUSDT",
+          "price": 20.066,
+          "base_qty": 7.0,
+          "quote_qty": 140.462,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699774.088,
+          "symbol": "RIVERUSDT",
+          "price": 20.156,
+          "base_qty": 5.8,
+          "quote_qty": 116.9048,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699775.09,
+          "symbol": "RIVERUSDT",
+          "price": 20.271,
+          "base_qty": 2.4,
+          "quote_qty": 48.6504,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699793.896,
+          "symbol": "RIVERUSDT",
+          "price": 19.87,
+          "base_qty": 193.1,
+          "quote_qty": 3836.897,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699795.684,
+          "symbol": "RIVERUSDT",
+          "price": 19.987,
+          "base_qty": 651.2,
+          "quote_qty": 13015.5344,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699816.0,
+          "symbol": "RIVERUSDT",
+          "price": 19.478,
+          "base_qty": 393.9,
+          "quote_qty": 7672.3842,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699906.313,
+          "symbol": "RIVERUSDT",
+          "price": 20.191,
+          "base_qty": 81.6,
+          "quote_qty": 1647.5855999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699916.737,
+          "symbol": "RIVERUSDT",
+          "price": 20.156,
+          "base_qty": 49.1,
+          "quote_qty": 989.6596,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699926.348,
+          "symbol": "RIVERUSDT",
+          "price": 20.211,
+          "base_qty": 15.8,
+          "quote_qty": 319.3338,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699940.357,
+          "symbol": "RIVERUSDT",
+          "price": 20.239,
+          "base_qty": 66.8,
+          "quote_qty": 1351.9652,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700071.436,
+          "symbol": "RIVERUSDT",
+          "price": 19.965,
+          "base_qty": 7.4,
+          "quote_qty": 147.741,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700232.663,
+          "symbol": "RIVERUSDT",
+          "price": 20.127,
+          "base_qty": 10.2,
+          "quote_qty": 205.29539999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700252.376,
+          "symbol": "RIVERUSDT",
+          "price": 20.276,
+          "base_qty": 45.0,
+          "quote_qty": 912.42,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700272.247,
+          "symbol": "RIVERUSDT",
+          "price": 19.979,
+          "base_qty": 2.9,
+          "quote_qty": 57.939099999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700305.282,
+          "symbol": "RIVERUSDT",
+          "price": 20.129,
+          "base_qty": 1.9,
+          "quote_qty": 38.2451,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700426.223,
+          "symbol": "RIVERUSDT",
+          "price": 20.232,
+          "base_qty": 257.2,
+          "quote_qty": 5203.6704,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700754.415,
+          "symbol": "RIVERUSDT",
+          "price": 20.194,
+          "base_qty": 1.2,
+          "quote_qty": 24.232799999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700764.603,
+          "symbol": "RIVERUSDT",
+          "price": 20.273,
+          "base_qty": 1.2,
+          "quote_qty": 24.3276,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700767.062,
+          "symbol": "RIVERUSDT",
+          "price": 20.316,
+          "base_qty": 231.6,
+          "quote_qty": 4705.1856,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700805.071,
+          "symbol": "RIVERUSDT",
+          "price": 20.076,
+          "base_qty": 3.5,
+          "quote_qty": 70.266,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700904.556,
+          "symbol": "RIVERUSDT",
+          "price": 20.116,
+          "base_qty": 18.6,
+          "quote_qty": 374.1576,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700930.264,
+          "symbol": "RIVERUSDT",
+          "price": 20.118,
+          "base_qty": 12.2,
+          "quote_qty": 245.43959999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700940.131,
+          "symbol": "RIVERUSDT",
+          "price": 20.131,
+          "base_qty": 12.0,
+          "quote_qty": 241.572,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700941.256,
+          "symbol": "RIVERUSDT",
+          "price": 20.145,
+          "base_qty": 17.4,
+          "quote_qty": 350.52299999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700955.648,
+          "symbol": "RIVERUSDT",
+          "price": 20.076,
+          "base_qty": 0.6,
+          "quote_qty": 12.0456,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700961.64,
+          "symbol": "RIVERUSDT",
+          "price": 20.091,
+          "base_qty": 38.3,
+          "quote_qty": 769.4852999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700970.203,
+          "symbol": "RIVERUSDT",
+          "price": 20.066,
+          "base_qty": 0.3,
+          "quote_qty": 6.019799999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700976.759,
+          "symbol": "RIVERUSDT",
+          "price": 20.058,
+          "base_qty": 42.4,
+          "quote_qty": 850.4592,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700977.943,
+          "symbol": "RIVERUSDT",
+          "price": 20.105,
+          "base_qty": 7.6,
+          "quote_qty": 152.798,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700982.099,
+          "symbol": "RIVERUSDT",
+          "price": 20.16,
+          "base_qty": 0.9,
+          "quote_qty": 18.144000000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700983.113,
+          "symbol": "RIVERUSDT",
+          "price": 20.173,
+          "base_qty": 116.9,
+          "quote_qty": 2358.2237,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700984.131,
+          "symbol": "RIVERUSDT",
+          "price": 20.258,
+          "base_qty": 180.2,
+          "quote_qty": 3650.4916,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700985.682,
+          "symbol": "RIVERUSDT",
+          "price": 20.274,
+          "base_qty": 0.5,
+          "quote_qty": 10.137,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700990.059,
+          "symbol": "RIVERUSDT",
+          "price": 20.303,
+          "base_qty": 14.8,
+          "quote_qty": 300.48440000000005,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700991.06,
+          "symbol": "RIVERUSDT",
+          "price": 20.361,
+          "base_qty": 64.1,
+          "quote_qty": 1305.1400999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700992.334,
+          "symbol": "RIVERUSDT",
+          "price": 20.38368,
+          "base_qty": 1.5,
+          "quote_qty": 30.575519999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701000.541,
+          "symbol": "RIVERUSDT",
+          "price": 20.118,
+          "base_qty": 7.8,
+          "quote_qty": 156.92039999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701006.637,
+          "symbol": "RIVERUSDT",
+          "price": 20.268,
+          "base_qty": 3.3,
+          "quote_qty": 66.8844,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701007.761,
+          "symbol": "RIVERUSDT",
+          "price": 20.265,
+          "base_qty": 73.6,
+          "quote_qty": 1491.504,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701032.521,
+          "symbol": "RIVERUSDT",
+          "price": 20.259,
+          "base_qty": 16.8,
+          "quote_qty": 340.3512,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701089.266,
+          "symbol": "RIVERUSDT",
+          "price": 19.003,
+          "base_qty": 27.4,
+          "quote_qty": 520.6822,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701093.541,
+          "symbol": "RIVERUSDT",
+          "price": 18.932,
+          "base_qty": 204.9,
+          "quote_qty": 3879.1668,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701094.546,
+          "symbol": "RIVERUSDT",
+          "price": 18.901,
+          "base_qty": 1.2,
+          "quote_qty": 22.6812,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701096.394,
+          "symbol": "RIVERUSDT",
+          "price": 18.873,
+          "base_qty": 6.0,
+          "quote_qty": 113.238,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701098.126,
+          "symbol": "RIVERUSDT",
+          "price": 18.845,
+          "base_qty": 5.7,
+          "quote_qty": 107.4165,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701100.316,
+          "symbol": "RIVERUSDT",
+          "price": 18.761,
+          "base_qty": 11.5,
+          "quote_qty": 215.7515,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701104.075,
+          "symbol": "RIVERUSDT",
+          "price": 18.724,
+          "base_qty": 0.7,
+          "quote_qty": 13.1068,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701207.355,
+          "symbol": "RIVERUSDT",
+          "price": 19.591,
+          "base_qty": 1.1,
+          "quote_qty": 21.550100000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.319,
+          "symbol": "RIVERUSDT",
+          "price": 19.631,
+          "base_qty": 55.1,
+          "quote_qty": 1081.6681,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701247.168,
+          "symbol": "RIVERUSDT",
+          "price": 19.863,
+          "base_qty": 2.3,
+          "quote_qty": 45.6849,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701248.612,
+          "symbol": "RIVERUSDT",
+          "price": 19.955,
+          "base_qty": 5.3,
+          "quote_qty": 105.76149999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701377.193,
+          "symbol": "RIVERUSDT",
+          "price": 20.006,
+          "base_qty": 7.9,
+          "quote_qty": 158.0474,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701378.467,
+          "symbol": "RIVERUSDT",
+          "price": 20.089,
+          "base_qty": 224.4,
+          "quote_qty": 4507.9716,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701412.089,
+          "symbol": "RIVERUSDT",
+          "price": 20.127,
+          "base_qty": 12.7,
+          "quote_qty": 255.61289999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701415.33,
+          "symbol": "RIVERUSDT",
+          "price": 20.144,
+          "base_qty": 7.8,
+          "quote_qty": 157.1232,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701416.436,
+          "symbol": "RIVERUSDT",
+          "price": 20.773,
+          "base_qty": 15.1,
+          "quote_qty": 313.6723,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701417.461,
+          "symbol": "RIVERUSDT",
+          "price": 20.221,
+          "base_qty": 1.7,
+          "quote_qty": 34.3757,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701444.291,
+          "symbol": "RIVERUSDT",
+          "price": 20.167,
+          "base_qty": 203.5,
+          "quote_qty": 4103.9845000000005,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701453.21,
+          "symbol": "RIVERUSDT",
+          "price": 20.774,
+          "base_qty": 27.1,
+          "quote_qty": 562.9754,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701587.512,
+          "symbol": "RIVERUSDT",
+          "price": 20.178,
+          "base_qty": 3.4,
+          "quote_qty": 68.6052,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701612.244,
+          "symbol": "RIVERUSDT",
+          "price": 20.827,
+          "base_qty": 0.9,
+          "quote_qty": 18.744300000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701649.556,
+          "symbol": "RIVERUSDT",
+          "price": 20.314,
+          "base_qty": 1.8,
+          "quote_qty": 36.565200000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701651.7,
+          "symbol": "RIVERUSDT",
+          "price": 20.271,
+          "base_qty": 1.0,
+          "quote_qty": 20.271,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701660.464,
+          "symbol": "RIVERUSDT",
+          "price": 20.291,
+          "base_qty": 0.2,
+          "quote_qty": 4.0582,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701669.451,
+          "symbol": "RIVERUSDT",
+          "price": 20.4,
+          "base_qty": 92.7,
+          "quote_qty": 1891.08,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701690.098,
+          "symbol": "RIVERUSDT",
+          "price": 20.423,
+          "base_qty": 102.8,
+          "quote_qty": 2099.4844,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701725.075,
+          "symbol": "RIVERUSDT",
+          "price": 20.495,
+          "base_qty": 79.4,
+          "quote_qty": 1627.303,
+          "side": "BUY"
+        }
+      ],
+      "ZECUSDT": [
+        {
+          "timestamp": 1767695642.108,
+          "symbol": "ZECUSDT",
+          "price": 514.55,
+          "base_qty": 2.762,
+          "quote_qty": 1421.1870999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767695643.274,
+          "symbol": "ZECUSDT",
+          "price": 514.45,
+          "base_qty": 1.104,
+          "quote_qty": 567.9528000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767695853.765,
+          "symbol": "ZECUSDT",
+          "price": 503.59,
+          "base_qty": 0.222,
+          "quote_qty": 111.79697999999999,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767695995.184,
+          "symbol": "ZECUSDT",
+          "price": 514.59,
+          "base_qty": 0.372,
+          "quote_qty": 191.42748,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696139.767,
+          "symbol": "ZECUSDT",
+          "price": 514.4,
+          "base_qty": 0.033,
+          "quote_qty": 16.9752,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696145.62,
+          "symbol": "ZECUSDT",
+          "price": 514.49,
+          "base_qty": 0.031,
+          "quote_qty": 15.94919,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696147.253,
+          "symbol": "ZECUSDT",
+          "price": 514.51,
+          "base_qty": 0.283,
+          "quote_qty": 145.60632999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696749.247,
+          "symbol": "ZECUSDT",
+          "price": 515.73,
+          "base_qty": 2.983,
+          "quote_qty": 1538.4225900000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697402.221,
+          "symbol": "ZECUSDT",
+          "price": 515.45,
+          "base_qty": 1.406,
+          "quote_qty": 724.7227,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697404.483,
+          "symbol": "ZECUSDT",
+          "price": 515.42,
+          "base_qty": 1.124,
+          "quote_qty": 579.33208,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697445.966,
+          "symbol": "ZECUSDT",
+          "price": 515.7,
+          "base_qty": 23.551,
+          "quote_qty": 12145.2507,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697608.669,
+          "symbol": "ZECUSDT",
+          "price": 514.4,
+          "base_qty": 6.329,
+          "quote_qty": 3255.6375999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697661.34,
+          "symbol": "ZECUSDT",
+          "price": 513.74,
+          "base_qty": 0.088,
+          "quote_qty": 45.20912,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697818.451,
+          "symbol": "ZECUSDT",
+          "price": 514.21,
+          "base_qty": 0.593,
+          "quote_qty": 304.92653,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698000.16,
+          "symbol": "ZECUSDT",
+          "price": 513.96,
+          "base_qty": 0.294,
+          "quote_qty": 151.10424,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698729.59,
+          "symbol": "ZECUSDT",
+          "price": 514.66,
+          "base_qty": 0.032,
+          "quote_qty": 16.46912,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699317.442,
+          "symbol": "ZECUSDT",
+          "price": 503.04,
+          "base_qty": 0.017,
+          "quote_qty": 8.551680000000001,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699373.369,
+          "symbol": "ZECUSDT",
+          "price": 502.89,
+          "base_qty": 0.349,
+          "quote_qty": 175.50860999999998,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699742.633,
+          "symbol": "ZECUSDT",
+          "price": 503.04,
+          "base_qty": 42.01,
+          "quote_qty": 21132.7104,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699773.406,
+          "symbol": "ZECUSDT",
+          "price": 512.27,
+          "base_qty": 0.579,
+          "quote_qty": 296.60432999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700129.68,
+          "symbol": "ZECUSDT",
+          "price": 512.84,
+          "base_qty": 0.536,
+          "quote_qty": 274.88224,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700984.352,
+          "symbol": "ZECUSDT",
+          "price": 504.98,
+          "base_qty": 1.033,
+          "quote_qty": 521.6443399999999,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701213.6,
+          "symbol": "ZECUSDT",
+          "price": 514.5,
+          "base_qty": 0.016,
+          "quote_qty": 8.232,
+          "side": "BUY"
+        }
+      ],
+      "SUIUSDT": [
+        {
+          "timestamp": 1767695727.682,
+          "symbol": "SUIUSDT",
+          "price": 1.9784,
+          "base_qty": 77.1,
+          "quote_qty": 152.53464,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696297.644,
+          "symbol": "SUIUSDT",
+          "price": 1.9862,
+          "base_qty": 49.6,
+          "quote_qty": 98.51552,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696300.728,
+          "symbol": "SUIUSDT",
+          "price": 1.987,
+          "base_qty": 103.2,
+          "quote_qty": 205.0584,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696536.07,
+          "symbol": "SUIUSDT",
+          "price": 1.9906,
+          "base_qty": 6706.6,
+          "quote_qty": 13350.15796,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696558.542,
+          "symbol": "SUIUSDT",
+          "price": 1.9923,
+          "base_qty": 62.9,
+          "quote_qty": 125.31567,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696829.601,
+          "symbol": "SUIUSDT",
+          "price": 1.9492,
+          "base_qty": 14.6,
+          "quote_qty": 28.45832,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697402.218,
+          "symbol": "SUIUSDT",
+          "price": 1.98,
+          "base_qty": 771.4,
+          "quote_qty": 1527.3719999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697604.566,
+          "symbol": "SUIUSDT",
+          "price": 1.9751,
+          "base_qty": 35.0,
+          "quote_qty": 69.1285,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697817.697,
+          "symbol": "SUIUSDT",
+          "price": 1.9809,
+          "base_qty": 10.1,
+          "quote_qty": 20.00709,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698021.358,
+          "symbol": "SUIUSDT",
+          "price": 1.9821,
+          "base_qty": 7.6,
+          "quote_qty": 15.06396,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698326.204,
+          "symbol": "SUIUSDT",
+          "price": 1.9863,
+          "base_qty": 3.0,
+          "quote_qty": 5.9589,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699448.345,
+          "symbol": "SUIUSDT",
+          "price": 1.9888,
+          "base_qty": 177.3,
+          "quote_qty": 352.61424,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699502.689,
+          "symbol": "SUIUSDT",
+          "price": 1.9898,
+          "base_qty": 1255.3,
+          "quote_qty": 2497.79594,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699523.452,
+          "symbol": "SUIUSDT",
+          "price": 1.9916,
+          "base_qty": 1045.6,
+          "quote_qty": 2082.41696,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699524.568,
+          "symbol": "SUIUSDT",
+          "price": 1.992,
+          "base_qty": 186.1,
+          "quote_qty": 370.71119999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699539.207,
+          "symbol": "SUIUSDT",
+          "price": 1.9921,
+          "base_qty": 364.5,
+          "quote_qty": 726.12045,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.469,
+          "symbol": "SUIUSDT",
+          "price": 1.9792,
+          "base_qty": 236.7,
+          "quote_qty": 468.47664,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699915.619,
+          "symbol": "SUIUSDT",
+          "price": 1.9948,
+          "base_qty": 141.0,
+          "quote_qty": 281.2668,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699994.242,
+          "symbol": "SUIUSDT",
+          "price": 1.9968,
+          "base_qty": 400.0,
+          "quote_qty": 798.7199999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700036.561,
+          "symbol": "SUIUSDT",
+          "price": 1.9973,
+          "base_qty": 33.7,
+          "quote_qty": 67.30901000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700131.085,
+          "symbol": "SUIUSDT",
+          "price": 1.9949,
+          "base_qty": 792.3,
+          "quote_qty": 1580.5592699999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700199.519,
+          "symbol": "SUIUSDT",
+          "price": 1.9984,
+          "base_qty": 126.7,
+          "quote_qty": 253.19728,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700204.31,
+          "symbol": "SUIUSDT",
+          "price": 1.9992,
+          "base_qty": 150.7,
+          "quote_qty": 301.27943999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700343.392,
+          "symbol": "SUIUSDT",
+          "price": 1.9994,
+          "base_qty": 636.1,
+          "quote_qty": 1271.81834,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700584.759,
+          "symbol": "SUIUSDT",
+          "price": 2.0022,
+          "base_qty": 988.9,
+          "quote_qty": 1979.9755800000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700615.736,
+          "symbol": "SUIUSDT",
+          "price": 2.0031,
+          "base_qty": 65.4,
+          "quote_qty": 131.00274000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700955.648,
+          "symbol": "SUIUSDT",
+          "price": 2.0018,
+          "base_qty": 31.5,
+          "quote_qty": 63.05669999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700977.943,
+          "symbol": "SUIUSDT",
+          "price": 2.003,
+          "base_qty": 172.7,
+          "quote_qty": 345.9181,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700982.387,
+          "symbol": "SUIUSDT",
+          "price": 2.003,
+          "base_qty": 235.7,
+          "quote_qty": 472.1071,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701178.551,
+          "symbol": "SUIUSDT",
+          "price": 2.0033,
+          "base_qty": 765.9,
+          "quote_qty": 1534.32747,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701180.336,
+          "symbol": "SUIUSDT",
+          "price": 2.006,
+          "base_qty": 1821.3,
+          "quote_qty": 3653.5277999999994,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701186.493,
+          "symbol": "SUIUSDT",
+          "price": 2.014,
+          "base_qty": 34542.9,
+          "quote_qty": 69569.4006,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701189.362,
+          "symbol": "SUIUSDT",
+          "price": 2.0084,
+          "base_qty": 177.4,
+          "quote_qty": 356.29016,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701194.286,
+          "symbol": "SUIUSDT",
+          "price": 2.0094,
+          "base_qty": 1797.9,
+          "quote_qty": 3612.70026,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701195.359,
+          "symbol": "SUIUSDT",
+          "price": 2.0103,
+          "base_qty": 26.5,
+          "quote_qty": 53.27295,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701203.765,
+          "symbol": "SUIUSDT",
+          "price": 2.0135,
+          "base_qty": 59.0,
+          "quote_qty": 118.79650000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701206.176,
+          "symbol": "SUIUSDT",
+          "price": 2.0176,
+          "base_qty": 4533.9,
+          "quote_qty": 9147.596639999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701207.274,
+          "symbol": "SUIUSDT",
+          "price": 2.0164,
+          "base_qty": 1240.7,
+          "quote_qty": 2501.74748,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701208.358,
+          "symbol": "SUIUSDT",
+          "price": 2.0207,
+          "base_qty": 7.8,
+          "quote_qty": 15.761460000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701209.386,
+          "symbol": "SUIUSDT",
+          "price": 2.0226,
+          "base_qty": 5921.3,
+          "quote_qty": 11976.421380000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701210.414,
+          "symbol": "SUIUSDT",
+          "price": 2.0274,
+          "base_qty": 39.0,
+          "quote_qty": 79.0686,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.458,
+          "symbol": "SUIUSDT",
+          "price": 2.0299,
+          "base_qty": 501.5,
+          "quote_qty": 1017.99485,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701212.771,
+          "symbol": "SUIUSDT",
+          "price": 2.0311,
+          "base_qty": 80.5,
+          "quote_qty": 163.50355,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701213.89,
+          "symbol": "SUIUSDT",
+          "price": 2.0319,
+          "base_qty": 258.9,
+          "quote_qty": 526.0589099999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701297.536,
+          "symbol": "SUIUSDT",
+          "price": 1.9715,
+          "base_qty": 2920.0,
+          "quote_qty": 5756.78,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701360.067,
+          "symbol": "SUIUSDT",
+          "price": 1.9689,
+          "base_qty": 499.4,
+          "quote_qty": 983.26866,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701407.778,
+          "symbol": "SUIUSDT",
+          "price": 1.963,
+          "base_qty": 297.1,
+          "quote_qty": 583.2073,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701411.749,
+          "symbol": "SUIUSDT",
+          "price": 1.9575,
+          "base_qty": 1229.2,
+          "quote_qty": 2406.159,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701427.513,
+          "symbol": "SUIUSDT",
+          "price": 1.9542,
+          "base_qty": 23.9,
+          "quote_qty": 46.70538,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701568.544,
+          "symbol": "SUIUSDT",
+          "price": 1.9997,
+          "base_qty": 280.7,
+          "quote_qty": 561.31579,
+          "side": "BUY"
+        }
+      ],
+      "1000PEPEUSDT": [
+        {
+          "timestamp": 1767696144.412,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069748,
+          "base_qty": 69713.0,
+          "quote_qty": 486.2342324,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696145.513,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069786,
+          "base_qty": 44258.0,
+          "quote_qty": 308.8588788,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696146.629,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069823,
+          "base_qty": 44431.0,
+          "quote_qty": 310.2305713,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696799.478,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069916,
+          "base_qty": 27759.0,
+          "quote_qty": 194.07982439999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696802.127,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069964,
+          "base_qty": 120536.0,
+          "quote_qty": 843.3180704,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696804.347,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070014,
+          "base_qty": 31998.0,
+          "quote_qty": 224.0307972,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696811.297,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070104,
+          "base_qty": 177254.0,
+          "quote_qty": 1242.6214416,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696831.19,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070147,
+          "base_qty": 75181.0,
+          "quote_qty": 527.3721607,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696941.307,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070172,
+          "base_qty": 40964.0,
+          "quote_qty": 287.4525808,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697086.236,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070251,
+          "base_qty": 21150.0,
+          "quote_qty": 148.58086500000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697090.877,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070332,
+          "base_qty": 5945.0,
+          "quote_qty": 41.812374,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697094.269,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070349,
+          "base_qty": 592821.0,
+          "quote_qty": 4170.4364529,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697114.245,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070418,
+          "base_qty": 10971.0,
+          "quote_qty": 77.2555878,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697402.221,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070031,
+          "base_qty": 257664.0,
+          "quote_qty": 1804.4467584,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697608.638,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070183,
+          "base_qty": 2378.0,
+          "quote_qty": 16.6895174,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698016.73,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0070011,
+          "base_qty": 2563.0,
+          "quote_qty": 17.943819299999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698067.207,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069131,
+          "base_qty": 942.0,
+          "quote_qty": 6.5121402,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698122.717,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0069919,
+          "base_qty": 900.0,
+          "quote_qty": 6.29271,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698656.307,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068736,
+          "base_qty": 2124696.0,
+          "quote_qty": 14604.310425599999,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767698908.524,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068621,
+          "base_qty": 2221.0,
+          "quote_qty": 15.240724100000001,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699006.095,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068516,
+          "base_qty": 15531.0,
+          "quote_qty": 106.41219960000001,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699012.999,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068495,
+          "base_qty": 70000.0,
+          "quote_qty": 479.465,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699575.304,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068373,
+          "base_qty": 63365.0,
+          "quote_qty": 433.2455145,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699695.248,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068244,
+          "base_qty": 898.0,
+          "quote_qty": 6.128311200000001,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699702.146,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068187,
+          "base_qty": 45997.0,
+          "quote_qty": 313.6397439,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699703.478,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068152,
+          "base_qty": 34521.0,
+          "quote_qty": 235.2675192,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699746.512,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068135,
+          "base_qty": 2190532.0,
+          "quote_qty": 14925.189782,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699775.214,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068981,
+          "base_qty": 866.0,
+          "quote_qty": 5.9737545999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699782.763,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.006813,
+          "base_qty": 867.0,
+          "quote_qty": 5.906871,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699846.058,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068108,
+          "base_qty": 757.0,
+          "quote_qty": 5.1557756,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700000.522,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068068,
+          "base_qty": 1039.0,
+          "quote_qty": 7.0722652,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700065.084,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0067822,
+          "base_qty": 10299.0,
+          "quote_qty": 69.8498778,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700077.15,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0067796,
+          "base_qty": 50255.0,
+          "quote_qty": 340.708798,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700805.071,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068755,
+          "base_qty": 5668.0,
+          "quote_qty": 38.970334,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700961.64,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068707,
+          "base_qty": 84541.0,
+          "quote_qty": 580.8558487,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700977.943,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068721,
+          "base_qty": 26030.0,
+          "quote_qty": 178.880763,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701024.12,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0067714,
+          "base_qty": 336019.0,
+          "quote_qty": 2275.3190566000003,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701209.779,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068825,
+          "base_qty": 2693049.0,
+          "quote_qty": 18534.9097425,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.319,
+          "symbol": "1000PEPEUSDT",
+          "price": 0.0068896,
+          "base_qty": 109378.0,
+          "quote_qty": 753.5706688,
+          "side": "BUY"
+        }
+      ],
+      "BTCUSDT": [
+        {
+          "timestamp": 1767696426.116,
+          "symbol": "BTCUSDT",
+          "price": 93920.9,
+          "base_qty": 0.012,
+          "quote_qty": 1127.0508,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696506.482,
+          "symbol": "BTCUSDT",
+          "price": 93945.4,
+          "base_qty": 0.002,
+          "quote_qty": 187.89079999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767696665.232,
+          "symbol": "BTCUSDT",
+          "price": 93135.2,
+          "base_qty": 0.006,
+          "quote_qty": 558.8112,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767696829.601,
+          "symbol": "BTCUSDT",
+          "price": 93167.8,
+          "base_qty": 0.002,
+          "quote_qty": 186.3356,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697402.221,
+          "symbol": "BTCUSDT",
+          "price": 93981.7,
+          "base_qty": 0.067,
+          "quote_qty": 6296.7739,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697403.453,
+          "symbol": "BTCUSDT",
+          "price": 93244.9,
+          "base_qty": 0.001,
+          "quote_qty": 93.2449,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697404.483,
+          "symbol": "BTCUSDT",
+          "price": 93980.3,
+          "base_qty": 0.1,
+          "quote_qty": 9398.03,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697420.294,
+          "symbol": "BTCUSDT",
+          "price": 94008.5,
+          "base_qty": 0.016,
+          "quote_qty": 1504.136,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697445.966,
+          "symbol": "BTCUSDT",
+          "price": 94016.5,
+          "base_qty": 0.148,
+          "quote_qty": 13914.442,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697454.47,
+          "symbol": "BTCUSDT",
+          "price": 94019.2,
+          "base_qty": 0.008,
+          "quote_qty": 752.1536,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697472.669,
+          "symbol": "BTCUSDT",
+          "price": 94029.7,
+          "base_qty": 1.057,
+          "quote_qty": 99389.39289999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697481.228,
+          "symbol": "BTCUSDT",
+          "price": 94040.1,
+          "base_qty": 0.007,
+          "quote_qty": 658.2807,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697482.283,
+          "symbol": "BTCUSDT",
+          "price": 94048.7,
+          "base_qty": 0.006,
+          "quote_qty": 564.2922,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697598.549,
+          "symbol": "BTCUSDT",
+          "price": 94024.0,
+          "base_qty": 0.002,
+          "quote_qty": 188.048,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697600.278,
+          "symbol": "BTCUSDT",
+          "price": 94026.3,
+          "base_qty": 0.015,
+          "quote_qty": 1410.3944999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697610.607,
+          "symbol": "BTCUSDT",
+          "price": 94023.88,
+          "base_qty": 0.002,
+          "quote_qty": 188.04776,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697638.437,
+          "symbol": "BTCUSDT",
+          "price": 94012.1,
+          "base_qty": 0.01,
+          "quote_qty": 940.1210000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697772.28,
+          "symbol": "BTCUSDT",
+          "price": 93282.0,
+          "base_qty": 0.007,
+          "quote_qty": 652.974,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697809.082,
+          "symbol": "BTCUSDT",
+          "price": 94079.1,
+          "base_qty": 0.05,
+          "quote_qty": 4703.955000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697810.49,
+          "symbol": "BTCUSDT",
+          "price": 94088.75,
+          "base_qty": 0.023,
+          "quote_qty": 2164.0412499999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697841.117,
+          "symbol": "BTCUSDT",
+          "price": 94097.2,
+          "base_qty": 0.007,
+          "quote_qty": 658.6804,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697927.722,
+          "symbol": "BTCUSDT",
+          "price": 94093.1,
+          "base_qty": 0.001,
+          "quote_qty": 94.0931,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697936.619,
+          "symbol": "BTCUSDT",
+          "price": 94107.4,
+          "base_qty": 0.099,
+          "quote_qty": 9316.632599999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697958.416,
+          "symbol": "BTCUSDT",
+          "price": 94107.6,
+          "base_qty": 0.021,
+          "quote_qty": 1976.2596000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698000.16,
+          "symbol": "BTCUSDT",
+          "price": 94099.4,
+          "base_qty": 0.002,
+          "quote_qty": 188.1988,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698057.372,
+          "symbol": "BTCUSDT",
+          "price": 94123.1,
+          "base_qty": 0.165,
+          "quote_qty": 15530.311500000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698059.545,
+          "symbol": "BTCUSDT",
+          "price": 94126.4,
+          "base_qty": 0.005,
+          "quote_qty": 470.632,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698920.052,
+          "symbol": "BTCUSDT",
+          "price": 94145.4,
+          "base_qty": 0.015,
+          "quote_qty": 1412.1809999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698925.648,
+          "symbol": "BTCUSDT",
+          "price": 94161.7,
+          "base_qty": 0.003,
+          "quote_qty": 282.4851,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699625.564,
+          "symbol": "BTCUSDT",
+          "price": 94134.8,
+          "base_qty": 0.002,
+          "quote_qty": 188.2696,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.108,
+          "symbol": "BTCUSDT",
+          "price": 93553.4,
+          "base_qty": 0.064,
+          "quote_qty": 5987.4176,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767699774.291,
+          "symbol": "BTCUSDT",
+          "price": 94121.3,
+          "base_qty": 0.006,
+          "quote_qty": 564.7278,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699775.34,
+          "symbol": "BTCUSDT",
+          "price": 94121.4,
+          "base_qty": 1.585,
+          "quote_qty": 149182.419,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699916.737,
+          "symbol": "BTCUSDT",
+          "price": 94172.4,
+          "base_qty": 0.082,
+          "quote_qty": 7722.1368,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699935.452,
+          "symbol": "BTCUSDT",
+          "price": 94174.1,
+          "base_qty": 0.013,
+          "quote_qty": 1224.2633,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699941.157,
+          "symbol": "BTCUSDT",
+          "price": 94190.6,
+          "base_qty": 1.574,
+          "quote_qty": 148256.0044,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699943.36,
+          "symbol": "BTCUSDT",
+          "price": 94201.1,
+          "base_qty": 0.643,
+          "quote_qty": 60571.30730000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700036.706,
+          "symbol": "BTCUSDT",
+          "price": 94220.5,
+          "base_qty": 0.002,
+          "quote_qty": 188.441,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700073.286,
+          "symbol": "BTCUSDT",
+          "price": 94183.8,
+          "base_qty": 0.002,
+          "quote_qty": 188.3676,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700207.639,
+          "symbol": "BTCUSDT",
+          "price": 94224.8,
+          "base_qty": 0.004,
+          "quote_qty": 376.8992,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700208.643,
+          "symbol": "BTCUSDT",
+          "price": 94227.5,
+          "base_qty": 0.03,
+          "quote_qty": 2826.825,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700216.902,
+          "symbol": "BTCUSDT",
+          "price": 94233.9,
+          "base_qty": 0.029,
+          "quote_qty": 2732.7831,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700232.663,
+          "symbol": "BTCUSDT",
+          "price": 94232.9,
+          "base_qty": 0.002,
+          "quote_qty": 188.4658,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700247.527,
+          "symbol": "BTCUSDT",
+          "price": 94240.8,
+          "base_qty": 0.032,
+          "quote_qty": 3015.7056000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700252.719,
+          "symbol": "BTCUSDT",
+          "price": 94237.9,
+          "base_qty": 0.17,
+          "quote_qty": 16020.443,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700977.943,
+          "symbol": "BTCUSDT",
+          "price": 94198.7,
+          "base_qty": 0.004,
+          "quote_qty": 376.7948,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700984.438,
+          "symbol": "BTCUSDT",
+          "price": 93470.6,
+          "base_qty": 0.002,
+          "quote_qty": 186.9412,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700992.457,
+          "symbol": "BTCUSDT",
+          "price": 94174.3,
+          "base_qty": 0.003,
+          "quote_qty": 282.5229,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701208.626,
+          "symbol": "BTCUSDT",
+          "price": 94242.5,
+          "base_qty": 0.012,
+          "quote_qty": 1130.91,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701209.779,
+          "symbol": "BTCUSDT",
+          "price": 94227.1,
+          "base_qty": 0.214,
+          "quote_qty": 20164.5994,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.262,
+          "symbol": "BTCUSDT",
+          "price": 94254.8,
+          "base_qty": 0.117,
+          "quote_qty": 11027.8116,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701215.081,
+          "symbol": "BTCUSDT",
+          "price": 94252.7,
+          "base_qty": 0.022,
+          "quote_qty": 2073.5593999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701216.767,
+          "symbol": "BTCUSDT",
+          "price": 94261.5,
+          "base_qty": 0.013,
+          "quote_qty": 1225.3995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701258.258,
+          "symbol": "BTCUSDT",
+          "price": 94266.5,
+          "base_qty": 0.005,
+          "quote_qty": 471.3325,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701259.409,
+          "symbol": "BTCUSDT",
+          "price": 94287.5,
+          "base_qty": 0.01,
+          "quote_qty": 942.875,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701262.625,
+          "symbol": "BTCUSDT",
+          "price": 94293.4,
+          "base_qty": 0.005,
+          "quote_qty": 471.467,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701272.279,
+          "symbol": "BTCUSDT",
+          "price": 94298.0,
+          "base_qty": 0.006,
+          "quote_qty": 565.788,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701273.558,
+          "symbol": "BTCUSDT",
+          "price": 94316.9,
+          "base_qty": 0.022,
+          "quote_qty": 2074.9718,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701274.652,
+          "symbol": "BTCUSDT",
+          "price": 94319.6,
+          "base_qty": 0.002,
+          "quote_qty": 188.63920000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701279.078,
+          "symbol": "BTCUSDT",
+          "price": 94320.7,
+          "base_qty": 0.004,
+          "quote_qty": 377.2828,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701281.26,
+          "symbol": "BTCUSDT",
+          "price": 94324.2,
+          "base_qty": 0.766,
+          "quote_qty": 72252.3372,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701418.414,
+          "symbol": "BTCUSDT",
+          "price": 93535.0,
+          "base_qty": 0.004,
+          "quote_qty": 374.14,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701649.811,
+          "symbol": "BTCUSDT",
+          "price": 94287.4,
+          "base_qty": 0.003,
+          "quote_qty": 282.8622,
+          "side": "BUY"
+        }
+      ],
+      "SOLUSDT": [
+        {
+          "timestamp": 1767696679.499,
+          "symbol": "SOLUSDT",
+          "price": 138.49,
+          "base_qty": 1.0,
+          "quote_qty": 138.49,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697402.22,
+          "symbol": "SOLUSDT",
+          "price": 138.51,
+          "base_qty": 14.35,
+          "quote_qty": 1987.6184999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697445.966,
+          "symbol": "SOLUSDT",
+          "price": 138.58,
+          "base_qty": 54.31,
+          "quote_qty": 7526.279800000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697638.437,
+          "symbol": "SOLUSDT",
+          "price": 137.19,
+          "base_qty": 2.26,
+          "quote_qty": 310.0494,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767697807.226,
+          "symbol": "SOLUSDT",
+          "price": 138.85,
+          "base_qty": 13.0,
+          "quote_qty": 1805.05,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697809.478,
+          "symbol": "SOLUSDT",
+          "price": 138.85,
+          "base_qty": 0.2,
+          "quote_qty": 27.77,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697811.582,
+          "symbol": "SOLUSDT",
+          "price": 138.95,
+          "base_qty": 0.19,
+          "quote_qty": 26.400499999999997,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697861.166,
+          "symbol": "SOLUSDT",
+          "price": 139.07,
+          "base_qty": 0.07,
+          "quote_qty": 9.7349,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697862.213,
+          "symbol": "SOLUSDT",
+          "price": 139.11,
+          "base_qty": 0.65,
+          "quote_qty": 90.42150000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697876.5,
+          "symbol": "SOLUSDT",
+          "price": 139.21,
+          "base_qty": 3.89,
+          "quote_qty": 541.5269000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697878.112,
+          "symbol": "SOLUSDT",
+          "price": 139.23,
+          "base_qty": 1.18,
+          "quote_qty": 164.29139999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697879.599,
+          "symbol": "SOLUSDT",
+          "price": 139.31,
+          "base_qty": 1.81,
+          "quote_qty": 252.1511,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697927.722,
+          "symbol": "SOLUSDT",
+          "price": 139.47,
+          "base_qty": 0.74,
+          "quote_qty": 103.20779999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697934.609,
+          "symbol": "SOLUSDT",
+          "price": 139.5,
+          "base_qty": 15.67,
+          "quote_qty": 2185.965,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698016.73,
+          "symbol": "SOLUSDT",
+          "price": 139.37,
+          "base_qty": 0.1,
+          "quote_qty": 13.937000000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698118.647,
+          "symbol": "SOLUSDT",
+          "price": 139.33,
+          "base_qty": 1.7,
+          "quote_qty": 236.86100000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698486.573,
+          "symbol": "SOLUSDT",
+          "price": 139.55,
+          "base_qty": 0.16,
+          "quote_qty": 22.328000000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698496.353,
+          "symbol": "SOLUSDT",
+          "price": 139.58,
+          "base_qty": 0.49,
+          "quote_qty": 68.3942,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698723.157,
+          "symbol": "SOLUSDT",
+          "price": 139.41,
+          "base_qty": 0.23,
+          "quote_qty": 32.0643,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699267.195,
+          "symbol": "SOLUSDT",
+          "price": 139.6,
+          "base_qty": 13.78,
+          "quote_qty": 1923.6879999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699516.388,
+          "symbol": "SOLUSDT",
+          "price": 139.63,
+          "base_qty": 0.05,
+          "quote_qty": 6.9815000000000005,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699518.136,
+          "symbol": "SOLUSDT",
+          "price": 139.77,
+          "base_qty": 10.84,
+          "quote_qty": 1515.1068,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699520.524,
+          "symbol": "SOLUSDT",
+          "price": 139.8055,
+          "base_qty": 3.03,
+          "quote_qty": 423.610665,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699524.128,
+          "symbol": "SOLUSDT",
+          "price": 139.86,
+          "base_qty": 31.84,
+          "quote_qty": 4453.142400000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699539.064,
+          "symbol": "SOLUSDT",
+          "price": 139.92,
+          "base_qty": 0.04,
+          "quote_qty": 5.5968,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699546.448,
+          "symbol": "SOLUSDT",
+          "price": 139.96,
+          "base_qty": 14.42,
+          "quote_qty": 2018.2232000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699547.617,
+          "symbol": "SOLUSDT",
+          "price": 139.98,
+          "base_qty": 7.48,
+          "quote_qty": 1047.0504,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.262,
+          "symbol": "SOLUSDT",
+          "price": 139.62,
+          "base_qty": 2.5,
+          "quote_qty": 349.05,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699775.397,
+          "symbol": "SOLUSDT",
+          "price": 139.7648,
+          "base_qty": 0.74,
+          "quote_qty": 103.42595200000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700198.162,
+          "symbol": "SOLUSDT",
+          "price": 140.11,
+          "base_qty": 37.26,
+          "quote_qty": 5220.4986,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700199.212,
+          "symbol": "SOLUSDT",
+          "price": 140.21,
+          "base_qty": 10.8,
+          "quote_qty": 1514.2680000000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700200.291,
+          "symbol": "SOLUSDT",
+          "price": 140.27,
+          "base_qty": 0.23,
+          "quote_qty": 32.262100000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700204.766,
+          "symbol": "SOLUSDT",
+          "price": 140.28,
+          "base_qty": 12.22,
+          "quote_qty": 1714.2216,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700983.241,
+          "symbol": "SOLUSDT",
+          "price": 140.04,
+          "base_qty": 0.35,
+          "quote_qty": 49.013999999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701053.201,
+          "symbol": "SOLUSDT",
+          "price": 138.62,
+          "base_qty": 0.46,
+          "quote_qty": 63.76520000000001,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767701209.507,
+          "symbol": "SOLUSDT",
+          "price": 140.11,
+          "base_qty": 0.3,
+          "quote_qty": 42.033,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.452,
+          "symbol": "SOLUSDT",
+          "price": 140.22,
+          "base_qty": 11.82,
+          "quote_qty": 1657.4004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701216.501,
+          "symbol": "SOLUSDT",
+          "price": 140.22,
+          "base_qty": 8.8,
+          "quote_qty": 1233.9360000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701280.168,
+          "symbol": "SOLUSDT",
+          "price": 140.2,
+          "base_qty": 0.74,
+          "quote_qty": 103.74799999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701812.688,
+          "symbol": "SOLUSDT",
+          "price": 140.09,
+          "base_qty": 1.9,
+          "quote_qty": 266.171,
+          "side": "BUY"
+        }
+      ],
+      "ETHUSDT": [
+        {
+          "timestamp": 1767696868.05,
+          "symbol": "ETHUSDT",
+          "price": 3243.28,
+          "base_qty": 0.4,
+          "quote_qty": 1297.3120000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697355.463,
+          "symbol": "ETHUSDT",
+          "price": 3243.41,
+          "base_qty": 0.196,
+          "quote_qty": 635.70836,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697389.104,
+          "symbol": "ETHUSDT",
+          "price": 3244.39,
+          "base_qty": 0.017,
+          "quote_qty": 55.154630000000004,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697390.562,
+          "symbol": "ETHUSDT",
+          "price": 3244.84,
+          "base_qty": 0.239,
+          "quote_qty": 775.51676,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697402.221,
+          "symbol": "ETHUSDT",
+          "price": 3244.62,
+          "base_qty": 0.575,
+          "quote_qty": 1865.6564999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697419.067,
+          "symbol": "ETHUSDT",
+          "price": 3245.15,
+          "base_qty": 0.019,
+          "quote_qty": 61.65785,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697426.132,
+          "symbol": "ETHUSDT",
+          "price": 3246.69,
+          "base_qty": 0.039,
+          "quote_qty": 126.62091,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697445.458,
+          "symbol": "ETHUSDT",
+          "price": 3246.81,
+          "base_qty": 1.0,
+          "quote_qty": 3246.81,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697447.277,
+          "symbol": "ETHUSDT",
+          "price": 3247.4,
+          "base_qty": 0.066,
+          "quote_qty": 214.32840000000002,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697600.278,
+          "symbol": "ETHUSDT",
+          "price": 3246.46,
+          "base_qty": 0.348,
+          "quote_qty": 1129.7680799999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697603.082,
+          "symbol": "ETHUSDT",
+          "price": 3246.59,
+          "base_qty": 0.559,
+          "quote_qty": 1814.8438100000003,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697610.607,
+          "symbol": "ETHUSDT",
+          "price": 3246.81,
+          "base_qty": 0.039,
+          "quote_qty": 126.62559,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697698.557,
+          "symbol": "ETHUSDT",
+          "price": 3245.0,
+          "base_qty": 0.287,
+          "quote_qty": 931.3149999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697782.753,
+          "symbol": "ETHUSDT",
+          "price": 3247.64,
+          "base_qty": 20.0,
+          "quote_qty": 64952.799999999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697784.137,
+          "symbol": "ETHUSDT",
+          "price": 3247.78,
+          "base_qty": 0.136,
+          "quote_qty": 441.69808000000006,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697785.944,
+          "symbol": "ETHUSDT",
+          "price": 3243.32,
+          "base_qty": 1.19,
+          "quote_qty": 3859.5508,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697799.1,
+          "symbol": "ETHUSDT",
+          "price": 3248.1,
+          "base_qty": 0.458,
+          "quote_qty": 1487.6298,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697803.128,
+          "symbol": "ETHUSDT",
+          "price": 3248.22,
+          "base_qty": 0.013,
+          "quote_qty": 42.226859999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697806.072,
+          "symbol": "ETHUSDT",
+          "price": 3248.55,
+          "base_qty": 0.04,
+          "quote_qty": 129.942,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697807.226,
+          "symbol": "ETHUSDT",
+          "price": 3249.15,
+          "base_qty": 1.0,
+          "quote_qty": 3249.15,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697809.082,
+          "symbol": "ETHUSDT",
+          "price": 3250.11,
+          "base_qty": 1.9,
+          "quote_qty": 6175.209,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767697813.29,
+          "symbol": "ETHUSDT",
+          "price": 3250.5,
+          "base_qty": 1.222,
+          "quote_qty": 3972.111,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698000.16,
+          "symbol": "ETHUSDT",
+          "price": 3250.31,
+          "base_qty": 0.031,
+          "quote_qty": 100.75961,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698011.677,
+          "symbol": "ETHUSDT",
+          "price": 3249.01,
+          "base_qty": 0.016,
+          "quote_qty": 51.98416,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698016.73,
+          "symbol": "ETHUSDT",
+          "price": 3250.87,
+          "base_qty": 0.015,
+          "quote_qty": 48.76305,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698088.188,
+          "symbol": "ETHUSDT",
+          "price": 3249.27,
+          "base_qty": 6.3,
+          "quote_qty": 20470.400999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698730.242,
+          "symbol": "ETHUSDT",
+          "price": 3250.91,
+          "base_qty": 0.091,
+          "quote_qty": 295.83281,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698731.299,
+          "symbol": "ETHUSDT",
+          "price": 3252.0,
+          "base_qty": 0.061,
+          "quote_qty": 198.37199999999999,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767698732.33,
+          "symbol": "ETHUSDT",
+          "price": 3253.48,
+          "base_qty": 0.168,
+          "quote_qty": 546.58464,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699305.062,
+          "symbol": "ETHUSDT",
+          "price": 3246.88,
+          "base_qty": 0.014,
+          "quote_qty": 45.456320000000005,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699773.357,
+          "symbol": "ETHUSDT",
+          "price": 3249.37,
+          "base_qty": 0.325,
+          "quote_qty": 1056.04525,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699775.397,
+          "symbol": "ETHUSDT",
+          "price": 3250.94,
+          "base_qty": 0.031,
+          "quote_qty": 100.77914,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699916.737,
+          "symbol": "ETHUSDT",
+          "price": 3252.48,
+          "base_qty": 2.045,
+          "quote_qty": 6651.3216,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699940.574,
+          "symbol": "ETHUSDT",
+          "price": 3253.2,
+          "base_qty": 1.658,
+          "quote_qty": 5393.8056,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700022.558,
+          "symbol": "ETHUSDT",
+          "price": 3227.64,
+          "base_qty": 0.154,
+          "quote_qty": 497.05656,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700131.086,
+          "symbol": "ETHUSDT",
+          "price": 3226.91,
+          "base_qty": 0.485,
+          "quote_qty": 1565.05135,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700204.31,
+          "symbol": "ETHUSDT",
+          "price": 3227.26,
+          "base_qty": 0.001,
+          "quote_qty": 3.2272600000000002,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700232.663,
+          "symbol": "ETHUSDT",
+          "price": 3252.36,
+          "base_qty": 0.17,
+          "quote_qty": 552.9012,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700387.704,
+          "symbol": "ETHUSDT",
+          "price": 3249.59,
+          "base_qty": 0.198,
+          "quote_qty": 643.4188200000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700941.383,
+          "symbol": "ETHUSDT",
+          "price": 3249.84,
+          "base_qty": 0.018,
+          "quote_qty": 58.497119999999995,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700977.943,
+          "symbol": "ETHUSDT",
+          "price": 3251.42,
+          "base_qty": 0.095,
+          "quote_qty": 308.8849,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767700984.438,
+          "symbol": "ETHUSDT",
+          "price": 3226.15,
+          "base_qty": 0.02,
+          "quote_qty": 64.523,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700992.44,
+          "symbol": "ETHUSDT",
+          "price": 3250.37,
+          "base_qty": 0.44,
+          "quote_qty": 1430.1628,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701207.129,
+          "symbol": "ETHUSDT",
+          "price": 3253.6,
+          "base_qty": 4.223,
+          "quote_qty": 13739.9528,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701208.679,
+          "symbol": "ETHUSDT",
+          "price": 3254.09,
+          "base_qty": 0.346,
+          "quote_qty": 1125.91514,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701209.779,
+          "symbol": "ETHUSDT",
+          "price": 3253.51,
+          "base_qty": 6.204,
+          "quote_qty": 20184.77604,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.319,
+          "symbol": "ETHUSDT",
+          "price": 3254.12,
+          "base_qty": 0.461,
+          "quote_qty": 1500.14932,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701213.275,
+          "symbol": "ETHUSDT",
+          "price": 3253.92,
+          "base_qty": 10.251,
+          "quote_qty": 33355.933919999996,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701215.561,
+          "symbol": "ETHUSDT",
+          "price": 3255.19,
+          "base_qty": 1.847,
+          "quote_qty": 6012.33593,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701217.305,
+          "symbol": "ETHUSDT",
+          "price": 3256.32,
+          "base_qty": 0.774,
+          "quote_qty": 2520.39168,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701649.813,
+          "symbol": "ETHUSDT",
+          "price": 3227.58,
+          "base_qty": 0.04,
+          "quote_qty": 129.1032,
+          "side": "SELL"
+        }
+      ],
+      "DOGEUSDT": [
+        {
+          "timestamp": 1767697402.221,
+          "symbol": "DOGEUSDT",
+          "price": 0.15153,
+          "base_qty": 11507.0,
+          "quote_qty": 1743.65571,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767699940.478,
+          "symbol": "DOGEUSDT",
+          "price": 0.14942,
+          "base_qty": 1938.0,
+          "quote_qty": 289.57596,
+          "side": "SELL"
+        },
+        {
+          "timestamp": 1767700232.663,
+          "symbol": "DOGEUSDT",
+          "price": 0.15155,
+          "base_qty": 1315.0,
+          "quote_qty": 199.28824999999998,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701207.192,
+          "symbol": "DOGEUSDT",
+          "price": 0.15182,
+          "base_qty": 107.0,
+          "quote_qty": 16.24474,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701211.319,
+          "symbol": "DOGEUSDT",
+          "price": 0.15196,
+          "base_qty": 49.0,
+          "quote_qty": 7.446040000000001,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701215.716,
+          "symbol": "DOGEUSDT",
+          "price": 0.15201,
+          "base_qty": 181958.0,
+          "quote_qty": 27659.43558,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701242.137,
+          "symbol": "DOGEUSDT",
+          "price": 0.15222,
+          "base_qty": 145.0,
+          "quote_qty": 22.0719,
+          "side": "BUY"
+        },
+        {
+          "timestamp": 1767701876.367,
+          "symbol": "DOGEUSDT",
+          "price": 0.15249,
+          "base_qty": 1616.0,
+          "quote_qty": 246.42383999999998,
+          "side": "BUY"
+        }
+      ]
+    }
+  },
+  "promoted_events": []
+}

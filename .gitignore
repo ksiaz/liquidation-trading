@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs (ALL log files)
+*.log
+logs/
+monitor.log
+dry_run_*.log
+
+# Test data
+test_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (CSV, market data, etc.)
+*.csv
+*.csv.gz
+data/
+historical_data/
+feature_importance.csv
+features_with_labels.csv
+labeled_data_*.csv
+signal_halflife_data.csv
+
+# Node modules
+node_modules/
+ui/node_modules/
+
+# Auto Claude data directory
+.auto-claude/

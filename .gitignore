@@ -33,10 +33,11 @@ wheels/
 *.swo
 *~
 
-# Logs
+# Logs (ALL log files)
 *.log
 logs/
 monitor.log
+dry_run_*.log
 
 # Test data
 test_data/
@@ -53,9 +54,19 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-# Data files (if keeping local backups)
-data/raw/*.csv
-data/raw/*.csv.gz
+# Data files (CSV, market data, etc.)
+*.csv
+*.csv.gz
+data/
+historical_data/
+feature_importance.csv
+features_with_labels.csv
+labeled_data_*.csv
+signal_halflife_data.csv
+
+# Node modules
+node_modules/
+ui/node_modules/
 
 # Auto Claude data directory
 .auto-claude/

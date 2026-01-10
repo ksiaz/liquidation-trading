@@ -161,7 +161,20 @@ class RiskCalculator:
             self.config.MMR_default
         )
         
-        liq_distance = self.calculate_liquidation_distance(mark_price, liq_price)
+        # Check if already liquidated (crossed price)
+        # If crossed, distance is effectively 0 (critical)
+        is_liquidated = False
+        if position.direction == Direction.LONG:
+            if mark_price <= liq_price:
+                is_liquidated = True
+        elif position.direction == Direction.SHORT:
+            if mark_price >= liq_price:
+                is_liquidated = True
+                
+        if is_liquidated:
+            liq_distance = 0.0
+        else:
+            liq_distance = self.calculate_liquidation_distance(mark_price, liq_price)
         
         return PositionRisk(
             symbol=position.symbol,

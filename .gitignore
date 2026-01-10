@@ -56,3 +56,6 @@ Thumbs.db
 # Data files (if keeping local backups)
 data/raw/*.csv
 data/raw/*.csv.gz
+
+# Auto Claude data directory
+.auto-claude/

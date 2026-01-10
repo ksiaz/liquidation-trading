@@ -45,7 +45,9 @@ Architect ruling, 2026-01-10
 - `docs/DIRECTORY_SCOPED_EXCEPTION_FRAMEWORK.md`
 
 **Follow-up Required:**  
-Next PR must implement scanner update with rule-class detection and directory-awareness. No further observation-layer PRs permitted until scanner is fixed.
+~~Next PR must implement scanner update with rule-class detection and directory-awareness. No further observation-layer PRs permitted until scanner is fixed.~~
+
+**RESOLVED:** PR #5 (2026-01-11) - Scanner updated with directory-scoped rule-class detection. Temporary exception removed. AD-001 closed.
 
 ---
 

@@ -296,10 +296,12 @@ class ContinuityMemoryStore:
 
         for node in nearby_nodes:
             if node.overlaps(price):
-                # Update resting size
+                # Store previous values for consumption detection
                 if side == "bid":
+                    node.previous_resting_size_bid = node.resting_size_bid
                     node.resting_size_bid = size
                 else:
+                    node.previous_resting_size_ask = node.resting_size_ask
                     node.resting_size_ask = size
 
                 node.last_orderbook_update_ts = timestamp

@@ -230,7 +230,12 @@ class ObservationSystem:
             from memory.m4_event_absence import compute_event_non_occurrence_counter
             from memory.m4_price_distribution import compute_central_tendency_deviation
             from memory.m4_traversal_voids import compute_traversal_void_span
-            from memory.m4_orderbook import compute_resting_size
+            from memory.m4_orderbook import (
+                compute_resting_size,
+                detect_order_consumption,
+                detect_absorption_event,
+                detect_refill_event
+            )
             
             # Query M2 for active nodes (symbol-filtered)
             active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
@@ -249,6 +254,8 @@ class ObservationSystem:
             event_non_occurrence_counter = None
             resting_size_primitive = None
             order_consumption_primitive = None
+            absorption_event_primitive = None
+            refill_event_primitive = None
             
             # 1. ZONE PENETRATION (Phase 6.1)
             if len(active_nodes) > 0 and len(recent_prices) > 0:
@@ -376,6 +383,68 @@ class ObservationSystem:
                     latest_ob_node = max(ob_nodes, key=lambda n: n.last_orderbook_update_ts)
                     resting_size_primitive = compute_resting_size(latest_ob_node)
 
+                    # 10. ORDER CONSUMPTION (Phase OB-2)
+                    # Detect consumption on bid side
+                    if latest_ob_node.previous_resting_size_bid > 0:
+                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
+                        consumption = detect_order_consumption(
+                            latest_ob_node,
+                            latest_ob_node.previous_resting_size_bid,
+                            latest_ob_node.resting_size_bid,
+                            duration
+                        )
+                        if consumption:
+                            order_consumption_primitive = consumption
+
+                    # Also check ask side consumption
+                    if latest_ob_node.previous_resting_size_ask > 0 and order_consumption_primitive is None:
+                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
+                        consumption = detect_order_consumption(
+                            latest_ob_node,
+                            latest_ob_node.previous_resting_size_ask,
+                            latest_ob_node.resting_size_ask,
+                            duration
+                        )
+                        if consumption:
+                            order_consumption_primitive = consumption
+
+                    # 11. ABSORPTION EVENT (Phase OB-2)
+                    # Detect absorption if consumption occurred with price stability
+                    if order_consumption_primitive is not None and len(recent_prices) >= 2:
+                        absorption = detect_absorption_event(
+                            node=latest_ob_node,
+                            price_start=recent_prices[0],
+                            price_end=recent_prices[-1],
+                            consumed_size=order_consumption_primitive.consumed_size,
+                            duration=order_consumption_primitive.duration,
+                            trade_count=latest_ob_node.trade_execution_count
+                        )
+                        if absorption:
+                            absorption_event_primitive = absorption
+
+                    # 12. REFILL EVENT (Phase OB-2)
+                    # Detect refill on bid side
+                    if latest_ob_node.previous_resting_size_bid > 0:
+                        refill = detect_refill_event(
+                            node=latest_ob_node,
+                            previous_size=latest_ob_node.previous_resting_size_bid,
+                            current_size=latest_ob_node.resting_size_bid,
+                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
+                        )
+                        if refill:
+                            refill_event_primitive = refill
+
+                    # Also check ask side refill
+                    if latest_ob_node.previous_resting_size_ask > 0 and refill_event_primitive is None:
+                        refill = detect_refill_event(
+                            node=latest_ob_node,
+                            previous_size=latest_ob_node.previous_resting_size_ask,
+                            current_size=latest_ob_node.resting_size_ask,
+                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
+                        )
+                        if refill:
+                            refill_event_primitive = refill
+
             # Return complete bundle
             return M4PrimitiveBundle(
                 symbol=symbol,
@@ -388,7 +457,9 @@ class ObservationSystem:
                 traversal_void_span=traversal_void_span,
                 event_non_occurrence_counter=event_non_occurrence_counter,
                 resting_size=resting_size_primitive,
-                order_consumption=order_consumption_primitive
+                order_consumption=order_consumption_primitive,
+                absorption_event=absorption_event_primitive,
+                refill_event=refill_event_primitive
             )
             
         except Exception as e:
@@ -405,5 +476,7 @@ class ObservationSystem:
                 traversal_void_span=None,
                 event_non_occurrence_counter=None,
                 resting_size=None,
-                order_consumption=None
+                order_consumption=None,
+                absorption_event=None,
+                refill_event=None
             )

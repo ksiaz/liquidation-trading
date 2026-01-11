@@ -15,7 +15,7 @@ from enum import Enum, auto
 from memory.m4_zone_geometry import ZonePenetrationDepth, DisplacementOriginAnchor
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_structural_absence import StructuralAbsenceDuration
-from memory.m4_orderbook import RestingSizeAtPrice, OrderConsumption
+from memory.m4_orderbook import RestingSizeAtPrice, OrderConsumption, AbsorptionEvent, RefillEvent
 
 class SystemHaltedException(Exception):
     """Critical Failure: System Invariant Broken."""
@@ -69,6 +69,8 @@ class M4PrimitiveBundle:
     # Order Book Primitives (Phase OB)
     resting_size: Optional[RestingSizeAtPrice]
     order_consumption: Optional[OrderConsumption]
+    absorption_event: Optional[AbsorptionEvent]
+    refill_event: Optional[RefillEvent]
 
 
 @dataclass(frozen=True)

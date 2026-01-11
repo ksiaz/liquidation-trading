@@ -40,7 +40,9 @@ def make_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
         traversal_void_span=None,
         event_non_occurrence_counter=None,
         resting_size=None,
-        order_consumption=None
+        order_consumption=None,
+        absorption_event=None,
+        refill_event=None
     )
 
 

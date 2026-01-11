@@ -79,6 +79,10 @@ class EnrichedLiquidityMemoryNode:
     last_orderbook_update_ts: Optional[float] = None
     orderbook_update_count: int = 0
 
+    # ORDER BOOK TEMPORAL TRACKING (Phase OB-2)
+    previous_resting_size_bid: float = 0.0
+    previous_resting_size_ask: float = 0.0
+
     # M3: TEMPORAL EVIDENCE ORDERING (Phase M3 extension)
     # Sequence buffer for chronological token ordering
     sequence_buffer: 'SequenceBuffer' = None  # type: ignore

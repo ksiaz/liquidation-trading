@@ -97,16 +97,17 @@ class CollectorService:
                                     event_type = "TRADE"
                                 elif 'forceOrder' in stream:
                                     event_type = "LIQUIDATION"
+                                    print(f"DEBUG: Liquidation received for {symbol}: {payload}")
                                 elif 'depth' in stream:
                                     event_type = "DEPTH"
-                                    
+
                                 # TIMESTAMP EXTRACTION
                                 ts = time.time()
                                 if 'T' in payload:
                                     ts = int(payload['T']) / 1000.0
                                 elif 'E' in payload:
                                     ts = int(payload['E']) / 1000.0
-                                    
+
                                 # INGEST
                                 self._obs.ingest_observation(ts, symbol, event_type, payload)
                                 

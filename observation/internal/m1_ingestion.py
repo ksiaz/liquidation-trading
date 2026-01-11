@@ -77,7 +77,7 @@ class M1IngestionEngine:
             quantity = float(order['q'])
             timestamp = int(raw_payload['E']) / 1000.0
             side = order['S'] # BUY or SELL
-            
+
             # 1. Update Raw Buffer
             event = {
                 'timestamp': timestamp,
@@ -90,10 +90,14 @@ class M1IngestionEngine:
             }
             self.raw_liquidations[symbol].append(event)
             self.counters['liquidations'] += 1
-            
+
+            print(f"DEBUG M1: Liquidation normalized - {symbol} {side} @ ${price} vol={quantity}")
+
             return event
-            
-        except Exception:
+
+        except Exception as e:
+            print(f"DEBUG M1: Liquidation normalization FAILED for {symbol}: {e}")
+            print(f"  Payload: {raw_payload}")
             self.counters['errors'] += 1
             return None
 

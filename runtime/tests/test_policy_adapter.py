@@ -42,7 +42,10 @@ def make_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
         resting_size=None,
         order_consumption=None,
         absorption_event=None,
-        refill_event=None
+        refill_event=None,
+        liquidation_density=None,
+        directional_continuity=None,
+        trade_burst=None
     )
 
 

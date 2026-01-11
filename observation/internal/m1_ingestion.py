@@ -29,6 +29,7 @@ class M1IngestionEngine:
             'klines': 0,
             'oi': 0,
             'depth_updates': 0,
+            'mark_price_updates': 0,
             'errors': 0
         }
 
@@ -144,6 +145,51 @@ class M1IngestionEngine:
             }
 
             self.counters['depth_updates'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def normalize_mark_price(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Binance @markPrice update.
+
+        Binance @markPrice format:
+        {
+            "e": "markPriceUpdate",
+            "E": 1234567890,  # Event time
+            "s": "BTCUSDT",
+            "p": "9000.00",   # Mark price
+            "i": "8999.50",   # Index price (optional)
+            "r": "0.0001"     # Funding rate (ignored - not a primitive)
+        }
+
+        Returns:
+            {
+                'timestamp': float,
+                'symbol': str,
+                'mark_price': float,
+                'index_price': float (optional)
+            }
+        """
+        try:
+            timestamp = int(raw_payload['E']) / 1000.0
+            mark_price = float(raw_payload['p'])
+
+            # Index price is optional
+            index_price = None
+            if 'i' in raw_payload and raw_payload['i']:
+                index_price = float(raw_payload['i'])
+
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'mark_price': mark_price,
+                'index_price': index_price
+            }
+
+            self.counters['mark_price_updates'] += 1
             return event
 
         except Exception:

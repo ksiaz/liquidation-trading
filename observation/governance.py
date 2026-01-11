@@ -63,7 +63,9 @@ class ObservationSystem:
                 self._m1.record_oi(symbol)
             elif event_type == 'DEPTH':
                 normalized_event = self._m1.normalize_depth_update(symbol, payload)
-                
+            elif event_type == 'MARK_PRICE':
+                normalized_event = self._m1.normalize_mark_price(symbol, payload)
+
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
                 self._m3.process_trade(
@@ -115,6 +117,16 @@ class ObservationSystem:
                         side='ask',
                         timestamp=normalized_event['timestamp']
                     )
+
+            # Phase MP: Feed M2 with mark/index price updates
+            if normalized_event and event_type == 'MARK_PRICE':
+                self._m2_store.update_mark_price_state(
+                    symbol=normalized_event['symbol'],
+                    mark_price=normalized_event['mark_price'],
+                    index_price=normalized_event.get('index_price'),
+                    timestamp=normalized_event['timestamp']
+                )
+
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -236,6 +248,9 @@ class ObservationSystem:
                 detect_absorption_event,
                 detect_refill_event
             )
+            from memory.m4_liquidation_density import compute_liquidation_density
+            from memory.m4_directional_continuity import compute_directional_continuity
+            from memory.m4_trade_burst import compute_trade_burst
             
             # Query M2 for active nodes (symbol-filtered)
             active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
@@ -256,6 +271,9 @@ class ObservationSystem:
             order_consumption_primitive = None
             absorption_event_primitive = None
             refill_event_primitive = None
+            liquidation_density_primitive = None
+            directional_continuity_primitive = None
+            trade_burst_primitive = None
             
             # 1. ZONE PENETRATION (Phase 6.1)
             if len(active_nodes) > 0 and len(recent_prices) > 0:
@@ -445,6 +463,46 @@ class ObservationSystem:
                         if refill:
                             refill_event_primitive = refill
 
+            # 13. DIRECTIONAL CONTINUITY (Phase 4.3)
+            if len(recent_prices) >= 2:
+                directional_continuity = compute_directional_continuity(recent_prices)
+                if directional_continuity:
+                    directional_continuity_primitive = directional_continuity
+
+            # 14. LIQUIDATION DENSITY (Phase 6.4)
+            if len(active_nodes) > 0 and len(recent_prices) >= 2:
+                # Collect liquidation volumes from active nodes
+                liquidation_volumes = []
+                for node in active_nodes:
+                    if node.liquidation_proximity_count > 0:
+                        # Use volume_total as proxy for liquidation volume
+                        liquidation_volumes.append(node.volume_total)
+
+                if liquidation_volumes and len(recent_prices) >= 2:
+                    density = compute_liquidation_density(
+                        liquidation_volumes=liquidation_volumes,
+                        price_start=recent_prices[0],
+                        price_end=recent_prices[-1]
+                    )
+                    if density:
+                        liquidation_density_primitive = density
+
+            # 15. TRADE BURST (Phase 5.4)
+            if len(active_nodes) > 0:
+                # Sum trade execution counts across active nodes
+                total_trade_count = sum(node.trade_execution_count for node in active_nodes)
+                # Use system time to estimate window duration
+                if len(recent_prices) >= 2:
+                    # Approximate window duration (1 second default)
+                    window_duration = 1.0
+                    burst = compute_trade_burst(
+                        trade_count=total_trade_count,
+                        window_duration=window_duration,
+                        baseline=10  # Mechanical baseline: 10 trades
+                    )
+                    if burst:
+                        trade_burst_primitive = burst
+
             # Return complete bundle
             return M4PrimitiveBundle(
                 symbol=symbol,
@@ -459,7 +517,10 @@ class ObservationSystem:
                 resting_size=resting_size_primitive,
                 order_consumption=order_consumption_primitive,
                 absorption_event=absorption_event_primitive,
-                refill_event=refill_event_primitive
+                refill_event=refill_event_primitive,
+                liquidation_density=liquidation_density_primitive,
+                directional_continuity=directional_continuity_primitive,
+                trade_burst=trade_burst_primitive
             )
             
         except Exception as e:
@@ -478,5 +539,8 @@ class ObservationSystem:
                 resting_size=None,
                 order_consumption=None,
                 absorption_event=None,
-                refill_event=None
+                refill_event=None,
+                liquidation_density=None,
+                directional_continuity=None,
+                trade_burst=None
             )

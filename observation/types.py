@@ -16,6 +16,9 @@ from memory.m4_zone_geometry import ZonePenetrationDepth, DisplacementOriginAnch
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_structural_absence import StructuralAbsenceDuration
 from memory.m4_orderbook import RestingSizeAtPrice, OrderConsumption, AbsorptionEvent, RefillEvent
+from memory.m4_liquidation_density import LiquidationDensity
+from memory.m4_directional_continuity import DirectionalContinuity
+from memory.m4_trade_burst import TradeBurst
 
 class SystemHaltedException(Exception):
     """Critical Failure: System Invariant Broken."""
@@ -71,6 +74,11 @@ class M4PrimitiveBundle:
     order_consumption: Optional[OrderConsumption]
     absorption_event: Optional[AbsorptionEvent]
     refill_event: Optional[RefillEvent]
+
+    # Additional Primitives (Phase MP/DC/TB/LD)
+    liquidation_density: Optional[LiquidationDensity]
+    directional_continuity: Optional[DirectionalContinuity]
+    trade_burst: Optional[TradeBurst]
 
 
 @dataclass(frozen=True)

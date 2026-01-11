@@ -307,6 +307,33 @@ class ContinuityMemoryStore:
                 node.last_orderbook_update_ts = timestamp
                 node.orderbook_update_count += 1
 
+    def update_mark_price_state(
+        self,
+        symbol: str,
+        mark_price: float,
+        index_price: Optional[float],
+        timestamp: float
+    ):
+        """
+        Update mark/index price for all nodes of this symbol.
+
+        Constitutional: Factual price update, no interpretation.
+
+        Args:
+            symbol: Symbol partitioning key
+            mark_price: Mark price
+            index_price: Index price (optional)
+            timestamp: Update timestamp
+        """
+        # Update all active nodes for this symbol
+        symbol_nodes = self.get_active_nodes(symbol=symbol)
+
+        for node in symbol_nodes:
+            node.last_mark_price = mark_price
+            node.last_index_price = index_price
+            node.last_mark_price_ts = timestamp
+            node.mark_price_update_count += 1
+
     def advance_time(self, current_ts: float):
         """
         Advance system time and apply decay/lifecycle mechanics.

@@ -73,6 +73,9 @@ class MainWindow(QMainWindow):
         self.loop_thread.start()
         
     def run_async_loop(self):
+        # Fix for Windows event loop with aiodns
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self.collector.start())
@@ -80,11 +83,12 @@ class MainWindow(QMainWindow):
     @Slot()
     def update_ui(self):
         try:
+            import time
             snapshot: ObservationSnapshot = self.obs_system.query({'type': 'snapshot'})
-            
+
             if snapshot.status == ObservationStatus.FAILED:
                 raise SystemHaltedException("Status reports FAILED")
-                
+
             if snapshot.status == ObservationStatus.UNINITIALIZED:
                 self.status_label.setText(
                     f"UNINITIALIZED\n"
@@ -92,6 +96,32 @@ class MainWindow(QMainWindow):
                     f"Symbols: {len(snapshot.symbols_active)}"
                 )
                 self.dashboard.setStyleSheet("background-color: #222244;")
+
+            elif snapshot.status == ObservationStatus.ACTIVE:
+                # Calculate primitive counts
+                primitive_count = 0
+                for bundle in snapshot.primitives.values():
+                    if bundle.zone_penetration: primitive_count += 1
+                    if bundle.displacement_origin_anchor: primitive_count += 1
+                    if bundle.price_traversal_velocity: primitive_count += 1
+                    if bundle.traversal_compactness: primitive_count += 1
+                    if bundle.central_tendency_deviation: primitive_count += 1
+                    if bundle.structural_absence_duration: primitive_count += 1
+                    if bundle.resting_size: primitive_count += 1
+                    if bundle.order_consumption: primitive_count += 1
+                    if bundle.absorption_event: primitive_count += 1
+                    if bundle.refill_event: primitive_count += 1
+                    if bundle.liquidation_density: primitive_count += 1
+                    if bundle.directional_continuity: primitive_count += 1
+                    if bundle.trade_burst: primitive_count += 1
+
+                self.status_label.setText(
+                    f"SYSTEM ACTIVE\n"
+                    f"Timestamp: {snapshot.timestamp:.2f}\n"
+                    f"Symbols Active: {len(snapshot.symbols_active)}\n"
+                    f"Primitives Generated: {primitive_count}\n"
+                )
+                self.dashboard.setStyleSheet("background-color: #002200;")
 
         except SystemHaltedException as e:
             self.red_screen.set_error(str(e))

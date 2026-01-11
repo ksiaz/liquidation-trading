@@ -271,21 +271,55 @@ class ContinuityMemoryStore:
         # No match found - Trade is ignored (constitutionally correct)
         return None
     
+    def update_orderbook_state(
+        self,
+        symbol: str,
+        price: float,
+        size: float,
+        side: str,
+        timestamp: float
+    ):
+        """
+        Update order book state for nodes at this price.
+
+        Constitutional: This is factual state update, not interpretation.
+
+        Args:
+            symbol: Symbol partitioning key
+            price: Order book price level
+            size: Resting size at price (0.0 = level removed)
+            side: "bid" or "ask"
+            timestamp: Update timestamp
+        """
+        # Find nodes within band of this price (symbol-partitioned)
+        nearby_nodes = self.get_active_nodes(symbol=symbol)
+
+        for node in nearby_nodes:
+            if node.overlaps(price):
+                # Update resting size
+                if side == "bid":
+                    node.resting_size_bid = size
+                else:
+                    node.resting_size_ask = size
+
+                node.last_orderbook_update_ts = timestamp
+                node.orderbook_update_count += 1
+
     def advance_time(self, current_ts: float):
         """
         Advance system time and apply decay/lifecycle mechanics.
-        
+
         Should be called periodically (e.g., every 1s or every N events).
         Drives:
         - Decay accumulation
         - State transitions (Active -> Dormant -> Archived)
-        
+
         Args:
             current_ts: Current system timestamp
         """
         # Apply decay to all nodes
         self.decay_nodes(current_ts)
-        
+
         # Check and update memory states
         self.update_memory_states(current_ts)
 

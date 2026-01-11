@@ -28,6 +28,7 @@ class M1IngestionEngine:
             'liquidations': 0,
             'klines': 0,
             'oi': 0,
+            'depth_updates': 0,
             'errors': 0
         }
 
@@ -100,6 +101,54 @@ class M1IngestionEngine:
 
     def record_oi(self, symbol: str):
         self.counters['oi'] += 1
+
+    def normalize_depth_update(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Binance @depth update.
+
+        Binance @depth format:
+        {
+            "e": "depthUpdate",
+            "E": 1234567890,  # Event time
+            "s": "BTCUSDT",
+            "U": 157,         # First update ID
+            "u": 160,         # Final update ID
+            "b": [            # Bids to be updated
+                ["9000.00", "1.5"]  # [price, qty]
+            ],
+            "a": [            # Asks to be updated
+                ["9001.00", "2.0"]
+            ]
+        }
+
+        Returns:
+            {
+                'timestamp': float,
+                'symbol': str,
+                'bids': [(price, size), ...],
+                'asks': [(price, size), ...]
+            }
+        """
+        try:
+            timestamp = int(raw_payload['E']) / 1000.0
+
+            # Parse bids/asks
+            bids = [(float(p), float(q)) for p, q in raw_payload.get('b', [])]
+            asks = [(float(p), float(q)) for p, q in raw_payload.get('a', [])]
+
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'bids': bids,
+                'asks': asks
+            }
+
+            self.counters['depth_updates'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
 
     def get_buffers(self) -> Dict:
         """Return copy of raw buffers."""

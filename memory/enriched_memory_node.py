@@ -72,7 +72,13 @@ class EnrichedLiquidityMemoryNode:
     
     # METADATA
     last_decay_application_ts: float = 0.0
-    
+
+    # ORDER BOOK STATE (Phase OB-1)
+    resting_size_bid: float = 0.0
+    resting_size_ask: float = 0.0
+    last_orderbook_update_ts: Optional[float] = None
+    orderbook_update_count: int = 0
+
     # M3: TEMPORAL EVIDENCE ORDERING (Phase M3 extension)
     # Sequence buffer for chronological token ordering
     sequence_buffer: 'SequenceBuffer' = None  # type: ignore

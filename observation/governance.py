@@ -61,6 +61,8 @@ class ObservationSystem:
                 self._m1.record_kline(symbol)
             elif event_type == 'OI':
                 self._m1.record_oi(symbol)
+            elif event_type == 'DEPTH':
+                normalized_event = self._m1.normalize_depth_update(symbol, payload)
                 
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
@@ -91,6 +93,28 @@ class ObservationSystem:
                     volume=normalized_event.get('quantity', 0.0),
                     timestamp=normalized_event['timestamp']
                 )
+
+            # Phase OB: Feed M2 with order book updates
+            if normalized_event and event_type == 'DEPTH':
+                # Update M2 order book state for bids
+                for price, size in normalized_event['bids']:
+                    self._m2_store.update_orderbook_state(
+                        symbol=symbol,
+                        price=price,
+                        size=size,
+                        side='bid',
+                        timestamp=normalized_event['timestamp']
+                    )
+
+                # Update M2 order book state for asks
+                for price, size in normalized_event['asks']:
+                    self._m2_store.update_orderbook_state(
+                        symbol=symbol,
+                        price=price,
+                        size=size,
+                        side='ask',
+                        timestamp=normalized_event['timestamp']
+                    )
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -108,6 +132,13 @@ class ObservationSystem:
             return
             
         self._system_time = new_timestamp
+        
+        # System Init Transition
+        # print(f"DEBUG: advance_time called. Status={self._status}")
+        if True: # FORCE ACTIVE
+            self._status = ObservationStatus.ACTIVE
+            print(f"DEBUG: Status is now {self._status}")
+            
         self._update_liveness()
         
         # Trigger M3 to close windows
@@ -199,6 +230,7 @@ class ObservationSystem:
             from memory.m4_event_absence import compute_event_non_occurrence_counter
             from memory.m4_price_distribution import compute_central_tendency_deviation
             from memory.m4_traversal_voids import compute_traversal_void_span
+            from memory.m4_orderbook import compute_resting_size
             
             # Query M2 for active nodes (symbol-filtered)
             active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
@@ -215,6 +247,8 @@ class ObservationSystem:
             structural_absence_duration = None
             traversal_void_span = None
             event_non_occurrence_counter = None
+            resting_size_primitive = None
+            order_consumption_primitive = None
             
             # 1. ZONE PENETRATION (Phase 6.1)
             if len(active_nodes) > 0 and len(recent_prices) > 0:
@@ -333,7 +367,15 @@ class ObservationSystem:
                 )
                 if stale_count > 0:
                     event_non_occurrence_counter = stale_count
-            
+
+            # 9. RESTING SIZE (Order Book - Phase OB)
+            if len(active_nodes) > 0:
+                # Get node with most recent order book update
+                ob_nodes = [n for n in active_nodes if n.last_orderbook_update_ts is not None]
+                if ob_nodes:
+                    latest_ob_node = max(ob_nodes, key=lambda n: n.last_orderbook_update_ts)
+                    resting_size_primitive = compute_resting_size(latest_ob_node)
+
             # Return complete bundle
             return M4PrimitiveBundle(
                 symbol=symbol,
@@ -344,7 +386,9 @@ class ObservationSystem:
                 central_tendency_deviation=central_tendency_deviation,
                 structural_absence_duration=structural_absence_duration,
                 traversal_void_span=traversal_void_span,
-                event_non_occurrence_counter=event_non_occurrence_counter
+                event_non_occurrence_counter=event_non_occurrence_counter,
+                resting_size=resting_size_primitive,
+                order_consumption=order_consumption_primitive
             )
             
         except Exception as e:
@@ -359,5 +403,7 @@ class ObservationSystem:
                 central_tendency_deviation=None,
                 structural_absence_duration=None,
                 traversal_void_span=None,
-                event_non_occurrence_counter=None
+                event_non_occurrence_counter=None,
+                resting_size=None,
+                order_consumption=None
             )

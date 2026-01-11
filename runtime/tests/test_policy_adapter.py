@@ -38,7 +38,9 @@ def make_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
         central_tendency_deviation=None,
         structural_absence_duration=None,
         traversal_void_span=None,
-        event_non_occurrence_counter=None
+        event_non_occurrence_counter=None,
+        resting_size=None,
+        order_consumption=None
     )
 
 

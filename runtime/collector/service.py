@@ -56,7 +56,8 @@ class CollectorService:
             current_time = time.time()
             try:
                 self._obs.advance_time(current_time)
-            except Exception:
+            except Exception as e:
+                print(f"Clock Driver Error: {e}")
                 pass
             
             await asyncio.sleep(0.1)
@@ -69,44 +70,53 @@ class CollectorService:
             f"{s.lower()}@aggTrade" for s in TOP_10_SYMBOLS
         ] + [
             f"{s.lower()}@forceOrder" for s in TOP_10_SYMBOLS
+        ] + [
+            f"{s.lower()}@depth@100ms" for s in TOP_10_SYMBOLS
         ]
         
         stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
         
-        
-        async with websockets.connect(stream_url) as ws:
+        async with aiohttp.ClientSession() as session:
             while self._running:
                 try:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    stream = data['stream']
-                    payload = data['data']
-                    
-                    # Parse Symbol & Type
-                    # stream name format: btcusdt@aggTrade
-                    symbol = stream.split('@')[0].upper()
-                    event_type = "UNKNOWN"
-                    
-                    if 'aggTrade' in stream:
-                        event_type = "TRADE"
-                    elif 'forceOrder' in stream:
-                        event_type = "LIQUIDATION"
-                        
-                    # TIMESTAMP EXTRACTION
-                    # We must provide the EXTERNAL timestamp to M5.
-                    ts = time.time()
-                    if 'T' in payload:
-                        ts = int(payload['T']) / 1000.0
-                    elif 'E' in payload:
-                        ts = int(payload['E']) / 1000.0
-                        
-                    # INGEST
-                    self._obs.ingest_observation(ts, symbol, event_type, payload)
-                    
-                    # M6 MAY be invoked here with an explicit ObservationSnapshot
-                    
+                    import websockets
+                    async with websockets.connect(stream_url) as ws:
+                        print("Connected to Binance Stream")
+                        while self._running:
+                            try:
+                                msg = await ws.recv()
+                                data = json.loads(msg)
+                                stream = data['stream']
+                                payload = data['data']
+                                
+                                # Parse Symbol & Type
+                                symbol = stream.split('@')[0].upper()
+                                event_type = "UNKNOWN"
+
+                                if 'aggTrade' in stream:
+                                    event_type = "TRADE"
+                                elif 'forceOrder' in stream:
+                                    event_type = "LIQUIDATION"
+                                elif 'depth' in stream:
+                                    event_type = "DEPTH"
+                                    
+                                # TIMESTAMP EXTRACTION
+                                ts = time.time()
+                                if 'T' in payload:
+                                    ts = int(payload['T']) / 1000.0
+                                elif 'E' in payload:
+                                    ts = int(payload['E']) / 1000.0
+                                    
+                                # INGEST
+                                self._obs.ingest_observation(ts, symbol, event_type, payload)
+                                
+                            except Exception as e:
+                                print(f"Processing Error: {e}")
+                                await asyncio.sleep(1)
+                                
                 except Exception as e:
-                    await asyncio.sleep(1)
+                    print(f"Connection Failed: {e}. Retrying in 5s...")
+                    await asyncio.sleep(5)
              
     async def stop(self):
         self._running = False

@@ -142,9 +142,9 @@ class PolicyAdapter:
 
         if self.config.enable_kinematics:
             proposal = generate_kinematics_proposal(
-                price_traversal_velocity=primitives.get("price_traversal_velocity"),
-                traversal_compactness=primitives.get("traversal_compactness"),
-                displacement_origin_anchor=primitives.get("displacement_origin_anchor"),
+                velocity=primitives.get("price_traversal_velocity"),
+                compactness=primitives.get("traversal_compactness"),
+                acceptance=primitives.get("price_acceptance_ratio"),
                 context=context,
                 permission=permission
             )
@@ -153,9 +153,9 @@ class PolicyAdapter:
 
         if self.config.enable_absence:
             proposal = generate_absence_proposal(
-                structural_absence_duration=primitives.get("structural_absence_duration"),
-                traversal_void_span=primitives.get("traversal_void_span"),
-                event_non_occurrence_counter=primitives.get("event_non_occurrence_counter"),
+                absence=primitives.get("structural_absence_duration"),
+                persistence=primitives.get("structural_persistence_duration"),
+                geometry=primitives.get("zone_penetration"),
                 context=context,
                 permission=permission
             )

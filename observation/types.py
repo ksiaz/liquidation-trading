@@ -15,6 +15,8 @@ from enum import Enum, auto
 from memory.m4_zone_geometry import ZonePenetrationDepth, DisplacementOriginAnchor
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_structural_absence import StructuralAbsenceDuration
+from memory.m4_structural_persistence import StructuralPersistenceDuration
+from memory.m4_price_distribution import PriceAcceptanceRatio, CentralTendencyDeviation
 from memory.m4_orderbook import RestingSizeAtPrice, OrderConsumption, AbsorptionEvent, RefillEvent
 from memory.m4_liquidation_density import LiquidationDensity
 from memory.m4_directional_continuity import DirectionalContinuity
@@ -60,14 +62,18 @@ class M4PrimitiveBundle:
     # Tier A - Traversal Kinematics
     price_traversal_velocity: Optional[PriceTraversalVelocity]
     traversal_compactness: Optional[TraversalCompactness]
+    price_acceptance_ratio: Optional[PriceAcceptanceRatio]
 
-    # Tier A - Central Tendency (when implemented)
-    central_tendency_deviation: Optional[Any]  # CentralTendencyDeviation
+    # Tier A - Central Tendency
+    central_tendency_deviation: Optional[CentralTendencyDeviation]
 
     # Tier B-1 - Structural Absence
     structural_absence_duration: Optional[StructuralAbsenceDuration]
     traversal_void_span: Optional[Any]  # TraversalVoidSpan (when implemented)
     event_non_occurrence_counter: Optional[Any]  # EventNonOccurrenceCounter (when implemented)
+
+    # Tier B-2 - Structural Persistence
+    structural_persistence_duration: Optional[StructuralPersistenceDuration]
 
     # Order Book Primitives (Phase OB)
     resting_size: Optional[RestingSizeAtPrice]

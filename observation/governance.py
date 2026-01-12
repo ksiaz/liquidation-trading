@@ -239,8 +239,9 @@ class ObservationSystem:
             from memory.m4_zone_geometry import compute_zone_penetration_depth, identify_displacement_origin_anchor
             from memory.m4_traversal_kinematics import compute_price_traversal_velocity, compute_traversal_compactness
             from memory.m4_structural_absence import compute_structural_absence_duration
+            from memory.m4_structural_persistence import compute_structural_persistence_duration
             from memory.m4_event_absence import compute_event_non_occurrence_counter
-            from memory.m4_price_distribution import compute_central_tendency_deviation
+            from memory.m4_price_distribution import compute_central_tendency_deviation, compute_price_acceptance_ratio
             from memory.m4_traversal_voids import compute_traversal_void_span
             from memory.m4_orderbook import (
                 compute_resting_size,
@@ -263,8 +264,10 @@ class ObservationSystem:
             displacement_origin_anchor = None
             price_traversal_velocity = None
             traversal_compactness = None
+            price_acceptance_ratio = None
             central_tendency_deviation = None
             structural_absence_duration = None
+            structural_persistence_duration = None
             traversal_void_span = None
             event_non_occurrence_counter = None
             resting_size_primitive = None
@@ -335,7 +338,23 @@ class ObservationSystem:
                     ordered_prices=recent_prices
                 )
                 traversal_compactness = compactness_result.compactness_ratio
-            
+
+            # 4b. PRICE ACCEPTANCE RATIO (Phase MISSING)
+            # Requires OHLC candle from M3
+            candle = self._m3.get_current_candle(symbol)
+            if candle is not None:
+                try:
+                    acceptance_result = compute_price_acceptance_ratio(
+                        candle_open=candle['open'],
+                        candle_high=candle['high'],
+                        candle_low=candle['low'],
+                        candle_close=candle['close']
+                    )
+                    price_acceptance_ratio = acceptance_result
+                except ValueError:
+                    # Invalid candle structure, skip
+                    pass
+
             # 5. CENTRAL TENDENCY DEVIATION (Phase 6.3)
             if len(recent_prices) > 0 and len(active_nodes) > 0:
                 # Central tendency = average of node centers
@@ -355,11 +374,34 @@ class ObservationSystem:
                     node.last_interaction_ts for node in active_nodes
                 )
                 absence_duration = self._system_time - most_recent_interaction
-                
+
                 # Only set if absence > 0
                 if absence_duration > 0:
                     structural_absence_duration = absence_duration
-            
+
+            # 6b. STRUCTURAL PERSISTENCE DURATION (Phase MISSING)
+            if len(active_nodes) > 0:
+                # Collect all presence intervals from all nodes
+                all_presence_intervals = []
+                earliest_observation = None
+                for node in active_nodes:
+                    presence_intervals = node.get_presence_intervals(self._system_time)
+                    all_presence_intervals.extend(presence_intervals)
+                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
+                        earliest_observation = node.first_seen_ts
+
+                if len(all_presence_intervals) > 0 and earliest_observation is not None:
+                    try:
+                        persistence_result = compute_structural_persistence_duration(
+                            observation_start_ts=earliest_observation,
+                            observation_end_ts=self._system_time,
+                            presence_intervals=tuple(all_presence_intervals)
+                        )
+                        structural_persistence_duration = persistence_result
+                    except ValueError:
+                        # Invalid intervals, skip
+                        pass
+
             # 7. TRAVERSAL VOID SPAN (Phase 6.3)
             if len(active_nodes) > 0:
                 # Collect all interaction timestamps from nodes
@@ -510,8 +552,10 @@ class ObservationSystem:
                 displacement_origin_anchor=displacement_origin_anchor,
                 price_traversal_velocity=price_traversal_velocity,
                 traversal_compactness=traversal_compactness,
+                price_acceptance_ratio=price_acceptance_ratio,
                 central_tendency_deviation=central_tendency_deviation,
                 structural_absence_duration=structural_absence_duration,
+                structural_persistence_duration=structural_persistence_duration,
                 traversal_void_span=traversal_void_span,
                 event_non_occurrence_counter=event_non_occurrence_counter,
                 resting_size=resting_size_primitive,
@@ -532,8 +576,10 @@ class ObservationSystem:
                 displacement_origin_anchor=None,
                 price_traversal_velocity=None,
                 traversal_compactness=None,
+                price_acceptance_ratio=None,
                 central_tendency_deviation=None,
                 structural_absence_duration=None,
+                structural_persistence_duration=None,
                 traversal_void_span=None,
                 event_non_occurrence_counter=None,
                 resting_size=None,

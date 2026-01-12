@@ -64,15 +64,18 @@ class M3TemporalEngine:
     def __init__(self, window_seconds: float = 1.0, baseline_windows: int = 60, threshold_sigma: float = 2.0):
         self._window_seconds = window_seconds
         self._threshold_sigma = threshold_sigma
-        
+
         # State
         self._current_window_start: Optional[float] = None
         self._current_windows: Dict[str, List[Dict]] = {} # Symbol -> List of raw trades in window
-        
+
+        # OHLC candle state (per symbol)
+        self._current_candles: Dict[str, Dict] = {}  # Symbol -> {open, high, low, close, timestamp}
+
         # Sub-components
         self._baseline = BaselineCalculator(baseline_windows)
         self._promoted_events: List[PromotedEventInternal] = []
-        
+
         # Counters (Internal M4)
         self.stats = {
             'windows_processed': 0,
@@ -92,12 +95,15 @@ class M3TemporalEngine:
         # 2. Add to current window
         if symbol not in self._current_windows:
             self._current_windows[symbol] = []
-            
+
         self._current_windows[symbol].append({
             'price': price,
             'quantity': quantity,
             'side': side
         })
+
+        # 2b. Update OHLC candle for this symbol
+        self._update_candle(symbol, price, timestamp)
         
         # 3. Check for Immediate Promotion (Instantaneous Pressure)
         # This differs from window-based promotion. The original code promoted *trades* based on baseline.
@@ -155,17 +161,19 @@ class M3TemporalEngine:
     def _close_window(self):
         """Aggregate current window and update baseline."""
         self.stats['windows_processed'] += 1
-        
+
         # Aggregate all symbols
         all_trades = []
         for sym_trades in self._current_windows.values():
             all_trades.extend(sym_trades)
-            
+
         if not all_trades:
             # Empty window, nothing to update baseline with?
             # Or update with 0 volume? Original code skipped empty windows.
             # We skip.
             self._current_windows = {}
+            # Reset candles on window close
+            self._current_candles = {}
             return
 
         # Calculate metrics
@@ -186,9 +194,11 @@ class M3TemporalEngine:
         
         # Update Baseline
         self._baseline.update(window)
-        
+
         # Clear buffer
         self._current_windows = {}
+        # Reset candles for next window
+        self._current_candles = {}
 
     # Read-Only Accessors
     def get_baseline_status(self) -> Dict:
@@ -221,6 +231,44 @@ class M3TemporalEngine:
         
         trades = self._current_windows[symbol]
         prices = [t['price'] for t in trades]
-        
+
         # Return most recent max_count prices
         return prices[-max_count:]
+
+    def _update_candle(self, symbol: str, price: float, timestamp: float) -> None:
+        """
+        Update OHLC candle for symbol with new price.
+
+        Creates new candle if symbol not tracked or window rollover occurred.
+
+        Args:
+            symbol: Symbol to update
+            price: Trade price
+            timestamp: Trade timestamp
+        """
+        if symbol not in self._current_candles:
+            # Initialize new candle
+            self._current_candles[symbol] = {
+                'open': price,
+                'high': price,
+                'low': price,
+                'close': price,
+                'timestamp': timestamp
+            }
+        else:
+            candle = self._current_candles[symbol]
+            # Update high/low/close
+            candle['high'] = max(candle['high'], price)
+            candle['low'] = min(candle['low'], price)
+            candle['close'] = price
+            candle['timestamp'] = timestamp
+
+    def get_current_candle(self, symbol: str) -> Optional[Dict]:
+        """
+        Get current OHLC candle for symbol.
+
+        Returns:
+            Dict with keys: open, high, low, close, timestamp
+            None if no candle exists for symbol
+        """
+        return self._current_candles.get(symbol)

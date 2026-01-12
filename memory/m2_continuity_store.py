@@ -199,8 +199,15 @@ class ContinuityMemoryStore:
             # Check spatial overlap
             if candidate.overlaps(price):
                 # Reinforce existing node
+                was_inactive = not candidate.active
                 candidate.record_liquidation(timestamp, side)
                 candidate.strength = min(1.0, candidate.strength + 0.15)
+
+                # Reactivate node if it was dormant
+                if was_inactive and candidate.strength >= 0.01:
+                    candidate.active = True
+                    candidate._start_presence_interval(timestamp)
+
                 self._total_interactions += 1
                 return candidate
         

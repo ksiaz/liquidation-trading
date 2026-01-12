@@ -60,14 +60,15 @@ class Mandate:
 @dataclass(frozen=True)
 class Action:
     """Arbitrated action to execute.
-    
+
     Exactly one action per symbol per cycle (Theorem 4.1).
     """
     type: ActionType
     symbol: str
-    
+    strategy_id: Optional[str] = None  # Which strategy triggered this (for tracing)
+
     @staticmethod
-    def from_mandate_type(mandate_type: MandateType, symbol: str) -> "Action":
+    def from_mandate_type(mandate_type: MandateType, symbol: str, strategy_id: Optional[str] = None) -> "Action":
         """Convert mandate type to action type."""
         mapping = {
             MandateType.ENTRY: ActionType.ENTRY,
@@ -76,4 +77,4 @@ class Action:
             MandateType.HOLD: ActionType.HOLD,
             MandateType.BLOCK: ActionType.NO_ACTION,  # BLOCK is not actionable
         }
-        return Action(type=mapping[mandate_type], symbol=symbol)
+        return Action(type=mapping[mandate_type], symbol=symbol, strategy_id=strategy_id)

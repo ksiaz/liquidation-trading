@@ -222,7 +222,7 @@ class ExecutionController:
                 )
             
             # Prepare equity tracking fields
-            strategy_id = getattr(action, 'strategy_id', None)
+            strategy_id = action.strategy_id
             price = None
             position_size = None
             entry_price_val = None

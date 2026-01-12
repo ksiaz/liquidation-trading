@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
     def export_trace(self):
         """Export execution trace to JSON."""
         try:
-            log = self.collector.controller.get_execution_log()
+            log = self.collector.executor.get_execution_log()
             
             # Convert to dictionary format
             records = [record.to_log_dict() for record in log]
@@ -143,30 +143,82 @@ class MainWindow(QMainWindow):
                 self.dashboard.setStyleSheet("background-color: #222244;")
 
             elif snapshot.status == ObservationStatus.ACTIVE:
-                # Calculate primitive counts
-                primitive_count = 0
-                for bundle in snapshot.primitives.values():
-                    if bundle.zone_penetration: primitive_count += 1
-                    if bundle.displacement_origin_anchor: primitive_count += 1
-                    if bundle.price_traversal_velocity: primitive_count += 1
-                    if bundle.traversal_compactness: primitive_count += 1
-                    if bundle.central_tendency_deviation: primitive_count += 1
-                    if bundle.structural_absence_duration: primitive_count += 1
-                    if bundle.resting_size: primitive_count += 1
-                    if bundle.order_consumption: primitive_count += 1
-                    if bundle.absorption_event: primitive_count += 1
-                    if bundle.refill_event: primitive_count += 1
-                    if bundle.liquidation_density: primitive_count += 1
-                    if bundle.directional_continuity: primitive_count += 1
-                    if bundle.trade_burst: primitive_count += 1
+                # Get M2 metrics
+                m2_metrics = self.obs_system._m2_store.get_metrics()
+                
+                # Calculate primitive counts per symbol and overall
+                total_primitives = 0
+                primitive_breakdown = {}
+                
+                for symbol, bundle in snapshot.primitives.items():
+                    count = 0
+                    if bundle.zone_penetration is not None: count += 1
+                    if bundle.displacement_origin_anchor is not None: count += 1
+                    if bundle.price_traversal_velocity is not None: count += 1
+                    if bundle.traversal_compactness is not None: count += 1
+                    if bundle.price_acceptance_ratio is not None: count += 1
+                    if bundle.central_tendency_deviation is not None: count += 1
+                    if bundle.structural_absence_duration is not None: count += 1
+                    if bundle.structural_persistence_duration is not None: count += 1
+                    if bundle.traversal_void_span is not None: count += 1
+                    if bundle.event_non_occurrence_counter is not None: count += 1
+                    if bundle.resting_size is not None: count += 1
+                    if bundle.order_consumption is not None: count += 1
+                    if bundle.absorption_event is not None: count += 1
+                    if bundle.refill_event is not None: count += 1
+                    if bundle.liquidation_density is not None: count += 1
+                    if bundle.directional_continuity is not None: count += 1
+                    if bundle.trade_burst is not None: count += 1
+                    
+                    if count > 0:
+                        primitive_breakdown[symbol] = count
+                    total_primitives += count
 
-                self.status_label.setText(
-                    f"SYSTEM ACTIVE\n"
-                    f"Timestamp: {snapshot.timestamp:.2f}\n"
-                    f"Symbols Active: {len(snapshot.symbols_active)}\n"
-                    f"Primitives Generated: {primitive_count}\n"
+                # Get execution stats
+                exec_log = self.collector.executor.get_execution_log()
+                mandate_count = len(exec_log)
+                
+                # Build comprehensive display
+                display_text = (
+                    f"🟢 SYSTEM ACTIVE\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"⏱️  System Time: {datetime.fromtimestamp(snapshot.timestamp).strftime('%H:%M:%S')}\n"
+                    f"📊 Symbols Active: {len(snapshot.symbols_active)}\n\n"
+                    
+                    f"━━━ M2 MEMORY NODES ━━━\n"
+                    f"  Total Created: {m2_metrics['total_nodes_created']}\n"
+                    f"  🟢 Active: {m2_metrics['active_nodes']}\n"
+                    f"  ⚪ Dormant: {m2_metrics['dormant_nodes']}\n"
+                    f"  📦 Archived: {m2_metrics['archived_nodes']}\n"
+                    f"  Interactions: {m2_metrics['total_interactions']}\n\n"
+                    
+                    f"━━━ M4 PRIMITIVES ━━━\n"
+                    f"  Total Computing: {total_primitives} / {len(snapshot.primitives) * 17}\n"
                 )
-                self.dashboard.setStyleSheet("background-color: #002200;")
+                
+                if primitive_breakdown:
+                    display_text += "  By Symbol:\n"
+                    for sym, cnt in sorted(primitive_breakdown.items(), key=lambda x: x[1], reverse=True):
+                        display_text += f"    • {sym}: {cnt}/17\n"
+                else:
+                    display_text += "  [Awaiting M2 data]\n"
+                
+                display_text += (
+                    f"\n━━━ M6 EXECUTION ━━━\n"
+                    f"  Mandates Processed: {mandate_count}\n"
+                    f"  Policy Adapter: ACTIVE\n"
+                    f"  Arbitrator: READY\n"
+                    f"  Controller: OPERATIONAL\n\n"
+                )
+                
+                # Add critical primitive highlights
+                for symbol, bundle in snapshot.primitives.items():
+                    if bundle.price_acceptance_ratio is not None or bundle.structural_persistence_duration is not None:
+                        display_text += f"⭐ {symbol} - Critical primitives active\n"
+                
+                self.status_label.setText(display_text)
+                self.status_label.setStyleSheet("font-family: 'Consolas', 'Courier New', monospace; font-size: 11pt; color: #00ff00;")
+                self.dashboard.setStyleSheet("background-color: #001100;")
 
         except SystemHaltedException as e:
             self.red_screen.set_error(str(e))

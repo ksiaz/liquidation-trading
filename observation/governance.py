@@ -14,7 +14,7 @@ class ObservationSystem:
     The sealed Observation System.
     """
 
-    def __init__(self, allowed_symbols: List[str]):
+    def __init__(self, allowed_symbols: List[str], event_logger=None):
         self._allowed_symbols = set(allowed_symbols)
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
@@ -24,8 +24,8 @@ class ObservationSystem:
         self._m1 = M1IngestionEngine()
         self._m3 = M3TemporalEngine()
 
-        # M2 Memory Store (STUB: Not populated yet)
-        self._m2_store = ContinuityMemoryStore()
+        # M2 Memory Store (with event logger for research)
+        self._m2_store = ContinuityMemoryStore(event_logger=event_logger)
 
         # M5 Access Layer (For primitive computation at snapshot time)
         self._m5_access = MemoryAccess(self._m2_store)

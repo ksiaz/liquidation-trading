@@ -31,8 +31,13 @@ class ContinuityMemoryStore:
     Historical evidence preserved across state transitions.
     """
     
-    def __init__(self):
-        """Initialize store with three collections."""
+    
+    def __init__(self, event_logger=None):
+        """Initialize store with three collections.
+        
+        Args:
+            event_logger: Optional database logger for event-level capture
+        """
         self._active_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_evidence: Dict[str, HistoricalEvidence] = {}
@@ -41,6 +46,9 @@ class ContinuityMemoryStore:
         self._total_nodes_created = 0
         self._total_interactions = 0
         self._last_state_update_ts: Optional[float] = None
+        
+        # Event logger for research
+        self._event_logger = event_logger
         
         # Topology and pressure analyzers
         self.topology = MemoryTopology()
@@ -188,6 +196,8 @@ class ContinuityMemoryStore:
         Returns:
             Created or updated node, or None if rejected
         """
+        print(f"DEBUG M2 ingest_liquidation: {symbol} @ ${price} {side} vol={volume}")
+        
         # Define spatial matching parameters
         PRICE_BAND_DEFAULT = 100.0  # Default band width
         OVERLAP_TOLERANCE = 0.5  # 50% overlap threshold
@@ -209,6 +219,23 @@ class ContinuityMemoryStore:
                     candidate._start_presence_interval(timestamp)
 
                 self._total_interactions += 1
+                
+                # Log node reinforcement event
+                if self._event_logger:
+                    try:
+                        self._event_logger.log_m2_node_event(
+                            timestamp=timestamp,
+                            event_type='REINFORCED',
+                            node_id=candidate.id,
+                            symbol=symbol,
+                            price=price,
+                            side=side,
+                            volume=volume,
+                            strength_after=candidate.strength
+                        )
+                    except:
+                        pass
+                
                 return candidate
         
         # No overlap found - Create new node
@@ -234,6 +261,24 @@ class ContinuityMemoryStore:
         
         # Record the liquidation evidence
         node.record_liquidation(timestamp, side)
+        
+        print(f"DEBUG M2: Node CREATED - {symbol} @ ${price:.2f} ({node_side} zone, vol={volume:.2f})")
+        
+        # Log node creation event
+        if self._event_logger:
+            try:
+                self._event_logger.log_m2_node_event(
+                    timestamp=timestamp,
+                    event_type='CREATED',
+                    node_id=node.id,
+                    symbol=symbol,
+                    price=price,
+                    side=node_side,
+                    volume=volume,
+                    strength_after=node.strength
+                )
+            except:
+                pass
         
         return node
     

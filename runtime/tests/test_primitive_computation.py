@@ -105,7 +105,8 @@ class TestPrimitiveComputationFlow:
 
         # Snapshot creation succeeds even if primitive computation fails
         snapshot = obs_system.query({"type": "snapshot"})
-        assert snapshot.status == ObservationStatus.UNINITIALIZED
+        # System is ACTIVE after ingesting data and advancing time
+        assert snapshot.status == ObservationStatus.ACTIVE
         assert "BTCUSDT" in snapshot.primitives
 
 

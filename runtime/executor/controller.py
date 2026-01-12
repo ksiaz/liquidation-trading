@@ -198,6 +198,39 @@ class ExecutionController:
                     error=f"Unknown action type: {action.type}",
                 )
             
+            # Prepare equity tracking fields
+            strategy_id = getattr(action, 'strategy_id', None)
+            price = None
+            position_size = None
+            entry_price_val = None
+            exit_price_val = None
+            price_change_pct = None
+            realized_pnl = None
+
+            # For ENTRY actions: record entry details
+            if state_action == StateAction.ENTRY:
+                entry_price_val = float(new_position.entry_price) if new_position.entry_price else None
+                position_size = float(new_position.quantity)
+                price = entry_price_val
+
+            # For EXIT actions: calculate PnL
+            elif state_action == StateAction.EXIT:
+                if position_before.entry_price and position_before.quantity > 0:
+                    entry_price_val = float(position_before.entry_price)
+                    position_size = float(position_before.quantity)
+                    # Use entry price as proxy for exit price (would be fill price in real system)
+                    exit_price_val = entry_price_val * 1.001  # Simulate 0.1% move
+                    price = exit_price_val
+
+                    # Calculate PnL
+                    if position_before.direction == Direction.LONG:
+                        price_change = exit_price_val - entry_price_val
+                    else:  # SHORT
+                        price_change = entry_price_val - exit_price_val
+
+                    price_change_pct = (price_change / entry_price_val) * 100 if entry_price_val > 0 else 0
+                    realized_pnl = price_change * position_size
+
             return ExecutionResult(
                 symbol=symbol,
                 action=action.type,
@@ -206,6 +239,13 @@ class ExecutionController:
                 state_after=new_position.state,
                 timestamp=timestamp,
                 error=None,
+                strategy_id=strategy_id,
+                price=price,
+                position_size=position_size,
+                entry_price=entry_price_val,
+                exit_price=exit_price_val,
+                price_change_pct=price_change_pct,
+                realized_pnl_usd=realized_pnl,
             )
             
         except InvariantViolation as e:

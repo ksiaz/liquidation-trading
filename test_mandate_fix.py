@@ -2,7 +2,13 @@
 Quick test to verify primitive fixes generate mandates.
 """
 import asyncio
+import sys
 import time
+
+# Fix Windows event loop for aiohttp/aiodns
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from observation import ObservationSystem
 from runtime.collector.service import CollectorService
 

@@ -149,8 +149,8 @@ class ObservationSystem:
         # print(f"DEBUG: advance_time called. Status={self._status}")
         if True: # FORCE ACTIVE
             self._status = ObservationStatus.ACTIVE
-            print(f"DEBUG: Status is now {self._status}")
-            
+            # print(f"DEBUG: Status is now {self._status}")  # Commented out - too verbose
+
         self._update_liveness()
         
         # Trigger M3 to close windows

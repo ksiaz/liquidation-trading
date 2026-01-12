@@ -251,7 +251,7 @@ class PolicyAdapter:
             }
 
         # Extract primitives from bundle (read-only access)
-        return {
+        result = {
             "zone_penetration": bundle.zone_penetration,
             "traversal_compactness": bundle.traversal_compactness,
             "central_tendency_deviation": bundle.central_tendency_deviation,
@@ -261,6 +261,8 @@ class PolicyAdapter:
             "traversal_void_span": bundle.traversal_void_span,
             "event_non_occurrence_counter": bundle.event_non_occurrence_counter,
         }
+
+        return result
 
     def _proposals_to_mandates(
         self,

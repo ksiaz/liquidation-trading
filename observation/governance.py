@@ -255,10 +255,10 @@ class ObservationSystem:
             
             # Query M2 for active nodes (symbol-filtered)
             active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
-            
+
             # Query M3 for recent price history
             recent_prices = self._m3.get_recent_prices(symbol=symbol, max_count=100)
-            
+
             # Initialize primitives
             zone_penetration = None
             displacement_origin_anchor = None
@@ -299,7 +299,7 @@ class ObservationSystem:
 
                 if max_penetration_result is not None:
                     zone_penetration = max_penetration_result
-            
+
             # 2. DISPLACEMENT ORIGIN ANCHOR (Phase 6.3)
             if len(recent_prices) >= 3:
                 # Use pre-traversal window (first 50% of prices)

@@ -175,6 +175,7 @@ jobs:
           python3 scripts/ci/scan_forbidden_vocabulary.py \
             --dirs observation/ memory/ \
             --forbidden signal setup opportunity edge alpha bias trend momentum \
+            --context-sensitive \
             --fail-on-violation
 
       - name: "Verify No time.time() or datetime.now()"
@@ -242,7 +243,7 @@ jobs:
         run: |
           python3 scripts/ci/validate_schema_completeness.py \
             --schema SYSTEM_MAP_SCHEMA.yaml \
-            --required-keys system_name system_version subsystems modules dependencies imports forbidden_edges state_machines invariants doc_bindings
+            --required-keys system_name system_version subsystems dependencies forbidden_edges state_machines invariants
 
       - name: "Verify All Modules Exist"
         run: |

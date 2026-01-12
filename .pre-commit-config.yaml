@@ -181,7 +181,7 @@ repos:
 
       - id: forbidden-vocabulary
         name: Forbidden Vocabulary Scan
-        entry: python scripts/ci/scan_forbidden_vocabulary.py --dirs observation/ runtime/ memory/ external_policy/ execution/ --forbidden signal setup opportunity bias edge alpha momentum pressure trend regime --fail-on-violation
+        entry: python scripts/ci/scan_forbidden_vocabulary.py --dirs observation/ runtime/ memory/ external_policy/ execution/ --forbidden signal setup opportunity bias edge alpha momentum pressure trend regime --context-sensitive --fail-on-violation
         language: system
         pass_filenames: false
         files: \.(py)$

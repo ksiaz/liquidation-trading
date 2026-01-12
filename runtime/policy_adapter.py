@@ -70,15 +70,17 @@ class PolicyAdapter:
     - State management (in runtime/position/)
     """
 
-    def __init__(self, config: Optional[AdapterConfig] = None):
-        """Initialize adapter with configuration."""
+    def __init__(self, config: Optional[AdapterConfig] = None, execution_db: Any = None):
+        """Initialize adapter with configuration and optional database."""
         self.config = config or AdapterConfig()
+        self._db = execution_db
 
     def generate_mandates(
         self,
         observation_snapshot: ObservationSnapshot,
         symbol: str,
-        timestamp: float
+        timestamp: float,
+        cycle_id: Optional[int] = None
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -88,6 +90,7 @@ class PolicyAdapter:
             observation_snapshot: Current observation state
             symbol: Symbol to generate mandates for
             timestamp: Current timestamp
+            cycle_id: Optional database cycle ID for linking logs
 
         Returns:
             List of Mandates (possibly empty)
@@ -139,28 +142,70 @@ class PolicyAdapter:
             )
             if proposal:
                 proposals.append(proposal)
+            
+            # Log evaluation
+            if self._db and cycle_id is not None:
+                self._db.log_policy_evaluation(
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    policy_name="geometry",
+                    is_active=proposal is not None,
+                    confidence=proposal.confidence if proposal else 0.0,
+                    components={
+                        "zone_penetration": primitives.get("zone_penetration"),
+                        "traversal_compactness": primitives.get("traversal_compactness")
+                    }
+                )
 
         if self.config.enable_kinematics:
             proposal = generate_kinematics_proposal(
-                price_traversal_velocity=primitives.get("price_traversal_velocity"),
-                traversal_compactness=primitives.get("traversal_compactness"),
-                displacement_origin_anchor=primitives.get("displacement_origin_anchor"),
+                velocity=primitives.get("price_traversal_velocity"),
+                compactness=primitives.get("traversal_compactness"),
+                acceptance=primitives.get("price_acceptance_ratio"),
+                context=context,
+                permission=permission
+            )
+            if proposal:
+                proposals.append(proposal)
+                
+            # Log evaluation
+            if self._db and cycle_id is not None:
+                self._db.log_policy_evaluation(
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    policy_name="kinematics",
+                    is_active=proposal is not None,
+                    confidence=proposal.confidence if proposal else 0.0,
+                    components={
+                        "velocity": primitives.get("price_traversal_velocity"),
+                        "acceptance": primitives.get("price_acceptance_ratio")
+                    }
+                )
+
+        if self.config.enable_absence:
+            proposal = generate_absence_proposal(
+                absence=primitives.get("structural_absence_duration"),
+                persistence=primitives.get("structural_persistence_duration"),
+                geometry=primitives.get("zone_penetration"),
                 context=context,
                 permission=permission
             )
             if proposal:
                 proposals.append(proposal)
 
-        if self.config.enable_absence:
-            proposal = generate_absence_proposal(
-                structural_absence_duration=primitives.get("structural_absence_duration"),
-                traversal_void_span=primitives.get("traversal_void_span"),
-                event_non_occurrence_counter=primitives.get("event_non_occurrence_counter"),
-                context=context,
-                permission=permission
-            )
-            if proposal:
-                proposals.append(proposal)
+            # Log evaluation
+            if self._db and cycle_id is not None:
+                self._db.log_policy_evaluation(
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    policy_name="absence",
+                    is_active=proposal is not None,
+                    confidence=proposal.confidence if proposal else 0.0,
+                    components={
+                        "absence": primitives.get("structural_absence_duration"),
+                        "persistence": primitives.get("structural_persistence_duration")
+                    }
+                )
 
         # Convert proposals to mandates (pure normalization)
         mandates = self._proposals_to_mandates(proposals, symbol, timestamp)
@@ -206,7 +251,7 @@ class PolicyAdapter:
             }
 
         # Extract primitives from bundle (read-only access)
-        return {
+        result = {
             "zone_penetration": bundle.zone_penetration,
             "traversal_compactness": bundle.traversal_compactness,
             "central_tendency_deviation": bundle.central_tendency_deviation,
@@ -216,6 +261,8 @@ class PolicyAdapter:
             "traversal_void_span": bundle.traversal_void_span,
             "event_non_occurrence_counter": bundle.event_non_occurrence_counter,
         }
+
+        return result
 
     def _proposals_to_mandates(
         self,

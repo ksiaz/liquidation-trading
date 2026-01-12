@@ -47,8 +47,11 @@ class MandateArbitrator:
         symbol = next(iter(symbols))
         
         # Step 1: EXIT supremacy (Theorem 2.2)
-        if any(m.type == MandateType.EXIT for m in mandates):
-            return Action(type=ActionType.EXIT, symbol=symbol)
+        exit_mandates = [m for m in mandates if m.type == MandateType.EXIT]
+        if exit_mandates:
+            # Use first EXIT mandate's strategy_id for tracing
+            strategy_id = exit_mandates[0].strategy_id if hasattr(exit_mandates[0], 'strategy_id') else None
+            return Action(type=ActionType.EXIT, symbol=symbol, strategy_id=strategy_id)
         
         # Step 2: Filter ENTRY if BLOCK present (Theorem 2.3)
         if any(m.type == MandateType.BLOCK for m in mandates):
@@ -72,7 +75,9 @@ class MandateArbitrator:
             MandateType.HOLD,    # Priority 1
         ]:
             if mandate_type in by_type:
-                return Action.from_mandate_type(mandate_type, symbol)
+                mandate = by_type[mandate_type]
+                strategy_id = mandate.strategy_id if hasattr(mandate, 'strategy_id') else None
+                return Action.from_mandate_type(mandate_type, symbol, strategy_id)
         
         # If only BLOCK remains, it's not actionable
         if MandateType.BLOCK in by_type:

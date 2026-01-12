@@ -28,6 +28,8 @@ class M1IngestionEngine:
             'liquidations': 0,
             'klines': 0,
             'oi': 0,
+            'depth_updates': 0,
+            'mark_price_updates': 0,
             'errors': 0
         }
 
@@ -75,7 +77,7 @@ class M1IngestionEngine:
             quantity = float(order['q'])
             timestamp = int(raw_payload['E']) / 1000.0
             side = order['S'] # BUY or SELL
-            
+
             # 1. Update Raw Buffer
             event = {
                 'timestamp': timestamp,
@@ -88,10 +90,14 @@ class M1IngestionEngine:
             }
             self.raw_liquidations[symbol].append(event)
             self.counters['liquidations'] += 1
-            
+
+            print(f"DEBUG M1: Liquidation normalized - {symbol} {side} @ ${price} vol={quantity}")
+
             return event
-            
-        except Exception:
+
+        except Exception as e:
+            print(f"DEBUG M1: Liquidation normalization FAILED for {symbol}: {e}")
+            print(f"  Payload: {raw_payload}")
             self.counters['errors'] += 1
             return None
 
@@ -100,6 +106,99 @@ class M1IngestionEngine:
 
     def record_oi(self, symbol: str):
         self.counters['oi'] += 1
+
+    def normalize_depth_update(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Binance @depth update.
+
+        Binance @depth format:
+        {
+            "e": "depthUpdate",
+            "E": 1234567890,  # Event time
+            "s": "BTCUSDT",
+            "U": 157,         # First update ID
+            "u": 160,         # Final update ID
+            "b": [            # Bids to be updated
+                ["9000.00", "1.5"]  # [price, qty]
+            ],
+            "a": [            # Asks to be updated
+                ["9001.00", "2.0"]
+            ]
+        }
+
+        Returns:
+            {
+                'timestamp': float,
+                'symbol': str,
+                'bids': [(price, size), ...],
+                'asks': [(price, size), ...]
+            }
+        """
+        try:
+            timestamp = int(raw_payload['E']) / 1000.0
+
+            # Parse bids/asks
+            bids = [(float(p), float(q)) for p, q in raw_payload.get('b', [])]
+            asks = [(float(p), float(q)) for p, q in raw_payload.get('a', [])]
+
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'bids': bids,
+                'asks': asks
+            }
+
+            self.counters['depth_updates'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def normalize_mark_price(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Binance @markPrice update.
+
+        Binance @markPrice format:
+        {
+            "e": "markPriceUpdate",
+            "E": 1234567890,  # Event time
+            "s": "BTCUSDT",
+            "p": "9000.00",   # Mark price
+            "i": "8999.50",   # Index price (optional)
+            "r": "0.0001"     # Funding rate (ignored - not a primitive)
+        }
+
+        Returns:
+            {
+                'timestamp': float,
+                'symbol': str,
+                'mark_price': float,
+                'index_price': float (optional)
+            }
+        """
+        try:
+            timestamp = int(raw_payload['E']) / 1000.0
+            mark_price = float(raw_payload['p'])
+
+            # Index price is optional
+            index_price = None
+            if 'i' in raw_payload and raw_payload['i']:
+                index_price = float(raw_payload['i'])
+
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'mark_price': mark_price,
+                'index_price': index_price
+            }
+
+            self.counters['mark_price_updates'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
 
     def get_buffers(self) -> Dict:
         """Return copy of raw buffers."""

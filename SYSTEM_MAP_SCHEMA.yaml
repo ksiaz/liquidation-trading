@@ -1,0 +1,716 @@
+# SYSTEM MAP SCHEMA — Constitutional Execution System
+# Version: 1.0.0-frozen
+# Purpose: Machine-readable contract enforcing constitutional architecture
+# Authority: SYSTEM_ARCHITECTURE_MAP.md + Constitutional Documents
+# Status: Binding CI Contract
+
+system_name: "Constitutional Execution System"
+system_version: "1.0.0-frozen"
+schema_authority: "SYSTEM_ARCHITECTURE_MAP.md"
+
+# ============================================================================
+# SUBSYSTEMS — Boundary Definitions
+# ============================================================================
+
+subsystems:
+  m1_ingestion:
+    modules:
+      - "observation/internal/m1_ingestion.py"
+    frozen: true
+    allowed_inputs:
+      - raw_websocket_payload
+      - exchange_trade_event
+      - exchange_liquidation_event
+    forbidden_knowledge:
+      - event_importance_filtering
+      - semantic_labeling
+      - time_based_decisions
+    epistemic_class: "recording_only"
+
+  m2_continuity:
+    modules:
+      - "memory/m2_continuity_store.py"
+    frozen: true
+    allowed_inputs:
+      - m1_normalized_events
+    forbidden_knowledge:
+      - node_ranking
+      - lifecycle_prediction
+      - semantic_importance
+    epistemic_class: "recording_only"
+
+  m3_temporal:
+    modules:
+      - "memory/m3_temporal.py"
+    frozen: true
+    allowed_inputs:
+      - m2_node_ids
+      - timestamp_boundaries
+    forbidden_knowledge:
+      - event_importance_scoring
+      - causality_inference
+      - next_event_prediction
+    epistemic_class: "recording_only"
+
+  m4_views:
+    modules:
+      - "memory/m4_views.py"
+    frozen: true
+    allowed_inputs:
+      - m2_memory_graph
+      - m3_temporal_index
+    forbidden_knowledge:
+      - view_quality_ranking
+      - metric_interpretation
+      - composite_scores
+    epistemic_class: "structural_only"
+
+  m5_governance:
+    modules:
+      - "memory/m5_access.py"
+    frozen: true
+    allowed_inputs:
+      - symbol_whitelist
+      - governance_rules
+    forbidden_knowledge:
+      - intent_inference
+      - helpful_defaults
+      - rule_bypassing
+    epistemic_class: "firewall"
+
+  observation_system:
+    modules:
+      - "observation/governance.py"
+      - "observation/types.py"
+    frozen: true
+    allowed_inputs:
+      - m1_through_m5_outputs
+      - current_timestamp
+    forbidden_knowledge:
+      - health_assessment
+      - readiness_claims
+      - quality_evaluation
+    epistemic_class: "assembly_only"
+    exposed_interface:
+      - ObservationSnapshot
+      - M4PrimitiveBundle
+
+  runtime_collector:
+    modules:
+      - "runtime/collector/service.py"
+    frozen: false
+    allowed_inputs:
+      - websocket_connection
+      - clock_signal
+    forbidden_knowledge: []
+    responsibilities:
+      - clock_driver
+      - m6_cycle_orchestration
+      - observation_invocation
+
+  policy_adapter:
+    modules:
+      - "runtime/policy_adapter.py"
+    frozen: true
+    allowed_inputs:
+      - ObservationSnapshot
+      - M4PrimitiveBundle
+    forbidden_knowledge:
+      - observation_interpretation
+      - quality_assessment
+      - confidence_derivation
+    responsibilities:
+      - primitive_extraction
+      - policy_input_preparation
+      - no_evaluation
+
+  external_policies:
+    modules:
+      - "external_policy/ep1_oracle_volatility.py"
+      - "external_policy/ep2_strategy_geometry.py"
+      - "external_policy/ep3_strategy_deviation_bounds.py"
+    frozen: true
+    allowed_inputs:
+      - M4PrimitiveBundle
+    forbidden_knowledge: []
+    responsibilities:
+      - mandate_emission
+      - stateless_per_cycle
+      - no_execution
+
+  arbitration:
+    modules:
+      - "runtime/arbitration/arbitrator.py"
+      - "runtime/arbitration/types.py"
+    frozen: true
+    allowed_inputs:
+      - mandate_list
+      - current_position_state
+    forbidden_knowledge: []
+    responsibilities:
+      - conflict_resolution
+      - exit_supremacy
+      - single_action_emission
+
+  position_tracking:
+    modules:
+      - "runtime/position/state_machine.py"
+      - "runtime/position/tracker.py"
+    frozen: true
+    allowed_inputs:
+      - arbitration_decision
+      - exchange_fill_events
+    forbidden_knowledge: []
+    responsibilities:
+      - state_machine_enforcement
+      - illegal_transition_rejection
+      - no_state_inference
+
+  execution_controller:
+    modules:
+      - "runtime/executor/controller.py"
+    frozen: true
+    allowed_inputs:
+      - arbitrated_action
+      - position_state
+    forbidden_knowledge: []
+    responsibilities:
+      - order_submission
+      - lifecycle_tracking
+      - no_interpretation
+
+  execution_policy:
+    modules:
+      - "execution/ep4_execution.py"
+    frozen: true
+    allowed_inputs:
+      - action_intent
+      - current_position
+    forbidden_knowledge: []
+    responsibilities:
+      - order_translation
+      - parameter_selection
+      - no_decision_making
+
+  m6_executor:
+    modules:
+      - "runtime/m6_executor.py"
+      - "runtime/native_app/main.py"
+    frozen: false
+    allowed_inputs:
+      - ObservationSnapshot
+    forbidden_knowledge: []
+    responsibilities:
+      - optional_execution_layer
+      - mandate_lifecycle
+      - observation_consumer
+
+# ============================================================================
+# DEPENDENCIES — Allowed Information Flow
+# ============================================================================
+
+dependencies:
+  - from: "runtime_collector"
+    to: "observation_system"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Clock driver invokes observation snapshot creation"
+
+  - from: "runtime_collector"
+    to: "m6_executor"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Orchestrates M6 cycle after observation"
+
+  - from: "observation_system"
+    to: "m1_ingestion"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Observation queries M1 for events"
+
+  - from: "observation_system"
+    to: "m2_continuity"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Observation queries M2 for nodes"
+
+  - from: "observation_system"
+    to: "m3_temporal"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Observation queries M3 for temporal index"
+
+  - from: "observation_system"
+    to: "m4_views"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Observation queries M4 for structural views"
+
+  - from: "observation_system"
+    to: "m5_governance"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Observation enforces governance rules"
+
+  - from: "m6_executor"
+    to: "policy_adapter"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "M6 uses adapter to extract primitives"
+
+  - from: "policy_adapter"
+    to: "observation_system"
+    artifact: "ObservationSnapshot"
+    dependency_type: "hard"
+    justification: "Adapter receives snapshot from observation"
+
+  - from: "m6_executor"
+    to: "external_policies"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "M6 invokes strategies for mandates"
+
+  - from: "m6_executor"
+    to: "arbitration"
+    artifact: "mandate_list"
+    dependency_type: "hard"
+    justification: "M6 sends mandates to arbitrator"
+
+  - from: "arbitration"
+    to: "position_tracking"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Arbitrator queries current position state"
+
+  - from: "m6_executor"
+    to: "execution_controller"
+    artifact: "arbitrated_action"
+    dependency_type: "hard"
+    justification: "M6 passes arbitrated action to controller"
+
+  - from: "execution_controller"
+    to: "execution_policy"
+    artifact: "function_calls"
+    dependency_type: "hard"
+    justification: "Controller uses policy to translate actions"
+
+  - from: "execution_controller"
+    to: "position_tracking"
+    artifact: "state_updates"
+    dependency_type: "hard"
+    justification: "Controller updates position state after execution"
+
+  - from: "external_policies"
+    to: "policy_adapter"
+    artifact: "M4PrimitiveBundle"
+    dependency_type: "soft"
+    justification: "Policies receive primitives from adapter (via M6)"
+
+# ============================================================================
+# FORBIDDEN EDGES — Constitutional Violations
+# ============================================================================
+
+forbidden_edges:
+  - from: "execution_controller"
+    to: "observation_system"
+    reason: "execution_must_not_query_observation_directly"
+    constitutional_reference: "SYSTEM_CANON.md Section 6.2"
+
+  - from: "external_policies"
+    to: "observation_system"
+    reason: "strategies_must_not_query_observation_directly"
+    constitutional_reference: "SYSTEM_CANON.md Section 6.2"
+
+  - from: "arbitration"
+    to: "observation_system"
+    reason: "arbitration_must_not_query_observation_directly"
+    constitutional_reference: "SYSTEM_CANON.md Section 6.2"
+
+  - from: "m6_executor"
+    to: "m1_ingestion"
+    reason: "m6_must_not_access_observation_internals"
+    constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 9"
+
+  - from: "m6_executor"
+    to: "m2_continuity"
+    reason: "m6_must_not_access_observation_internals"
+    constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 9"
+
+  - from: "policy_adapter"
+    to: "m5_governance"
+    reason: "adapter_must_not_query_m5_for_primitives"
+    constitutional_reference: "R012: Primitives computed inline"
+
+  - from: "external_policies"
+    to: "execution_controller"
+    reason: "strategies_must_never_execute_directly"
+    constitutional_reference: "SYSTEM_CANON.md Section 4.3"
+
+# ============================================================================
+# STATE MACHINES — Canonical Transition Tables
+# ============================================================================
+
+state_machines:
+  position_lifecycle:
+    states:
+      - FLAT
+      - ENTERING
+      - OPEN
+      - REDUCING
+      - CLOSING
+    transitions:
+      allowed:
+        - from: "FLAT"
+          action: "ENTRY"
+          to: "ENTERING"
+        - from: "ENTERING"
+          action: "fill_confirmed"
+          to: "OPEN"
+        - from: "ENTERING"
+          action: "BLOCK"
+          to: "FLAT"
+        - from: "OPEN"
+          action: "EXIT"
+          to: "CLOSING"
+        - from: "OPEN"
+          action: "REDUCE"
+          to: "REDUCING"
+        - from: "REDUCING"
+          action: "partial_fill"
+          to: "OPEN"
+        - from: "REDUCING"
+          action: "EXIT"
+          to: "CLOSING"
+        - from: "CLOSING"
+          action: "full_exit_confirmed"
+          to: "FLAT"
+    enforcement_point: "runtime/position/state_machine.py:validate_transition"
+
+  arbitration_priority:
+    mandate_types:
+      - EXIT
+      - BLOCK
+      - REDUCE
+      - ENTRY
+      - HOLD
+    priority_order: "EXIT > BLOCK > REDUCE > ENTRY > HOLD"
+    enforcement_point: "runtime/arbitration/arbitrator.py:arbitrate"
+
+  observation_status:
+    states:
+      - UNINITIALIZED
+      - OPERATIONAL
+      - FAILED
+    allowed_exposures:
+      - UNINITIALIZED
+      - FAILED
+    forbidden_exposures:
+      - OPERATIONAL
+      - HEALTHY
+      - READY
+    enforcement_point: "observation/governance.py:_get_snapshot"
+
+  m2_node_lifecycle:
+    states:
+      - NEW
+      - ACTIVE
+      - DECAYED
+    transitions:
+      allowed:
+        - from: "NEW"
+          trigger: "first_timestamp_recorded"
+          to: "ACTIVE"
+        - from: "ACTIVE"
+          trigger: "decay_threshold_exceeded"
+          to: "DECAYED"
+    enforcement_point: "memory/m2_continuity_store.py:_update_node_state"
+
+# ============================================================================
+# INVARIANTS — Constitutional Constraints
+# ============================================================================
+
+invariants:
+  epistemic:
+    - id: "no_health_claims"
+      rule: "System must never claim health, readiness, or data quality"
+      enforcement_point: "observation/governance.py:_get_snapshot"
+      constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 1"
+
+    - id: "no_prediction"
+      rule: "No prediction, forecasting, or future-state claims"
+      enforcement_point: "observation/governance.py (all functions)"
+      constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 2"
+
+    - id: "no_causation"
+      rule: "No causal inference or explanation generation"
+      enforcement_point: "memory/m3_temporal.py (all functions)"
+      constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 2"
+
+    - id: "silence_on_uncertainty"
+      rule: "When truth unknown, system must remain silent"
+      enforcement_point: "observation/governance.py:_get_snapshot"
+      constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 3"
+
+  architectural:
+    - id: "no_upward_dependencies"
+      rule: "Execution/M6 must never import observation internals"
+      enforcement_point: "CI: check_forbidden_imports.py"
+      constitutional_reference: "SYSTEM_CANON.md Section 6"
+
+    - id: "m5_query_firewall"
+      rule: "M5 queries restricted to frozen primitive set"
+      enforcement_point: "memory/m5_access.py:query"
+      constitutional_reference: "CODE_FREEZE.md + SYSTEM_GUIDANCE.md"
+
+    - id: "primitives_computed_inline"
+      rule: "M4 primitives computed in governance.py, not via M5 query"
+      enforcement_point: "observation/governance.py:_compute_primitives"
+      constitutional_reference: "R012 in CI_VALIDATION_RULES"
+
+  semantic:
+    - id: "forbidden_vocabulary"
+      rule: "No: signal, setup, opportunity, bias, edge, alpha, momentum, pressure, trend, regime"
+      enforcement_point: "CI: scan_forbidden_vocabulary.py"
+      constitutional_reference: "SYSTEM_CANON.md Section 3.1"
+
+    - id: "mandate_semantics"
+      rule: "Mandates are binary intent, not advice or scores"
+      enforcement_point: "runtime/arbitration/types.py:Mandate"
+      constitutional_reference: "SYSTEM_CANON.md Section 4"
+
+  determinism:
+    - id: "no_time_reversals"
+      rule: "Timestamps must advance monotonically"
+      enforcement_point: "observation/governance.py:advance_time"
+      constitutional_reference: "EPISTEMIC_CONSTITUTION.md Article 5"
+
+# ============================================================================
+# FROZEN COMPONENTS — Code Freeze Registry
+# ============================================================================
+
+frozen_components:
+  tier_a_memory:
+    - "observation/internal/m1_ingestion.py"
+    - "memory/m2_continuity_store.py"
+    - "memory/m3_temporal.py"
+    - "memory/m4_views.py"
+    - "memory/m5_access.py"
+    - "observation/governance.py"
+    - "observation/types.py"
+
+  tier_b1_primitives:
+    - "observation/governance.py:_compute_primitives"
+    - "observation/types.py:M4PrimitiveBundle"
+
+  tier_b2_m6_mandate:
+    - "runtime/m6_executor.py:evaluate_mandates"
+    - "runtime/policy_adapter.py:_extract_primitives"
+
+  tier_c_external_policy:
+    - "external_policy/ep2_strategy_geometry.py"
+    - "external_policy/ep3_strategy_deviation_bounds.py"
+
+  tier_d_execution:
+    - "runtime/position/state_machine.py"
+    - "runtime/arbitration/arbitrator.py"
+    - "runtime/executor/controller.py"
+    - "execution/ep4_execution.py"
+
+freeze_policy:
+  modification_requires:
+    - logged_evidence: "Phase V1-LIVE run logs with failure timestamp"
+    - structural_proof: "Primitive outputs demonstrating ambiguity"
+    - constitutional_approval: "Logged decision with evidence reference"
+  override_keyword: "OVERRIDE: CODE_FREEZE"
+  emergency_protocol: "Two architect approvals + 24h post-merge audit"
+
+# ============================================================================
+# CI VALIDATION RULES — Enforcement Contract
+# ============================================================================
+
+CI_VALIDATION_RULES:
+  blocking:
+    R001:
+      name: "Forbidden Imports — Execution → Observation"
+      script: "scripts/ci/check_forbidden_imports.py"
+      args: "--scan runtime/ execution/ external_policy/ --forbidden observation/internal/ memory/m2_ memory/m3_ memory/m4_ --fail-on-violation"
+      exit_code: 1
+
+    R002:
+      name: "Forbidden Imports — Observation → Execution"
+      script: "scripts/ci/check_forbidden_imports.py"
+      args: "--scan observation/ memory/ --forbidden runtime/m6_ runtime/executor --fail-on-violation"
+      exit_code: 1
+
+    R003:
+      name: "State Machine Transition Table Changed"
+      script: "scripts/ci/verify_state_machine.py"
+      args: "--file runtime/position/state_machine.py --expected-transitions 8 --fail-on-change"
+      exit_code: 1
+
+    R004:
+      name: "Arbitration Priority Order Changed"
+      script: "scripts/ci/verify_arbitration_priority.py"
+      args: "--file runtime/arbitration/arbitrator.py --expected-order EXIT,BLOCK,REDUCE,ENTRY,HOLD --fail-on-change"
+      exit_code: 1
+
+    R005:
+      name: "New Module Not Registered in Schema"
+      script: "scripts/ci/check_new_modules.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --codebase . --fail-on-unregistered"
+      exit_code: 1
+
+    R006:
+      name: "Frozen Component Modified Without Override"
+      script: "scripts/ci/check_frozen_components.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --fail-on-violation"
+      exit_code: 1
+
+    R007:
+      name: "Invariant Without Enforcement Point"
+      script: "scripts/ci/verify_invariant_coverage.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --codebase . --fail-on-missing"
+      exit_code: 1
+
+    R008:
+      name: "Evaluative Field in ObservationSnapshot"
+      script: "scripts/ci/check_epistemic_exposure.py"
+      args: "--file observation/types.py --class ObservationSnapshot --forbidden health ready quality confidence --fail-on-violation"
+      exit_code: 1
+
+    R009:
+      name: "Forbidden M5 Query Parameter"
+      script: "scripts/ci/check_m5_query_params.py"
+      args: "--file memory/m5_access.py --allowed get_node get_edges get_temporal_range get_primitive --fail-on-violation"
+      exit_code: 1
+
+    R010:
+      name: "Unregistered Mandate Type"
+      script: "scripts/ci/check_mandate_types.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --scan external_policy/ --fail-on-unregistered"
+      exit_code: 1
+
+    R011:
+      name: "Undeclared Dependency in Schema"
+      script: "scripts/ci/check_dependency_drift.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --codebase . --fail-on-drift"
+      exit_code: 1
+
+    R012:
+      name: "Primitive Computation via M5 Query"
+      script: "scripts/ci/check_primitive_computation.py"
+      args: "--file observation/governance.py --function _compute_primitives --fail-on-m5-query"
+      exit_code: 1
+
+    R013:
+      name: "EXIT Not Checked First in Arbitration"
+      script: "scripts/ci/check_exit_supremacy.py"
+      args: "--file runtime/arbitration/arbitrator.py --function arbitrate --fail-on-violation"
+      exit_code: 1
+
+    R014:
+      name: "FAILED State Has Exit Transition"
+      script: "scripts/ci/check_failed_state_terminal.py"
+      args: "--file observation/governance.py --fail-on-exit-path"
+      exit_code: 1
+
+    R017:
+      name: "Timestamp Units Incorrect"
+      script: "scripts/ci/check_timestamp_units.py"
+      args: "--scan observation/ runtime/ --forbidden time.time() --require-ms --fail-on-violation"
+      exit_code: 1
+
+  warnings:
+    R015:
+      name: "Doc-Code Correspondence Missing"
+      script: "scripts/ci/check_doc_correspondence.py"
+      args: "--schema SYSTEM_MAP_SCHEMA.yaml --docs docs/ --warn-on-drift"
+      exit_code: 0
+
+    R016:
+      name: "Case Sensitivity Handling Incomplete"
+      script: "scripts/ci/check_case_sensitivity.py"
+      args: "--file runtime/policy_adapter.py --function _extract_primitives --warn-on-incomplete"
+      exit_code: 0
+
+# ============================================================================
+# VOCABULARY ENFORCEMENT
+# ============================================================================
+
+forbidden_vocabulary:
+  semantic_adjectives:
+    - signal
+    - setup
+    - opportunity
+    - edge
+    - alpha
+    - bias
+  market_psychology:
+    - momentum
+    - pressure
+    - trend
+    - regime
+    - sentiment
+    - conviction
+  evaluative:
+    - strong
+    - weak
+    - quality
+    - confidence
+    - healthy
+    - ready
+
+enforcement: "CI: scan_forbidden_vocabulary.py (full codebase scan, exit 1 on violation)"
+
+# ============================================================================
+# AGENT ALIGNMENT CONTRACT
+# ============================================================================
+
+agent_instructions:
+  mandatory_reading:
+    - SYSTEM_ARCHITECTURE_MAP.md
+    - EPISTEMIC_CONSTITUTION.md
+    - SYSTEM_CANON.md
+    - CODE_FREEZE.md
+    - SYSTEM_MAP_SCHEMA.yaml
+
+  prohibited_actions:
+    - modify_frozen_components_without_evidence
+    - add_upward_dependencies
+    - expose_evaluative_metrics
+    - introduce_prediction_or_causation
+    - bypass_m5_governance
+    - add_new_mandate_types
+    - modify_state_machines
+    - introduce_forbidden_vocabulary
+    - self_verify_correctness
+    - claim_system_health
+
+  required_actions:
+    - update_schema_with_code_changes
+    - mark_uncertainties_explicitly
+    - verify_no_forbidden_imports
+    - verify_invariant_coverage
+    - run_ci_validation_locally
+    - document_constitutional_references
+
+  emergency_override_protocol:
+    commit_message_format: "EMERGENCY OVERRIDE: [reason]"
+    required_approvals: 2
+    audit_deadline: "24 hours post-merge"
+    logging_requirement: "Evidence logged in decision_log/"
+
+# ============================================================================
+# METADATA
+# ============================================================================
+
+schema_metadata:
+  created: "2025-01-12"
+  last_modified: "2025-01-12"
+  format_version: "1.0"
+  checksum_algorithm: "SHA256"
+  enforcement_level: "CI_BLOCKING"
+  human_authority: "System Architect"
+  machine_authority: "GitHub Actions + Pre-Commit Hooks"
+
+# END OF SCHEMA

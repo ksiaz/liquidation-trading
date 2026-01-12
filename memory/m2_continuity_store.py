@@ -31,8 +31,13 @@ class ContinuityMemoryStore:
     Historical evidence preserved across state transitions.
     """
     
-    def __init__(self):
-        """Initialize store with three collections."""
+    
+    def __init__(self, event_logger=None):
+        """Initialize store with three collections.
+        
+        Args:
+            event_logger: Optional database logger for event-level capture
+        """
         self._active_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_evidence: Dict[str, HistoricalEvidence] = {}
@@ -41,6 +46,9 @@ class ContinuityMemoryStore:
         self._total_nodes_created = 0
         self._total_interactions = 0
         self._last_state_update_ts: Optional[float] = None
+        
+        # Event logger for research
+        self._event_logger = event_logger
         
         # Topology and pressure analyzers
         self.topology = MemoryTopology()
@@ -188,6 +196,8 @@ class ContinuityMemoryStore:
         Returns:
             Created or updated node, or None if rejected
         """
+        print(f"DEBUG M2 ingest_liquidation: {symbol} @ ${price} {side} vol={volume}")
+        
         # Define spatial matching parameters
         PRICE_BAND_DEFAULT = 100.0  # Default band width
         OVERLAP_TOLERANCE = 0.5  # 50% overlap threshold
@@ -199,9 +209,33 @@ class ContinuityMemoryStore:
             # Check spatial overlap
             if candidate.overlaps(price):
                 # Reinforce existing node
+                was_inactive = not candidate.active
                 candidate.record_liquidation(timestamp, side)
                 candidate.strength = min(1.0, candidate.strength + 0.15)
+
+                # Reactivate node if it was dormant
+                if was_inactive and candidate.strength >= 0.01:
+                    candidate.active = True
+                    candidate._start_presence_interval(timestamp)
+
                 self._total_interactions += 1
+                
+                # Log node reinforcement event
+                if self._event_logger:
+                    try:
+                        self._event_logger.log_m2_node_event(
+                            timestamp=timestamp,
+                            event_type='REINFORCED',
+                            node_id=candidate.id,
+                            symbol=symbol,
+                            price=price,
+                            side=side,
+                            volume=volume,
+                            strength_after=candidate.strength
+                        )
+                    except:
+                        pass
+                
                 return candidate
         
         # No overlap found - Create new node
@@ -227,6 +261,24 @@ class ContinuityMemoryStore:
         
         # Record the liquidation evidence
         node.record_liquidation(timestamp, side)
+        
+        print(f"DEBUG M2: Node CREATED - {symbol} @ ${price:.2f} ({node_side} zone, vol={volume:.2f})")
+        
+        # Log node creation event
+        if self._event_logger:
+            try:
+                self._event_logger.log_m2_node_event(
+                    timestamp=timestamp,
+                    event_type='CREATED',
+                    node_id=node.id,
+                    symbol=symbol,
+                    price=price,
+                    side=node_side,
+                    volume=volume,
+                    strength_after=node.strength
+                )
+            except:
+                pass
         
         return node
     
@@ -271,21 +323,84 @@ class ContinuityMemoryStore:
         # No match found - Trade is ignored (constitutionally correct)
         return None
     
+    def update_orderbook_state(
+        self,
+        symbol: str,
+        price: float,
+        size: float,
+        side: str,
+        timestamp: float
+    ):
+        """
+        Update order book state for nodes at this price.
+
+        Constitutional: This is factual state update, not interpretation.
+
+        Args:
+            symbol: Symbol partitioning key
+            price: Order book price level
+            size: Resting size at price (0.0 = level removed)
+            side: "bid" or "ask"
+            timestamp: Update timestamp
+        """
+        # Find nodes within band of this price (symbol-partitioned)
+        nearby_nodes = self.get_active_nodes(symbol=symbol)
+
+        for node in nearby_nodes:
+            if node.overlaps(price):
+                # Store previous values for consumption detection
+                if side == "bid":
+                    node.previous_resting_size_bid = node.resting_size_bid
+                    node.resting_size_bid = size
+                else:
+                    node.previous_resting_size_ask = node.resting_size_ask
+                    node.resting_size_ask = size
+
+                node.last_orderbook_update_ts = timestamp
+                node.orderbook_update_count += 1
+
+    def update_mark_price_state(
+        self,
+        symbol: str,
+        mark_price: float,
+        index_price: Optional[float],
+        timestamp: float
+    ):
+        """
+        Update mark/index price for all nodes of this symbol.
+
+        Constitutional: Factual price update, no interpretation.
+
+        Args:
+            symbol: Symbol partitioning key
+            mark_price: Mark price
+            index_price: Index price (optional)
+            timestamp: Update timestamp
+        """
+        # Update all active nodes for this symbol
+        symbol_nodes = self.get_active_nodes(symbol=symbol)
+
+        for node in symbol_nodes:
+            node.last_mark_price = mark_price
+            node.last_index_price = index_price
+            node.last_mark_price_ts = timestamp
+            node.mark_price_update_count += 1
+
     def advance_time(self, current_ts: float):
         """
         Advance system time and apply decay/lifecycle mechanics.
-        
+
         Should be called periodically (e.g., every 1s or every N events).
         Drives:
         - Decay accumulation
         - State transitions (Active -> Dormant -> Archived)
-        
+
         Args:
             current_ts: Current system timestamp
         """
         # Apply decay to all nodes
         self.decay_nodes(current_ts)
-        
+
         # Check and update memory states
         self.update_memory_states(current_ts)
 

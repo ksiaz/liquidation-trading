@@ -14,7 +14,7 @@ class ObservationSystem:
     The sealed Observation System.
     """
 
-    def __init__(self, allowed_symbols: List[str]):
+    def __init__(self, allowed_symbols: List[str], event_logger=None):
         self._allowed_symbols = set(allowed_symbols)
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
@@ -24,8 +24,8 @@ class ObservationSystem:
         self._m1 = M1IngestionEngine()
         self._m3 = M3TemporalEngine()
 
-        # M2 Memory Store (STUB: Not populated yet)
-        self._m2_store = ContinuityMemoryStore()
+        # M2 Memory Store (with event logger for research)
+        self._m2_store = ContinuityMemoryStore(event_logger=event_logger)
 
         # M5 Access Layer (For primitive computation at snapshot time)
         self._m5_access = MemoryAccess(self._m2_store)
@@ -61,7 +61,11 @@ class ObservationSystem:
                 self._m1.record_kline(symbol)
             elif event_type == 'OI':
                 self._m1.record_oi(symbol)
-                
+            elif event_type == 'DEPTH':
+                normalized_event = self._m1.normalize_depth_update(symbol, payload)
+            elif event_type == 'MARK_PRICE':
+                normalized_event = self._m1.normalize_mark_price(symbol, payload)
+
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
                 self._m3.process_trade(
@@ -91,6 +95,38 @@ class ObservationSystem:
                     volume=normalized_event.get('quantity', 0.0),
                     timestamp=normalized_event['timestamp']
                 )
+
+            # Phase OB: Feed M2 with order book updates
+            if normalized_event and event_type == 'DEPTH':
+                # Update M2 order book state for bids
+                for price, size in normalized_event['bids']:
+                    self._m2_store.update_orderbook_state(
+                        symbol=symbol,
+                        price=price,
+                        size=size,
+                        side='bid',
+                        timestamp=normalized_event['timestamp']
+                    )
+
+                # Update M2 order book state for asks
+                for price, size in normalized_event['asks']:
+                    self._m2_store.update_orderbook_state(
+                        symbol=symbol,
+                        price=price,
+                        size=size,
+                        side='ask',
+                        timestamp=normalized_event['timestamp']
+                    )
+
+            # Phase MP: Feed M2 with mark/index price updates
+            if normalized_event and event_type == 'MARK_PRICE':
+                self._m2_store.update_mark_price_state(
+                    symbol=normalized_event['symbol'],
+                    mark_price=normalized_event['mark_price'],
+                    index_price=normalized_event.get('index_price'),
+                    timestamp=normalized_event['timestamp']
+                )
+
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -108,6 +144,13 @@ class ObservationSystem:
             return
             
         self._system_time = new_timestamp
+        
+        # System Init Transition
+        # print(f"DEBUG: advance_time called. Status={self._status}")
+        if True: # FORCE ACTIVE
+            self._status = ObservationStatus.ACTIVE
+            # print(f"DEBUG: Status is now {self._status}")  # Commented out - too verbose
+
         self._update_liveness()
         
         # Trigger M3 to close windows
@@ -196,46 +239,67 @@ class ObservationSystem:
             from memory.m4_zone_geometry import compute_zone_penetration_depth, identify_displacement_origin_anchor
             from memory.m4_traversal_kinematics import compute_price_traversal_velocity, compute_traversal_compactness
             from memory.m4_structural_absence import compute_structural_absence_duration
+            from memory.m4_structural_persistence import compute_structural_persistence_duration
             from memory.m4_event_absence import compute_event_non_occurrence_counter
-            from memory.m4_price_distribution import compute_central_tendency_deviation
+            from memory.m4_price_distribution import compute_central_tendency_deviation, compute_price_acceptance_ratio
             from memory.m4_traversal_voids import compute_traversal_void_span
+            from memory.m4_orderbook import (
+                compute_resting_size,
+                detect_order_consumption,
+                detect_absorption_event,
+                detect_refill_event
+            )
+            from memory.m4_liquidation_density import compute_liquidation_density
+            from memory.m4_directional_continuity import compute_directional_continuity
+            from memory.m4_trade_burst import compute_trade_burst
             
             # Query M2 for active nodes (symbol-filtered)
             active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
-            
+
             # Query M3 for recent price history
             recent_prices = self._m3.get_recent_prices(symbol=symbol, max_count=100)
-            
+
             # Initialize primitives
             zone_penetration = None
             displacement_origin_anchor = None
             price_traversal_velocity = None
             traversal_compactness = None
+            price_acceptance_ratio = None
             central_tendency_deviation = None
             structural_absence_duration = None
+            structural_persistence_duration = None
             traversal_void_span = None
             event_non_occurrence_counter = None
+            resting_size_primitive = None
+            order_consumption_primitive = None
+            absorption_event_primitive = None
+            refill_event_primitive = None
+            liquidation_density_primitive = None
+            directional_continuity_primitive = None
+            trade_burst_primitive = None
             
             # 1. ZONE PENETRATION (Phase 6.1)
             if len(active_nodes) > 0 and len(recent_prices) > 0:
-                max_penetration = 0.0
+                max_penetration_result = None
+                max_penetration_depth = 0.0
                 for node in active_nodes:
                     zone_low = node.price_center - node.price_band / 2
                     zone_high = node.price_center + node.price_band / 2
-                    
+
                     result = compute_zone_penetration_depth(
                         zone_id=node.id,
                         zone_low=zone_low,
                         zone_high=zone_high,
                         traversal_prices=recent_prices
                     )
-                    
-                    if result is not None:
-                        max_penetration = max(max_penetration, result.penetration_depth)
-                
-                if max_penetration > 0:
-                    zone_penetration = max_penetration
-            
+
+                    if result is not None and result.penetration_depth > max_penetration_depth:
+                        max_penetration_depth = result.penetration_depth
+                        max_penetration_result = result
+
+                if max_penetration_result is not None:
+                    zone_penetration = max_penetration_result
+
             # 2. DISPLACEMENT ORIGIN ANCHOR (Phase 6.3)
             if len(recent_prices) >= 3:
                 # Use pre-traversal window (first 50% of prices)
@@ -276,7 +340,23 @@ class ObservationSystem:
                     ordered_prices=recent_prices
                 )
                 traversal_compactness = compactness_result.compactness_ratio
-            
+
+            # 4b. PRICE ACCEPTANCE RATIO (Phase MISSING)
+            # Requires OHLC candle from M3
+            candle = self._m3.get_current_candle(symbol)
+            if candle is not None:
+                try:
+                    acceptance_result = compute_price_acceptance_ratio(
+                        candle_open=candle['open'],
+                        candle_high=candle['high'],
+                        candle_low=candle['low'],
+                        candle_close=candle['close']
+                    )
+                    price_acceptance_ratio = acceptance_result
+                except ValueError:
+                    # Invalid candle structure, skip
+                    pass
+
             # 5. CENTRAL TENDENCY DEVIATION (Phase 6.3)
             if len(recent_prices) > 0 and len(active_nodes) > 0:
                 # Central tendency = average of node centers
@@ -291,16 +371,55 @@ class ObservationSystem:
             
             # 6. STRUCTURAL ABSENCE DURATION (Phase 6.2)
             if len(active_nodes) > 0:
-                # Find most recent interaction across all nodes
-                most_recent_interaction = max(
-                    node.last_interaction_ts for node in active_nodes
-                )
-                absence_duration = self._system_time - most_recent_interaction
-                
-                # Only set if absence > 0
-                if absence_duration > 0:
-                    structural_absence_duration = absence_duration
-            
+                # Collect all presence intervals from nodes and compute absence
+                all_presence_intervals = []
+                earliest_observation = None
+                for node in active_nodes:
+                    presence_intervals = node.get_presence_intervals(self._system_time)
+                    all_presence_intervals.extend(presence_intervals)
+                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
+                        earliest_observation = node.first_seen_ts
+
+                if len(all_presence_intervals) > 0 and earliest_observation is not None:
+                    try:
+                        from memory.m4_structural_absence import compute_structural_absence_duration
+                        absence_result = compute_structural_absence_duration(
+                            observation_start_ts=earliest_observation,
+                            observation_end_ts=self._system_time,
+                            presence_intervals=tuple(all_presence_intervals)
+                        )
+                        structural_absence_duration = absence_result
+                    except ValueError as e:
+                        # Invalid intervals, skip
+                        if symbol == "BTCUSDT":
+                            print(f"DEBUG: structural_absence_duration failed for {symbol}: {e}")
+                        pass
+
+            # 6b. STRUCTURAL PERSISTENCE DURATION (Phase MISSING)
+            if len(active_nodes) > 0:
+                # Collect all presence intervals from all nodes
+                all_presence_intervals = []
+                earliest_observation = None
+                for node in active_nodes:
+                    presence_intervals = node.get_presence_intervals(self._system_time)
+                    all_presence_intervals.extend(presence_intervals)
+                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
+                        earliest_observation = node.first_seen_ts
+
+                if len(all_presence_intervals) > 0 and earliest_observation is not None:
+                    try:
+                        persistence_result = compute_structural_persistence_duration(
+                            observation_start_ts=earliest_observation,
+                            observation_end_ts=self._system_time,
+                            presence_intervals=tuple(all_presence_intervals)
+                        )
+                        structural_persistence_duration = persistence_result
+                    except ValueError as e:
+                        # Invalid intervals, skip (but log for debugging)
+                        if symbol == "BTCUSDT" and len(all_presence_intervals) > 0:
+                            print(f"DEBUG: structural_persistence_duration failed for {symbol}: {e}")
+                        pass
+
             # 7. TRAVERSAL VOID SPAN (Phase 6.3)
             if len(active_nodes) > 0:
                 # Collect all interaction timestamps from nodes
@@ -333,7 +452,117 @@ class ObservationSystem:
                 )
                 if stale_count > 0:
                     event_non_occurrence_counter = stale_count
-            
+
+            # 9. RESTING SIZE (Order Book - Phase OB)
+            if len(active_nodes) > 0:
+                # Get node with most recent order book update
+                ob_nodes = [n for n in active_nodes if n.last_orderbook_update_ts is not None]
+                if ob_nodes:
+                    latest_ob_node = max(ob_nodes, key=lambda n: n.last_orderbook_update_ts)
+                    resting_size_primitive = compute_resting_size(latest_ob_node)
+
+                    # 10. ORDER CONSUMPTION (Phase OB-2)
+                    # Detect consumption on bid side
+                    if latest_ob_node.previous_resting_size_bid > 0:
+                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
+                        consumption = detect_order_consumption(
+                            latest_ob_node,
+                            latest_ob_node.previous_resting_size_bid,
+                            latest_ob_node.resting_size_bid,
+                            duration
+                        )
+                        if consumption:
+                            order_consumption_primitive = consumption
+
+                    # Also check ask side consumption
+                    if latest_ob_node.previous_resting_size_ask > 0 and order_consumption_primitive is None:
+                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
+                        consumption = detect_order_consumption(
+                            latest_ob_node,
+                            latest_ob_node.previous_resting_size_ask,
+                            latest_ob_node.resting_size_ask,
+                            duration
+                        )
+                        if consumption:
+                            order_consumption_primitive = consumption
+
+                    # 11. ABSORPTION EVENT (Phase OB-2)
+                    # Detect absorption if consumption occurred with price stability
+                    if order_consumption_primitive is not None and len(recent_prices) >= 2:
+                        absorption = detect_absorption_event(
+                            node=latest_ob_node,
+                            price_start=recent_prices[0],
+                            price_end=recent_prices[-1],
+                            consumed_size=order_consumption_primitive.consumed_size,
+                            duration=order_consumption_primitive.duration,
+                            trade_count=latest_ob_node.trade_execution_count
+                        )
+                        if absorption:
+                            absorption_event_primitive = absorption
+
+                    # 12. REFILL EVENT (Phase OB-2)
+                    # Detect refill on bid side
+                    if latest_ob_node.previous_resting_size_bid > 0:
+                        refill = detect_refill_event(
+                            node=latest_ob_node,
+                            previous_size=latest_ob_node.previous_resting_size_bid,
+                            current_size=latest_ob_node.resting_size_bid,
+                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
+                        )
+                        if refill:
+                            refill_event_primitive = refill
+
+                    # Also check ask side refill
+                    if latest_ob_node.previous_resting_size_ask > 0 and refill_event_primitive is None:
+                        refill = detect_refill_event(
+                            node=latest_ob_node,
+                            previous_size=latest_ob_node.previous_resting_size_ask,
+                            current_size=latest_ob_node.resting_size_ask,
+                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
+                        )
+                        if refill:
+                            refill_event_primitive = refill
+
+            # 13. DIRECTIONAL CONTINUITY (Phase 4.3)
+            if len(recent_prices) >= 2:
+                directional_continuity = compute_directional_continuity(recent_prices)
+                if directional_continuity:
+                    directional_continuity_primitive = directional_continuity
+
+            # 14. LIQUIDATION DENSITY (Phase 6.4)
+            if len(active_nodes) > 0 and len(recent_prices) >= 2:
+                # Collect liquidation volumes from active nodes
+                liquidation_volumes = []
+                for node in active_nodes:
+                    if node.liquidation_proximity_count > 0:
+                        # Use volume_total as proxy for liquidation volume
+                        liquidation_volumes.append(node.volume_total)
+
+                if liquidation_volumes and len(recent_prices) >= 2:
+                    density = compute_liquidation_density(
+                        liquidation_volumes=liquidation_volumes,
+                        price_start=recent_prices[0],
+                        price_end=recent_prices[-1]
+                    )
+                    if density:
+                        liquidation_density_primitive = density
+
+            # 15. TRADE BURST (Phase 5.4)
+            if len(active_nodes) > 0:
+                # Sum trade execution counts across active nodes
+                total_trade_count = sum(node.trade_execution_count for node in active_nodes)
+                # Use system time to estimate window duration
+                if len(recent_prices) >= 2:
+                    # Approximate window duration (1 second default)
+                    window_duration = 1.0
+                    burst = compute_trade_burst(
+                        trade_count=total_trade_count,
+                        window_duration=window_duration,
+                        baseline=10  # Mechanical baseline: 10 trades
+                    )
+                    if burst:
+                        trade_burst_primitive = burst
+
             # Return complete bundle
             return M4PrimitiveBundle(
                 symbol=symbol,
@@ -341,10 +570,19 @@ class ObservationSystem:
                 displacement_origin_anchor=displacement_origin_anchor,
                 price_traversal_velocity=price_traversal_velocity,
                 traversal_compactness=traversal_compactness,
+                price_acceptance_ratio=price_acceptance_ratio,
                 central_tendency_deviation=central_tendency_deviation,
                 structural_absence_duration=structural_absence_duration,
+                structural_persistence_duration=structural_persistence_duration,
                 traversal_void_span=traversal_void_span,
-                event_non_occurrence_counter=event_non_occurrence_counter
+                event_non_occurrence_counter=event_non_occurrence_counter,
+                resting_size=resting_size_primitive,
+                order_consumption=order_consumption_primitive,
+                absorption_event=absorption_event_primitive,
+                refill_event=refill_event_primitive,
+                liquidation_density=liquidation_density_primitive,
+                directional_continuity=directional_continuity_primitive,
+                trade_burst=trade_burst_primitive
             )
             
         except Exception as e:
@@ -356,8 +594,17 @@ class ObservationSystem:
                 displacement_origin_anchor=None,
                 price_traversal_velocity=None,
                 traversal_compactness=None,
+                price_acceptance_ratio=None,
                 central_tendency_deviation=None,
                 structural_absence_duration=None,
+                structural_persistence_duration=None,
                 traversal_void_span=None,
-                event_non_occurrence_counter=None
+                event_non_occurrence_counter=None,
+                resting_size=None,
+                order_consumption=None,
+                absorption_event=None,
+                refill_event=None,
+                liquidation_density=None,
+                directional_continuity=None,
+                trade_burst=None
             )

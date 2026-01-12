@@ -449,6 +449,105 @@ class ResearchDatabase:
         
         self.conn.commit()
     
+    def log_ohlc_candle(
+        self,
+        symbol: str,
+        timestamp: float,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float = 0,
+        trade_count: int = 0
+    ):
+        """Log 1-minute OHLC candle."""
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO ohlc_candles (
+                symbol, timestamp, open, high, low, close, volume, trade_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            symbol, timestamp, open_price, high, low, close, volume, trade_count
+        ))
+        self.conn.commit()
+    
+    def log_mandate(
+        self,
+        cycle_id: int,
+        symbol: str,
+        mandate_type: str,
+        authority: float,
+        timestamp: float
+    ):
+        """Log generated mandate."""
+        if cycle_id is None: return
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO mandates (
+                cycle_id, symbol, mandate_type, authority, timestamp
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (
+            cycle_id, symbol, mandate_type, authority, timestamp
+        ))
+        
+        self.conn.commit()
+
+    def log_arbitration_round(
+        self,
+        cycle_id: int,
+        symbol: str,
+        mandate_count: int,
+        conflicting_mandates: str,
+        winning_mandate_type: str,
+        resolution_reason: str
+    ):
+        """Log arbitration conflict resolution."""
+        if cycle_id is None: return
+        cursor = self.conn.cursor()
+        
+        # Matches table: cycle_id, symbol, mandate_count, conflicting_mandates, winning_policy, resolution_reason
+        cursor.execute("""
+            INSERT INTO arbitration_rounds (
+                cycle_id, symbol, mandate_count, conflicting_mandates,
+                winning_policy, resolution_reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            cycle_id, symbol, mandate_count, conflicting_mandates,
+            winning_mandate_type, resolution_reason
+        ))
+        
+        self.conn.commit()
+
+    def log_policy_evaluation(
+        self,
+        cycle_id: int,
+        symbol: str,
+        policy_name: str,
+        is_active: bool,
+        confidence: float,
+        components: Dict[str, Any]
+    ):
+        """Log policy evaluation details."""
+        if cycle_id is None: return
+        cursor = self.conn.cursor()
+        
+        # Matches table: cycle_id, policy_name, symbol, generated_proposal, triggering_primitives, proposal_reason
+        cursor.execute("""
+            INSERT INTO policy_evaluations (
+                cycle_id, policy_name, symbol,
+                generated_proposal, triggering_primitives, proposal_reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            cycle_id, policy_name, symbol,
+            1 if is_active else 0,
+            json.dumps(components),
+            f"Confidence: {confidence}"
+        ))
+        
+        self.conn.commit()
+
     def log_m2_node_event(
         self,
         timestamp: float,

@@ -51,7 +51,7 @@ class CollectorService:
             self._obs._m2_store._event_logger = self._execution_db
 
         # Phase 8: M6 Integration
-        self.policy_adapter = PolicyAdapter(AdapterConfig())
+        self.policy_adapter = PolicyAdapter(AdapterConfig(), execution_db=self._execution_db)
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())
 
@@ -114,6 +114,12 @@ class CollectorService:
             timestamp: Current timestamp
         """
         try:
+            # Log execution cycle FIRST to establish context
+            cycle_id = None
+            if hasattr(self, '_execution_db'):
+                cycle_id = self._log_cycle_to_db(snapshot, [], timestamp)
+                # print(f"DEBUG M6: Started cycle {cycle_id} for {len(snapshot.symbols_active)} symbols")
+
             # Collect mandates from all active symbols
             all_mandates = []
 
@@ -122,7 +128,8 @@ class CollectorService:
                 mandates = self.policy_adapter.generate_mandates(
                     observation_snapshot=snapshot,
                     symbol=symbol,
-                    timestamp=timestamp
+                    timestamp=timestamp,
+                    cycle_id=cycle_id
                 )
                 all_mandates.extend(mandates)
 
@@ -137,22 +144,61 @@ class CollectorService:
                 mark_prices=mark_prices
             )
             
-            # Log execution cycle to database
-            if hasattr(self, '_execution_db'):
-                self._log_cycle_to_db(snapshot, all_mandates, timestamp)
+            # Log mandates and arbitration (linked to cycle)
+            if hasattr(self, '_execution_db') and cycle_id is not None:
+                # Log mandates
+                
+                # Log mandates
+                for mandate in all_mandates:
+                    try:
+                        self._execution_db.log_mandate(
+                            cycle_id=cycle_id,
+                            symbol=mandate.symbol,
+                            mandate_type=mandate.type.value,
+                            authority=mandate.authority,
+                            timestamp=mandate.timestamp
+                        )
+                    except:
+                        pass
+                
+                # Log arbitration (symbol-level)
+                arbitrated = {}
+                for mandate in all_mandates:
+                    if mandate.symbol not in arbitrated:
+                        arbitrated[mandate.symbol] = []
+                    arbitrated[mandate.symbol].append(mandate)
+                
+                for symbol, symbol_mandates in arbitrated.items():
+                    if len(symbol_mandates) > 1:  # Conflict
+                        try:
+                            # Determine winner
+                            winner = max(symbol_mandates, key=lambda m: m.authority)
+                            self._execution_db.log_arbitration_round(
+                                cycle_id=cycle_id,
+                                symbol=symbol,
+                                mandate_count=len(symbol_mandates),
+                                conflicting_mandates=str([m.type.value for m in symbol_mandates]),
+                                winning_mandate_type=winner.type.value,
+                                resolution_reason=f"Authority: {winner.authority}"
+                            )
+                        except:
+                            pass
 
         except Exception as e:
             # Log but don't halt system
             self._logger.debug(f"M6 execution cycle error: {e}")
             pass
     
-    def _log_cycle_to_db(self, snapshot: ObservationSnapshot, mandates: list, timestamp: float):
+    def _log_cycle_to_db(self, snapshot: ObservationSnapshot, mandates: list, timestamp: float) -> int:
         """Log comprehensive execution cycle data to research database.
         
         Args:
             snapshot: Current observation snapshot
             mandates: List of mandates generated this cycle
             timestamp: Cycle timestamp
+            
+        Returns:
+            cycle_id for linking related records
         """
         try:
             # Get M2 metrics
@@ -294,11 +340,13 @@ class CollectorService:
             
             self._execution_db.log_primitive_values(cycle_id, primitives_by_symbol)
             
+            return cycle_id
+            
         except Exception as e:
             self._logger.debug(f"DB logging error: {e}")
             import traceback
             traceback.print_exc()
-            pass
+            return None
 
     async def _run_binance_stream(self):
         """Connect to Binance Filtered Stream."""
@@ -338,7 +386,38 @@ class CollectorService:
                                         self._mark_prices[symbol] = Decimal(str(payload['p']))
                                 elif 'forceOrder' in stream:
                                     event_type = "LIQUIDATION"
-                                    print(f"DEBUG: Liquidation received for {symbol}: {payload}")
+                                    # Log raw liquidation event
+                                    if 'o' in payload:
+                                        order = payload['o']
+                                        try:
+                                            self._execution_db.log_liquidation_event(
+                                                timestamp=ts if 'ts' in locals() else time.time(),
+                                                symbol=order.get('s', symbol),
+                                                side=order.get('S', 'UNKNOWN'),
+                                                price=float(order.get('p', 0)),
+                                                volume=float(order.get('q', 0))
+                                            )
+                                        except Exception as e:
+                                            pass
+                                elif 'kline' in stream:
+                                    event_type = "KLINE"
+                                    # Log OHLC candle
+                                    if 'k' in payload:
+                                        k = payload['k']
+                                        if k.get('x', False):  # Only closed candles
+                                            try:
+                                                self._execution_db.log_ohlc_candle(
+                                                    symbol=symbol,
+                                                    timestamp=int(k['t']) / 1000.0,
+                                                    open_price=float(k['o']),
+                                                    high=float(k['h']),
+                                                    low=float(k['l']),
+                                                    close=float(k['c']),
+                                                    volume=float(k.get('v', 0)),
+                                                    trade_count=int(k.get('n', 0))
+                                                )
+                                            except:
+                                                pass
                                 elif 'depth' in stream:
                                     event_type = "DEPTH"
 

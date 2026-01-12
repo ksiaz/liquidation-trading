@@ -280,23 +280,25 @@ class ObservationSystem:
             
             # 1. ZONE PENETRATION (Phase 6.1)
             if len(active_nodes) > 0 and len(recent_prices) > 0:
-                max_penetration = 0.0
+                max_penetration_result = None
+                max_penetration_depth = 0.0
                 for node in active_nodes:
                     zone_low = node.price_center - node.price_band / 2
                     zone_high = node.price_center + node.price_band / 2
-                    
+
                     result = compute_zone_penetration_depth(
                         zone_id=node.id,
                         zone_low=zone_low,
                         zone_high=zone_high,
                         traversal_prices=recent_prices
                     )
-                    
-                    if result is not None:
-                        max_penetration = max(max_penetration, result.penetration_depth)
-                
-                if max_penetration > 0:
-                    zone_penetration = max_penetration
+
+                    if result is not None and result.penetration_depth > max_penetration_depth:
+                        max_penetration_depth = result.penetration_depth
+                        max_penetration_result = result
+
+                if max_penetration_result is not None:
+                    zone_penetration = max_penetration_result
             
             # 2. DISPLACEMENT ORIGIN ANCHOR (Phase 6.3)
             if len(recent_prices) >= 3:
@@ -369,15 +371,29 @@ class ObservationSystem:
             
             # 6. STRUCTURAL ABSENCE DURATION (Phase 6.2)
             if len(active_nodes) > 0:
-                # Find most recent interaction across all nodes
-                most_recent_interaction = max(
-                    node.last_interaction_ts for node in active_nodes
-                )
-                absence_duration = self._system_time - most_recent_interaction
+                # Collect all presence intervals from nodes and compute absence
+                all_presence_intervals = []
+                earliest_observation = None
+                for node in active_nodes:
+                    presence_intervals = node.get_presence_intervals(self._system_time)
+                    all_presence_intervals.extend(presence_intervals)
+                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
+                        earliest_observation = node.first_seen_ts
 
-                # Only set if absence > 0
-                if absence_duration > 0:
-                    structural_absence_duration = absence_duration
+                if len(all_presence_intervals) > 0 and earliest_observation is not None:
+                    try:
+                        from memory.m4_structural_absence import compute_structural_absence_duration
+                        absence_result = compute_structural_absence_duration(
+                            observation_start_ts=earliest_observation,
+                            observation_end_ts=self._system_time,
+                            presence_intervals=tuple(all_presence_intervals)
+                        )
+                        structural_absence_duration = absence_result
+                    except ValueError as e:
+                        # Invalid intervals, skip
+                        if symbol == "BTCUSDT":
+                            print(f"DEBUG: structural_absence_duration failed for {symbol}: {e}")
+                        pass
 
             # 6b. STRUCTURAL PERSISTENCE DURATION (Phase MISSING)
             if len(active_nodes) > 0:

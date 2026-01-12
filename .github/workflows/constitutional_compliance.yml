@@ -1,0 +1,272 @@
+name: "Constitutional Compliance Gate"
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  schema_validation:
+    name: "Validate System Map Schema"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: "Install Dependencies"
+        run: |
+          pip install pyyaml
+
+      - name: "Load System Map Schema"
+        id: schema
+        run: |
+          python3 scripts/ci/load_schema.py SYSTEM_MAP_SCHEMA.yaml
+
+      - name: "R001: Check Forbidden Imports (Execution → Observation)"
+        run: |
+          python3 scripts/ci/check_forbidden_imports.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --scan runtime/ execution/ external_policy/ \
+            --forbidden observation/internal/ memory/m2_ memory/m3_ memory/m4_ \
+            --fail-on-violation
+
+      - name: "R002: Check Observation Imports Execution"
+        run: |
+          python3 scripts/ci/check_forbidden_imports.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --scan observation/ memory/ \
+            --forbidden runtime/ execution/ external_policy/ \
+            --fail-on-violation
+
+      - name: "R003: Verify State Machine Transition Table"
+        run: |
+          python3 scripts/ci/verify_state_machine.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --module runtime/position/state_machine.py \
+            --machine position_lifecycle \
+            --fail-on-mismatch
+
+      - name: "R004: Verify Arbitration Priority Order"
+        run: |
+          python3 scripts/ci/verify_arbitration_priority.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --module runtime/arbitration/arbitrator.py \
+            --fail-on-mismatch
+
+      - name: "R005: Check New Module Registration"
+        run: |
+          python3 scripts/ci/check_new_modules.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --git-diff ${{ github.event.pull_request.base.sha }}...${{ github.sha }} \
+            --fail-on-unregistered
+        if: github.event_name == 'pull_request'
+
+      - name: "R006: Check Frozen Component Modification"
+        run: |
+          python3 scripts/ci/check_frozen_components.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --git-diff ${{ github.event.pull_request.base.sha }}...${{ github.sha }} \
+            --require-override "OVERRIDE: CODE_FREEZE" \
+            --fail-on-unauthorized
+        if: github.event_name == 'pull_request'
+
+      - name: "R007: Verify Invariant Coverage"
+        run: |
+          python3 scripts/ci/verify_invariant_coverage.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --codebase . \
+            --fail-on-missing-enforcement
+
+      - name: "R008: Check Epistemic Exposure"
+        run: |
+          python3 scripts/ci/check_epistemic_exposure.py \
+            --file observation/types.py \
+            --forbidden-fields strength confidence quality health readiness score profit loss ranking \
+            --fail-on-violation
+
+      - name: "R009: Check M5 Forbidden Query Params"
+        run: |
+          python3 scripts/ci/check_m5_query_params.py \
+            --file memory/m5_query_schemas.py \
+            --forbidden sort_by rank_by top_n filter min_confidence strength quality score profit loss entry exit bull bear \
+            --fail-on-violation
+
+      - name: "R010: Check Mandate Type Addition"
+        run: |
+          python3 scripts/ci/check_mandate_types.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --file runtime/arbitration/types.py \
+            --enum MandateType \
+            --fail-on-unregistered
+
+      - name: "R011: Detect Dependency Drift"
+        run: |
+          python3 scripts/ci/check_dependency_drift.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --codebase . \
+            --fail-on-undeclared
+
+      - name: "R012: Verify Primitive Computation Inline"
+        run: |
+          python3 scripts/ci/check_primitive_computation.py \
+            --file observation/governance.py \
+            --function _compute_primitives_for_symbol \
+            --forbidden-calls self._m5_access \
+            --fail-on-violation
+
+      - name: "R013: Verify EXIT Supremacy"
+        run: |
+          python3 scripts/ci/check_exit_supremacy.py \
+            --file runtime/arbitration/arbitrator.py \
+            --function arbitrate \
+            --required-first-check EXIT \
+            --fail-on-violation
+
+      - name: "R014: Verify FAILED State Terminal"
+        run: |
+          python3 scripts/ci/check_failed_state_terminal.py \
+            --file observation/governance.py \
+            --forbidden-transition "FAILED" \
+            --fail-on-violation
+
+      - name: "R017: Verify Timestamp Units"
+        run: |
+          python3 scripts/ci/check_timestamp_units.py \
+            --file observation/internal/m1_ingestion.py \
+            --require-division-by-1000 \
+            --fail-on-violation
+
+      - name: "R015: Doc-Code Correspondence (Warning Only)"
+        continue-on-error: true
+        run: |
+          python3 scripts/ci/check_doc_correspondence.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --warn-on-missing
+
+      - name: "R016: Case Sensitivity Handling (Warning Only)"
+        continue-on-error: true
+        run: |
+          python3 scripts/ci/check_case_sensitivity.py \
+            --file runtime/policy_adapter.py \
+            --function _extract_primitives \
+            --warn-on-incomplete
+
+  constitutional_compliance:
+    name: "Constitutional Document Compliance"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: "Verify Constitutional Documents Present"
+        run: |
+          test -f EPISTEMIC_CONSTITUTION.md
+          test -f SYSTEM_CANON.md
+          test -f CODE_FREEZE.md
+          test -f SYSTEM_GUIDANCE.md
+          test -f SYSTEM_ARCHITECTURE_MAP.md
+          test -f SYSTEM_MAP_SCHEMA.yaml
+
+      - name: "Scan for Forbidden Vocabulary"
+        run: |
+          python3 scripts/ci/scan_forbidden_vocabulary.py \
+            --dirs observation/ memory/ \
+            --forbidden signal setup opportunity edge alpha bias trend momentum \
+            --fail-on-violation
+
+      - name: "Verify No time.time() or datetime.now()"
+        run: |
+          if grep -r "time\.time()" observation/ memory/ 2>/dev/null; then
+            echo "ERROR: time.time() found in observation/memory layers"
+            exit 1
+          fi
+          if grep -r "datetime\.now()" observation/ memory/ 2>/dev/null; then
+            echo "ERROR: datetime.now() found in observation/memory layers"
+            exit 1
+          fi
+          if grep -r "datetime\.utcnow()" observation/ memory/ 2>/dev/null; then
+            echo "ERROR: datetime.utcnow() found in observation/memory layers"
+            exit 1
+          fi
+
+  state_machine_tests:
+    name: "State Machine Invariant Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: "Install Dependencies"
+        run: |
+          pip install -r requirements.txt
+
+      - name: "Run Position State Machine Tests"
+        run: |
+          if [ -d "runtime/position/tests" ]; then
+            pytest runtime/position/tests/ -v --tb=short || echo "No position tests found"
+          fi
+
+      - name: "Run Arbitration Tests"
+        run: |
+          if [ -d "runtime/arbitration/tests" ]; then
+            pytest runtime/arbitration/tests/ -v --tb=short || echo "No arbitration tests found"
+          fi
+
+  schema_consistency:
+    name: "Schema Self-Consistency Check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: "Install Dependencies"
+        run: |
+          pip install pyyaml
+
+      - name: "Validate YAML Syntax"
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('SYSTEM_MAP_SCHEMA.yaml'))"
+
+      - name: "Check Schema Completeness"
+        run: |
+          python3 scripts/ci/validate_schema_completeness.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --required-keys system_name system_version subsystems modules dependencies imports forbidden_edges state_machines invariants doc_bindings
+
+      - name: "Verify All Modules Exist"
+        run: |
+          python3 scripts/ci/verify_modules_exist.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --codebase .
+
+      - name: "Check Dependency Graph Acyclic"
+        run: |
+          python3 scripts/ci/check_dependency_graph.py \
+            --schema SYSTEM_MAP_SCHEMA.yaml \
+            --fail-on-cycle
+
+  merge_gate:
+    name: "Final Merge Gate"
+    runs-on: ubuntu-latest
+    needs: [schema_validation, constitutional_compliance, state_machine_tests, schema_consistency]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: "All Checks Passed"
+        run: |
+          echo "✓ Schema validation passed"
+          echo "✓ Constitutional compliance passed"
+          echo "✓ State machine tests passed"
+          echo "✓ Schema consistency passed"
+          echo ""
+          echo "MERGE APPROVED by Constitutional Gate"

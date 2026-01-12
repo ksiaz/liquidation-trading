@@ -1,6 +1,15 @@
+# Pre-Commit Hooks — Constitutional Compliance
+# Purpose: Local enforcement of CI validation rules
+# Install: pre-commit install
+# Run: pre-commit run --all-files
+
 repos:
   - repo: local
     hooks:
+      # ========================================================================
+      # LEGACY VALIDATORS (Keep existing)
+      # ========================================================================
+
       - id: semantic-leak-scan
         name: Semantic Leak Scanner
         entry: python .github/scripts/semantic_leak_scan.py
@@ -8,7 +17,7 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
         verbose: true
-      
+
       - id: import-validator
         name: Import Path Validator
         entry: python .github/scripts/import_validator.py
@@ -16,7 +25,7 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
         verbose: true
-      
+
       - id: structural-validator
         name: Structural Validator
         entry: python .github/scripts/structural_validator.py
@@ -24,6 +33,176 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
         verbose: true
+
+      # ========================================================================
+      # SCHEMA VALIDATION
+      # ========================================================================
+
+      - id: schema-load-test
+        name: Schema Load Test
+        entry: python scripts/ci/load_schema.py SYSTEM_MAP_SCHEMA.yaml
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: schema-completeness
+        name: Schema Completeness Check
+        entry: python scripts/ci/validate_schema_completeness.py --schema SYSTEM_MAP_SCHEMA.yaml --required-keys system_name system_version subsystems dependencies invariants
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: modules-exist
+        name: Verify Declared Modules Exist
+        entry: python scripts/ci/verify_modules_exist.py --schema SYSTEM_MAP_SCHEMA.yaml --codebase .
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: dependency-cycles
+        name: Check for Circular Dependencies
+        entry: python scripts/ci/check_dependency_graph.py --schema SYSTEM_MAP_SCHEMA.yaml --fail-on-cycle
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # ========================================================================
+      # BLOCKING RULES (R001-R014, R017)
+      # ========================================================================
+
+      - id: r001-forbidden-imports-execution-to-obs
+        name: "R001: Forbidden Imports (Execution → Observation)"
+        entry: python scripts/ci/check_forbidden_imports.py --schema SYSTEM_MAP_SCHEMA.yaml --scan runtime/ execution/ external_policy/ --forbidden observation/internal/ memory/m2_ memory/m3_ memory/m4_ --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      - id: r002-forbidden-imports-obs-to-execution
+        name: "R002: Forbidden Imports (Observation → Execution)"
+        entry: python scripts/ci/check_forbidden_imports.py --schema SYSTEM_MAP_SCHEMA.yaml --scan observation/ memory/ --forbidden runtime/m6_ runtime/executor --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      - id: r003-state-machine-frozen
+        name: "R003: State Machine Transition Table Changed"
+        entry: python scripts/ci/verify_state_machine.py --schema SYSTEM_MAP_SCHEMA.yaml --module runtime/position/state_machine.py --machine position_lifecycle --fail-on-mismatch
+        language: system
+        pass_filenames: false
+        files: runtime/position/state_machine\.py$
+
+      - id: r004-arbitration-priority-frozen
+        name: "R004: Arbitration Priority Order Changed"
+        entry: python scripts/ci/verify_arbitration_priority.py --schema SYSTEM_MAP_SCHEMA.yaml --module runtime/arbitration/arbitrator.py --fail-on-mismatch
+        language: system
+        pass_filenames: false
+        files: runtime/arbitration/arbitrator\.py$
+
+      - id: r005-new-module-registration
+        name: "R005: New Module Not Registered in Schema"
+        entry: python scripts/ci/check_new_modules.py --schema SYSTEM_MAP_SCHEMA.yaml --git-diff HEAD~1..HEAD --fail-on-unregistered
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      - id: r006-frozen-component-modified
+        name: "R006: Frozen Component Modified Without Override"
+        entry: 'python scripts/ci/check_frozen_components.py --schema SYSTEM_MAP_SCHEMA.yaml --git-diff HEAD~1..HEAD --require-override "OVERRIDE: CODE_FREEZE" --fail-on-unauthorized'
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      - id: r007-invariant-coverage
+        name: "R007: Invariant Without Enforcement Point"
+        entry: python scripts/ci/verify_invariant_coverage.py --schema SYSTEM_MAP_SCHEMA.yaml --codebase . --fail-on-missing-enforcement
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: r008-epistemic-exposure
+        name: "R008: Evaluative Field in ObservationSnapshot"
+        entry: python scripts/ci/check_epistemic_exposure.py --file observation/types.py --forbidden-fields health ready quality confidence score rating strength --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: observation/types\.py$
+
+      - id: r009-m5-query-params
+        name: "R009: Forbidden M5 Query Parameter"
+        entry: python scripts/ci/check_m5_query_params.py --file memory/m5_access.py --forbidden score rating quality confidence predict --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: memory/m5_access\.py$
+
+      - id: r010-mandate-types
+        name: "R010: Unregistered Mandate Type"
+        entry: python scripts/ci/check_mandate_types.py --schema SYSTEM_MAP_SCHEMA.yaml --file runtime/arbitration/types.py --enum MandateType --fail-on-unregistered
+        language: system
+        pass_filenames: false
+        files: runtime/arbitration/types\.py$
+
+      - id: r011-dependency-drift
+        name: "R011: Undeclared Dependency in Schema"
+        entry: python scripts/ci/check_dependency_drift.py --schema SYSTEM_MAP_SCHEMA.yaml --codebase . --fail-on-undeclared
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      - id: r012-primitive-computation
+        name: "R012: Primitive Computation via M5 Query"
+        entry: python scripts/ci/check_primitive_computation.py --file observation/governance.py --function _compute_primitives --forbidden-calls m5.query m5_access.query --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: observation/governance\.py$
+
+      - id: r013-exit-supremacy
+        name: "R013: EXIT Not Checked First"
+        entry: python scripts/ci/check_exit_supremacy.py --file runtime/arbitration/arbitrator.py --function arbitrate --required-first-check EXIT --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: runtime/arbitration/arbitrator\.py$
+
+      - id: r014-failed-state-terminal
+        name: "R014: FAILED State Has Exit Transition"
+        entry: python scripts/ci/check_failed_state_terminal.py --file observation/governance.py --forbidden-transition FAILED --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: observation/governance\.py$
+
+      - id: r017-timestamp-units
+        name: "R017: Timestamp Units Incorrect"
+        entry: python scripts/ci/check_timestamp_units.py --file observation/internal/m1_ingestion.py --require-division-by-1000 --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: observation/internal/m1_ingestion\.py$
+
+      # ========================================================================
+      # VOCABULARY ENFORCEMENT
+      # ========================================================================
+
+      - id: forbidden-vocabulary
+        name: Forbidden Vocabulary Scan
+        entry: python scripts/ci/scan_forbidden_vocabulary.py --dirs observation/ runtime/ memory/ external_policy/ execution/ --forbidden signal setup opportunity bias edge alpha momentum pressure trend regime --fail-on-violation
+        language: system
+        pass_filenames: false
+        files: \.(py)$
+
+      # ========================================================================
+      # WARNING RULES (R015, R016)
+      # ========================================================================
+
+      - id: r015-doc-correspondence
+        name: "R015: Doc-Code Correspondence (Warning)"
+        entry: python scripts/ci/check_doc_correspondence.py --schema SYSTEM_MAP_SCHEMA.yaml --warn-on-missing
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: r016-case-sensitivity
+        name: "R016: Case Sensitivity Handling (Warning)"
+        entry: python scripts/ci/check_case_sensitivity.py --file runtime/policy_adapter.py --function _extract_primitives --warn-on-incomplete
+        language: system
+        pass_filenames: false
+        files: runtime/policy_adapter\.py$
 
 # Configuration
 default_stages: [pre-commit]

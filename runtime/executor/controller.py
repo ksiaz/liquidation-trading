@@ -128,7 +128,7 @@ class ExecutionController:
                     actions_rejected += 1
                     continue
             
-            result = self.execute_action(symbol, action)
+            result = self.execute_action(symbol, action, mark_prices)
             self._execution_log.append(result)
             
             if result.success:
@@ -143,20 +143,30 @@ class ExecutionController:
             symbols_processed=len(actions),
         )
     
-    def execute_action(self, symbol: str, action: Action) -> ExecutionResult:
+    def execute_action(
+        self,
+        symbol: str,
+        action: Action,
+        mark_prices: Dict[str, Decimal]
+    ) -> ExecutionResult:
         """Execute a single action on a position.
-        
+
         Args:
             symbol: Symbol to execute on
             action: Arbitrated action to execute
-            
+            mark_prices: Current mark prices for equity tracking
+
         Returns:
             ExecutionResult with outcome
         """
         timestamp = time.time()
         position_before = self.state_machine.get_position(symbol)
         state_before = position_before.state
-        
+
+        # Get mark price for this symbol (used for simulation and equity tracking)
+        mark_price = mark_prices.get(symbol)
+        mark_price_float = float(mark_price) if mark_price else None
+
         # Validate action is compatible with state
         if not self._is_valid_action(state_before, action.type):
             return ExecutionResult(
@@ -178,11 +188,24 @@ class ExecutionController:
             if state_action == StateAction.ENTRY:
                 # Entry requires direction (simplified - would come from mandate)
                 # TODO: Get actual direction/size from Action/Mandate
-                new_position = self.state_machine.transition(
+                # Simulate two-phase entry: ENTRY -> SUCCESS
+                temp_position = self.state_machine.transition(
                     symbol, state_action, direction=Direction.LONG
                 )
+                # Immediately simulate successful fill using mark price
+                if mark_price:
+                    new_position = self.state_machine.transition(
+                        symbol, "SUCCESS",
+                        quantity=Decimal("1.0"),  # Simulated size
+                        entry_price=mark_price
+                    )
+                else:
+                    new_position = temp_position
             elif state_action == StateAction.EXIT:
-                new_position = self.state_machine.transition(symbol, state_action)
+                # Simulate two-phase exit: EXIT -> SUCCESS
+                temp_position = self.state_machine.transition(symbol, state_action)
+                # Immediately simulate successful close
+                new_position = self.state_machine.transition(symbol, "SUCCESS")
             elif state_action == StateAction.REDUCE:
                 new_position = self.state_machine.transition(symbol, state_action)
             elif state_action == StateAction.HOLD:
@@ -207,20 +230,30 @@ class ExecutionController:
             price_change_pct = None
             realized_pnl = None
 
-            # For ENTRY actions: record entry details
+            # For ENTRY actions: record entry details using mark price
             if state_action == StateAction.ENTRY:
-                entry_price_val = float(new_position.entry_price) if new_position.entry_price else None
-                position_size = float(new_position.quantity)
+                # In simulation, use mark price as entry price
+                # Position won't have entry_price until SUCCESS transition
+                entry_price_val = mark_price_float
+                position_size = 1.0  # Simulated size (would come from risk sizing in real system)
                 price = entry_price_val
 
             # For EXIT actions: calculate PnL
             elif state_action == StateAction.EXIT:
-                if position_before.entry_price and position_before.quantity > 0:
-                    entry_price_val = float(position_before.entry_price)
-                    position_size = float(position_before.quantity)
-                    # Use entry price as proxy for exit price (would be fill price in real system)
-                    exit_price_val = entry_price_val * 1.001  # Simulate 0.1% move
+                # Use mark price as exit price
+                if mark_price_float:
+                    exit_price_val = mark_price_float
                     price = exit_price_val
+
+                    # Try to get entry price from position (if it was set)
+                    # Otherwise use simulated entry that's 0.1% away from current price
+                    if position_before.entry_price:
+                        entry_price_val = float(position_before.entry_price)
+                    else:
+                        # Simulate entry price 0.1% away from exit price
+                        entry_price_val = mark_price_float * 0.999
+
+                    position_size = 1.0  # Simulated size
 
                     # Calculate PnL
                     if position_before.direction == Direction.LONG:

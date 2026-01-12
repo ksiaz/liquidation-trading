@@ -83,3 +83,7 @@ PROJECT_UNDERSTANDING.md
 SECURITY_AUDIT_REPORT.md
 
 constitutional-clean/
+
+# Test output files
+trace_latest.json
+*.log

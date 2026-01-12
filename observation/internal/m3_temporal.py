@@ -172,8 +172,8 @@ class M3TemporalEngine:
             # Or update with 0 volume? Original code skipped empty windows.
             # We skip.
             self._current_windows = {}
-            # Reset candles on window close
-            self._current_candles = {}
+            # NOTE: Don't reset candles - they should persist across windows
+            # for price_acceptance_ratio computation in M5
             return
 
         # Calculate metrics
@@ -197,8 +197,8 @@ class M3TemporalEngine:
 
         # Clear buffer
         self._current_windows = {}
-        # Reset candles for next window
-        self._current_candles = {}
+        # NOTE: Don't reset candles - they should persist across windows
+        # for price_acceptance_ratio computation in M5
 
     # Read-Only Accessors
     def get_baseline_status(self) -> Dict:

@@ -12,6 +12,11 @@ import sys
 import os
 import asyncio
 import threading
+import signal
+import json
+import argparse
+from datetime import datetime
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, 
                               QLabel, QHBoxLayout, QFrame, QStackedWidget)
 from PySide6.QtCore import QTimer, Slot, Qt
@@ -72,6 +77,46 @@ class MainWindow(QMainWindow):
         self.loop_thread = threading.Thread(target=self.run_async_loop, daemon=True)
         self.loop_thread.start()
         
+    def closeEvent(self, event):
+        """Handle window close event for graceful shutdown."""
+        print("\nShutdown initiated via Window Close...")
+        self.shutdown()
+        event.accept()
+
+    def shutdown(self):
+        """Execute graceful shutdown sequence."""
+        if hasattr(self, 'collector'):
+            print("Stopping collector...")
+            # Simple flag flip, async loop will exit
+            self.collector._running = False
+            
+            # Export Trace
+            self.export_trace()
+            
+    def export_trace(self):
+        """Export execution trace to JSON."""
+        try:
+            log = self.collector.controller.get_execution_log()
+            
+            # Convert to dictionary format
+            records = [record.to_log_dict() for record in log]
+            
+            trace_data = {
+                "timestamp": time.time(),
+                "records": records,
+                "count": len(records)
+            }
+            
+            # Save to file
+            filename = "trace_latest.json"
+            with open(filename, 'w') as f:
+                json.dump(trace_data, f, indent=2)
+                
+            print(f"Trace exported to {filename} ({len(records)} records)")
+            
+        except Exception as e:
+            print(f"Failed to export trace: {e}")
+        
     def run_async_loop(self):
         # Fix for Windows event loop with aiodns
         if sys.platform == 'win32':
@@ -130,8 +175,26 @@ class MainWindow(QMainWindow):
             print(f"UI Error: {e}")
 
 def main():
+    # Parse Arguments
+    parser = argparse.ArgumentParser(description='Liquidation Trading Runtime')
+    parser.add_argument('--export-trace', action='store_true', help='Export execution trace on exit')
+    args = parser.parse_args()
+
     app = QApplication(sys.argv)
     window = MainWindow()
+    
+    # Store args in window for access during shutdown
+    window.args = args
+    
+    # Signal Handling for Console (Ctrl+C)
+    # We need a timer to let the python interpretter run to catch signals
+    signal.signal(signal.SIGINT, lambda sig, frame: window.close())
+    
+    # Timer hack to allow Ctrl+C to work in PySide6 app
+    timer = QTimer()
+    timer.start(500)
+    timer.timeout.connect(lambda: None)
+    
     window.show()
     sys.exit(app.exec())
 

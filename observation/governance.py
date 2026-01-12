@@ -398,8 +398,10 @@ class ObservationSystem:
                             presence_intervals=tuple(all_presence_intervals)
                         )
                         structural_persistence_duration = persistence_result
-                    except ValueError:
-                        # Invalid intervals, skip
+                    except ValueError as e:
+                        # Invalid intervals, skip (but log for debugging)
+                        if symbol == "BTCUSDT" and len(all_presence_intervals) > 0:
+                            print(f"DEBUG: structural_persistence_duration failed for {symbol}: {e}")
                         pass
 
             # 7. TRAVERSAL VOID SPAN (Phase 6.3)

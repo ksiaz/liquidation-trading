@@ -274,6 +274,35 @@ class ResearchDatabase:
             )
         """)
 
+        # Table 8.6: Policy Outcomes (Primitive Performance Attribution)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS policy_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+
+                mandate_type TEXT NOT NULL,
+                authority REAL NOT NULL,
+                policy_name TEXT,
+
+                active_primitives TEXT,
+
+                executed_action TEXT,
+                execution_success BOOLEAN,
+                rejection_reason TEXT,
+
+                ghost_trade_id INTEGER,
+                realized_pnl REAL,
+                holding_duration_sec REAL,
+                exit_reason TEXT,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id),
+                FOREIGN KEY (ghost_trade_id) REFERENCES ghost_trades(id)
+            )
+        """)
+
         # Table 9: M2 Node Events (Event-level capture)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS m2_node_events (
@@ -306,7 +335,10 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_liquidations_timestamp ON liquidation_events(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON ohlc_candles(symbol, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trade_events(symbol, timestamp)")
-        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_cycle ON policy_outcomes(cycle_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_symbol_ts ON policy_outcomes(symbol, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_trade ON policy_outcomes(ghost_trade_id)")
+
         self.conn.commit()
     
     def log_cycle(
@@ -508,6 +540,52 @@ class ResearchDatabase:
             symbol, timestamp, price, volume, is_buyer_maker
         ))
         self.conn.commit()
+
+    def log_policy_outcome(
+        self,
+        cycle_id: int,
+        symbol: str,
+        timestamp: float,
+        mandate_type: str,
+        authority: float,
+        policy_name: str,
+        active_primitives: List[str],
+        executed_action: str = None,
+        execution_success: bool = None,
+        rejection_reason: str = None,
+        ghost_trade_id: int = None,
+        realized_pnl: float = None,
+        holding_duration_sec: float = None,
+        exit_reason: str = None
+    ):
+        """Log policy outcome linking primitives to execution results.
+
+        Called when a mandate is generated to record which primitives were active.
+        Can be updated later when ghost trade completes to add PNL/exit data.
+        """
+        cursor = self.conn.cursor()
+
+        import json
+        primitives_json = json.dumps(active_primitives) if active_primitives else None
+
+        cursor.execute("""
+            INSERT INTO policy_outcomes (
+                cycle_id, symbol, timestamp,
+                mandate_type, authority, policy_name,
+                active_primitives,
+                executed_action, execution_success, rejection_reason,
+                ghost_trade_id, realized_pnl, holding_duration_sec, exit_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            cycle_id, symbol, timestamp,
+            mandate_type, authority, policy_name,
+            primitives_json,
+            executed_action, execution_success, rejection_reason,
+            ghost_trade_id, realized_pnl, holding_duration_sec, exit_reason
+        ))
+        self.conn.commit()
+
+        return cursor.lastrowid
 
     def log_mandate(
         self,

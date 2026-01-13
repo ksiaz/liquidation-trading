@@ -181,6 +181,7 @@ class CollectorService:
 
             # Collect mandates from all active symbols
             all_mandates = []
+            mandate_primitives_map = {}  # Track primitives for each mandate
 
             # DEBUG EXIT: Show all position states once per cycle
             import os
@@ -199,6 +200,9 @@ class CollectorService:
                     position = self.executor.state_machine.get_position(symbol)
                     position_state = position.state if position else None
 
+                    # Extract active primitives BEFORE generating mandates
+                    active_primitives = self._extract_active_primitive_names(symbol, snapshot)
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -209,6 +213,8 @@ class CollectorService:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
                         for m in mandates:
                             print(f"  Type: {m.type.name}, Authority: {m.authority}")
+                            # Track primitives for this mandate
+                            mandate_primitives_map[id(m)] = active_primitives
                     all_mandates.extend(mandates)
                 except Exception as e:
                     # CRITICAL: Don't silently swallow exceptions - log and continue
@@ -235,8 +241,6 @@ class CollectorService:
             # Log mandates and arbitration (linked to cycle)
             if hasattr(self, '_execution_db') and cycle_id is not None:
                 # Log mandates
-                
-                # Log mandates
                 for mandate in all_mandates:
                     try:
                         self._execution_db.log_mandate(
@@ -248,7 +252,35 @@ class CollectorService:
                         )
                     except:
                         pass
-                
+
+                # Log policy outcomes (mandate -> primitives linkage)
+                for mandate in all_mandates:
+                    try:
+                        active_primitives = mandate_primitives_map.get(id(mandate), [])
+
+                        # Determine executed action from arbitration
+                        executed_action = None
+                        if mandate.symbol in actions_by_symbol:
+                            action = actions_by_symbol[mandate.symbol]
+                            if action:
+                                executed_action = action.action_type.value
+
+                        self._execution_db.log_policy_outcome(
+                            cycle_id=cycle_id,
+                            symbol=mandate.symbol,
+                            timestamp=timestamp,
+                            mandate_type=mandate.type.value,
+                            authority=mandate.authority,
+                            policy_name=mandate.policy_name if hasattr(mandate, 'policy_name') else None,
+                            active_primitives=active_primitives,
+                            executed_action=executed_action,
+                            execution_success=None,  # Will be updated when ghost trade completes
+                            rejection_reason=None
+                        )
+                    except Exception as e:
+                        # Don't fail cycle if outcome logging fails
+                        pass
+
                 # Log arbitration (symbol-level)
                 arbitrated = {}
                 for mandate in all_mandates:
@@ -417,6 +449,49 @@ class CollectorService:
         except Exception as e:
             # self._logger.debug(f"Ghost trade processing: {e}")
             pass
+
+    def _extract_active_primitive_names(self, symbol: str, snapshot: ObservationSnapshot) -> List[str]:
+        """Extract names of non-None primitives for a symbol.
+
+        Args:
+            symbol: Symbol to extract primitives for
+            snapshot: Current observation snapshot
+
+        Returns:
+            List of primitive names that are non-None
+        """
+        if symbol not in snapshot.primitives:
+            return []
+
+        bundle = snapshot.primitives[symbol]
+        active_primitives = []
+
+        # Check each primitive field and add name if not None
+        primitive_fields = [
+            ('zone_penetration', bundle.zone_penetration),
+            ('displacement_origin_anchor', bundle.displacement_origin_anchor),
+            ('price_traversal_velocity', bundle.price_traversal_velocity),
+            ('traversal_compactness', bundle.traversal_compactness),
+            ('central_tendency_deviation', bundle.central_tendency_deviation),
+            ('structural_absence_duration', bundle.structural_absence_duration),
+            ('traversal_void_span', bundle.traversal_void_span),
+            ('event_non_occurrence_counter', bundle.event_non_occurrence_counter),
+            ('structural_persistence_duration', bundle.structural_persistence_duration),
+            ('resting_size', bundle.resting_size),
+            ('order_consumption', bundle.order_consumption),
+            ('absorption_event', bundle.absorption_event),
+            ('refill_event', bundle.refill_event),
+            ('price_acceptance_ratio', bundle.price_acceptance_ratio),
+            ('liquidation_density', bundle.liquidation_density),
+            ('directional_continuity', bundle.directional_continuity),
+            ('trade_burst', bundle.trade_burst),
+        ]
+
+        for name, value in primitive_fields:
+            if value is not None:
+                active_primitives.append(name)
+
+        return active_primitives
 
     def _log_cycle_to_db(self, snapshot: ObservationSnapshot, mandates: list, timestamp: float) -> int:
         """Log comprehensive execution cycle data to research database.

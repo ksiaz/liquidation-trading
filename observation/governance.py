@@ -199,5 +199,14 @@ class ObservationSystem:
             central_tendency_deviation=None,
             structural_absence_duration=None,
             traversal_void_span=None,
-            event_non_occurrence_counter=None
+            event_non_occurrence_counter=None,
+            structural_persistence_duration=None,
+            resting_size=None,
+            order_consumption=None,
+            absorption_event=None,
+            refill_event=None,
+            price_acceptance_ratio=None,
+            liquidation_density=None,
+            directional_continuity=None,
+            trade_burst=None
         )

@@ -64,6 +64,25 @@ class M4PrimitiveBundle:
     traversal_void_span: Optional[Any]  # TraversalVoidSpan (when implemented)
     event_non_occurrence_counter: Optional[Any]  # EventNonOccurrenceCounter (when implemented)
 
+    # Tier B-2 - Structural Persistence
+    structural_persistence_duration: Optional[Any]  # StructuralPersistenceDuration
+
+    # Tier B-2.1 - Order Book Primitives (validation target)
+    resting_size: Optional[Any]  # RestingSizeAtPrice
+    order_consumption: Optional[Any]  # OrderConsumption
+    absorption_event: Optional[Any]  # AbsorptionEvent
+    refill_event: Optional[Any]  # RefillEvent
+
+    # Tier B-2.2 - Price Acceptance
+    price_acceptance_ratio: Optional[Any]  # PriceAcceptanceRatio
+
+    # Tier B-3 - Liquidation Clustering
+    liquidation_density: Optional[Any]  # LiquidationDensity
+
+    # Tier B-4 - Trade Flow
+    directional_continuity: Optional[Any]  # DirectionalContinuity
+    trade_burst: Optional[Any]  # TradeBurst
+
 
 @dataclass(frozen=True)
 class ObservationSnapshot:

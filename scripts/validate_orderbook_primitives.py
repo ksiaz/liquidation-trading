@@ -37,10 +37,9 @@ def validate_consumption_vs_trades(db_path: str, time_window_sec: float = 3600.0
             mn.price_center
         FROM primitive_values pv
         JOIN execution_cycles ec ON pv.cycle_id = ec.id
-        JOIN m2_node_events mn ON pv.symbol = mn.symbol
+        JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
         WHERE pv.order_consumption_size > 0
           AND ec.timestamp > ?
-          AND mn.event_type = 'CREATED'
         ORDER BY ec.timestamp DESC
     """
 
@@ -150,10 +149,9 @@ def validate_absorption_vs_price_stability(db_path: str, time_window_sec: float 
             mn.price_center
         FROM primitive_values pv
         JOIN execution_cycles ec ON pv.cycle_id = ec.id
-        JOIN m2_node_events mn ON pv.symbol = mn.symbol
+        JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
         WHERE pv.absorption_event = 1
           AND ec.timestamp > ?
-          AND mn.event_type = 'CREATED'
         ORDER BY ec.timestamp DESC
     """
 

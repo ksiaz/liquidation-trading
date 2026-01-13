@@ -247,17 +247,33 @@ class ResearchDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
                 timestamp REAL NOT NULL,
-                
+
                 open REAL NOT NULL,
                 high REAL NOT NULL,
                 low REAL NOT NULL,
                 close REAL NOT NULL,
-                
+
                 volume REAL,
                 trade_count INTEGER
             )
         """)
-        
+
+        # Table 8.5: Trade Events (Ground Truth for Validation)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trade_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+
+                price REAL NOT NULL,
+                volume REAL NOT NULL,
+
+                is_buyer_maker BOOLEAN,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Table 9: M2 Node Events (Event-level capture)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS m2_node_events (
@@ -289,6 +305,7 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_arbitration_cycle ON arbitration_rounds(cycle_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_liquidations_timestamp ON liquidation_events(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON ohlc_candles(symbol, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trade_events(symbol, timestamp)")
         
         self.conn.commit()
     
@@ -471,7 +488,27 @@ class ResearchDatabase:
             symbol, timestamp, open_price, high, low, close, volume, trade_count
         ))
         self.conn.commit()
-    
+
+    def log_trade_event(
+        self,
+        symbol: str,
+        timestamp: float,
+        price: float,
+        volume: float,
+        is_buyer_maker: bool = False
+    ):
+        """Log individual trade event for ground truth validation."""
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO trade_events (
+                symbol, timestamp, price, volume, is_buyer_maker
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (
+            symbol, timestamp, price, volume, is_buyer_maker
+        ))
+        self.conn.commit()
+
     def log_mandate(
         self,
         cycle_id: int,

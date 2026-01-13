@@ -60,9 +60,9 @@ class CollectorService:
             self._obs._m2_store._event_logger = self._execution_db
 
         # Phase 8: M6 Integration
-        self.policy_adapter = PolicyAdapter(AdapterConfig(), execution_db=self._execution_db)
+        self.policy_adapter = PolicyAdapter(AdapterConfig())
         self.arbitrator = MandateArbitrator()
-        self.executor = ExecutionController(RiskConfig(), db_path=self._execution_db.db_path)
+        self.executor = ExecutionController(RiskConfig())
 
         # Track mark prices for execution (estimated from trade stream)
         self._mark_prices: Dict[str, Decimal] = {}
@@ -133,8 +133,8 @@ class CollectorService:
                 # 2. Query Observation Snapshot
                 snapshot = self._obs.query({'type': 'snapshot'})
 
-                # 3. M6 Execution Cycle (only if observation is ACTIVE)
-                if snapshot.status == ObservationStatus.ACTIVE:
+                # 3. M6 Execution Cycle (only if observation is not FAILED)
+                if snapshot.status != ObservationStatus.FAILED:
                     self._execute_m6_cycle(snapshot, current_time)
 
                     # 4. Process Ghost Trades based on execution results
@@ -199,13 +199,11 @@ class CollectorService:
                     position = self.executor.state_machine.get_position(symbol)
                     position_state = position.state if position else None
 
-                    # Invoke PolicyAdapter for this symbol with position state
+                    # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
                         symbol=symbol,
-                        timestamp=timestamp,
-                        cycle_id=cycle_id,
-                        position_state=position_state
+                        timestamp=timestamp
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -589,6 +587,8 @@ class CollectorService:
             f"{s.lower()}@forceOrder" for s in TOP_10_SYMBOLS
         ] + [
             f"{s.lower()}@depth@100ms" for s in TOP_10_SYMBOLS
+        ] + [
+            f"{s.lower()}@kline_1m" for s in TOP_10_SYMBOLS
         ]
         
         stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
@@ -615,6 +615,17 @@ class CollectorService:
                                     # Track mark price from trades
                                     if 'p' in payload:
                                         self._mark_prices[symbol] = Decimal(str(payload['p']))
+                                    # Log trade event for ground truth validation
+                                    try:
+                                        self._execution_db.log_trade_event(
+                                            symbol=symbol,
+                                            timestamp=int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time(),
+                                            price=float(payload.get('p', 0)),
+                                            volume=float(payload.get('q', 0)),
+                                            is_buyer_maker=payload.get('m', False)
+                                        )
+                                    except:
+                                        pass
                                 elif 'forceOrder' in stream:
                                     event_type = "LIQUIDATION"
                                     print(f"DEBUG STREAM: Received forceOrder for {symbol}")
@@ -700,7 +711,7 @@ async def main():
     )
 
     # Initialize Observation System with ground truth validation
-    obs_system = ObservationSystem(allowed_symbols=TOP_10_SYMBOLS, db_path="logs/execution.db")
+    obs_system = ObservationSystem(allowed_symbols=TOP_10_SYMBOLS)
     
     # Create and start collector
     collector = CollectorService(obs_system)

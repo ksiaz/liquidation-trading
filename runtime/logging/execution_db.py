@@ -258,6 +258,22 @@ class ResearchDatabase:
             )
         """)
 
+        # Table 8.4: Order Book Events (Best Bid/Ask Updates)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orderbook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+
+                best_bid_price REAL NOT NULL,
+                best_bid_qty REAL NOT NULL,
+                best_ask_price REAL NOT NULL,
+                best_ask_qty REAL NOT NULL,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Table 8.5: Trade Events (Ground Truth for Validation)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_events (
@@ -334,6 +350,7 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_arbitration_cycle ON arbitration_rounds(cycle_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_liquidations_timestamp ON liquidation_events(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON ohlc_candles(symbol, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_events(symbol, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trade_events(symbol, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_cycle ON policy_outcomes(cycle_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_symbol_ts ON policy_outcomes(symbol, timestamp)")
@@ -511,13 +528,36 @@ class ResearchDatabase:
     ):
         """Log 1-minute OHLC candle."""
         cursor = self.conn.cursor()
-        
+
         cursor.execute("""
             INSERT INTO ohlc_candles (
                 symbol, timestamp, open, high, low, close, volume, trade_count
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             symbol, timestamp, open_price, high, low, close, volume, trade_count
+        ))
+        self.conn.commit()
+
+    def log_orderbook_event(
+        self,
+        symbol: str,
+        timestamp: float,
+        best_bid_price: float,
+        best_bid_qty: float,
+        best_ask_price: float,
+        best_ask_qty: float
+    ):
+        """Log order book best bid/ask update."""
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO orderbook_events (
+                symbol, timestamp, best_bid_price, best_bid_qty,
+                best_ask_price, best_ask_qty
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            symbol, timestamp, best_bid_price, best_bid_qty,
+            best_ask_price, best_ask_qty
         ))
         self.conn.commit()
 

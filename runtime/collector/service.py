@@ -255,7 +255,7 @@ class CollectorService:
                         self._execution_db.log_mandate(
                             cycle_id=cycle_id,
                             symbol=mandate.symbol,
-                            mandate_type=mandate.type.value,
+                            mandate_type=mandate.type.name,
                             authority=mandate.authority,
                             timestamp=mandate.timestamp
                         )
@@ -272,13 +272,13 @@ class CollectorService:
                         if mandate.symbol in actions_by_symbol:
                             action = actions_by_symbol[mandate.symbol]
                             if action:
-                                executed_action = action.action_type.value
+                                executed_action = action.action_type.name
 
                         self._execution_db.log_policy_outcome(
                             cycle_id=cycle_id,
                             symbol=mandate.symbol,
                             timestamp=timestamp,
-                            mandate_type=mandate.type.value,
+                            mandate_type=mandate.type.name,
                             authority=mandate.authority,
                             policy_name=mandate.policy_name if hasattr(mandate, 'policy_name') else None,
                             active_primitives=active_primitives,
@@ -306,8 +306,8 @@ class CollectorService:
                                 cycle_id=cycle_id,
                                 symbol=symbol,
                                 mandate_count=len(symbol_mandates),
-                                conflicting_mandates=str([m.type.value for m in symbol_mandates]),
-                                winning_mandate_type=winner.type.value,
+                                conflicting_mandates=str([m.type.name for m in symbol_mandates]),
+                                winning_mandate_type=winner.type.name,
                                 resolution_reason=f"Authority: {winner.authority}"
                             )
                         except:
@@ -593,26 +593,28 @@ class CollectorService:
             # Log full primitive values
             # Primitives can be floats OR dataclasses - use generic approach
             primitives_by_symbol = {}
+
             for symbol, bundle in snapshot.primitives.items():
                 primitives = {}
-                
-                # Generic extraction helper
+
+                # Generic extraction helper for other primitives
                 def extract_value(primitive):
                     """Extract numeric value from primitive (float or dataclass)."""
                     if primitive is None:
                         return None
                     if isinstance(primitive, (int, float)):
                         return float(primitive)
-                    # It's a dataclass - try common attribute names
-                    for attr in ['value', 'ratio', 'depth', 'density', 'duration', 'continuity_score', 
-                                 'acceptance_ratio', 'total_duration_seconds', 'total_persistence_duration']:
+                    # For dataclass objects, try common attribute names
+                    for attr in ['velocity', 'value', 'ratio', 'depth', 'density', 'duration',
+                                 'continuity_score', 'acceptance_ratio', 'total_duration_seconds',
+                                 'total_persistence_duration', 'dwell_time', 'size', 'rate']:
                         if hasattr(primitive, attr):
                             val = getattr(primitive, attr)
                             if isinstance(val, (int, float)):
                                 return float(val)
                     # Fallback: return first numeric attribute found
                     for attr_name in dir(primitive):
-                        if not attr_name.startswith('_'):
+                        if not attr_name.startswith('_') and not callable(getattr(primitive, attr_name)):
                             try:
                                 val = getattr(primitive, attr_name)
                                 if isinstance(val, (int, float)):
@@ -620,16 +622,49 @@ class CollectorService:
                             except:
                                 pass
                     return None
-                
-                # Extract values safely
-                primitives['zone_penetration_depth'] = extract_value(bundle.zone_penetration)
+
+                # Extract core primitives using direct attribute access with error handling
+                try:
+                    pen = bundle.zone_penetration.penetration_depth if bundle.zone_penetration else None
+                except (AttributeError, TypeError):
+                    pen = None
+
+                try:
+                    comp = bundle.traversal_compactness.compactness_ratio if bundle.traversal_compactness else None
+                except (AttributeError, TypeError):
+                    comp = None
+
+                try:
+                    dev = bundle.central_tendency_deviation.deviation_value if bundle.central_tendency_deviation else None
+                except (AttributeError, TypeError):
+                    dev = None
+
+                primitives['zone_penetration_depth'] = pen
                 primitives['displacement_anchor_dwell_time'] = extract_value(bundle.displacement_origin_anchor)
                 primitives['price_velocity'] = extract_value(bundle.price_traversal_velocity)
-                primitives['traversal_compactness'] = extract_value(bundle.traversal_compactness)
-                primitives['central_tendency_deviation'] = extract_value(bundle.central_tendency_deviation)
-                primitives['absence_duration'] = extract_value(bundle.structural_absence_duration)
+                primitives['traversal_compactness'] = comp
+                primitives['central_tendency_deviation'] = dev
+
+                # Structural absence/persistence
+                if bundle.structural_absence_duration is not None:
+                    primitives['absence_duration'] = getattr(bundle.structural_absence_duration, 'absence_duration', None)
+                else:
+                    primitives['absence_duration'] = None
+
                 primitives['liquidation_density'] = extract_value(bundle.liquidation_density)
-                
+
+                # Traversal void span - extract max_void_duration
+                if bundle.traversal_void_span is not None:
+                    primitives['void_span_max'] = getattr(bundle.traversal_void_span, 'max_void_duration', None)
+                else:
+                    primitives['void_span_max'] = None
+
+                # Event non-occurrence counter
+                if bundle.event_non_occurrence_counter is not None:
+                    primitives['event_non_occurrence_count'] = getattr(bundle.event_non_occurrence_counter, 'non_occurrence_count', None)
+                else:
+                    primitives['event_non_occurrence_count'] = None
+
                 # Special cases with multiple values
                 if bundle.price_acceptance_ratio is not None:
                     primitives['acceptance_ratio'] = extract_value(bundle.price_acceptance_ratio)
@@ -637,13 +672,19 @@ class CollectorService:
                         primitives['acceptance_accepted_range'] = float(bundle.price_acceptance_ratio.accepted_range)
                     if hasattr(bundle.price_acceptance_ratio, 'rejected_range'):
                         primitives['acceptance_rejected_range'] = float(bundle.price_acceptance_ratio.rejected_range)
-                
+
                 if bundle.structural_persistence_duration is not None:
                     primitives['persistence_duration'] = extract_value(bundle.structural_persistence_duration)
                     if hasattr(bundle.structural_persistence_duration, 'persistence_ratio'):
                         primitives['persistence_presence_pct'] = float(bundle.structural_persistence_duration.persistence_ratio) * 100
-               
+
                 primitives['directional_continuity_value'] = extract_value(bundle.directional_continuity)
+
+                # Trade burst - extract trade_count
+                if bundle.trade_burst is not None:
+                    primitives['trade_burst_count'] = getattr(bundle.trade_burst, 'trade_count', None)
+                else:
+                    primitives['trade_burst_count'] = None
 
                 # Order book primitives - extract bid/ask separately
                 if bundle.resting_size is not None:
@@ -755,6 +796,20 @@ class CollectorService:
                                                 pass
                                 elif 'bookTicker' in stream:
                                     event_type = "DEPTH"
+                                    # Log order book update for ground truth validation
+                                    try:
+                                        if 'b' in payload and 'B' in payload and 'a' in payload and 'A' in payload:
+                                            ts_orderbook = int(payload.get('T', 0)) / 1000.0 if payload.get('T') else time.time()
+                                            self._execution_db.log_orderbook_event(
+                                                symbol=symbol,
+                                                timestamp=ts_orderbook,
+                                                best_bid_price=float(payload['b']),
+                                                best_bid_qty=float(payload['B']),
+                                                best_ask_price=float(payload['a']),
+                                                best_ask_qty=float(payload['A'])
+                                            )
+                                    except:
+                                        pass
 
                                 # TIMESTAMP EXTRACTION
                                 ts = time.time()

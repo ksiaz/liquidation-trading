@@ -18,10 +18,35 @@ from memory.m4_orderbook_primitives import (
     detect_refill_event
 )
 
+# Zone geometry primitives
+from memory.m4_zone_geometry import (
+    ZonePenetrationDepth,
+    compute_zone_penetration_depth,
+    DisplacementOriginAnchor
+)
+
+# Traversal kinematics primitives
+from memory.m4_traversal_kinematics import (
+    PriceTraversalVelocity,
+    compute_price_traversal_velocity,
+    TraversalCompactness,
+    compute_traversal_compactness
+)
+
+# Price distribution primitives
+from memory.m4_price_distribution import (
+    CentralTendencyDeviation,
+    compute_central_tendency_deviation
+)
+
 # Detection thresholds (structural boundaries, not interpretation)
 _OB_SIZE_CHANGE_THRESHOLD = 0.1  # Minimum size delta to record (contract units)
 _OB_PRICE_STABILITY_PCT = 1.0     # Maximum price movement for absorption (percentage)
 _OB_PRICE_WINDOW_SEC = 2.0        # Time window for price correlation (seconds)
+
+# Zone geometry parameters (structural boundaries)
+_ZONE_BAND_PCT = 0.5  # Zone width as percentage of current price
+_MIN_TRADES_FOR_KINEMATICS = 10  # Minimum trades needed for velocity/compactness
 
 class ObservationSystem:
     """
@@ -306,14 +331,77 @@ class ObservationSystem:
             # Return None primitives and continue
             pass
 
+        # Initialize zone geometry and kinematics primitives to None
+        zone_penetration_primitive = None
+        traversal_velocity_primitive = None
+        traversal_compactness_primitive = None
+        central_tendency_primitive = None
+
+        try:
+            # Get trade data from M1
+            trades = list(self._m1.raw_trades.get(symbol, []))
+
+            if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
+                # Extract price sequence
+                prices = [t['price'] for t in trades]
+                timestamps = [t['timestamp'] for t in trades]
+
+                # Compute traversal velocity (first to last)
+                first_price = prices[0]
+                last_price = prices[-1]
+                first_ts = timestamps[0]
+                last_ts = timestamps[-1]
+
+                if last_ts > first_ts:
+                    traversal_velocity_primitive = compute_price_traversal_velocity(
+                        traversal_id=f"{symbol}_{int(self._system_time)}",
+                        price_start=first_price,
+                        price_end=last_price,
+                        ts_start=first_ts,
+                        ts_end=last_ts
+                    )
+
+                # Compute traversal compactness
+                if len(prices) >= 2:
+                    traversal_compactness_primitive = compute_traversal_compactness(
+                        traversal_id=f"{symbol}_{int(self._system_time)}",
+                        ordered_prices=prices
+                    )
+
+                # Compute zone penetration using dynamic zone around current price
+                current_price = last_price
+                zone_width = current_price * (_ZONE_BAND_PCT / 100.0)
+                zone_low = current_price - zone_width
+                zone_high = current_price + zone_width
+
+                zone_penetration_primitive = compute_zone_penetration_depth(
+                    zone_id=f"{symbol}_zone_{int(self._system_time)}",
+                    zone_low=zone_low,
+                    zone_high=zone_high,
+                    traversal_prices=prices
+                )
+
+                # Compute central tendency deviation
+                if len(prices) >= 3:
+                    mean_price = sum(prices) / len(prices)
+                    central_tendency_primitive = compute_central_tendency_deviation(
+                        price=current_price,
+                        central_tendency=mean_price
+                    )
+
+        except Exception as e:
+            # Computation failures should not crash snapshot creation
+            # Return None primitives and continue
+            pass
+
         # Return bundle with computed primitives
         return M4PrimitiveBundle(
             symbol=symbol,
-            zone_penetration=None,
-            displacement_origin_anchor=None,
-            price_traversal_velocity=None,
-            traversal_compactness=None,
-            central_tendency_deviation=None,
+            zone_penetration=zone_penetration_primitive,
+            displacement_origin_anchor=None,  # Not yet implemented
+            price_traversal_velocity=traversal_velocity_primitive,
+            traversal_compactness=traversal_compactness_primitive,
+            central_tendency_deviation=central_tendency_primitive,
             structural_absence_duration=None,
             traversal_void_span=None,
             event_non_occurrence_counter=None,

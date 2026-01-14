@@ -61,10 +61,10 @@ class CollectorService:
 
         # Phase 8: M6 Integration
         self.policy_adapter = PolicyAdapter(AdapterConfig(
-            enable_geometry=False,       # Zone geometry primitives not implemented
-            enable_kinematics=False,     # Kinematics primitives not implemented
+            enable_geometry=True,        # Zone geometry primitives NOW IMPLEMENTED
+            enable_kinematics=True,      # Kinematics primitives NOW IMPLEMENTED
             enable_absence=False,        # Absence primitives not implemented
-            enable_orderbook_test=True   # Test policy using working order book primitives
+            enable_orderbook_test=False  # Test policy (disabled, using real policies now)
         ))
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())

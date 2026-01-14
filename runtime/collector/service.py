@@ -60,7 +60,12 @@ class CollectorService:
             self._obs._m2_store._event_logger = self._execution_db
 
         # Phase 8: M6 Integration
-        self.policy_adapter = PolicyAdapter(AdapterConfig())
+        self.policy_adapter = PolicyAdapter(AdapterConfig(
+            enable_geometry=False,       # Zone geometry primitives not implemented
+            enable_kinematics=False,     # Kinematics primitives not implemented
+            enable_absence=False,        # Absence primitives not implemented
+            enable_orderbook_test=True   # Test policy using working order book primitives
+        ))
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())
 
@@ -673,7 +678,7 @@ class CollectorService:
         ] + [
             f"{s.lower()}@forceOrder" for s in TOP_10_SYMBOLS
         ] + [
-            f"{s.lower()}@depth@100ms" for s in TOP_10_SYMBOLS
+            f"{s.lower()}@bookTicker" for s in TOP_10_SYMBOLS
         ] + [
             f"{s.lower()}@kline_1m" for s in TOP_10_SYMBOLS
         ]
@@ -748,7 +753,7 @@ class CollectorService:
                                                 )
                                             except:
                                                 pass
-                                elif 'depth' in stream:
+                                elif 'bookTicker' in stream:
                                     event_type = "DEPTH"
 
                                 # TIMESTAMP EXTRACTION

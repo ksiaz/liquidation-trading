@@ -109,21 +109,28 @@ class M1IngestionEngine:
 
     def normalize_depth(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
         """
-        Normalize raw binance depth payload.
+        Normalize raw binance bookTicker payload.
+
+        bookTicker format:
+        {
+            "e": "bookTicker",
+            "E": 1234567890123,  // Event time
+            "s": "BTCUSDT",
+            "b": "96573.28",     // Best bid price
+            "B": "0.44492",      // Best bid quantity
+            "a": "96573.29",     // Best ask price
+            "A": "5.85264"       // Best ask quantity
+        }
         """
         try:
-            # Binance Depth format
-            bids = raw_payload.get('b', [])
-            asks = raw_payload.get('a', [])
+            # Extract timestamp
             timestamp = int(raw_payload.get('E', 0)) / 1000.0
 
-            # Calculate total size at best levels (top 5 levels)
-            bid_size = sum(float(level[1]) for level in bids[:5]) if bids else 0.0
-            ask_size = sum(float(level[1]) for level in asks[:5]) if asks else 0.0
-
-            # Extract best prices
-            best_bid_price = float(bids[0][0]) if bids else None
-            best_ask_price = float(asks[0][0]) if asks else None
+            # Extract best bid/ask from bookTicker format
+            best_bid_price = float(raw_payload['b']) if 'b' in raw_payload else None
+            bid_size = float(raw_payload['B']) if 'B' in raw_payload else 0.0
+            best_ask_price = float(raw_payload['a']) if 'a' in raw_payload else None
+            ask_size = float(raw_payload['A']) if 'A' in raw_payload else 0.0
 
             # Create normalized event
             event = {
@@ -133,8 +140,8 @@ class M1IngestionEngine:
                 'ask_size': ask_size,
                 'best_bid_price': best_bid_price,
                 'best_ask_price': best_ask_price,
-                'bid_levels': len(bids),
-                'ask_levels': len(asks)
+                'bid_levels': 1,  # bookTicker only provides best level
+                'ask_levels': 1
             }
             self.raw_depth[symbol].append(event)
 

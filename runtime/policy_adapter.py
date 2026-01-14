@@ -41,6 +41,8 @@ from external_policy.ep2_strategy_geometry import (
 )
 from external_policy.ep2_strategy_kinematics import generate_kinematics_proposal
 from external_policy.ep2_strategy_absence import generate_absence_proposal
+# Test policy for order book primitives (verification only)
+from external_policy.ep2_strategy_orderbook_test import generate_orderbook_test_proposal
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class AdapterConfig:
     enable_geometry: bool = True
     enable_kinematics: bool = True
     enable_absence: bool = True
+    enable_orderbook_test: bool = False  # Test policy for verification
 
 
 class PolicyAdapter:
@@ -169,6 +172,18 @@ class PolicyAdapter:
             if proposal:
                 proposals.append(proposal)
 
+        if self.config.enable_orderbook_test:
+            proposal = generate_orderbook_test_proposal(
+                resting_size=primitives.get("resting_size"),
+                order_consumption=primitives.get("order_consumption"),
+                refill_event=primitives.get("refill_event"),
+                context=context,
+                permission=permission,
+                position_state=position_state
+            )
+            if proposal:
+                proposals.append(proposal)
+
         # Convert proposals to mandates (pure normalization)
         mandates = self._proposals_to_mandates(proposals, symbol, timestamp)
 
@@ -210,6 +225,9 @@ class PolicyAdapter:
                 "structural_absence_duration": None,
                 "traversal_void_span": None,
                 "event_non_occurrence_counter": None,
+                "resting_size": None,
+                "order_consumption": None,
+                "refill_event": None,
             }
 
         # Extract primitives from bundle (read-only access)
@@ -222,6 +240,9 @@ class PolicyAdapter:
             "structural_absence_duration": bundle.structural_absence_duration,
             "traversal_void_span": bundle.traversal_void_span,
             "event_non_occurrence_counter": bundle.event_non_occurrence_counter,
+            "resting_size": bundle.resting_size,
+            "order_consumption": bundle.order_consumption,
+            "refill_event": bundle.refill_event,
         }
 
     def _proposals_to_mandates(

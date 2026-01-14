@@ -98,7 +98,8 @@ class PolicyAdapter:
         Returns:
             List of Mandates (possibly empty)
         """
-        # Handle observation status per M6_CONSUMPTION_CONTRACT.md
+        # Handle observation status per EPISTEMIC_CONSTITUTION.md
+        # Only two valid states: UNINITIALIZED (normal operation) or FAILED (halt)
         if observation_snapshot.status == ObservationStatus.FAILED:
             # Observation FAILED -> emit BLOCK mandate (halt execution)
             return [Mandate(
@@ -108,11 +109,7 @@ class PolicyAdapter:
                 timestamp=timestamp
             )]
 
-        if observation_snapshot.status == ObservationStatus.UNINITIALIZED:
-            # Observation not ready -> no mandates
-            return []
-
-        # Status is ACTIVE - proceed with mandate generation
+        # Status is UNINITIALIZED (normal operation) - proceed with mandate generation
         # Extract M4 primitives from observation
         # NOTE: This is a stub - actual implementation needs M5 query interface
         # For now, we simulate primitive extraction
@@ -152,7 +149,7 @@ class PolicyAdapter:
             proposal = generate_kinematics_proposal(
                 velocity=primitives.get("price_traversal_velocity"),
                 compactness=primitives.get("traversal_compactness"),
-                acceptance=primitives.get("displacement_origin_anchor"),
+                acceptance=primitives.get("price_acceptance_ratio"),
                 permission=permission,
                 context=context,
                 position_state=position_state
@@ -164,7 +161,7 @@ class PolicyAdapter:
             proposal = generate_absence_proposal(
                 permission=permission,
                 absence=primitives.get("structural_absence_duration"),
-                persistence=primitives.get("traversal_void_span"),
+                persistence=primitives.get("structural_persistence_duration"),
                 geometry=primitives.get("zone_penetration"),
                 context=context,
                 position_state=position_state

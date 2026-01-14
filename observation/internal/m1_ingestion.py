@@ -26,6 +26,12 @@ class M1IngestionEngine:
         # Latest depth snapshot per symbol (for order book primitives)
         self.latest_depth: Dict[str, Optional[Dict]] = {}
 
+        # Previous depth snapshot per symbol (for change detection)
+        self.previous_depth: Dict[str, Optional[Dict]] = {}
+
+        # Recent price tracking per symbol (for absorption detection)
+        self.recent_prices: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=10))
+
         # Counters
         self.counters = {
             'trades': 0,
@@ -61,8 +67,9 @@ class M1IngestionEngine:
                 'quote_qty': quantity * price
             }
             self.raw_trades[symbol].append(event)
+            self.recent_prices[symbol].append((timestamp, price))  # Track for absorption detection
             self.counters['trades'] += 1
-            
+
             return event
             
         except Exception as e:
@@ -130,6 +137,11 @@ class M1IngestionEngine:
                 'ask_levels': len(asks)
             }
             self.raw_depth[symbol].append(event)
+
+            # Save previous state before updating latest
+            if symbol in self.latest_depth:
+                self.previous_depth[symbol] = self.latest_depth[symbol]
+
             self.latest_depth[symbol] = event  # Store latest for primitive computation
             self.counters['depth'] += 1
 

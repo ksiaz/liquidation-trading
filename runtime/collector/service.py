@@ -746,7 +746,6 @@ class CollectorService:
                                                 pass
                                 elif 'depth' in stream:
                                     event_type = "DEPTH"
-                                    print(f"DEBUG STREAM: Received depth for {symbol}")
 
                                 # TIMESTAMP EXTRACTION
                                 ts = time.time()

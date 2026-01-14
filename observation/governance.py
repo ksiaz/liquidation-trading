@@ -12,8 +12,16 @@ from memory.m5_access import MemoryAccess
 # Order book primitives
 from memory.m4_orderbook_primitives import (
     RestingSizeAtPrice,
-    compute_resting_size
+    compute_resting_size,
+    detect_order_consumption,
+    detect_absorption_event,
+    detect_refill_event
 )
+
+# Detection thresholds (structural boundaries, not interpretation)
+_OB_SIZE_CHANGE_THRESHOLD = 0.1  # Minimum size delta to record (contract units)
+_OB_PRICE_STABILITY_PCT = 1.0     # Maximum price movement for absorption (percentage)
+_OB_PRICE_WINDOW_SEC = 2.0        # Time window for price correlation (seconds)
 
 class ObservationSystem:
     """
@@ -185,40 +193,116 @@ class ObservationSystem:
         """
         # Initialize all primitives to None
         resting_size_primitive = None
+        consumption_primitive = None
+        absorption_primitive = None
+        refill_primitive = None
 
         try:
-            # Compute order book primitives from M1 latest depth snapshot
-            depth_snapshot = self._m1.latest_depth.get(symbol)
+            # Get current and previous depth snapshots
+            current_depth = self._m1.latest_depth.get(symbol)
+            previous_depth = self._m1.previous_depth.get(symbol)
 
-            if depth_snapshot:
-                # Extract data from latest depth snapshot
-                bid_size = depth_snapshot.get('bid_size', 0.0)
-                ask_size = depth_snapshot.get('ask_size', 0.0)
-                best_bid_price = depth_snapshot.get('best_bid_price')
-                best_ask_price = depth_snapshot.get('best_ask_price')
+            if current_depth:
+                # Extract current state
+                current_bid = current_depth.get('bid_size', 0.0)
+                current_ask = current_depth.get('ask_size', 0.0)
+                best_bid = current_depth.get('best_bid_price')
+                best_ask = current_depth.get('best_ask_price')
+                current_ts = current_depth.get('timestamp', self._system_time)
 
-                if bid_size > 0 or ask_size > 0:
+                # Compute resting size
+                if current_bid > 0 or current_ask > 0:
                     resting_size_primitive = compute_resting_size(
-                        bid_size=bid_size,
-                        ask_size=ask_size,
-                        best_bid_price=best_bid_price,
-                        best_ask_price=best_ask_price,
-                        timestamp=depth_snapshot.get('timestamp', self._system_time)
+                        bid_size=current_bid,
+                        ask_size=current_ask,
+                        best_bid_price=best_bid,
+                        best_ask_price=best_ask,
+                        timestamp=current_ts
                     )
-            else:
-                # Debug: Check why depth snapshot not found
-                import sys
-                print(f"DEBUG M4: No depth snapshot for {symbol}. Available: {list(self._m1.latest_depth.keys())[:5]}", file=sys.stderr)
+
+                # Detect consumption and refill if we have previous state
+                if previous_depth:
+                    prev_bid = previous_depth.get('bid_size', 0.0)
+                    prev_ask = previous_depth.get('ask_size', 0.0)
+                    prev_ts = previous_depth.get('timestamp', 0.0)
+
+                    # Skip if timestamps are identical (duplicate update)
+                    if prev_ts < current_ts:
+                        # Detect bid consumption
+                        if prev_bid > 0 and best_bid:
+                            consumption_primitive = detect_order_consumption(
+                                previous_size=prev_bid,
+                                current_size=current_bid,
+                                side='bid',
+                                price_level=best_bid,
+                                timestamp=current_ts,
+                                min_consumption_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
+
+                        # Detect ask consumption if no bid consumption
+                        if consumption_primitive is None and prev_ask > 0 and best_ask:
+                            consumption_primitive = detect_order_consumption(
+                                previous_size=prev_ask,
+                                current_size=current_ask,
+                                side='ask',
+                                price_level=best_ask,
+                                timestamp=current_ts,
+                                min_consumption_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
+
+                        # Detect absorption (consumption + price stability)
+                        if consumption_primitive:
+                            # Get price before/after from recent trades
+                            prices = list(self._m1.recent_prices.get(symbol, []))
+                            if len(prices) >= 2:
+                                # Find prices around previous and current timestamps
+                                price_before = None
+                                price_after = None
+
+                                for ts, price in prices:
+                                    if ts <= prev_ts + _OB_PRICE_WINDOW_SEC:
+                                        price_before = price
+                                    if ts <= current_ts and ts > prev_ts:
+                                        price_after = price
+
+                                if price_before and price_after:
+                                    absorption_primitive = detect_absorption_event(
+                                        consumed_size=consumption_primitive.consumed_size,
+                                        price_before=price_before,
+                                        price_after=price_after,
+                                        side=consumption_primitive.side,
+                                        timestamp=current_ts,
+                                        max_price_movement_pct=_OB_PRICE_STABILITY_PCT
+                                    )
+
+                        # Detect refill (size increase)
+                        if prev_bid > 0 and best_bid:
+                            refill_primitive = detect_refill_event(
+                                previous_size=prev_bid,
+                                current_size=current_bid,
+                                side='bid',
+                                price_level=best_bid,
+                                timestamp=current_ts,
+                                min_refill_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
+
+                        # Detect ask refill if no bid refill
+                        if refill_primitive is None and prev_ask > 0 and best_ask:
+                            refill_primitive = detect_refill_event(
+                                previous_size=prev_ask,
+                                current_size=current_ask,
+                                side='ask',
+                                price_level=best_ask,
+                                timestamp=current_ts,
+                                min_refill_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
 
         except Exception as e:
             # Computation failures should not crash snapshot creation
             # Return None primitives and continue
-            import sys
-            print(f"DEBUG M4: Exception computing primitives for {symbol}: {e}", file=sys.stderr)
+            pass
 
         # Return bundle with computed primitives
-        # Note: Only resting_size implemented for order book validation
-        # Other primitives remain stubbed pending implementation
         return M4PrimitiveBundle(
             symbol=symbol,
             zone_penetration=None,
@@ -231,9 +315,9 @@ class ObservationSystem:
             event_non_occurrence_counter=None,
             structural_persistence_duration=None,
             resting_size=resting_size_primitive,
-            order_consumption=None,  # TODO: Detect size decreases
-            absorption_event=None,   # TODO: Detect consumption + price stability
-            refill_event=None,       # TODO: Detect size increases
+            order_consumption=consumption_primitive,
+            absorption_event=absorption_primitive,
+            refill_event=refill_primitive,
             price_acceptance_ratio=None,
             liquidation_density=None,
             directional_continuity=None,

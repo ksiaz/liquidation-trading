@@ -25,6 +25,7 @@ class EnrichedLiquidityMemoryNode:
     
     # IDENTITY
     id: str
+    symbol: str
     price_center: float
     price_band: float
     side: Literal["bid", "ask", "both"]
@@ -258,6 +259,7 @@ class EnrichedLiquidityMemoryNode:
         """Export to dict."""
         return {
             'id': self.id,
+            'symbol': self.symbol,
             'price_center': self.price_center,
             'price_band': self.price_band,
             'side': self.side,
@@ -287,7 +289,7 @@ class EnrichedLiquidityMemoryNode:
         """String representation."""
         status = "ACTIVE" if self.active else "ARCHIVED"
         return (
-            f"EnrichedLMN({self.side} ${self.price_center:.4f}±{self.price_band:.4f} "
+            f"EnrichedLMN({self.symbol} {self.side} ${self.price_center:.4f}±{self.price_band:.4f} "
             f"str={self.strength:.2f} interactions={self.interaction_count} "
             f"vol=${self.volume_total:.0f} {status})"
         )

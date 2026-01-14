@@ -49,6 +49,7 @@ class ContinuityMemoryStore:
     def add_or_update_node(
         self,
         node_id: str,
+        symbol: str,
         price_center: float,
         price_band: float,
         side: str,
@@ -81,6 +82,7 @@ class ContinuityMemoryStore:
         # Create new node
         node = EnrichedLiquidityMemoryNode(
             id=node_id,
+            symbol=symbol,
             price_center=price_center,
             price_band=price_band,
             side=side,
@@ -261,8 +263,11 @@ class ContinuityMemoryStore:
             best_bid_price: Best bid price level (or None)
             best_ask_price: Best ask price level (or None)
         """
-        # Update active nodes that overlap with best bid/ask
+        # Update active nodes that overlap with best bid/ask (symbol-filtered)
         for node in self._active_nodes.values():
+            if node.symbol != symbol:
+                continue
+
             # Check if node overlaps with best bid
             if best_bid_price is not None and node.overlaps(best_bid_price):
                 if node.side in ('bid', 'both'):
@@ -272,6 +277,120 @@ class ContinuityMemoryStore:
             if best_ask_price is not None and node.overlaps(best_ask_price):
                 if node.side in ('ask', 'both'):
                     node.update_orderbook_state(timestamp, 0.0, ask_size)
+
+    def get_active_nodes_for_symbol(self, symbol: str) -> List[EnrichedLiquidityMemoryNode]:
+        """Get all active nodes for a specific symbol.
+
+        Args:
+            symbol: Trading symbol to filter by
+
+        Returns:
+            List of active nodes for the symbol
+        """
+        return [node for node in self._active_nodes.values() if node.symbol == symbol]
+
+    def get_nodes_near_price(
+        self,
+        symbol: str,
+        price: float,
+        max_distance: Optional[float] = None
+    ) -> List[EnrichedLiquidityMemoryNode]:
+        """Get active nodes near a price level (spatial matching).
+
+        Args:
+            symbol: Trading symbol
+            price: Price level to search near
+            max_distance: Maximum distance from price (default: use node price_band)
+
+        Returns:
+            List of nodes that overlap with or are near the price
+        """
+        nearby_nodes = []
+
+        for node in self._active_nodes.values():
+            if node.symbol != symbol:
+                continue
+
+            # Check if price overlaps with node band
+            if node.overlaps(price):
+                nearby_nodes.append(node)
+            # Check if within max_distance (if specified)
+            elif max_distance is not None:
+                distance = abs(price - node.price_center)
+                if distance <= max_distance:
+                    nearby_nodes.append(node)
+
+        return nearby_nodes
+
+    def record_liquidation_at_node(
+        self,
+        node_id: str,
+        timestamp: float,
+        side: str
+    ):
+        """Record liquidation event at a node.
+
+        Args:
+            node_id: Node identifier
+            timestamp: Liquidation timestamp
+            side: Liquidation side ("BUY" or "SELL")
+        """
+        # Check active nodes first
+        if node_id in self._active_nodes:
+            node = self._active_nodes[node_id]
+            node.record_liquidation(timestamp, side)
+            # Boost strength on liquidation
+            node.strength = min(1.0, node.strength + 0.15)
+            self._total_interactions += 1
+        # Check dormant nodes (could trigger revival)
+        elif node_id in self._dormant_nodes:
+            # Revival handled by add_or_update_node if needed
+            pass
+
+    def record_trade_at_node(
+        self,
+        node_id: str,
+        timestamp: float,
+        volume: float,
+        is_buyer_maker: bool
+    ):
+        """Record trade execution at a node.
+
+        Args:
+            node_id: Node identifier
+            timestamp: Trade timestamp
+            volume: Trade volume (quote currency)
+            is_buyer_maker: Whether buyer was maker (passive)
+        """
+        # Check active nodes first
+        if node_id in self._active_nodes:
+            node = self._active_nodes[node_id]
+            node.record_trade_execution(timestamp, volume, is_buyer_maker)
+            # Boost strength proportional to volume
+            volume_boost = min(0.10, volume / 10000.0)  # Cap at 0.10
+            node.strength = min(1.0, node.strength + volume_boost)
+            self._total_interactions += 1
+        # Check dormant nodes (could trigger revival)
+        elif node_id in self._dormant_nodes:
+            # Revival handled by add_or_update_node if needed
+            pass
+
+    def get_node(self, node_id: str) -> Optional[EnrichedLiquidityMemoryNode]:
+        """Get node by ID from any state.
+
+        Args:
+            node_id: Node identifier
+
+        Returns:
+            Node if found, None otherwise
+        """
+        if node_id in self._active_nodes:
+            return self._active_nodes[node_id]
+        elif node_id in self._dormant_nodes:
+            return self._dormant_nodes[node_id]
+        elif node_id in self._archived_nodes:
+            return self._archived_nodes[node_id]
+        return None
 
     def _transition_to_dormant(self, node_id: str):
         """Transition node from ACTIVE to DORMANT."""

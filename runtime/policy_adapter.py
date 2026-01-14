@@ -228,6 +228,8 @@ class PolicyAdapter:
                 "resting_size": None,
                 "order_consumption": None,
                 "refill_event": None,
+                "order_block": None,
+                "supply_demand_zone": None,
             }
 
         # Extract primitives from bundle (read-only access)
@@ -243,6 +245,8 @@ class PolicyAdapter:
             "resting_size": bundle.resting_size,
             "order_consumption": bundle.order_consumption,
             "refill_event": bundle.refill_event,
+            "order_block": bundle.order_block,
+            "supply_demand_zone": bundle.supply_demand_zone,
         }
 
     def _proposals_to_mandates(

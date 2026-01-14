@@ -113,6 +113,13 @@ class ObservationSystem:
                     side=normalized_event['side']
                 )
 
+                # M2 Population: Associate trade with nearby nodes
+                self._associate_trade_with_nodes(normalized_event)
+
+            # M2 Population: Create/update nodes from liquidations
+            if normalized_event and event_type == 'LIQUIDATION':
+                self._create_or_update_node_from_liquidation(normalized_event)
+
             # Update M2 nodes with orderbook state if it's a depth event
             if normalized_event and event_type == 'DEPTH':
                 self._m2_store.update_orderbook_state(
@@ -138,7 +145,20 @@ class ObservationSystem:
             # Invariant A: Time Monotonicity
             self._trigger_failure(f"Time Regression: {new_timestamp} < {self._system_time}")
             return
-            
+
+        # M2 Lifecycle Management: Update node states every 10 seconds
+        prev_interval = int(self._system_time / 10.0)
+        new_interval = int(new_timestamp / 10.0)
+
+        if new_interval > prev_interval:
+            try:
+                # Apply decay to all nodes
+                self._m2_store.decay_nodes(new_timestamp)
+                # Update node states (ACTIVE → DORMANT → ARCHIVED)
+                self._m2_store.update_memory_states(new_timestamp)
+            except Exception as e:
+                self._trigger_failure(f"M2 Lifecycle Failure: {e}")
+
         self._system_time = new_timestamp
         self._update_liveness()
 
@@ -178,10 +198,100 @@ class ObservationSystem:
         # But 'advance_time' is called by the runtime loop using Wall Clock.
         # So 'new_timestamp' IS effectively Wall Clock (or Data Clock).
         # We need to rely on the Runtime to push time frequently.
-        # If Runtime stops pushing, 'query' won't know unless we verify against machine time 
+        # If Runtime stops pushing, 'query' won't know unless we verify against machine time
         # inside query (which violates isolation but is necessary for safety).
         # Compromise: Check lag against machine time in Query Guard.
         pass
+
+    def _create_or_update_node_from_liquidation(self, normalized_event: Dict) -> None:
+        """Create or update M2 node from liquidation event.
+
+        Args:
+            normalized_event: Normalized liquidation event from M1
+        """
+        symbol = normalized_event['symbol']
+        price = normalized_event['price']
+        side = normalized_event['side']
+        timestamp = normalized_event['timestamp']
+        volume = normalized_event.get('quote_qty', 0.0)
+
+        # Generate node ID: {symbol}_{side}_{price_bucket}
+        # Price bucket: round to 0.1% precision
+        import math
+        price_precision = max(1, int(-math.log10(price * 0.001)))
+        price_bucket = round(price, price_precision)
+        node_id = f"{symbol}_{side}_{price_bucket}"
+
+        # Check if node exists
+        existing_node = self._m2_store.get_node(node_id)
+
+        if existing_node:
+            # Update existing node
+            self._m2_store.record_liquidation_at_node(node_id, timestamp, side)
+        else:
+            # Create new node
+            price_band = price * 0.001  # 10 bps (0.1%)
+            self._m2_store.add_or_update_node(
+                node_id=node_id,
+                symbol=symbol,
+                price_center=price_bucket,
+                price_band=price_band,
+                side="both",  # Liquidations can trigger in either direction
+                timestamp=timestamp,
+                creation_reason="liquidation",
+                initial_strength=0.5,
+                volume=volume
+            )
+
+    def _associate_trade_with_nodes(self, normalized_event: Dict) -> None:
+        """Associate trade with nearby M2 nodes.
+
+        Updates nodes that overlap with the trade price.
+        Creates new node if trade is large and no nearby nodes exist.
+
+        Args:
+            normalized_event: Normalized trade event from M1
+        """
+        symbol = normalized_event['symbol']
+        price = normalized_event['price']
+        timestamp = normalized_event['timestamp']
+        volume = normalized_event.get('quote_qty', 0.0)
+        is_buyer_maker = normalized_event['side'] == 'SELL'
+
+        # Find nodes near this price
+        nearby_nodes = self._m2_store.get_nodes_near_price(symbol, price)
+
+        if nearby_nodes:
+            # Update all nearby nodes with trade evidence
+            for node in nearby_nodes:
+                self._m2_store.record_trade_at_node(
+                    node_id=node.id,
+                    timestamp=timestamp,
+                    volume=volume,
+                    is_buyer_maker=is_buyer_maker
+                )
+        elif volume >= 1000.0:  # Large trade threshold: $1000
+            # Create new node from large trade
+            import math
+            price_precision = max(1, int(-math.log10(price * 0.001)))
+            price_bucket = round(price, price_precision)
+            side = "bid" if is_buyer_maker else "ask"
+            node_id = f"{symbol}_{side}_{price_bucket}"
+
+            # Only create if doesn't exist
+            if not self._m2_store.get_node(node_id):
+                price_band = price * 0.001  # 10 bps
+                self._m2_store.add_or_update_node(
+                    node_id=node_id,
+                    symbol=symbol,
+                    price_center=price_bucket,
+                    price_band=price_band,
+                    side=side,
+                    timestamp=timestamp,
+                    creation_reason="large_trade",
+                    initial_strength=0.3,
+                    volume=volume
+                )
 
     def _get_snapshot(self) -> ObservationSnapshot:
         """Construct public snapshot from internal states.
@@ -394,6 +504,69 @@ class ObservationSystem:
             # Return None primitives and continue
             pass
 
+        # Detect patterns from M2 nodes
+        order_block_primitive = None
+        supply_demand_zone_primitive = None
+
+        try:
+            from memory.m4_node_patterns import (
+                detect_order_block,
+                detect_supply_demand_zone,
+                find_node_clusters
+            )
+
+            # Get M2 nodes for this symbol
+            active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+
+            if active_nodes:
+                # Detect order blocks from individual nodes
+                # Find strongest order block candidate
+                order_blocks = []
+                for node in active_nodes:
+                    ob = detect_order_block(node, self._system_time)
+                    if ob:
+                        order_blocks.append(ob)
+
+                # Return strongest order block (highest interaction density)
+                if order_blocks:
+                    order_block_primitive = max(
+                        order_blocks,
+                        key=lambda ob: ob.interactions_per_hour
+                    )
+
+                # Detect supply/demand zones from node clusters
+                if len(active_nodes) >= 3:
+                    # Get current price for displacement detection
+                    current_price = None
+                    if trades:
+                        current_price = trades[-1]['price']
+
+                    if current_price:
+                        # Find clusters
+                        clusters = find_node_clusters(active_nodes, max_gap_pct=0.2)
+
+                        # Detect zones from clusters
+                        zones = []
+                        for cluster in clusters:
+                            zone = detect_supply_demand_zone(
+                                cluster,
+                                current_price,
+                                self._system_time
+                            )
+                            if zone:
+                                zones.append(zone)
+
+                        # Return strongest zone (highest total volume)
+                        if zones:
+                            supply_demand_zone_primitive = max(
+                                zones,
+                                key=lambda z: z.total_volume
+                            )
+
+        except Exception as e:
+            # Pattern detection failures should not crash snapshot
+            pass
+
         # Return bundle with computed primitives
         return M4PrimitiveBundle(
             symbol=symbol,
@@ -413,5 +586,7 @@ class ObservationSystem:
             price_acceptance_ratio=None,
             liquidation_density=None,
             directional_continuity=None,
-            trade_burst=None
+            trade_burst=None,
+            order_block=order_block_primitive,
+            supply_demand_zone=supply_demand_zone_primitive
         )

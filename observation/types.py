@@ -84,6 +84,10 @@ class M4PrimitiveBundle:
     directional_continuity: Optional[Any]  # DirectionalContinuity
     trade_burst: Optional[Any]  # TradeBurst
 
+    # Tier B-5 - Node Pattern Detection (from M2 memory nodes)
+    order_block: Optional[Any]  # OrderBlockPrimitive
+    supply_demand_zone: Optional[Any]  # SupplyDemandZonePrimitive
+
 
 @dataclass(frozen=True)
 class ObservationSnapshot:

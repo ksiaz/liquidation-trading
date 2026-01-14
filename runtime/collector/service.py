@@ -635,7 +635,15 @@ class CollectorService:
                         primitives['persistence_presence_pct'] = float(bundle.structural_persistence_duration.persistence_ratio) * 100
                
                 primitives['directional_continuity_value'] = extract_value(bundle.directional_continuity)
-                primitives['resting_size_bid'] = extract_value(bundle.resting_size)
+
+                # Order book primitives - extract bid/ask separately
+                if bundle.resting_size is not None:
+                    primitives['resting_size_bid'] = getattr(bundle.resting_size, 'bid_size', None)
+                    primitives['resting_size_ask'] = getattr(bundle.resting_size, 'ask_size', None)
+                else:
+                    primitives['resting_size_bid'] = None
+                    primitives['resting_size_ask'] = None
+
                 primitives['order_consumption_size'] = extract_value(bundle.order_consumption)
                 primitives['absorption_event'] = bundle.absorption_event is not None
                 primitives['refill_event'] = bundle.refill_event is not None
@@ -738,6 +746,7 @@ class CollectorService:
                                                 pass
                                 elif 'depth' in stream:
                                     event_type = "DEPTH"
+                                    print(f"DEBUG STREAM: Received depth for {symbol}")
 
                                 # TIMESTAMP EXTRACTION
                                 ts = time.time()

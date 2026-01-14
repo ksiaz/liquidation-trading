@@ -238,17 +238,52 @@ class ContinuityMemoryStore:
         
         return self.topology.identify_clusters(all_nodes, price_threshold, min_cluster_size)
     
+    def update_orderbook_state(
+        self,
+        symbol: str,
+        timestamp: float,
+        bid_size: float,
+        ask_size: float,
+        best_bid_price: Optional[float],
+        best_ask_price: Optional[float]
+    ):
+        """
+        Update order book state for nodes near best bid/ask.
+
+        Updates resting size fields for active nodes that overlap with
+        observed best bid/ask price levels.
+
+        Args:
+            symbol: Trading symbol
+            timestamp: Observation timestamp
+            bid_size: Total observed bid size
+            ask_size: Total observed ask size
+            best_bid_price: Best bid price level (or None)
+            best_ask_price: Best ask price level (or None)
+        """
+        # Update active nodes that overlap with best bid/ask
+        for node in self._active_nodes.values():
+            # Check if node overlaps with best bid
+            if best_bid_price is not None and node.overlaps(best_bid_price):
+                if node.side in ('bid', 'both'):
+                    node.update_orderbook_state(timestamp, bid_size, 0.0)
+
+            # Check if node overlaps with best ask
+            if best_ask_price is not None and node.overlaps(best_ask_price):
+                if node.side in ('ask', 'both'):
+                    node.update_orderbook_state(timestamp, 0.0, ask_size)
+
     def _transition_to_dormant(self, node_id: str):
         """Transition node from ACTIVE to DORMANT."""
         node = self._active_nodes.pop(node_id)
-        
+
         # Extract and preserve historical evidence
         evidence = extract_historical_evidence(node)
         self._dormant_evidence[node_id] = evidence
-        
+
         # Reduce decay rate
         node.decay_rate = MemoryStateThresholds.DORMANT_DECAY_RATE
-        
+
         self._dormant_nodes[node_id] = node
     
     def _transition_to_archived(self, node_id: str):

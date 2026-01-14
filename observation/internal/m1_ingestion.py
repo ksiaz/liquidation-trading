@@ -17,17 +17,22 @@ class M1IngestionEngine:
     No IO, no threads, no clock.
     """
     
-    def __init__(self, trade_buffer_size: int = 500, liquidation_buffer_size: int = 200):
+    def __init__(self, trade_buffer_size: int = 500, liquidation_buffer_size: int = 200, depth_buffer_size: int = 100):
         # Raw Buffers (Per Symbol)
         self.raw_trades: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=trade_buffer_size))
         self.raw_liquidations: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=liquidation_buffer_size))
-        
+        self.raw_depth: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=depth_buffer_size))
+
+        # Latest depth snapshot per symbol (for order book primitives)
+        self.latest_depth: Dict[str, Optional[Dict]] = {}
+
         # Counters
         self.counters = {
             'trades': 0,
             'liquidations': 0,
             'klines': 0,
             'oi': 0,
+            'depth': 0,
             'errors': 0
         }
 
@@ -91,6 +96,45 @@ class M1IngestionEngine:
             
             return event
             
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def normalize_depth(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
+        """
+        Normalize raw binance depth payload.
+        """
+        try:
+            # Binance Depth format
+            bids = raw_payload.get('b', [])
+            asks = raw_payload.get('a', [])
+            timestamp = int(raw_payload.get('E', 0)) / 1000.0
+
+            # Calculate total size at best levels (top 5 levels)
+            bid_size = sum(float(level[1]) for level in bids[:5]) if bids else 0.0
+            ask_size = sum(float(level[1]) for level in asks[:5]) if asks else 0.0
+
+            # Extract best prices
+            best_bid_price = float(bids[0][0]) if bids else None
+            best_ask_price = float(asks[0][0]) if asks else None
+
+            # Create normalized event
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'bid_size': bid_size,
+                'ask_size': ask_size,
+                'best_bid_price': best_bid_price,
+                'best_ask_price': best_ask_price,
+                'bid_levels': len(bids),
+                'ask_levels': len(asks)
+            }
+            self.raw_depth[symbol].append(event)
+            self.latest_depth[symbol] = event  # Store latest for primitive computation
+            self.counters['depth'] += 1
+
+            return event
+
         except Exception:
             self.counters['errors'] += 1
             return None

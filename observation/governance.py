@@ -9,6 +9,12 @@ from memory.m2_continuity_store import ContinuityMemoryStore
 # M5 Access Layer (For M4 primitive computation)
 from memory.m5_access import MemoryAccess
 
+# Order book primitives
+from memory.m4_orderbook_primitives import (
+    RestingSizeAtPrice,
+    compute_resting_size
+)
+
 class ObservationSystem:
     """
     The sealed Observation System.
@@ -61,7 +67,9 @@ class ObservationSystem:
                 self._m1.record_kline(symbol)
             elif event_type == 'OI':
                 self._m1.record_oi(symbol)
-                
+            elif event_type == 'DEPTH':
+                normalized_event = self._m1.normalize_depth(symbol, payload)
+
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
                 self._m3.process_trade(
@@ -70,6 +78,17 @@ class ObservationSystem:
                     price=normalized_event['price'],
                     quantity=normalized_event['quantity'],
                     side=normalized_event['side']
+                )
+
+            # Update M2 nodes with orderbook state if it's a depth event
+            if normalized_event and event_type == 'DEPTH':
+                self._m2_store.update_orderbook_state(
+                    symbol=normalized_event['symbol'],
+                    timestamp=normalized_event['timestamp'],
+                    bid_size=normalized_event['bid_size'],
+                    ask_size=normalized_event['ask_size'],
+                    best_bid_price=normalized_event['best_bid_price'],
+                    best_ask_price=normalized_event['best_ask_price']
                 )
         except Exception as e:
             # Internal crash -> FAILED state
@@ -164,32 +183,42 @@ class ObservationSystem:
 
         Authority: ANNEX_M4_PRIMITIVE_FLOW.md
         """
-        # Query M2 for active nodes (this will return empty list until M2 is populated)
-        # For now, gracefully handle empty M2 by returning None primitives
-        # Future implementation will compute real primitives when M2 is populated
+        # Initialize all primitives to None
+        resting_size_primitive = None
 
         try:
-            # Attempt to get active nodes for this symbol
-            # M2 store query (spatial filter by symbol would require current price)
-            # For now, we don't have symbol-specific nodes, so return None primitives
+            # Compute order book primitives from M1 latest depth snapshot
+            depth_snapshot = self._m1.latest_depth.get(symbol)
 
-            # This stub maintains correct call structure without requiring
-            # fully populated M2 store or complex query parameter construction
+            if depth_snapshot:
+                # Extract data from latest depth snapshot
+                bid_size = depth_snapshot.get('bid_size', 0.0)
+                ask_size = depth_snapshot.get('ask_size', 0.0)
+                best_bid_price = depth_snapshot.get('best_bid_price')
+                best_ask_price = depth_snapshot.get('best_ask_price')
 
-            # Future implementation will:
-            # 1. Query M2 for nodes associated with symbol
-            # 2. Build query params from node data
-            # 3. Call M5 access layer for each primitive
-            # 4. Assemble M4PrimitiveBundle from results
+                if bid_size > 0 or ask_size > 0:
+                    resting_size_primitive = compute_resting_size(
+                        bid_size=bid_size,
+                        ask_size=ask_size,
+                        best_bid_price=best_bid_price,
+                        best_ask_price=best_ask_price,
+                        timestamp=depth_snapshot.get('timestamp', self._system_time)
+                    )
+            else:
+                # Debug: Check why depth snapshot not found
+                import sys
+                print(f"DEBUG M4: No depth snapshot for {symbol}. Available: {list(self._m1.latest_depth.keys())[:5]}", file=sys.stderr)
 
-            pass
-        except Exception:
+        except Exception as e:
             # Computation failures should not crash snapshot creation
             # Return None primitives and continue
-            pass
+            import sys
+            print(f"DEBUG M4: Exception computing primitives for {symbol}: {e}", file=sys.stderr)
 
-        # Return bundle with all primitives as None until M2 is populated
-        # This maintains structural correctness while deferring implementation
+        # Return bundle with computed primitives
+        # Note: Only resting_size implemented for order book validation
+        # Other primitives remain stubbed pending implementation
         return M4PrimitiveBundle(
             symbol=symbol,
             zone_penetration=None,
@@ -201,10 +230,10 @@ class ObservationSystem:
             traversal_void_span=None,
             event_non_occurrence_counter=None,
             structural_persistence_duration=None,
-            resting_size=None,
-            order_consumption=None,
-            absorption_event=None,
-            refill_event=None,
+            resting_size=resting_size_primitive,
+            order_consumption=None,  # TODO: Detect size decreases
+            absorption_event=None,   # TODO: Detect consumption + price stability
+            refill_event=None,       # TODO: Detect size increases
             price_acceptance_ratio=None,
             liquidation_density=None,
             directional_continuity=None,

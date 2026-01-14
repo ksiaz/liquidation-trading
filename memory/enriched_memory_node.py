@@ -71,7 +71,7 @@ class EnrichedLiquidityMemoryNode:
     
     # METADATA
     last_decay_application_ts: float = 0.0
-    
+
     # M3: TEMPORAL EVIDENCE ORDERING (Phase M3 extension)
     # Sequence buffer for chronological token ordering
     sequence_buffer: 'SequenceBuffer' = None  # type: ignore
@@ -80,6 +80,12 @@ class EnrichedLiquidityMemoryNode:
     motif_last_seen: dict = field(default_factory=dict)  # {motif_tuple: timestamp}
     motif_strength: dict = field(default_factory=dict)  # {motif_tuple: strength}
     total_sequences_observed: int = 0
+
+    # ORDER BOOK STATE (for B-2.1 primitives)
+    # Tracks observed resting size at this price level
+    last_observed_bid_size: float = 0.0
+    last_observed_ask_size: float = 0.0
+    last_orderbook_update_ts: Optional[float] = None
     
     def __post_init__(self):
         """Validate invariants."""
@@ -145,6 +151,21 @@ class EnrichedLiquidityMemoryNode:
         self.last_interaction_ts = timestamp
         self.interaction_timestamps.append(timestamp)
         self._update_temporal_stats()
+
+    def update_orderbook_state(self, timestamp: float, bid_size: float, ask_size: float):
+        """Update observed resting size at this price level.
+
+        Args:
+            timestamp: Observation timestamp
+            bid_size: Observed bid size at this price level
+            ask_size: Observed ask size at this price level
+        """
+        self.last_observed_bid_size = bid_size
+        self.last_observed_ask_size = ask_size
+        self.last_orderbook_update_ts = timestamp
+
+        if bid_size > 0 or ask_size > 0:
+            self.record_orderbook_appearance(timestamp)
     
     def apply_decay(self, current_timestamp: float, current_price: float = None):
         """Apply time-based decay."""

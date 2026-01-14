@@ -33,13 +33,17 @@ class RiskConfig:
     # Operational parameters
     reduction_pct_default: float = 0.5  # 50% default reduction
     safety_factor: float = 0.7  # 70% of max loss tolerance
-    
+    risk_fraction_per_trade: float = 0.02  # 2% max loss per trade
+    min_free_margin_pct: float = 0.10  # 10% minimum free margin
+
     def validate(self):
         """Validate configuration consistency."""
         assert self.L_target <= self.L_max, "L_target must be <= L_max"
         assert self.L_symbol_max <= self.L_max, "L_symbol_max must be <= L_max"
         assert 0 < self.D_critical < self.D_min_safe, "D_critical must be < D_min_safe"
         assert 0 < self.safety_factor < 1.0, "safety_factor must be in (0, 1)"
+        assert 0 < self.risk_fraction_per_trade < 1.0, "risk_fraction must be in (0, 1)"
+        assert 0 < self.min_free_margin_pct < 1.0, "min_free_margin_pct must be in (0, 1)"
 
 
 @dataclass(frozen=True)
@@ -129,13 +133,19 @@ class ValidationResult:
     valid: bool
     reason: Optional[str] = None
     violated_invariant: Optional[str] = None  # I-L1, I-LA1, etc.
-    
+    blocking: bool = False  # Whether this violation blocks action
+
+    @property
+    def passed(self) -> bool:
+        """Alias for valid (for compatibility)."""
+        return self.valid
+
     @classmethod
-    def accept(cls) -> 'ValidationResult':
+    def accept(cls, reason: str = "Validation passed") -> 'ValidationResult':
         """Create acceptance result."""
-        return cls(valid=True, reason=None)
-    
+        return cls(valid=True, reason=reason, blocking=False)
+
     @classmethod
-    def reject(cls, reason: str, invariant: str) -> 'ValidationResult':
+    def reject(cls, reason: str, invariant: Optional[str] = None, blocking: bool = True) -> 'ValidationResult':
         """Create rejection result."""
-        return cls(valid=False, reason=reason, violated_invariant=invariant)
+        return cls(valid=False, reason=reason, violated_invariant=invariant, blocking=blocking)

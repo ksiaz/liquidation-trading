@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from observation.types import ObservationSnapshot, ObservationStatus
 from runtime.arbitration.types import Mandate, MandateType
+from runtime.position.types import PositionState
 
 # External policy imports (frozen)
 from external_policy.ep2_strategy_geometry import (
@@ -78,7 +79,8 @@ class PolicyAdapter:
         self,
         observation_snapshot: ObservationSnapshot,
         symbol: str,
-        timestamp: float
+        timestamp: float,
+        position_state: Optional[PositionState] = None
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -88,6 +90,7 @@ class PolicyAdapter:
             observation_snapshot: Current observation state
             symbol: Symbol to generate mandates for
             timestamp: Current timestamp
+            position_state: Current position state for symbol (from executor)
 
         Returns:
             List of Mandates (possibly empty)
@@ -106,6 +109,7 @@ class PolicyAdapter:
             # Observation not ready -> no mandates
             return []
 
+        # Status is ACTIVE - proceed with mandate generation
         # Extract M4 primitives from observation
         # NOTE: This is a stub - actual implementation needs M5 query interface
         # For now, we simulate primitive extraction
@@ -135,29 +139,32 @@ class PolicyAdapter:
                 traversal_compactness=primitives.get("traversal_compactness"),
                 central_tendency_deviation=primitives.get("central_tendency_deviation"),
                 context=context,
-                permission=permission
+                permission=permission,
+                position_state=position_state
             )
             if proposal:
                 proposals.append(proposal)
 
         if self.config.enable_kinematics:
             proposal = generate_kinematics_proposal(
-                price_traversal_velocity=primitives.get("price_traversal_velocity"),
-                traversal_compactness=primitives.get("traversal_compactness"),
-                displacement_origin_anchor=primitives.get("displacement_origin_anchor"),
+                velocity=primitives.get("price_traversal_velocity"),
+                compactness=primitives.get("traversal_compactness"),
+                acceptance=primitives.get("displacement_origin_anchor"),
+                permission=permission,
                 context=context,
-                permission=permission
+                position_state=position_state
             )
             if proposal:
                 proposals.append(proposal)
 
         if self.config.enable_absence:
             proposal = generate_absence_proposal(
-                structural_absence_duration=primitives.get("structural_absence_duration"),
-                traversal_void_span=primitives.get("traversal_void_span"),
-                event_non_occurrence_counter=primitives.get("event_non_occurrence_counter"),
+                permission=permission,
+                absence=primitives.get("structural_absence_duration"),
+                persistence=primitives.get("traversal_void_span"),
+                geometry=primitives.get("zone_penetration"),
                 context=context,
-                permission=permission
+                position_state=position_state
             )
             if proposal:
                 proposals.append(proposal)
@@ -265,6 +272,12 @@ class PolicyAdapter:
         # Mechanical mapping based on frozen policy conventions
         # These mappings are defined by external policy contracts
 
-        # Currently all proposals map to ENTRY (structural events suggest entry)
-        # This is intentionally simple - real logic in arbitration layer
-        return MandateType.ENTRY
+        if action_type == "ENTRY":
+            return MandateType.ENTRY
+        elif action_type == "EXIT":
+            return MandateType.EXIT
+        elif action_type == "REDUCE":
+            return MandateType.REDUCE
+        else:
+            # Default fallback (should not reach here with well-formed policies)
+            return MandateType.ENTRY

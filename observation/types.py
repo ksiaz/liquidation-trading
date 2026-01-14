@@ -22,6 +22,7 @@ class SystemHaltedException(Exception):
 
 class ObservationStatus(Enum):
     UNINITIALIZED = auto()
+    ACTIVE = auto()
     FAILED = auto()
 
 @dataclass(frozen=True)

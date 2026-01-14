@@ -97,7 +97,8 @@ class CollectorService:
     async def start(self):
         """Start all collectors."""
         self._running = True
-        self._startup_time = time.time()  # Record startup time for warm-up period
+        # Don't set _startup_time here - will be set on first stream data
+        # self._startup_time = time.time()  # REMOVED: causes clock skew with Binance time
 
         # self._logger.info(f"Warmup period duration: {self._warmup_duration_sec}s from startup")
 
@@ -157,17 +158,20 @@ class CollectorService:
             timestamp: Current timestamp
         """
         try:
+            # Set startup time on first call using stream timestamp
+            if self._startup_time is None:
+                self._startup_time = timestamp
+
             # Check warm-up period - skip mandate generation if still warming up
-            if self._startup_time is not None:
-                elapsed = timestamp - self._startup_time
-                if elapsed < self._warmup_duration_sec:
-                    # Still in warm-up - allow observation layer to build state
-                    return
-                elif not self._warmup_complete:
-                    # Warm-up just completed
-                    self._warmup_complete = True
-                    self._logger.info(f"Mandate generation suppression period ended at {elapsed:.1f}s")
-                    print(f"Mandate generation suppression period ended at {elapsed:.1f}s")
+            elapsed = timestamp - self._startup_time
+            if elapsed < self._warmup_duration_sec:
+                # Still in warm-up - allow observation layer to build state
+                return
+            elif not self._warmup_complete:
+                # Warm-up just completed
+                self._warmup_complete = True
+                self._logger.info(f"Mandate generation suppression period ended at {elapsed:.1f}s")
+                print(f"Mandate generation suppression period ended at {elapsed:.1f}s")
 
             # Log execution cycle FIRST to establish context
             cycle_id = None
@@ -207,7 +211,8 @@ class CollectorService:
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
                         symbol=symbol,
-                        timestamp=timestamp
+                        timestamp=timestamp,
+                        position_state=position_state
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -234,8 +239,7 @@ class CollectorService:
             cycle_stats = self.executor.process_cycle(
                 mandates=all_mandates,
                 account=self._account,
-                mark_prices=mark_prices,
-                cycle_id=cycle_id
+                mark_prices=mark_prices
             )
             
             # Log mandates and arbitration (linked to cycle)

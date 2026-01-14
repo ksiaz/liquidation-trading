@@ -116,7 +116,11 @@ class ObservationSystem:
             
         self._system_time = new_timestamp
         self._update_liveness()
-        
+
+        # Transition from UNINITIALIZED to ACTIVE once time advances
+        if self._status == ObservationStatus.UNINITIALIZED and new_timestamp > 0:
+            self._status = ObservationStatus.ACTIVE
+
         # Trigger M3 to close windows
         try:
             self._m3.advance_time(new_timestamp)

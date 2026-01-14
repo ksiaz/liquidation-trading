@@ -1,10 +1,73 @@
-# Peak Pressure Detection System - v1.0
+# Constitutional Execution System
 
 ## Overview
 
-**System v1.0** is a mechanical market structure observer for cryptocurrency futures markets. It detects rare multi-stream stress coincidences called "Peak Pressure events."
+The **Constitutional Execution System** is a formally constrained trading execution substrate that operates under strict epistemic and architectural rules. It observes market structure through a layered observation stack (M1-M6), evaluates conditions via policy strategies (EP2-EP4), and executes via ghost trading with constitutional risk constraints.
 
-**This system observes market structure. It does not trade, predict, or generate signals.**
+**Core Principle**: This system is constitution-driven. It does not interpret, predict, or make discretionary decisions. All behavior is deterministic and provably constrained.
+
+---
+
+## System Architecture
+
+### Observation Layers (M1-M5)
+
+```
+M1: Ingestion Engine
+├── Raw market data (trades, liquidations, orderbook)
+├── Event normalization
+└── Temporal sequencing
+
+M2: Continuity Memory
+├── Price level memory nodes
+├── Liquidity structure tracking
+└── Node lifecycle management (ACTIVE → DORMANT → ARCHIVED)
+
+M3: Temporal Engine
+├── Event sequencing
+├── Time monotonicity enforcement
+└── Causality preservation
+
+M4: Primitive Computation (19 primitives)
+├── Zone Geometry: penetration depth, displacement anchor
+├── Traversal Kinematics: velocity, compactness
+├── Central Tendency: price distribution deviation
+├── Structural Absence/Persistence: node presence over time
+├── Trade Flow: directional continuity, burst detection
+├── Liquidation Clustering: spatial concentration
+└── Order Book: resting size, consumption, absorption, refill
+
+M5: Governance Layer
+├── Orchestrates M4 primitive computation
+├── Generates observation snapshots
+├── Enforces invariants (time monotonicity, data completeness)
+└── Exposes ONLY: status (UNINITIALIZED or FAILED), timestamp, symbols
+```
+
+### Policy & Execution Layers (EP2-EP4, M6)
+
+```
+EP2: Strategy Policies
+├── Geometry Strategy: zone penetration conditions
+├── Kinematics Strategy: traversal velocity/compactness conditions
+└── Absence Strategy: structural absence/persistence conditions
+
+EP3: Arbitration
+├── Deterministic mandate conflict resolution
+├── EXIT supremacy enforcement
+└── Single action emission per cycle
+
+EP4: Execution
+├── Ghost Trading: simulated position lifecycle
+├── Risk Gates: R1-R15 invariant validation
+├── Exchange Adapter: order submission (future)
+└── Position Tracking: FLAT → ENTERING → OPEN → REDUCING → EXITING
+
+M6: Permission Layer
+├── Execution permission enforcement
+├── Constitutional constraint validation
+└── No observation interpretation
+```
 
 ---
 
@@ -12,268 +75,382 @@
 
 ### Prerequisites
 
-```powershell
-# Install Python dependencies
-pip install PySide6 pandas websockets requests
+```bash
+# Python 3.11+
+python --version
 
-# Verify installation
-python --version  # Should be 3.9+
+# Install dependencies
+pip install websockets requests pandas
+
+# Verify database exists
+ls logs/execution.db
 ```
 
 ### Launch System
 
-**Step 1: Start Collector**
+**Ghost Trading Mode** (no real capital):
 
-```powershell
-cd scripts
-python market_event_collector.py
+```bash
+# Start collector service (runtime/collector/service.py)
+python runtime/native_app/main.py
+
+# System will:
+# 1. Connect to Hyperliquid WebSocket streams
+# 2. Populate M1-M5 observation layers
+# 3. Compute 19 M4 primitives per cycle
+# 4. Evaluate EP2 strategy policies
+# 5. Arbitrate mandates (EP3)
+# 6. Execute ghost trades (EP4)
+# 7. Log all data to logs/execution.db
 ```
 
-Wait for: `[NATIVE APP] SystemState initialized with TOP_10 symbols`
-
-**Step 2: Launch Native Observability App**
-
-```powershell
-cd native_app
-python main.py
+**Expected Output**:
+```
+[INFO] ObservationSystem initialized for 10 symbols
+[INFO] Warmup period: 300 seconds
+[INFO] Cycle 1: 8 primitives computed
+[INFO] Ghost trade opened: BTC LONG @ $43250.50
+[INFO] Ghost trade exited: BTC LONG @ $43275.20 | PNL: $24.70
 ```
 
-Window opens (1600×1000) showing live market data.
-
 ---
 
-## Architecture
+## Database Schema
 
-### Single-Process Design
+All system activity logged to `logs/execution.db`:
 
 ```
-Peak Pressure System (one process)
-├── Collector (background threads)
-│   ├── Trade stream (WebSocket)
-│   ├── Liquidation stream (WebSocket)
-│   ├── Kline stream (WebSocket, 1s)
-│   └── Open Interest (HTTP poll, 5s)
-├── Detector (deterministic)
-│   ├── Window aggregation (1s fixed)
-│   ├── Baseline calculation (rolling 60)
-│   └── Promotion check (4 required conditions)
-├── SystemState (double-buffered)
-│   ├── staging (write)
-│   ├── active (read)
-│   └── commit() every 500ms
-└── Native App (PySide6, read-only UI)
-    ├── Status bar
-    ├── System health panel
-    ├── Raw market feed
-    └── Promoted events
+execution_cycles      - Cycle metadata, timestamps
+m2_nodes              - Memory node state snapshots
+primitive_values      - All 19 M4 primitive values (per cycle, per symbol)
+policy_evaluations    - Policy decision tracking
+mandates              - Mandate generation log (ENTRY, EXIT, REDUCE)
+arbitration_results   - Arbitration outcomes
+ghost_trades          - Ghost trade lifecycle (entry_ts, exit_ts, pnl)
+policy_outcomes       - Trade outcome attribution
 ```
 
-**Key Property**: No browser, no FastAPI runtime dependency for UI.
+---
+
+## Key Concepts
+
+### Constitutional Constraints
+
+**Epistemic Constitution (EPISTEMIC_CONSTITUTION.md)**:
+- System may NEVER claim: health, readiness, correctness, quality
+- Silence Rule: Say nothing when truth cannot be proven
+- Failure Rule: Halt on time reversal, invariant violation
+- Exposure Rule: Only expose status (UNINITIALIZED or FAILED), timestamp, symbols
+
+**Semantic Canon (SYSTEM_CANON.md)**:
+- Allowed vocabulary: Observation, Structure, Event, Threshold exceedance
+- Forbidden vocabulary: Signal, Setup, Opportunity, Bias, Edge, Confidence
+
+### Risk Mathematics (R1-R15 Invariants)
+
+All position sizing and risk management governed by 15 constitutional invariants:
+
+- **R1**: MaxLoss(symbol) ≤ RiskFraction × Equity
+- **R2**: Leverage(symbol) ≤ MaxLeverage
+- **R3**: DistanceToLiquidation(symbol) ≥ MinLiquidationBuffer
+- **R5**: Σ PositionNotional(all symbols) ≤ ExposureCap × Equity
+- **R6**: PositionNotional(symbol) ≤ SymbolExposureCap × Equity
+- **R7**: Risk limits apply identically to LONG and SHORT
+- **R9**: REDUCE must be attempted before EXIT
+- **R12**: Partial exits only if post-reduce state satisfies all invariants
+- **R13**: No additional ENTRY if it increases MaxLoss or reduces buffer
+- **R14**: FreeMargin ≥ MinFreeMargin
+
+See: `docs/RISK&EXPOSUREINVARIANTS.md`
+
+### Primitive Computation
+
+19 M4 primitives computed per cycle, per symbol:
+
+| Primitive | Category | Description |
+|-----------|----------|-------------|
+| zone_penetration | Geometry | Price penetration into historical zones |
+| displacement_origin_anchor | Geometry | Pre-traversal anchor region |
+| price_traversal_velocity | Kinematics | Rate of price movement |
+| traversal_compactness | Kinematics | Trade density over price range |
+| central_tendency_deviation | Distribution | Deviation from price center |
+| structural_absence_duration | Absence | Duration nodes absent from observation window |
+| traversal_void_span | Absence | Maximum gap between trade timestamps |
+| event_non_occurrence_counter | Absence | Expected vs observed symbol count |
+| structural_persistence_duration | Persistence | Duration nodes present in observation window |
+| price_acceptance_ratio | Acceptance | OHLC body vs wick ratio |
+| liquidation_density | Liquidation | Spatial concentration of liquidations |
+| directional_continuity | Trade Flow | Consistency of trade direction |
+| trade_burst | Trade Flow | Maximum trade density in 1s window |
+| resting_size | Order Book | Size at best bid/ask |
+| order_consumption | Order Book | Reduction in resting size |
+| absorption_event | Order Book | Complete level consumption |
+| refill_event | Order Book | Level replenishment |
+| order_block | Pattern | M2 node concentration |
+| supply_demand_zone | Pattern | M2 cluster formation |
 
 ---
 
-## What System v1.0 Guarantees
+## Ghost Trading
 
-✅ **Deterministic observation**: Same data → same promoted events  
-✅ **Symbol isolation**: TOP_10 only, resolved at startup  
-✅ **Frozen detection logic**: M3 Peak Pressure rules immutable  
-✅ **Event rarity**: < 5-20 events/day under normal conditions  
-✅ **Silence is valid**: Zero events may be correct (explained in UI)  
-✅ **No predictions**: System describes past, never forecasts future  
+**Purpose**: Validate system logic without real capital risk.
 
----
+**Lifecycle**:
+1. **ENTRY**: Mandate generated when primitives exceed thresholds
+2. **OPEN**: Ghost position tracked with simulated entry price
+3. **EXIT**: Mandate generated when entry conditions no longer met
+4. **PNL**: Calculated as (exit_price - entry_price) × quantity
 
-## Documentation
-
-### For Operators
-
-- **[Live Run Guidance](docs/live_run_guidance.md)**: How to start, monitor, and interpret system behavior
-- **[Observability UI Reference](docs/observability_ui_reference.md)**: What each UI panel means
-
-### For Engineers
-
-- **[System Handover v1.0](docs/system_handover_v1.md)**: Authoritative architecture, frozen layers, constraints
-- **[Native App Plan](native_app_plan.md)**: Implementation details for PySide6 app
-
-### Legacy (Deprecated)
-
-- **[Web UI README](ui/README.md)**: Old browser-based interface (replaced by native app)
+**Database**: `ghost_trades` table tracks all entry/exit pairs with PNL.
 
 ---
 
-## System Status
+## Configuration
 
-| Component | Status | Version | Notes |
-|-----------|--------|---------|-------|
-| **Peak Pressure Logic** | FROZEN | M3 | Immutable without approval |
-| **Native Observability App** | ACTIVE | v1.0 | Primary interface |
-| **Web UI** | DEPRECATED | - | Replaced Jan 2026 |
-| **Baseline Calculation** | FROZEN | M4 | 60-window rolling P90/P95 |
-| **Symbol Scope** | FROZEN | TOP_10 | Binance Futures 24h volume |
+### Risk Parameters (runtime/risk/types.py)
+
+```python
+RiskConfig(
+    L_max=10.0,              # Maximum total leverage
+    L_target=8.0,            # Operational target leverage
+    L_symbol_max=5.0,        # Per-symbol maximum leverage
+    D_min_safe=0.08,         # 8% minimum liquidation distance
+    D_critical=0.03,         # 3% immediate exit threshold
+    risk_fraction_per_trade=0.02,  # 2% max loss per trade
+    min_free_margin_pct=0.10       # 10% minimum free margin
+)
+```
+
+### Symbols (runtime/collector/service.py)
+
+```python
+TOP_10_SYMBOLS = [
+    'BTC', 'ETH', 'SOL', 'ARB', 'OP',
+    'AVAX', 'MATIC', 'DOGE', 'XRP', 'ADA'
+]
+```
 
 ---
 
-## Non-Goals (Explicit)
+## Testing
 
-This system **does NOT**:
+### Unit Tests
 
-❌ Generate trading signals  
-❌ Provide entry/exit recommendations  
-❌ Predict future price movements  
-❌ Execute trades  
-❌ Optimize for event count  
-❌ Include charts, indicators, or ML  
+```bash
+# M4 primitive tests
+pytest memory/test_m4_*.py -v
 
-**Peak Pressure events are observational data, not actionable signals.**
+# Policy strategy tests
+pytest external_policy/test_ep2_*.py -v
+
+# Arbitration tests
+pytest external_policy/test_ep3_*.py -v
+
+# Execution tests
+pytest execution/test_ep4_*.py -v
+
+# Risk invariant tests
+pytest runtime/risk/tests/test_invariants.py -v
+```
+
+### Integration Tests
+
+```bash
+# Full observation system test
+pytest tests/integration/test_observation_system.py -v
+
+# Exit lifecycle test
+pytest runtime/executor/tests/test_exit_lifecycle.py -v
+```
 
 ---
 
-## Understanding Silence
+## Operational Stages
 
-### Why "0 Events" Is Normal
+### Stage 1A: Baseline Collection (24-48 hours)
 
-**Peak Pressure requires ALL 4 conditions simultaneously**:
-1. Trade flow surge (≥ baseline P90)
-2. Large trade participation (≥ 1 trade above P95)
-3. Price compression OR expansion
-4. External stress (liquidations OR open interest change)
+**Goal**: Establish primitive value distributions
 
-**Multi-stream coincidence is rare by design.**
+```bash
+# Run with permissive thresholds
+python scripts/stage_1a_baseline_collection.py --duration 48h
 
-Most market activity does NOT meet promotion criteria. This is expected.
+# Analyze distributions
+python scripts/analyze_stage_1a_distributions.py
+```
 
-### When to Investigate
+**Output**: Percentile tables (P1, P5, P10, P25, P50, P75, P90, P95, P99) per primitive.
 
-**If all true for > 2 hours**:
-- Baselines ready: 10 / 10 ✅
-- Windows processed: > 1000 ✅  
-- Ingestion health: OK ✅
-- High volatility visible in raw feed ✅
-- **AND** promoted events: 0
+### Stage 1B: Test Thresholds (12-24 hours)
 
-**Then**: Check `debug/latest_snapshot.json` → `counters` to see which condition fails most.
+**Goal**: Generate ghost trades for outcome attribution
 
-**Most likely**: `stress_failed` (no liquidations/OI coinciding with flow surge).
+```bash
+# Apply P95 thresholds from Stage 1A
+# Verify EXIT mandates generating
+# Collect 100+ completed trades
+```
+
+### Stage 2: Threshold Sweep (7-14 days)
+
+**Goal**: Test 125 threshold combinations, identify Pareto frontier
+
+**Method**: Adaptive pruning (eliminate bottom quartile every 24h)
 
 ---
 
 ## Key Files
 
-### Core System
-
 ```
-scripts/
-├── market_event_collector.py   # Ingestion engine
-├── peak_pressure_detector.py   # Detection logic (FROZEN)
-├── system_state.py              # Double-buffered state
-├── symbol_config.py             # TOP_10 resolution
-└── inspection_surface.py        # Debug snapshots
+observation/
+├── governance.py              # M5 orchestration
+├── internal/
+│   ├── m1_ingestion.py       # Raw data ingestion
+│   └── m3_temporal.py        # Event sequencing
+└── types.py                  # Core types
 
-native_app/
-└── main.py                      # PySide6 desktop app
+memory/
+├── m2_continuity_store.py    # Memory node store
+├── m4_*.py                   # Primitive computation modules
+└── M3_MASTER_SPECIFICATION.md
 
-debug/
-└── latest_snapshot.json         # 5s state dumps (inspection)
-```
+external_policy/
+├── ep2_strategy_geometry.py  # Zone geometry policy
+├── ep2_strategy_kinematics.py # Traversal kinematics policy
+└── ep2_strategy_absence.py   # Structural absence policy
 
-### Data Outputs
+execution/
+├── ep4_execution.py          # Core execution logic
+├── ep4_ghost_adapter.py      # Ghost trading adapter
+└── ep4_risk_gates.py         # Risk invariant gates
 
-```
-data/v1_live_validation/
-├── market_events/
-│   └── market_events.parquet    # Normalized events archive
-└── runtime_stats/
-    └── collector_stats.json     # Ingestion metrics (IPC)
+runtime/
+├── collector/service.py      # Main collector service
+├── policy_adapter.py         # Policy routing
+├── m6_executor.py            # Permission layer
+└── risk/
+    ├── invariants.py         # R1-R15 validators
+    ├── calculator.py         # Risk calculations
+    └── types.py              # Risk data structures
+
+docs/
+├── EPISTEMIC_CONSTITUTION.md # Absolute epistemic rules
+├── SYSTEM_CANON.md           # Single source of truth
+├── RISK&EXPOSUREINVARIANTS.md # 15 risk invariants
+└── PROJECT SPECIFICATION — CONSTITUTIONAL EXECUTION SYSTEM.md
 ```
 
 ---
 
-## Frozen Layers (Do Not Modify)
+## System Status
 
-| Layer | What's Frozen | Why |
-|-------|---------------|-----|
-| **M3** | Peak Pressure promotion rules | Observational continuity |
-| **Baseline** | 60-window rolling P90/P95 | Statistical validity |
-| **Symbols** | TOP_10 (per run) | Scope discipline |
-| **Windows** | 1s fixed size | Temporal determinism |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **M1-M5 Observation Stack** | ✅ Operational | All 19 primitives computing |
+| **EP2-EP4 Policy/Execution** | ✅ Operational | Ghost trading functional |
+| **Risk Mathematics (R1-R15)** | ✅ Implemented | Formal invariant validators |
+| **Ghost Trading** | ✅ Operational | Entry/exit lifecycle complete |
+| **Real Execution** | ⏳ Pending | Exchange adapter not connected |
+| **Threshold Calibration** | ⏳ Pending | Stage 1A baseline collection |
 
-**Changing these requires executive approval.**
+---
+
+## What This System Does NOT Do
+
+❌ Make predictions about future price movements
+❌ Interpret market conditions as "bullish" or "bearish"
+❌ Use indicators, machine learning, or pattern recognition
+❌ Provide investment advice or trading signals
+❌ Claim any edge, alpha, or statistical advantage
+❌ Optimize for profitability or win rate
+❌ Trade without explicit constitutional authorization
+
+**This system observes structure and executes under constraint. Nothing more.**
+
+---
+
+## Frozen Components (CODE_FREEZE.md)
+
+**No modifications without logged evidence**:
+- All M1-M5 observation layers
+- All M4 primitive computation
+- M6 permission layer
+- All EP2-EP4 policy/execution modules
+
+**To modify frozen code**:
+1. Provide logged evidence from live runs
+2. Document specific timestamp of failure
+3. Show primitive outputs revealing structural ambiguity
+4. Obtain authorization
+
+---
+
+## Documentation
+
+### Constitutional Documents
+- **[EPISTEMIC_CONSTITUTION.md](docs/EPISTEMIC_CONSTITUTION.md)** - Absolute epistemic rules
+- **[SYSTEM_CANON.md](docs/SYSTEM_CANON.md)** - Vocabulary, layer definitions, rejected paths
+- **[CODE_FREEZE.md](docs/CODE_FREEZE.md)** - Frozen component policy
+
+### Technical Specifications
+- **[PROJECT SPECIFICATION.md](docs/PROJECT%20SPECIFICATION%20%E2%80%94%20CONSTITUTIONAL%20EXECUTION%20SYSTEM.md)** - Complete system spec
+- **[RISK&EXPOSUREINVARIANTS.md](docs/RISK&EXPOSUREINVARIANTS.md)** - 15 risk invariants (R1-R15)
+- **[M3_MASTER_SPECIFICATION.md](memory/M3_MASTER_SPECIFICATION.md)** - Temporal engine spec
+
+### Implementation Status
+- **[MISSING_COMPONENTS_AUDIT.md](MISSING_COMPONENTS_AUDIT.md)** - P1-P3 priority gaps
+- **[PRIMITIVE_IMPLEMENTATION_STATUS.md](PRIMITIVE_IMPLEMENTATION_STATUS.md)** - All 19 M4 primitives
 
 ---
 
 ## Troubleshooting
 
-### Collector won't start
-
-```powershell
-# Check if another instance is running
-tasklist | findstr python
-
-# Kill if needed
+### Database locked error
+```bash
+# Another process accessing logs/execution.db
+# Stop all python processes
 taskkill /F /IM python.exe
 
-# Remove temp files
-cd data\v1_live_validation\market_events
-Remove-Item *.tmp
+# Remove lock file
+rm logs/execution.db-wal
 ```
 
-### Native app shows "LOADING..."
+### Primitives not computing
+```bash
+# Check database
+python check_primitives_quick.py
 
-**Cause**: SystemState not initialized (collector not running or failed).
-
-**Fix**: Start collector first, wait for "SystemState initialized" message.
-
-### Baselines stuck at X/10 after 15 min
-
-**Cause**: Some symbols not receiving stream data.
-
-**Fix**:
-1. Check System Health panel for degraded streams
-2. Restart collector (baselines reset to 0/10)
-
-### Zero events after 1 hour
-
-**This is probably correct.** Check `debug/latest_snapshot.json`:
-
-```powershell
-Get-Content debug\latest_snapshot.json
+# Expected: 8+ primitives at 90% rate
+# If 0%, check M1 ingestion
 ```
 
-Look at `counters` → `flow_surge_failed`, `stress_failed` etc. to see why.
+### Ghost trades exit immediately
+**Cause**: EXIT mandates generating due to None primitive values being treated as "conditions false"
+
+**Fix**: Verify primitive extraction in `runtime/collector/service.py`
+
+### Time regression error
+**Cause**: Websocket timestamp < last processed timestamp
+
+**System will HALT** (constitutional requirement). Restart collector.
 
 ---
 
-## Contact & Support
-
-**Before reporting issues**:
-1. Check `debug/latest_snapshot.json` for system state
-2. Verify ingestion health in native app
-3. Read [Live Run Guidance](docs/live_run_guidance.md)
-
-**For frozen layer modifications**:
-- Document proposed change
-- Justify necessity
-- Analyze historical data impact
-- Request executive approval
-
-**This system is frozen by design. Stability > features.**
-
----
-
-## Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| **v1.0** | 2026-01-06 | Native app complete, web UI deprecated |
-| v0.9 | 2025-12-XX | Peak Pressure logic frozen (M3) |
-| v0.8 | 2025-11-XX | Symbol isolation (TOP_10) implemented |
-
----
-
-## License & Usage
+## License & Disclaimer
 
 **Internal Research Use Only**
 
-This system observes cryptocurrency futures markets for research purposes. It does not provide investment advice, trading signals, or financial recommendations.
+This system is a research prototype for exploring constitutional constraints in automated trading systems. It is NOT production-ready and does NOT provide investment advice.
 
-**Peak Pressure events describe past market structure. They are not predictions.**
+**All trading involves risk of loss. Use at your own risk.**
+
+---
+
+## Contact
+
+For questions about frozen layer modifications, constitutional interpretation, or system architecture, refer to:
+- `docs/EPISTEMIC_CONSTITUTION.md` (authority on epistemic rules)
+- `docs/SYSTEM_CANON.md` (authority on vocabulary and layer boundaries)
+- `CODE_FREEZE.md` (authority on modification policy)
+
+**This system is frozen by design. Correctness > features. Silence > speculation.**

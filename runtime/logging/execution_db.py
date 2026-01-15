@@ -409,6 +409,98 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_symbol_ts ON policy_outcomes(symbol, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_trade ON policy_outcomes(ghost_trade_id)")
 
+        # =====================================================================
+        # Hyperliquid Integration Tables
+        # =====================================================================
+
+        # Table: Hyperliquid positions (position snapshots)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                position_size REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                liquidation_price REAL NOT NULL,
+                leverage REAL,
+                margin_used REAL,
+                unrealized_pnl REAL,
+                position_value REAL,
+                distance_to_liquidation_pct REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Hyperliquid liquidation proximity (aggregated)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_liquidation_proximity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                coin TEXT NOT NULL,
+                current_price REAL NOT NULL,
+                threshold_pct REAL NOT NULL,
+
+                long_positions_count INTEGER,
+                long_positions_size REAL,
+                long_positions_value REAL,
+                long_avg_distance_pct REAL,
+                long_closest_liquidation REAL,
+
+                short_positions_count INTEGER,
+                short_positions_size REAL,
+                short_positions_value REAL,
+                short_avg_distance_pct REAL,
+                short_closest_liquidation REAL,
+
+                total_positions_at_risk INTEGER,
+                total_value_at_risk REAL,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Hyperliquid wallet tracking (which wallets we monitor)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_tracked_wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL UNIQUE,
+                wallet_type TEXT,
+                label TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT
+            )
+        """)
+
+        # Table: Hyperliquid cascade events (when proximity threshold crossed)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_cascade_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                coin TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                current_price REAL NOT NULL,
+                threshold_pct REAL NOT NULL,
+                positions_at_risk INTEGER,
+                value_at_risk REAL,
+                dominant_side TEXT,
+                closest_liquidation REAL,
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Hyperliquid indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_ts ON hl_positions(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_wallet ON hl_positions(wallet_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_coin ON hl_positions(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_proximity_ts ON hl_liquidation_proximity(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_proximity_coin ON hl_liquidation_proximity(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_ts ON hl_cascade_events(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_coin ON hl_cascade_events(coin)")
+
         self.conn.commit()
     
     def log_cycle(
@@ -859,7 +951,224 @@ class ResearchDatabase:
         ))
         
         self.conn.commit()
-    
+
+    # =========================================================================
+    # Hyperliquid Logging Methods
+    # =========================================================================
+
+    def log_hl_position(
+        self,
+        timestamp: float,
+        wallet_address: str,
+        coin: str,
+        side: str,
+        position_size: float,
+        entry_price: float,
+        liquidation_price: float,
+        leverage: float = None,
+        margin_used: float = None,
+        unrealized_pnl: float = None,
+        position_value: float = None,
+        distance_to_liquidation_pct: float = None
+    ):
+        """Log Hyperliquid position snapshot.
+
+        Args:
+            timestamp: Position snapshot timestamp
+            wallet_address: Ethereum address of position holder
+            coin: Asset symbol (e.g., "BTC", "ETH")
+            side: Position side ("LONG" or "SHORT")
+            position_size: Absolute position size
+            entry_price: Position entry price
+            liquidation_price: Liquidation price
+            leverage: Position leverage
+            margin_used: Margin used by position
+            unrealized_pnl: Current unrealized PnL
+            position_value: Notional position value
+            distance_to_liquidation_pct: Distance from current price to liquidation
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_positions (
+                timestamp, wallet_address, coin, side,
+                position_size, entry_price, liquidation_price,
+                leverage, margin_used, unrealized_pnl,
+                position_value, distance_to_liquidation_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp, wallet_address, coin, side,
+            position_size, entry_price, liquidation_price,
+            leverage, margin_used, unrealized_pnl,
+            position_value, distance_to_liquidation_pct
+        ))
+        self.conn.commit()
+
+    def log_hl_liquidation_proximity(
+        self,
+        timestamp: float,
+        coin: str,
+        current_price: float,
+        threshold_pct: float,
+        long_positions_count: int = 0,
+        long_positions_size: float = 0.0,
+        long_positions_value: float = 0.0,
+        long_avg_distance_pct: float = None,
+        long_closest_liquidation: float = None,
+        short_positions_count: int = 0,
+        short_positions_size: float = 0.0,
+        short_positions_value: float = 0.0,
+        short_avg_distance_pct: float = None,
+        short_closest_liquidation: float = None,
+        total_positions_at_risk: int = 0,
+        total_value_at_risk: float = 0.0
+    ):
+        """Log aggregated liquidation proximity data.
+
+        Core data for the "priming" strategy - tracks how much is about to liquidate.
+
+        Args:
+            timestamp: Calculation timestamp
+            coin: Asset symbol
+            current_price: Current market price
+            threshold_pct: Proximity threshold (e.g., 0.005 = 0.5%)
+            long_*: Aggregated long position data at risk
+            short_*: Aggregated short position data at risk
+            total_*: Combined totals
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_liquidation_proximity (
+                timestamp, coin, current_price, threshold_pct,
+                long_positions_count, long_positions_size, long_positions_value,
+                long_avg_distance_pct, long_closest_liquidation,
+                short_positions_count, short_positions_size, short_positions_value,
+                short_avg_distance_pct, short_closest_liquidation,
+                total_positions_at_risk, total_value_at_risk
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp, coin, current_price, threshold_pct,
+            long_positions_count, long_positions_size, long_positions_value,
+            long_avg_distance_pct, long_closest_liquidation,
+            short_positions_count, short_positions_size, short_positions_value,
+            short_avg_distance_pct, short_closest_liquidation,
+            total_positions_at_risk, total_value_at_risk
+        ))
+        self.conn.commit()
+
+    def log_hl_cascade_event(
+        self,
+        timestamp: float,
+        coin: str,
+        event_type: str,
+        current_price: float,
+        threshold_pct: float,
+        positions_at_risk: int,
+        value_at_risk: float,
+        dominant_side: str = None,
+        closest_liquidation: float = None,
+        notes: str = None
+    ):
+        """Log cascade/proximity alert event.
+
+        Triggered when significant liquidation proximity detected.
+
+        Args:
+            timestamp: Event timestamp
+            coin: Asset symbol
+            event_type: Type of event (e.g., "CLUSTER_DETECTED", "CASCADE_IMMINENT")
+            current_price: Price at event time
+            threshold_pct: Threshold that triggered event
+            positions_at_risk: Number of positions at risk
+            value_at_risk: Total value at risk (USD)
+            dominant_side: Which side has more exposure ("LONG" or "SHORT")
+            closest_liquidation: Nearest liquidation price
+            notes: Additional context
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_cascade_events (
+                timestamp, coin, event_type, current_price, threshold_pct,
+                positions_at_risk, value_at_risk, dominant_side,
+                closest_liquidation, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp, coin, event_type, current_price, threshold_pct,
+            positions_at_risk, value_at_risk, dominant_side,
+            closest_liquidation, notes
+        ))
+        self.conn.commit()
+
+    def add_hl_tracked_wallet(
+        self,
+        wallet_address: str,
+        wallet_type: str = None,
+        label: str = None
+    ) -> int:
+        """Add a wallet to the tracking list.
+
+        Args:
+            wallet_address: Ethereum address
+            wallet_type: Type (e.g., "WHALE", "HLP", "SYSTEM")
+            label: Human-readable label
+
+        Returns:
+            Row ID of inserted wallet
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO hl_tracked_wallets (
+                wallet_address, wallet_type, label
+            ) VALUES (?, ?, ?)
+        """, (wallet_address.lower(), wallet_type, label))
+        self.conn.commit()
+
+        return cursor.lastrowid
+
+    def get_hl_tracked_wallets(self, active_only: bool = True) -> List[Dict]:
+        """Get list of tracked wallets.
+
+        Args:
+            active_only: Only return active wallets
+
+        Returns:
+            List of wallet records
+        """
+        cursor = self.conn.cursor()
+
+        query = "SELECT * FROM hl_tracked_wallets"
+        if active_only:
+            query += " WHERE is_active = 1"
+
+        cursor.execute(query)
+        rows = cursor.fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_latest_hl_proximity(self, coin: str) -> Optional[Dict]:
+        """Get most recent liquidation proximity for a coin.
+
+        Args:
+            coin: Asset symbol
+
+        Returns:
+            Latest proximity record or None
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM hl_liquidation_proximity
+            WHERE coin = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (coin,))
+
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def close(self):
         """Close database connection."""
         self.conn.close()

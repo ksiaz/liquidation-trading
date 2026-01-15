@@ -40,6 +40,13 @@ from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator
 
+# Import Hyperliquid Integration
+try:
+    from runtime.hyperliquid.collector import HyperliquidCollector, HyperliquidCollectorConfig
+    HYPERLIQUID_AVAILABLE = True
+except ImportError:
+    HYPERLIQUID_AVAILABLE = False
+
 # Constants
 TOP_10_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
@@ -126,7 +133,28 @@ class CollectorService:
 
         # Track previous regime state for transition logging (Phase 6)
         self._prev_regime_states: Dict[str, RegimeState] = {}
-        
+
+        # Hyperliquid Integration (optional)
+        self._hyperliquid_collector = None
+        self._hyperliquid_enabled = False
+        if HYPERLIQUID_AVAILABLE:
+            try:
+                hl_config = HyperliquidCollectorConfig(
+                    use_testnet=False,
+                    proximity_threshold=0.005,  # 0.5% threshold
+                    min_position_value=1000.0,
+                    wallet_poll_interval=5.0,
+                    track_hlp_vault=True  # Track liquidator vault
+                )
+                self._hyperliquid_collector = HyperliquidCollector(
+                    db=self._execution_db,
+                    config=hl_config
+                )
+                self._hyperliquid_enabled = True
+                self._logger.info("Hyperliquid collector initialized")
+            except Exception as e:
+                self._logger.warning(f"Hyperliquid collector init failed: {e}")
+
     async def start(self):
         """Start all collectors."""
         self._running = True
@@ -137,15 +165,16 @@ class CollectorService:
 
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
-        
-        # 2. Start WebSocket Consumers (Simulated for now, or ported real logic)
-        # For Remediation Phase, we will implement the SHELL of the collectors 
-        # that drives the real M5, effectively verifying integration.
-        # Ideally we port the actual binance connection logic here.
-        # Given the task complexity, I will port the structure and stub the actual socket for safety,
-        # or reuse the logic if I can import 'scripts' (but I shouldn't).
-        # I will re-implement the basic websocket client here.
-        
+
+        # 2. Start Hyperliquid Collector (if enabled)
+        if self._hyperliquid_enabled and self._hyperliquid_collector:
+            try:
+                asyncio.create_task(self._hyperliquid_collector.start())
+                self._logger.info("Hyperliquid collector started")
+            except Exception as e:
+                self._logger.warning(f"Hyperliquid collector start failed: {e}")
+
+        # 3. Start Binance WebSocket (primary data source)
         await self._run_binance_stream()
 
     async def _drive_clock(self):
@@ -1133,6 +1162,50 @@ class CollectorService:
 
     async def stop(self):
         self._running = False
+
+        # Stop Hyperliquid collector if running
+        if self._hyperliquid_collector:
+            try:
+                await self._hyperliquid_collector.stop()
+            except Exception as e:
+                self._logger.debug(f"Hyperliquid stop error: {e}")
+
+    def get_liquidation_proximity(self, coin: str):
+        """
+        Get current liquidation proximity for a Hyperliquid coin.
+
+        Args:
+            coin: Coin symbol (e.g., "BTC", "ETH")
+
+        Returns:
+            LiquidationProximity or None if not available
+        """
+        if self._hyperliquid_collector:
+            return self._hyperliquid_collector.get_proximity(coin)
+        return None
+
+    def get_all_liquidation_proximity(self):
+        """
+        Get liquidation proximity for all tracked Hyperliquid coins.
+
+        Returns:
+            Dict of coin -> LiquidationProximity
+        """
+        if self._hyperliquid_collector:
+            return self._hyperliquid_collector.get_all_proximity()
+        return {}
+
+    def add_hyperliquid_wallet(self, wallet_address: str, wallet_type: str = None, label: str = None):
+        """
+        Add a wallet to Hyperliquid tracking.
+
+        Args:
+            wallet_address: Ethereum address
+            wallet_type: Type label (e.g., "WHALE", "LEADERBOARD")
+            label: Human-readable label
+        """
+        if self._hyperliquid_collector:
+            self._hyperliquid_collector.add_wallet(wallet_address, wallet_type, label)
 
 
 async def main():

@@ -49,40 +49,44 @@ class ExecutionController:
         # Initialize risk monitor with default or provided config
         self.risk_monitor = RiskMonitor(risk_config or RiskConfig())
         self._execution_log: List[ExecutionResult] = []
+        self._mark_prices: Dict[str, Decimal] = {}  # Current mark prices
     
     def process_cycle(
-        self, 
+        self,
         mandates: List[Mandate],
         account: AccountState,
         mark_prices: Dict[str, Decimal]
     ) -> CycleStats:
         """Process one execution cycle.
-        
+
         Args:
             mandates: List of mandates from strategies
             account: Current account state (equity, margin)
             mark_prices: Current mark prices
-            
+
         Returns:
             CycleStats with execution summary
         """
+        # Store mark prices for use in execute_action
+        self._mark_prices = mark_prices
+
         actions_executed = 0
         actions_rejected = 0
-        
+
         # Step 0: Get current positions
         positions = self.state_machine._positions
-        
+
         # Step 1: Risk Monitor check (emit protective mandates)
         risk_mandates = self.risk_monitor.check_and_emit(
             account, positions, mark_prices
         )
-        
+
         # Combine strategy mandates with risk mandates
         all_mandates = mandates + risk_mandates
-        
+
         # Step 2: Arbitrate mandates per symbol
         actions = self.arbitrator.arbitrate_all(all_mandates)
-        
+
         # Step 3: Execute actions
         for symbol, action in actions.items():
             if action.type == ActionType.NO_ACTION:
@@ -181,10 +185,36 @@ class ExecutionController:
                 new_position = self.state_machine.transition(
                     symbol, state_action, direction=Direction.LONG
                 )
+
+                # For ghost trading: immediately confirm entry (ENTERING → OPEN)
+                # In live trading, this would happen after exchange confirms fill
+                if new_position.state == PositionState.ENTERING:
+                    # Use actual mark price instead of zero
+                    entry_price = self._mark_prices.get(symbol, Decimal("1"))  # Fallback to 1 if missing
+                    new_position = self.state_machine.transition(
+                        symbol, "SUCCESS",
+                        quantity=Decimal("0.01"),  # Placeholder
+                        entry_price=entry_price
+                    )
             elif state_action == StateAction.EXIT:
                 new_position = self.state_machine.transition(symbol, state_action)
+
+                # For ghost trading: immediately confirm exit (CLOSING → FLAT)
+                # In live trading, this would happen after exchange confirms fill
+                if new_position.state == PositionState.CLOSING:
+                    new_position = self.state_machine.transition(symbol, "SUCCESS")
+
             elif state_action == StateAction.REDUCE:
                 new_position = self.state_machine.transition(symbol, state_action)
+
+                # For ghost trading: immediately confirm reduction
+                # In live trading, this would happen after exchange confirms partial fill
+                if new_position.state == PositionState.REDUCING:
+                    # Could transition to OPEN (partial) or CLOSING (complete)
+                    # For now, assume partial → back to OPEN
+                    new_position = self.state_machine.transition(symbol, "PARTIAL",
+                        quantity=Decimal("0.005")  # Placeholder for remaining
+                    )
             elif state_action == StateAction.HOLD:
                 new_position = position_before  # No change
             else:

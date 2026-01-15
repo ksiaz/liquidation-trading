@@ -34,6 +34,12 @@ from runtime.logging.execution_db import ResearchDatabase
 from execution.ep4_ghost_tracker import GhostPositionTracker
 import os
 
+# Import Regime Classification (Phase 5)
+from runtime.regime import RegimeState, RegimeMetrics, classify_regime
+from runtime.indicators import VWAPCalculator, MultiTimeframeATR
+from runtime.orderflow import MultiWindowOrderflow
+from runtime.liquidations import LiquidationZScoreCalculator
+
 # Constants
 TOP_10_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
@@ -42,7 +48,7 @@ TOP_10_SYMBOLS = [
 ]
 
 class CollectorService:
-    def __init__(self, observation_system: ObservationSystem, warmup_duration_sec: int = 60):
+    def __init__(self, observation_system: ObservationSystem, warmup_duration_sec: int = 5):
         self._obs = observation_system
         self._running = False
         self._logger = logging.getLogger("CollectorService")
@@ -61,10 +67,13 @@ class CollectorService:
 
         # Phase 8: M6 Integration
         self.policy_adapter = PolicyAdapter(AdapterConfig(
-            enable_geometry=True,        # Zone geometry primitives NOW IMPLEMENTED
-            enable_kinematics=True,      # Kinematics primitives NOW IMPLEMENTED
+            enable_geometry=True,        # TESTING: Enable for immediate mandate generation (no regime needed)
+            enable_kinematics=False,     # OLD: Baseline kinematics strategy (replaced by EFFCS)
             enable_absence=False,        # Absence primitives not implemented
-            enable_orderbook_test=False  # Test policy (disabled, using real policies now)
+            enable_orderbook_test=False,  # Test policy (disabled)
+            # Phase 5: Enable regime-gated strategies
+            enable_slbrs=True,           # NEW: SLBRS strategy (SIDEWAYS regime)
+            enable_effcs=True            # NEW: EFFCS strategy (EXPANSION regime)
         ))
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())
@@ -98,6 +107,25 @@ class CollectorService:
         # Store latest cycle context for ghost tracker
         self._latest_cycle_id = None
         self._latest_snapshot = None
+
+        # Phase 5: Regime Classification Infrastructure
+        # Initialize regime metric calculators (per-symbol tracking)
+        self._vwap_calculators: Dict[str, VWAPCalculator] = {}
+        self._atr_calculators: Dict[str, MultiTimeframeATR] = {}
+        self._orderflow_calculators: Dict[str, MultiWindowOrderflow] = {}
+        self._liquidation_calculators: Dict[str, LiquidationZScoreCalculator] = {}
+
+        # Track current prices for regime calculation
+        self._current_prices: Dict[str, float] = {}
+
+        # Track regime state per symbol
+        self._regime_states: Dict[str, RegimeState] = {}
+
+        # Track regime metrics per symbol (Phase 5)
+        self._regime_metrics: Dict[str, RegimeMetrics] = {}
+
+        # Track previous regime state for transition logging (Phase 6)
+        self._prev_regime_states: Dict[str, RegimeState] = {}
         
     async def start(self):
         """Start all collectors."""
@@ -171,6 +199,7 @@ class CollectorService:
             elapsed = timestamp - self._startup_time
             if elapsed < self._warmup_duration_sec:
                 # Still in warm-up - allow observation layer to build state
+                print(f"DEBUG M6: Still in warmup - {elapsed:.1f}s / {self._warmup_duration_sec}s")
                 return
             elif not self._warmup_complete:
                 # Warm-up just completed
@@ -187,6 +216,70 @@ class CollectorService:
             # Store for ghost tracker
             self._latest_cycle_id = cycle_id
             self._latest_snapshot = snapshot
+
+            # Phase 5: Compute regime metrics and classify regime for each symbol
+            for symbol in snapshot.symbols_active:
+                try:
+                    # Get current price
+                    price = self._current_prices.get(symbol)
+                    if price is None:
+                        continue  # No price data yet
+
+                    # Get calculators
+                    vwap_calc = self._vwap_calculators.get(symbol)
+                    atr_calc = self._atr_calculators.get(symbol)
+                    orderflow_calc = self._orderflow_calculators.get(symbol)
+                    liquidation_calc = self._liquidation_calculators.get(symbol)
+
+                    if not all([vwap_calc, atr_calc, orderflow_calc, liquidation_calc]):
+                        print(f"DEBUG Regime: {symbol} - Calculators not ready: VWAP={vwap_calc is not None}, ATR={atr_calc is not None}, Orderflow={orderflow_calc is not None}, Liq={liquidation_calc is not None}")
+                        continue  # Calculators not initialized yet
+
+                    # Compute regime metrics
+                    vwap_distance = vwap_calc.get_distance(price)
+                    atr_5m = atr_calc.get_atr_5m()
+                    atr_30m = atr_calc.get_atr_30m()
+                    orderflow_imbalance = orderflow_calc.get_imbalance_30s()
+                    liquidation_zscore = liquidation_calc.get_zscore(timestamp)
+
+                    # Check if all metrics available
+                    if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
+                        print(f"DEBUG Regime: {symbol} - Metrics not ready: VWAP_dist={vwap_distance}, ATR_5m={atr_5m}, ATR_30m={atr_30m}, OFI={orderflow_imbalance}, Liq_Z={liquidation_zscore}")
+                        continue  # Metrics not ready yet
+
+                    # Create regime metrics object
+                    print(f"DEBUG Regime: {symbol} - Metrics ready! VWAP_dist={vwap_distance:.2f}, ATR_5m={atr_5m:.2f}, ATR_30m={atr_30m:.2f}, OFI={orderflow_imbalance:.3f}, Liq_Z={liquidation_zscore:.2f}")
+                    regime_metrics = RegimeMetrics(
+                        vwap_distance=vwap_distance,
+                        atr_5m=atr_5m,
+                        atr_30m=atr_30m,
+                        orderflow_imbalance=orderflow_imbalance,
+                        liquidation_zscore=liquidation_zscore
+                    )
+
+                    # Classify regime
+                    regime_state = classify_regime(regime_metrics)
+                    print(f"DEBUG Regime: {symbol} - Regime classified as {regime_state.name}")
+
+                    # Phase 6: Log regime transitions
+                    prev_regime = self._prev_regime_states.get(symbol)
+                    if prev_regime is not None and prev_regime != regime_state:
+                        # Regime transition detected
+                        self._logger.info(
+                            f"Regime transition: {symbol} {prev_regime.name} → {regime_state.name} "
+                            f"(VWAP dist={vwap_distance:.1f}, ATR 5m/30m={atr_5m:.1f}/{atr_30m:.1f}, "
+                            f"orderflow={orderflow_imbalance:.3f}, liq_z={liquidation_zscore:.2f})"
+                        )
+
+                    # Store regime state and metrics for this symbol
+                    self._regime_states[symbol] = regime_state
+                    self._regime_metrics[symbol] = regime_metrics
+                    self._prev_regime_states[symbol] = regime_state
+
+                except Exception as e:
+                    # Don't fail cycle if regime classification fails
+                    self._logger.debug(f"Regime classification error for {symbol}: {e}")
+                    continue
 
             # Collect mandates from all active symbols
             all_mandates = []
@@ -212,12 +305,32 @@ class CollectorService:
                     # Extract active primitives BEFORE generating mandates
                     active_primitives = self._extract_active_primitive_names(symbol, snapshot)
 
+                    # Get regime state and metrics for this symbol (Phase 5)
+                    regime_state = self._regime_states.get(symbol)
+                    regime_metrics = self._regime_metrics.get(symbol)
+                    current_price = self._current_prices.get(symbol)
+
+                    # Phase 6: Log which strategy will evaluate
+                    if regime_state is not None:
+                        active_strategy = "None (DISABLED)"
+                        if regime_state.name == "SIDEWAYS_ACTIVE" and self.policy_adapter.config.enable_slbrs:
+                            active_strategy = "SLBRS"
+                        elif regime_state.name == "EXPANSION_ACTIVE" and self.policy_adapter.config.enable_effcs:
+                            active_strategy = "EFFCS"
+
+                        self._logger.debug(
+                            f"Strategy evaluation: {symbol} regime={regime_state.name} → {active_strategy}"
+                        )
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
                         symbol=symbol,
                         timestamp=timestamp,
-                        position_state=position_state
+                        position_state=position_state,
+                        regime_state=regime_state,  # Phase 5: Pass regime state
+                        regime_metrics=regime_metrics,  # Phase 5: Pass regime metrics
+                        current_price=current_price  # Phase 5: Pass current price
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -324,15 +437,20 @@ class CollectorService:
         Checks execution log for new successful ENTRY/EXIT actions
         and executes corresponding ghost trades.
         """
+        print(f"DEBUG: _process_ghost_trades called")
         try:
             execution_log = self.executor.get_execution_log()
+            print(f"DEBUG: execution_log has {len(execution_log)} entries")
 
             # Process new execution results since last check
             new_results = execution_log[self._last_execution_index:]
+            print(f"DEBUG: Processing {len(new_results)} new results (last_index={self._last_execution_index})")
 
-            for result in new_results:
+            for idx, result in enumerate(new_results):
+                print(f"DEBUG: Processing result {idx}: action={result.action.name}, symbol={result.symbol}, success={result.success}")
                 # Only process successful actions for symbols in TOP_10
                 if not result.success or result.symbol not in TOP_10_SYMBOLS:
+                    print(f"DEBUG: Skipping result {idx}: not successful or not in TOP_10_SYMBOLS")
                     continue
 
                 # Get cycle context from result (captured at execution time)
@@ -389,10 +507,27 @@ class CollectorService:
 
                 # Handle ENTRY actions
                 if result.action.name == "ENTRY":
+                    print(f"DEBUG: Processing ENTRY action for {result.symbol}")
+
                     # Query position state machine to get actual direction
                     # (executor hardcodes LONG for now, but this will work when direction is added to mandates)
-                    position = self.executor.state_machine.get_position(result.symbol)
-                    side = "LONG" if position.direction and position.direction.value == "LONG" else "SHORT"
+                    # Default to LONG if position doesn't exist or has no direction
+                    side = "LONG"
+                    print(f"DEBUG: Initialized side = {side}")
+
+                    try:
+                        position = self.executor.state_machine.get_position(result.symbol)
+                        print(f"DEBUG: Got position = {position}")
+                        if position and hasattr(position, 'direction') and position.direction:
+                            side = position.direction.value if hasattr(position.direction, 'value') else str(position.direction)
+                            print(f"DEBUG: Updated side from position = {side}")
+                    except Exception as e:
+                        print(f"DEBUG: Exception getting position direction: {e}")
+                        # Use default LONG if anything fails
+                        pass
+
+                    print(f"DEBUG: Final side value before open_position = {side}")
+                    print(f"DEBUG: About to call ghost_tracker.open_position with side={side}")
 
                     success, error, trade = self.ghost_tracker.open_position(
                         symbol=result.symbol,
@@ -402,13 +537,17 @@ class CollectorService:
                         active_primitives=active_primitives
                     )
 
+                    print(f"DEBUG: open_position returned: success={success}, error={error}")
+
                     if success and trade:
+                        print(f"DEBUG: About to print GHOST ENTRY with side={side}")
                         print(f"GHOST: ENTRY {result.symbol} {side} {trade.quantity:.4f} @ ${trade.price:,.2f} [{len(active_primitives or [])} primitives]")
                     else:
                         print(f"GHOST: ENTRY_REJECTED {result.symbol} - {error}")
 
                         # Log rejection
                         if snapshot:
+                            print(f"DEBUG: About to log_rejection with side={side}")
                             self.ghost_tracker.log_rejection(
                                 cycle_id=cycle_id or 0,
                                 timestamp=result.timestamp,
@@ -419,6 +558,7 @@ class CollectorService:
                                 policy_name=policy_name,
                                 triggering_primitives=active_primitives
                             )
+                            print(f"DEBUG: log_rejection completed")
 
                 # Handle EXIT actions
                 elif result.action.name == "EXIT":
@@ -456,8 +596,9 @@ class CollectorService:
             self._last_execution_index = len(execution_log)
 
         except Exception as e:
-            # self._logger.debug(f"Ghost trade processing: {e}")
-            pass
+            print(f"ERROR in ghost trade processing: {e}")
+            import traceback
+            traceback.print_exc()  # Print full traceback for debugging
 
     def _extract_active_primitive_names(self, symbol: str, snapshot: ObservationSnapshot) -> List[str]:
         """Extract names of non-None primitives for a symbol.
@@ -538,6 +679,23 @@ class CollectorService:
                 if bundle.directional_continuity is not None: primitives_computing += 1
                 if bundle.trade_burst is not None: primitives_computing += 1
             
+            # Phase 6: Collect regime data for logging (use first symbol with regime data)
+            regime_state_for_log = None
+            regime_metrics_for_log = None
+
+            for symbol in snapshot.symbols_active:
+                if symbol in self._regime_states and symbol in self._regime_metrics:
+                    regime_state_for_log = self._regime_states[symbol].name
+                    metrics = self._regime_metrics[symbol]
+                    regime_metrics_for_log = {
+                        'vwap': self._vwap_calculators[symbol].get_vwap() if symbol in self._vwap_calculators else None,
+                        'atr_5m': metrics.atr_5m,
+                        'atr_30m': metrics.atr_30m,
+                        'orderflow_imbalance': metrics.orderflow_imbalance,
+                        'liquidation_zscore': metrics.liquidation_zscore
+                    }
+                    break  # Use first symbol's regime data
+
             # Log core execution cycle
             cycle_id = self._execution_db.log_cycle(
                 timestamp=timestamp,
@@ -545,7 +703,9 @@ class CollectorService:
                 m2_metrics=m2_metrics,
                 symbols_active=list(snapshot.symbols_active),
                 primitives_computing=primitives_computing,
-                primitives_total=len(snapshot.primitives) * 17
+                primitives_total=len(snapshot.primitives) * 17,
+                regime_state=regime_state_for_log,
+                regime_metrics=regime_metrics_for_log
             )
             
             # Log M2 node snapshots (capture ALL nodes for research, not just active)
@@ -711,39 +871,61 @@ class CollectorService:
             return None
 
     async def _run_binance_stream(self):
-        """Connect to Binance Filtered Stream."""
+        """Connect to Binance Filtered Stream with exponential backoff reconnection."""
         import websockets
-        
+
+        # Reduce stream count to avoid Windows socket limits (test with fewer symbols)
+        test_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Start with 3 symbols instead of 10
+
         streams = [
-            f"{s.lower()}@aggTrade" for s in TOP_10_SYMBOLS
+            f"{s.lower()}@aggTrade" for s in test_symbols
         ] + [
-            f"{s.lower()}@forceOrder" for s in TOP_10_SYMBOLS
+            f"{s.lower()}@forceOrder" for s in test_symbols
         ] + [
-            f"{s.lower()}@bookTicker" for s in TOP_10_SYMBOLS
+            f"{s.lower()}@bookTicker" for s in test_symbols
         ] + [
-            f"{s.lower()}@kline_1m" for s in TOP_10_SYMBOLS
-        ]
-        
+            f"{s.lower()}@depth20@100ms" for s in test_symbols
+        ] + [
+            f"{s.lower()}@markPrice@1s" for s in test_symbols
+        ]  # 5 streams per symbol = 15 streams for 3 symbols
+
         stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-        
+
+        # Exponential backoff parameters
+        reconnect_delay = 1  # Start with 1 second
+        max_reconnect_delay = 60  # Cap at 60 seconds
+
         async with aiohttp.ClientSession() as session:
             while self._running:
                 try:
                     import websockets
-                    async with websockets.connect(stream_url) as ws:
+                    # Binance Futures WebSocket keepalive requirements:
+                    # - Server sends ping every 3 minutes
+                    # - Must respond with pong within 10 minutes or disconnect
+                    # Configure client to send ping every 60s and wait up to 300s for pong
+                    async with websockets.connect(
+                        stream_url,
+                        ping_interval=60,    # Send ping every 60 seconds
+                        ping_timeout=300,    # Wait up to 5 minutes for pong
+                        close_timeout=10     # Clean connection close timeout
+                    ) as ws:
                         print("Connected to Binance Stream")
+                        reconnect_delay = 1  # Reset backoff on successful connection
                         while self._running:
                             try:
                                 msg = await ws.recv()
                                 data = json.loads(msg)
                                 stream = data['stream']
                                 payload = data['data']
-                                
+
                                 # Parse Symbol & Type
                                 symbol = stream.split('@')[0].upper()
                                 event_type = "UNKNOWN"
 
-                                if 'aggTrade' in stream:
+                                # DEBUG: Log what stream we received
+                                print(f"DEBUG STREAM: Received stream='{stream}', symbol={symbol}")
+
+                                if 'aggtrade' in stream.lower():
                                     event_type = "TRADE"
                                     # Track mark price from trades
                                     if 'p' in payload:
@@ -759,22 +941,78 @@ class CollectorService:
                                         )
                                     except:
                                         pass
-                                elif 'forceOrder' in stream:
+
+                                    # Phase 5: Update regime calculators with trade data
+                                    try:
+                                        price = float(payload.get('p', 0))
+                                        volume = float(payload.get('q', 0))
+                                        timestamp = int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time()
+                                        is_buyer_maker = payload.get('m', False)
+
+                                        # Initialize calculators for symbol if needed
+                                        if symbol not in self._vwap_calculators:
+                                            self._vwap_calculators[symbol] = VWAPCalculator()
+                                        if symbol not in self._atr_calculators:
+                                            # Use period=3 for testing (needs 15min for 5m, 90min for 30m instead of 70min/7hrs)
+                                            self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
+                                        if symbol not in self._orderflow_calculators:
+                                            self._orderflow_calculators[symbol] = MultiWindowOrderflow()
+                                        if symbol not in self._liquidation_calculators:
+                                            self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
+
+                                        # Update VWAP
+                                        self._vwap_calculators[symbol].update(price, volume, timestamp)
+
+                                        # Update ATR
+                                        self._atr_calculators[symbol].update_trade(price, timestamp)
+
+                                        # Update orderflow imbalance
+                                        self._orderflow_calculators[symbol].update(is_buyer_maker, volume, timestamp)
+
+                                        # Track current price
+                                        self._current_prices[symbol] = price
+                                    except:
+                                        pass
+                                elif 'forceorder' in stream.lower():
                                     event_type = "LIQUIDATION"
                                     print(f"DEBUG STREAM: Received forceOrder for {symbol}")
                                     # Log raw liquidation event
                                     if 'o' in payload:
                                         order = payload['o']
                                         try:
+                                            print(f"DEBUG: About to log liquidation event")
+                                            print(f"DEBUG: order dict = {order}")
+                                            side_value = order.get('S', 'UNKNOWN')
+                                            print(f"DEBUG: side_value = {side_value}")
+
                                             self._execution_db.log_liquidation_event(
                                                 timestamp=ts if 'ts' in locals() else time.time(),
                                                 symbol=order.get('s', symbol),
-                                                side=order.get('S', 'UNKNOWN'),
+                                                side=side_value,
                                                 price=float(order.get('p', 0)),
                                                 volume=float(order.get('q', 0))
                                             )
+                                            print(f"DEBUG: Liquidation event logged successfully")
                                         except Exception as e:
-                                            pass
+                                            print(f"ERROR logging liquidation: {e}")
+                                            import traceback
+                                            traceback.print_exc()
+
+                                    # Phase 5: Update liquidation Z-score calculator
+                                    try:
+                                        if 'o' in payload:
+                                            order = payload['o']
+                                            quantity = float(order.get('q', 0))
+                                            timestamp = ts if 'ts' in locals() else time.time()
+
+                                            # Initialize calculator for symbol if needed
+                                            if symbol not in self._liquidation_calculators:
+                                                self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
+
+                                            # Update liquidation Z-score
+                                            self._liquidation_calculators[symbol].update(quantity, timestamp)
+                                    except:
+                                        pass
                                 elif 'kline' in stream:
                                     event_type = "KLINE"
                                     # Log OHLC candle
@@ -794,7 +1032,7 @@ class CollectorService:
                                                 )
                                             except:
                                                 pass
-                                elif 'bookTicker' in stream:
+                                elif 'bookticker' in stream.lower():
                                     event_type = "DEPTH"
                                     # Log order book update for ground truth validation
                                     try:
@@ -808,6 +1046,45 @@ class CollectorService:
                                                 best_ask_price=float(payload['a']),
                                                 best_ask_qty=float(payload['A'])
                                             )
+                                    except:
+                                        pass
+                                elif 'depth20' in stream.lower():
+                                    event_type = "DEPTH_L2"
+                                    # Log L2 orderbook depth (20 levels)
+                                    try:
+                                        ts_depth = int(payload.get('T', 0)) / 1000.0 if payload.get('T') else time.time()
+                                        bids = payload.get('b', [])
+                                        asks = payload.get('a', [])
+                                        if bids or asks:
+                                            self._execution_db.log_orderbook_depth(
+                                                symbol=symbol,
+                                                timestamp=ts_depth,
+                                                bids=bids,
+                                                asks=asks
+                                            )
+                                            # Update mark price from mid if available
+                                            if bids and asks:
+                                                mid = (float(bids[0][0]) + float(asks[0][0])) / 2
+                                                self._mark_prices[symbol] = Decimal(str(mid))
+                                    except:
+                                        pass
+                                elif 'markprice' in stream.lower():
+                                    event_type = "MARK_PRICE"
+                                    # Log official mark price with funding info
+                                    try:
+                                        ts_mark = int(payload.get('E', 0)) / 1000.0 if payload.get('E') else time.time()
+                                        mark_price = float(payload.get('p', 0))
+                                        if mark_price > 0:
+                                            self._execution_db.log_mark_price(
+                                                symbol=symbol,
+                                                timestamp=ts_mark,
+                                                mark_price=mark_price,
+                                                index_price=float(payload.get('i', 0)) if payload.get('i') else None,
+                                                funding_rate=float(payload.get('r', 0)) if payload.get('r') else None,
+                                                next_funding_time=float(payload.get('T', 0)) / 1000.0 if payload.get('T') else None
+                                            )
+                                            # Update authoritative mark price
+                                            self._mark_prices[symbol] = Decimal(str(mark_price))
                                     except:
                                         pass
 
@@ -830,11 +1107,17 @@ class CollectorService:
                                 
                             except Exception as e:
                                 print(f"Processing Error: {e}")
+                                import traceback
+                                traceback.print_exc()  # Print full stack trace
                                 await asyncio.sleep(1)
-                                
+
                 except Exception as e:
-                    print(f"Connection Failed: {e}. Retrying in 5s...")
-                    await asyncio.sleep(5)
+                    print(f"Connection Failed: {e}. Retrying in {reconnect_delay}s...")
+                    import traceback
+                    traceback.print_exc()  # Print full traceback
+                    await asyncio.sleep(reconnect_delay)
+                    # Exponential backoff: double the delay, capped at max
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
     def get_execution_log(self):

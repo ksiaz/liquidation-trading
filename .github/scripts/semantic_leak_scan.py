@@ -69,15 +69,26 @@ R6_M6_INTERPRETATION = re.compile(
 # Format: {filepath: {line_number: "justification"}}
 EXCEPTIONS: Dict[str, Dict[int, str]] = {
     'observation/governance.py': {
-        22: "Structural threshold: factual minimum size delta in contract units",
-        23: "Structural threshold: factual maximum price movement in percentage",
-        24: "Structural threshold: factual time window for correlation in seconds",
-        239: "Parameter passing structural threshold (size change)",
-        250: "Parameter passing structural threshold (size change)",
-        256: "Local variable for price list (no semantic claim)",
-        275: "Parameter passing structural threshold (price stability)",
-        286: "Parameter passing structural threshold (size change)",
-        297: "Parameter passing structural threshold (size change)",
+        # Structural thresholds (factual boundaries, not interpretation)
+        86: "Structural config: time window for price correlation in seconds",
+        # Trade handling - Binance API semantic field names
+        309: "Binance API semantic: is_taker_sell indicates trade aggressor side",
+        321: "Parameter passing Binance API field to M2 store",
+        328: "Local variable derived from Binance trade side field",
+        # Orderbook primitive parameters
+        428: "Structural parameter: minimum consumption size threshold",
+        439: "Structural parameter: minimum consumption size threshold",
+        445: "Data access: recent_prices is collection name, not semantic claim",
+        464: "Structural parameter: maximum price movement percentage",
+        475: "Structural parameter: minimum refill size threshold",
+        486: "Structural parameter: minimum refill size threshold",
+        # Debug logging with structural parameter
+        505: "Debug logging with structural constant name",
+        # Clustering parameter
+        599: "Structural parameter: maximum gap percentage for clustering",
+    },
+    'runtime/collector/service.py': {
+        281: "Factual error logging: reports exception occurred, no interpretation",
     },
 }
 

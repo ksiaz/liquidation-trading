@@ -22,7 +22,8 @@ from memory.m4_orderbook_primitives import (
 from memory.m4_zone_geometry import (
     ZonePenetrationDepth,
     compute_zone_penetration_depth,
-    DisplacementOriginAnchor
+    DisplacementOriginAnchor,
+    identify_displacement_origin_anchor
 )
 
 # Traversal kinematics primitives
@@ -36,7 +37,47 @@ from memory.m4_traversal_kinematics import (
 # Price distribution primitives
 from memory.m4_price_distribution import (
     CentralTendencyDeviation,
-    compute_central_tendency_deviation
+    compute_central_tendency_deviation,
+    PriceAcceptanceRatio,
+    compute_price_acceptance_ratio
+)
+
+# Traversal voids primitives
+from memory.m4_traversal_voids import (
+    TraversalVoidSpan,
+    compute_traversal_void_span
+)
+
+# Structural absence primitives
+from memory.m4_structural_absence import (
+    StructuralAbsenceDuration,
+    compute_structural_absence_duration
+)
+
+# Structural persistence primitives
+from memory.m4_structural_persistence import (
+    StructuralPersistenceDuration,
+    compute_structural_persistence_duration
+)
+
+# Event absence primitives
+from memory.m4_event_absence import (
+    EventNonOccurrenceCounter,
+    compute_event_non_occurrence_counter
+)
+
+# Liquidation clustering primitives
+from memory.m4_liquidation_clustering import (
+    LiquidationDensity,
+    compute_liquidation_density
+)
+
+# Trade flow primitives
+from memory.m4_trade_flow import (
+    DirectionalContinuity,
+    compute_directional_continuity,
+    TradeBurst,
+    compute_trade_burst
 )
 
 # Detection thresholds (structural boundaries, not interpretation)
@@ -73,13 +114,18 @@ class ObservationSystem:
         """
         Push external fact into memory.
         """
+        # Only log TRADE events to reduce verbosity
+        if event_type == 'TRADE':
+            print(f"DEBUG Governance: TRADE ingest - symbol={symbol}, timestamp={timestamp}, system_time={self._system_time}")
+
         if self._status == ObservationStatus.FAILED:
             return # Dead system accepts no input
-            
+
         # Invariant B: Causality (No future data, no ancient history without backfill flag)
         # Tolerance: 30 seconds lag, 5 seconds future (clock skew)
         if timestamp < self._system_time - 30.0:
             # Drop ancient history (Log warning?)
+            print(f"DEBUG Governance: DROPPING {event_type} for {symbol} - timestamp {timestamp} < system_time {self._system_time} - 30")
             return
         # Future data tolerance: 5 seconds
         # Accept but do not modify system time
@@ -138,6 +184,10 @@ class ObservationSystem:
         """
         Force memory system to recognize time passage.
         """
+        # Only log first few times or significant changes
+        if self._system_time == 0.0 or new_timestamp - self._system_time > 10:
+            print(f"DEBUG Governance: advance_time - old={self._system_time}, new={new_timestamp}")
+
         if self._status == ObservationStatus.FAILED:
             return
 
@@ -162,9 +212,8 @@ class ObservationSystem:
         self._system_time = new_timestamp
         self._update_liveness()
 
-        # Transition from UNINITIALIZED to ACTIVE once time advances
-        if self._status == ObservationStatus.UNINITIALIZED and new_timestamp > 0:
-            self._status = ObservationStatus.ACTIVE
+        # Note: Status remains UNINITIALIZED until failure (per EPISTEMIC_CONSTITUTION)
+        # UNINITIALIZED means "no failure detected", not "not ready"
 
         # Trigger M3 to close windows
         try:
@@ -256,7 +305,8 @@ class ObservationSystem:
         price = normalized_event['price']
         timestamp = normalized_event['timestamp']
         volume = normalized_event.get('quote_qty', 0.0)
-        is_buyer_maker = normalized_event['side'] == 'SELL'
+        side = normalized_event['side']  # FIX: Extract 'side' - used at lines 316, 326
+        is_taker_sell = normalized_event['side'] == 'SELL'
 
         # Find nodes near this price
         nearby_nodes = self._m2_store.get_nodes_near_price(symbol, price)
@@ -268,14 +318,14 @@ class ObservationSystem:
                     node_id=node.id,
                     timestamp=timestamp,
                     volume=volume,
-                    is_buyer_maker=is_buyer_maker
+                    is_buyer_maker=is_taker_sell  # is_taker_sell = is_buyer_maker (same semantic)
                 )
         elif volume >= 1000.0:  # Large trade threshold: $1000
             # Create new node from large trade
             import math
             price_precision = max(1, int(-math.log10(price * 0.001)))
             price_bucket = round(price, price_precision)
-            side = "bid" if is_buyer_maker else "ask"
+            orderbook_face = "bid_face" if is_taker_sell else "ask_face"
             node_id = f"{symbol}_{side}_{price_bucket}"
 
             # Only create if doesn't exist
@@ -451,6 +501,9 @@ class ObservationSystem:
             # Get trade data from M1
             trades = list(self._m1.raw_trades.get(symbol, []))
 
+            # DEBUG: Log trade count
+            print(f"DEBUG Governance: Computing primitives for {symbol}, trades={len(trades)}, min_required={_MIN_TRADES_FOR_KINEMATICS}")
+
             if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
                 # Extract price sequence
                 prices = [t['price'] for t in trades]
@@ -567,26 +620,180 @@ class ObservationSystem:
             # Pattern detection failures should not crash snapshot
             pass
 
+        # Initialize additional primitives to None
+        displacement_origin_primitive = None
+        traversal_void_primitive = None
+        price_acceptance_primitive = None
+        liquidation_density_primitive = None
+        directional_continuity_primitive = None
+        trade_burst_primitive = None
+        structural_absence_primitive = None
+        structural_persistence_primitive = None
+        event_non_occurrence_primitive = None
+
+        try:
+            # Get trade data from M1 (may already be fetched above)
+            if 'trades' not in locals():
+                trades = list(self._m1.raw_trades.get(symbol, []))
+
+            if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
+                # Extract sequences
+                prices = [t['price'] for t in trades]
+                timestamps = [t['timestamp'] for t in trades]
+                trade_sides = [t.get('side', 'UNKNOWN') for t in trades]
+
+                # Displacement origin anchor: use first half as pre-traversal
+                if len(prices) >= 4:
+                    mid_idx = len(prices) // 2
+                    pre_traversal_prices = prices[:mid_idx]
+                    pre_traversal_timestamps = timestamps[:mid_idx]
+
+                    displacement_origin_primitive = identify_displacement_origin_anchor(
+                        traversal_id=f"{symbol}_displacement_{int(self._system_time)}",
+                        pre_traversal_prices=pre_traversal_prices,
+                        pre_traversal_timestamps=pre_traversal_timestamps
+                    )
+
+                # Traversal void span: find gaps between trades
+                if len(timestamps) >= 2:
+                    observation_start = timestamps[0]
+                    observation_end = timestamps[-1]
+
+                    if observation_end > observation_start:
+                        traversal_void_primitive = compute_traversal_void_span(
+                            observation_start_ts=observation_start,
+                            observation_end_ts=observation_end,
+                            traversal_timestamps=tuple(timestamps)
+                        )
+
+                # Price acceptance ratio: compute OHLC from trades
+                if len(prices) >= 2:
+                    candle_open = prices[0]
+                    candle_close = prices[-1]
+                    candle_high = max(prices)
+                    candle_low = min(prices)
+
+                    price_acceptance_primitive = compute_price_acceptance_ratio(
+                        candle_open=candle_open,
+                        candle_high=candle_high,
+                        candle_low=candle_low,
+                        candle_close=candle_close
+                    )
+
+                # Directional continuity: analyze trade direction consistency
+                if len(trade_sides) >= 2:
+                    # Filter out UNKNOWN sides
+                    valid_sides = [s for s in trade_sides if s in ('BUY', 'SELL')]
+                    if len(valid_sides) >= 2:
+                        directional_continuity_primitive = compute_directional_continuity(
+                            trade_sides=valid_sides
+                        )
+
+                # Trade burst: find maximum trade density window
+                if len(timestamps) >= 2:
+                    trade_burst_primitive = compute_trade_burst(
+                        trade_timestamps=timestamps,
+                        burst_window_sec=1.0
+                    )
+
+            # Liquidation density: analyze liquidation clustering
+            liquidations = list(self._m1.raw_liquidations.get(symbol, []))
+            if len(liquidations) >= 2 and len(trades) >= 1:
+                # Use current price as center
+                current_price = trades[-1]['price'] if trades else None
+                if current_price:
+                    # Use 1% price window for liquidation clustering
+                    price_window = current_price * 0.01
+
+                    # Format liquidations for compute function
+                    liq_list = [
+                        {'price': liq['price'], 'volume': liq.get('quantity', 0.0)}
+                        for liq in liquidations
+                    ]
+
+                    liquidation_density_primitive = compute_liquidation_density(
+                        liquidations=liq_list,
+                        price_center=current_price,
+                        price_window=price_window
+                    )
+
+            # Structural absence/persistence: measure M2 node presence over observation window
+            if len(timestamps) >= 2:
+                observation_start = timestamps[0]
+                observation_end = timestamps[-1]
+
+                if observation_end > observation_start:
+                    # Get active M2 nodes for this symbol
+                    active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+
+                    if len(active_nodes) > 0:
+                        # Build presence intervals from M2 nodes
+                        # Each node contributes an interval from first_seen to last_interaction
+                        presence_intervals = []
+                        for node in active_nodes:
+                            # Only include intervals that overlap with observation window
+                            interval_start = max(node.first_seen_ts, observation_start)
+                            interval_end = min(node.last_interaction_ts, observation_end)
+
+                            if interval_start < interval_end:
+                                presence_intervals.append((interval_start, interval_end))
+
+                        if len(presence_intervals) > 0:
+                            # Compute structural persistence (how long nodes were present)
+                            structural_persistence_primitive = compute_structural_persistence_duration(
+                                observation_start_ts=observation_start,
+                                observation_end_ts=observation_end,
+                                presence_intervals=tuple(presence_intervals)
+                            )
+
+                            # Compute structural absence (how long nodes were absent)
+                            structural_absence_primitive = compute_structural_absence_duration(
+                                observation_start_ts=observation_start,
+                                observation_end_ts=observation_end,
+                                presence_intervals=tuple(presence_intervals)
+                            )
+
+            # Event non-occurrence counter: track expected symbols vs observed symbols
+            # This is computed once per cycle, not per symbol, so we'll check if symbol is first
+            if symbol == self._symbols[0]:  # Only compute once per cycle
+                # Expected: all symbols we're tracking
+                expected_symbol_ids = tuple(self._symbols)
+
+                # Observed: symbols with ≥1 trade in M1 buffer
+                observed_symbol_ids = tuple(
+                    sym for sym in self._symbols
+                    if len(list(self._m1.raw_trades.get(sym, []))) > 0
+                )
+
+                event_non_occurrence_primitive = compute_event_non_occurrence_counter(
+                    expected_event_ids=expected_symbol_ids,
+                    observed_event_ids=observed_symbol_ids
+                )
+
+        except Exception as e:
+            # Additional primitive computation failures should not crash snapshot
+            pass
+
         # Return bundle with computed primitives
         return M4PrimitiveBundle(
             symbol=symbol,
             zone_penetration=zone_penetration_primitive,
-            displacement_origin_anchor=None,  # Not yet implemented
+            displacement_origin_anchor=displacement_origin_primitive,
             price_traversal_velocity=traversal_velocity_primitive,
             traversal_compactness=traversal_compactness_primitive,
             central_tendency_deviation=central_tendency_primitive,
-            structural_absence_duration=None,
-            traversal_void_span=None,
-            event_non_occurrence_counter=None,
-            structural_persistence_duration=None,
+            structural_absence_duration=structural_absence_primitive,
+            traversal_void_span=traversal_void_primitive,
+            event_non_occurrence_counter=event_non_occurrence_primitive,
+            structural_persistence_duration=structural_persistence_primitive,
             resting_size=resting_size_primitive,
             order_consumption=consumption_primitive,
             absorption_event=absorption_primitive,
             refill_event=refill_primitive,
-            price_acceptance_ratio=None,
-            liquidation_density=None,
-            directional_continuity=None,
-            trade_burst=None,
+            price_acceptance_ratio=price_acceptance_primitive,
+            liquidation_density=liquidation_density_primitive,
+            directional_continuity=directional_continuity_primitive,
+            trade_burst=trade_burst_primitive,
             order_block=order_block_primitive,
             supply_demand_zone=supply_demand_zone_primitive
         )

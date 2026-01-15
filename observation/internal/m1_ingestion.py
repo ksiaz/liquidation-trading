@@ -70,6 +70,9 @@ class M1IngestionEngine:
             self.recent_prices[symbol].append((timestamp, price))  # Track for absorption detection
             self.counters['trades'] += 1
 
+            # DEBUG: Log trade buffer size
+            print(f"DEBUG M1: Added TRADE for {symbol}, buffer size now={len(self.raw_trades[symbol])}")
+
             return event
             
         except Exception as e:

@@ -18,6 +18,7 @@ CRITICAL: This module makes no decisions. It only proposes.
 
 from dataclasses import dataclass
 from typing import Optional
+from runtime.position.types import PositionState
 
 
 # ==============================================================================
@@ -55,65 +56,111 @@ class StrategyProposal:
 # EP-2 Strategy #2: Kinematics-Driven Structural Proposal
 # ==============================================================================
 
+def _entry_conditions_met(
+    velocity,
+    compactness,
+    acceptance
+) -> bool:
+    """
+    Check if entry conditions are met (structural existence).
+
+    Returns:
+        True if all three kinematic primitives show structural presence
+    """
+    # Any input missing -> conditions not met
+    if velocity is None:
+        return False
+    if compactness is None:
+        return False
+    if acceptance is None:
+        return False
+
+    # Check structural existence conditions
+    # Condition 1: Velocity is non-zero
+    if not (velocity.velocity != 0):
+        return False
+
+    # Condition 2: Compactness is non-degenerate
+    if not (compactness.compactness_ratio > 0):
+        return False
+
+    # Condition 3: Acceptance is non-zero
+    if not (acceptance.acceptance_ratio > 0):
+        return False
+
+    return True
+
+
 def generate_kinematics_proposal(
     *,
     velocity,  # PriceTraversalVelocity | None
     compactness,  # TraversalCompactness | None
     acceptance,  # PriceAcceptanceRatio | None
     permission: PermissionOutput,
-    context: StrategyContext
+    context: StrategyContext,
+    position_state: Optional[PositionState] = None
 ) -> Optional[StrategyProposal]:
     """
     Generate at most one structural kinematics proposal.
-    
-    Proposes only if ALL three conditions are true:
+
+    Proposes ENTRY if ALL three conditions are true:
     1. Velocity is non-zero (velocity != 0)
     2. Compactness is non-degenerate (compactness_ratio > 0)
     3. Acceptance is non-zero (acceptance_ratio > 0)
-    
+
+    Proposes EXIT if position exists and conditions no longer met.
+
     These are structural existence checks only.
     No thresholds, no comparisons, no interpretation.
-    
+
     Args:
         velocity: A3 primitive output or None
         compactness: A4 primitive output or None
         acceptance: A5 primitive output or None
         permission: M6 permission result
         context: Strategy execution context
-    
+        position_state: Current position state (from executor)
+
     Returns:
-        StrategyProposal if all conditions met, None otherwise
+        StrategyProposal if conditions warrant action, None otherwise
     """
     # Rule 1: M6 DENIED -> no proposal
     if permission.result == "DENIED":
         return None
-    
-    # Rule 2: Any input missing -> no proposal
-    if velocity is None:
+
+    # Rule 2: If position exists (ENTERING, OPEN, REDUCING), check if should exit
+    if position_state in (PositionState.ENTERING, PositionState.OPEN, PositionState.REDUCING):
+        # If primitives are None, we have insufficient data -> HOLD
+        if velocity is None or compactness is None or acceptance is None:
+            # Insufficient data to evaluate -> HOLD (don't exit)
+            return None
+
+        # Primitives exist - check if original entry conditions are still met
+        if not _entry_conditions_met(velocity, compactness, acceptance):
+            # Raw event invalidating original entry condition
+            return StrategyProposal(
+                strategy_id="EP2-KINEMATICS-V1",
+                action_type="EXIT",
+                confidence="INVALIDATED",
+                justification_ref="A3|A4|A5_ABSENT",
+                timestamp=context.timestamp
+            )
+
+        # Conditions still met -> HOLD (don't generate duplicate ENTRY)
         return None
-    if compactness is None:
-        return None
-    if acceptance is None:
-        return None
-    
-    # Rule 3: Check structural existence conditions
-    # Condition 1: Velocity is non-zero
-    if not (velocity.velocity != 0):
-        return None
-    
-    # Condition 2: Compactness is non-degenerate
-    if not (compactness.compactness_ratio > 0):
-        return None
-    
-    # Condition 3: Acceptance is non-zero
-    if not (acceptance.acceptance_ratio > 0):
-        return None
-    
-    # All conditions met -> emit proposal
-    return StrategyProposal(
-        strategy_id="EP2-KINEMATICS-V1",
-        action_type="STRUCTURAL_KINEMATIC_EVENT",
-        confidence="STRUCTURAL_PRESENT",
-        justification_ref="A3|A4|A5",
-        timestamp=context.timestamp
-    )
+
+    # Rule 3: Position FLAT -> check if should enter
+    if position_state == PositionState.FLAT or position_state is None:
+        # Check if entry conditions met
+        if _entry_conditions_met(velocity, compactness, acceptance):
+            # All conditions met -> emit ENTRY proposal
+            return StrategyProposal(
+                strategy_id="EP2-KINEMATICS-V1",
+                action_type="ENTRY",
+                confidence="STRUCTURAL_PRESENT",
+                justification_ref="A3|A4|A5",
+                timestamp=context.timestamp
+            )
+
+    # No action warranted
+    return None

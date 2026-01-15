@@ -44,6 +44,10 @@ from external_policy.ep2_strategy_absence import generate_absence_proposal
 # Test policy for order book primitives (verification only)
 from external_policy.ep2_strategy_orderbook_test import generate_orderbook_test_proposal
 
+# Phase 5: SLBRS/EFFCS strategies with regime gating
+from external_policy.ep2_slbrs_strategy import generate_slbrs_proposal, RegimeState as SLBRSRegimeState
+from external_policy.ep2_effcs_strategy import generate_effcs_proposal
+
 
 @dataclass(frozen=True)
 class AdapterConfig:
@@ -56,6 +60,10 @@ class AdapterConfig:
     enable_kinematics: bool = True
     enable_absence: bool = True
     enable_orderbook_test: bool = False  # Test policy for verification
+
+    # Phase 5: Regime-gated strategies (SLBRS/EFFCS)
+    enable_slbrs: bool = False  # SLBRS strategy (SIDEWAYS regime)
+    enable_effcs: bool = False  # EFFCS strategy (EXPANSION regime)
 
 
 class PolicyAdapter:
@@ -83,7 +91,10 @@ class PolicyAdapter:
         observation_snapshot: ObservationSnapshot,
         symbol: str,
         timestamp: float,
-        position_state: Optional[PositionState] = None
+        position_state: Optional[PositionState] = None,
+        regime_state: Optional[Any] = None,  # RegimeState from regime classifier
+        regime_metrics: Optional[Any] = None,  # RegimeMetrics from regime classifier
+        current_price: Optional[float] = None  # Current price from collector
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -94,6 +105,9 @@ class PolicyAdapter:
             symbol: Symbol to generate mandates for
             timestamp: Current timestamp
             position_state: Current position state for symbol (from executor)
+            regime_state: Regime classification (Phase 5)
+            regime_metrics: Regime metrics (VWAP distance, ATR, orderflow, liquidations)
+            current_price: Current market price
 
         Returns:
             List of Mandates (possibly empty)
@@ -129,6 +143,13 @@ class PolicyAdapter:
             reason_code="WIRING_STUB",
             timestamp=timestamp
         )
+
+        # DEBUG: Log primitive availability
+        print(f"DEBUG PolicyAdapter: Generating mandates for {symbol}")
+        print(f"DEBUG PolicyAdapter: Primitives available:")
+        for key, value in primitives.items():
+            if value is not None:
+                print(f"  - {key}: {type(value).__name__}")
 
         # Invoke frozen external policies
         proposals: List[StrategyProposal] = []
@@ -181,8 +202,63 @@ class PolicyAdapter:
             if proposal:
                 proposals.append(proposal)
 
+        # Phase 5: SLBRS/EFFCS strategies with regime gating
+        if regime_state is not None and regime_metrics is not None:
+            # Convert regime_state to strategy-compatible format
+            regime_state_obj = SLBRSRegimeState(
+                regime=regime_state.name,  # "SIDEWAYS_ACTIVE", "EXPANSION_ACTIVE", or "DISABLED"
+                vwap_distance=regime_metrics.vwap_distance,
+                atr_5m=regime_metrics.atr_5m,
+                atr_30m=regime_metrics.atr_30m
+            )
+
+            # Use current price from collector (if not available, skip strategy calls)
+            if current_price is None:
+                return mandates
+
+            if self.config.enable_slbrs:
+                # SLBRS strategy (SIDEWAYS regime)
+                proposal = generate_slbrs_proposal(
+                    symbol=symbol,
+                    regime_state=regime_state_obj,
+                    zone_penetration=primitives.get("zone_penetration"),
+                    resting_size=primitives.get("resting_size"),
+                    order_consumption=primitives.get("order_consumption"),
+                    structural_persistence=primitives.get("structural_persistence_duration"),
+                    price=current_price,
+                    context=context,
+                    permission=permission,
+                    position_state=position_state
+                )
+                if proposal:
+                    proposals.append(proposal)
+
+            if self.config.enable_effcs:
+                # EFFCS strategy (EXPANSION regime)
+                proposal = generate_effcs_proposal(
+                    symbol=symbol,
+                    regime_state=regime_state_obj,
+                    price_velocity=primitives.get("price_traversal_velocity"),
+                    displacement=primitives.get("displacement_origin_anchor"),
+                    liquidation_zscore=regime_metrics.liquidation_zscore,
+                    price=current_price,
+                    price_high=current_price,  # TODO: Track recent high separately
+                    price_low=current_price,  # TODO: Track recent low separately
+                    context=context,
+                    permission=permission,
+                    position_state=position_state
+                )
+                if proposal:
+                    proposals.append(proposal)
+
         # Convert proposals to mandates (pure normalization)
         mandates = self._proposals_to_mandates(proposals, symbol, timestamp)
+
+        # DEBUG: Log results
+        print(f"DEBUG PolicyAdapter: Generated {len(proposals)} proposals → {len(mandates)} mandates")
+        if len(mandates) > 0:
+            for mandate in mandates:
+                print(f"  - Mandate: {mandate.type.name}")
 
         return mandates
 

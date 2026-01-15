@@ -274,6 +274,41 @@ class ResearchDatabase:
             )
         """)
 
+        # Table 8.1: Orderbook Depth (L2 - 20 levels)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orderbook_depth (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+
+                bids TEXT NOT NULL,
+                asks TEXT NOT NULL,
+
+                bid_total_qty REAL,
+                ask_total_qty REAL,
+                mid_price REAL,
+                spread_bps REAL,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table 8.2: Mark Prices (Official Binance Mark Price)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mark_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+
+                mark_price REAL NOT NULL,
+                index_price REAL,
+                funding_rate REAL,
+                next_funding_time REAL,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Table 8.5: Trade Events (Ground Truth for Validation)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trade_events (
@@ -338,6 +373,24 @@ class ResearchDatabase:
             )
         """)
         
+        # Phase 6: Add regime tracking columns (migration-safe)
+        # Check if columns exist before adding
+        cursor.execute("PRAGMA table_info(execution_cycles)")
+        existing_columns = [row[1] for row in cursor.fetchall()]
+
+        if 'regime_state' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN regime_state TEXT")
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN vwap REAL")
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN atr_5m REAL")
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN atr_30m REAL")
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN orderflow_imbalance REAL")
+                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN liquidation_zscore REAL")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                # Columns might already exist from a previous migration
+                pass
+
         # Create indexes for performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON execution_cycles(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cycle ON m2_nodes(cycle_id)")
@@ -366,7 +419,9 @@ class ResearchDatabase:
         symbols_active: List[str],
         primitives_computing: int,
         primitives_total: int,
-        performance: Optional[Dict[str, float]] = None
+        performance: Optional[Dict[str, float]] = None,
+        regime_state: Optional[str] = None,
+        regime_metrics: Optional[Dict[str, float]] = None
     ) -> int:
         """Log execution cycle (Phase 1 - Core).
         
@@ -384,8 +439,9 @@ class ResearchDatabase:
                 primitives_computing_total, primitives_possible_total,
                 snapshot_generation_ms, primitive_computation_ms,
                 policy_evaluation_ms, arbitration_ms,
-                memory_usage_mb, cpu_percent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                memory_usage_mb, cpu_percent,
+                regime_state, vwap, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             timestamp, observation_status,
             m2_metrics.get('active_nodes', 0),
@@ -402,7 +458,13 @@ class ResearchDatabase:
             performance.get('policy_evaluation_ms') if performance else None,
             performance.get('arbitration_ms') if performance else None,
             performance.get('memory_usage_mb') if performance else None,
-            performance.get('cpu_percent') if performance else None
+            performance.get('cpu_percent') if performance else None,
+            regime_state,
+            regime_metrics.get('vwap') if regime_metrics else None,
+            regime_metrics.get('atr_5m') if regime_metrics else None,
+            regime_metrics.get('atr_30m') if regime_metrics else None,
+            regime_metrics.get('orderflow_imbalance') if regime_metrics else None,
+            regime_metrics.get('liquidation_zscore') if regime_metrics else None
         ))
         
         cycle_id = cursor.lastrowid
@@ -558,6 +620,75 @@ class ResearchDatabase:
         """, (
             symbol, timestamp, best_bid_price, best_bid_qty,
             best_ask_price, best_ask_qty
+        ))
+        self.conn.commit()
+
+    def log_orderbook_depth(
+        self,
+        symbol: str,
+        timestamp: float,
+        bids: list,
+        asks: list
+    ):
+        """Log L2 orderbook depth (20 levels).
+
+        Args:
+            symbol: Trading pair
+            timestamp: Event timestamp
+            bids: List of [price, qty] pairs for bids
+            asks: List of [price, qty] pairs for asks
+        """
+        cursor = self.conn.cursor()
+
+        # Calculate aggregates
+        bid_total = sum(float(b[1]) for b in bids) if bids else 0
+        ask_total = sum(float(a[1]) for a in asks) if asks else 0
+
+        best_bid = float(bids[0][0]) if bids else 0
+        best_ask = float(asks[0][0]) if asks else 0
+        mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+        spread_bps = ((best_ask - best_bid) / mid_price * 10000) if mid_price else 0
+
+        cursor.execute("""
+            INSERT INTO orderbook_depth (
+                symbol, timestamp, bids, asks,
+                bid_total_qty, ask_total_qty, mid_price, spread_bps
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            symbol, timestamp, json.dumps(bids), json.dumps(asks),
+            bid_total, ask_total, mid_price, spread_bps
+        ))
+        self.conn.commit()
+
+    def log_mark_price(
+        self,
+        symbol: str,
+        timestamp: float,
+        mark_price: float,
+        index_price: float = None,
+        funding_rate: float = None,
+        next_funding_time: float = None
+    ):
+        """Log official mark price from Binance.
+
+        Args:
+            symbol: Trading pair
+            timestamp: Event timestamp
+            mark_price: Official mark price
+            index_price: Index price (optional)
+            funding_rate: Current funding rate (optional)
+            next_funding_time: Next funding timestamp (optional)
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO mark_prices (
+                symbol, timestamp, mark_price, index_price,
+                funding_rate, next_funding_time
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            symbol, timestamp, mark_price, index_price,
+            funding_rate, next_funding_time
         ))
         self.conn.commit()
 

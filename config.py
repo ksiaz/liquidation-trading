@@ -25,6 +25,10 @@ DATA_DIR = 'D:\\liquidation-trading\\data'
 LOG_FILE = 'data/liquidations.log'
 CSV_FILE = 'data/liquidations.csv'
 
+# Temp directory (keeps temp files on D drive, not C)
+TEMP_DIR = 'D:\\liquidation-trading\\tmp'
+LOG_DIR = 'D:\\liquidation-trading\\logs'
+
 # Data persistence settings
 BUFFER_SIZE = 100          # Events before flush
 FLUSH_INTERVAL = 10        # Seconds between auto-flush

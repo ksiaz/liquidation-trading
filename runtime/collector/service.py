@@ -1089,11 +1089,14 @@ class CollectorService:
                                         pass
 
                                 # TIMESTAMP EXTRACTION
+                                # Note: 'E' is event time, 'T' varies by stream type
+                                # For markPrice, 'T' is next_funding_time (FUTURE!) - must use 'E'
                                 ts = time.time()
-                                if 'T' in payload:
-                                    ts = int(payload['T']) / 1000.0
-                                elif 'E' in payload:
+                                if 'E' in payload:
                                     ts = int(payload['E']) / 1000.0
+                                elif 'T' in payload and 'markprice' not in stream.lower():
+                                    # Only use 'T' for non-markPrice streams (trade timestamp)
+                                    ts = int(payload['T']) / 1000.0
 
                                 # Update authoritative system clock
                                 if self._last_stream_time is None or ts > self._last_stream_time:

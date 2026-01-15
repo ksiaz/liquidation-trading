@@ -38,7 +38,7 @@ import os
 from runtime.regime import RegimeState, RegimeMetrics, classify_regime
 from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
-from runtime.liquidations import LiquidationZScoreCalculator
+from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator
 
 # Import Hyperliquid Integration
 try:
@@ -80,7 +80,10 @@ class CollectorService:
             enable_orderbook_test=False,  # Test policy (disabled)
             # Phase 5: Enable regime-gated strategies
             enable_slbrs=True,           # NEW: SLBRS strategy (SIDEWAYS regime)
-            enable_effcs=True            # NEW: EFFCS strategy (EXPANSION regime)
+            enable_effcs=True,           # NEW: EFFCS strategy (EXPANSION regime)
+            # Phase 6: Cascade Sniper (Hyperliquid proximity)
+            enable_cascade_sniper=True,  # NEW: Cascade sniper (liquidation proximity)
+            cascade_sniper_entry_mode="ABSORPTION_REVERSAL"  # Conservative: enter on reversal
         ))
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())
@@ -121,6 +124,12 @@ class CollectorService:
         self._atr_calculators: Dict[str, MultiTimeframeATR] = {}
         self._orderflow_calculators: Dict[str, MultiWindowOrderflow] = {}
         self._liquidation_calculators: Dict[str, LiquidationZScoreCalculator] = {}
+
+        # Phase 6: Liquidation burst aggregator (for cascade sniper)
+        self._liquidation_burst_aggregator = LiquidationBurstAggregator(
+            window_seconds=10.0,  # 10-second window
+            max_events=1000
+        )
 
         # Track current prices for regime calculation
         self._current_prices: Dict[str, float] = {}
@@ -351,6 +360,16 @@ class CollectorService:
                             f"Strategy evaluation: {symbol} regime={regime_state.name} → {active_strategy}"
                         )
 
+                    # Phase 6: Get Hyperliquid proximity data (convert symbol to coin)
+                    # BTCUSDT -> BTC, ETHUSDT -> ETH
+                    hl_proximity = None
+                    if self._hyperliquid_enabled and self._hyperliquid_collector:
+                        coin = symbol.replace('USDT', '')
+                        hl_proximity = self._hyperliquid_collector.get_proximity(coin)
+
+                    # Phase 6: Get liquidation burst data
+                    liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -359,7 +378,9 @@ class CollectorService:
                         position_state=position_state,
                         regime_state=regime_state,  # Phase 5: Pass regime state
                         regime_metrics=regime_metrics,  # Phase 5: Pass regime metrics
-                        current_price=current_price  # Phase 5: Pass current price
+                        current_price=current_price,  # Phase 5: Pass current price
+                        hl_proximity=hl_proximity,  # Phase 6: Hyperliquid proximity
+                        liquidation_burst=liquidation_burst  # Phase 6: Liquidation burst
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1040,6 +1061,17 @@ class CollectorService:
 
                                             # Update liquidation Z-score
                                             self._liquidation_calculators[symbol].update(quantity, timestamp)
+
+                                            # Phase 6: Update liquidation burst aggregator (for cascade sniper)
+                                            price = float(order.get('p', 0))
+                                            side = order.get('S', 'UNKNOWN')
+                                            self._liquidation_burst_aggregator.add_event(
+                                                timestamp=timestamp,
+                                                symbol=symbol,
+                                                side=side,
+                                                price=price,
+                                                quantity=quantity
+                                            )
                                     except:
                                         pass
                                 elif 'kline' in stream:

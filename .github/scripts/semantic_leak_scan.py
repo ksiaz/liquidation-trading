@@ -88,12 +88,12 @@ EXCEPTIONS: Dict[str, Dict[int, str]] = {
         599: "Structural parameter: maximum gap percentage for clustering",
     },
     'runtime/collector/service.py': {
-        156: "Factual error logging: reports initialization exception",
-        173: "Factual status logging: reports collector task created",
-        175: "Factual error logging: reports start exception",
-        281: "Factual error logging: reports exception occurred, no interpretation",
-        310: "Factual error logging: reports classification exception",
-        1171: "Factual error logging: reports stop exception",
+        165: "Factual error logging: reports initialization exception",
+        182: "Factual status logging: reports collector task created",
+        184: "Factual error logging: reports start exception",
+        290: "Factual error logging: reports exception occurred, no interpretation",
+        319: "Factual error logging: reports classification exception",
+        1203: "Factual error logging: reports stop exception",
     },
 }
 

@@ -48,6 +48,14 @@ from external_policy.ep2_strategy_orderbook_test import generate_orderbook_test_
 from external_policy.ep2_slbrs_strategy import generate_slbrs_proposal, RegimeState as SLBRSRegimeState
 from external_policy.ep2_effcs_strategy import generate_effcs_proposal
 
+# Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
+from external_policy.ep2_strategy_cascade_sniper import (
+    generate_cascade_sniper_proposal,
+    ProximityData,
+    EntryMode as CascadeSniperEntryMode
+)
+from runtime.liquidations import LiquidationBurst
+
 
 @dataclass(frozen=True)
 class AdapterConfig:
@@ -64,6 +72,10 @@ class AdapterConfig:
     # Phase 5: Regime-gated strategies (SLBRS/EFFCS)
     enable_slbrs: bool = False  # SLBRS strategy (SIDEWAYS regime)
     enable_effcs: bool = False  # EFFCS strategy (EXPANSION regime)
+
+    # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
+    enable_cascade_sniper: bool = False  # Cascade sniper (liquidation proximity)
+    cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL" or "CASCADE_MOMENTUM"
 
 
 class PolicyAdapter:
@@ -94,7 +106,9 @@ class PolicyAdapter:
         position_state: Optional[PositionState] = None,
         regime_state: Optional[Any] = None,  # RegimeState from regime classifier
         regime_metrics: Optional[Any] = None,  # RegimeMetrics from regime classifier
-        current_price: Optional[float] = None  # Current price from collector
+        current_price: Optional[float] = None,  # Current price from collector
+        hl_proximity: Optional[ProximityData] = None,  # Hyperliquid proximity data
+        liquidation_burst: Optional[LiquidationBurst] = None  # Recent Binance liquidations
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -108,6 +122,8 @@ class PolicyAdapter:
             regime_state: Regime classification (Phase 5)
             regime_metrics: Regime metrics (VWAP distance, ATR, orderflow, liquidations)
             current_price: Current market price
+            hl_proximity: Hyperliquid liquidation proximity data (Phase 6)
+            liquidation_burst: Recent Binance liquidation burst (Phase 6)
 
         Returns:
             List of Mandates (possibly empty)
@@ -250,6 +266,24 @@ class PolicyAdapter:
                 )
                 if proposal:
                     proposals.append(proposal)
+
+        # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
+        if self.config.enable_cascade_sniper and (hl_proximity is not None or liquidation_burst is not None):
+            # Determine entry mode from config
+            entry_mode = CascadeSniperEntryMode.ABSORPTION_REVERSAL
+            if self.config.cascade_sniper_entry_mode == "CASCADE_MOMENTUM":
+                entry_mode = CascadeSniperEntryMode.CASCADE_MOMENTUM
+
+            proposal = generate_cascade_sniper_proposal(
+                permission=permission,
+                proximity=hl_proximity,
+                liquidations=liquidation_burst,
+                context=context,
+                position_state=position_state,
+                entry_mode=entry_mode
+            )
+            if proposal:
+                proposals.append(proposal)
 
         # Convert proposals to mandates (pure normalization)
         mandates = self._proposals_to_mandates(proposals, symbol, timestamp)

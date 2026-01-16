@@ -22,6 +22,32 @@ from runtime.position.types import PositionState
 
 
 # ==============================================================================
+# Threshold Configuration
+# ==============================================================================
+
+@dataclass(frozen=True)
+class KinematicsThresholds:
+    """Calibrated thresholds for meaningful kinematic entry conditions.
+
+    These filter noise from signal - constitutional thresholds on observable facts.
+    NOT predictions, NOT confidence scores - just minimum values for structural presence.
+    """
+    # Velocity: minimum absolute velocity as fraction of price per second
+    # e.g., 0.001 = 0.1% per second = 6% per minute
+    min_velocity_abs: float = 0.001
+
+    # Traversal compactness: minimum ratio (0-1 scale)
+    min_compactness_ratio: float = 0.3
+
+    # Acceptance ratio: minimum fraction of time price accepted at level
+    min_acceptance_ratio: float = 0.5
+
+
+# Default thresholds - can be overridden per-instance
+DEFAULT_KINEMATICS_THRESHOLDS = KinematicsThresholds()
+
+
+# ==============================================================================
 # Input/Output Types
 # ==============================================================================
 
@@ -59,13 +85,17 @@ class StrategyProposal:
 def _entry_conditions_met(
     velocity,
     compactness,
-    acceptance
+    acceptance,
+    thresholds: KinematicsThresholds = DEFAULT_KINEMATICS_THRESHOLDS
 ) -> bool:
     """
-    Check if entry conditions are met (structural existence).
+    Check if entry conditions are met (meaningful structural presence).
+
+    Uses calibrated thresholds to filter noise from signal.
+    Thresholds are factual comparisons, NOT predictions or confidence scores.
 
     Returns:
-        True if all three kinematic primitives show structural presence
+        True if all three kinematic primitives exceed meaningful thresholds
     """
     # Any input missing -> conditions not met
     if velocity is None:
@@ -75,17 +105,17 @@ def _entry_conditions_met(
     if acceptance is None:
         return False
 
-    # Check structural existence conditions
-    # Condition 1: Velocity is non-zero
-    if not (velocity.velocity != 0):
+    # Check structural conditions against meaningful thresholds
+    # Condition 1: Velocity exceeds minimum (filters micro-movements)
+    if not (abs(velocity.velocity) >= thresholds.min_velocity_abs):
         return False
 
-    # Condition 2: Compactness is non-degenerate
-    if not (compactness.compactness_ratio > 0):
+    # Condition 2: Compactness exceeds minimum (filters degenerate traversals)
+    if not (compactness.compactness_ratio >= thresholds.min_compactness_ratio):
         return False
 
-    # Condition 3: Acceptance is non-zero
-    if not (acceptance.acceptance_ratio > 0):
+    # Condition 3: Acceptance exceeds minimum (filters rejected price levels)
+    if not (acceptance.acceptance_ratio >= thresholds.min_acceptance_ratio):
         return False
 
     return True
@@ -98,20 +128,21 @@ def generate_kinematics_proposal(
     acceptance,  # PriceAcceptanceRatio | None
     permission: PermissionOutput,
     context: StrategyContext,
-    position_state: Optional[PositionState] = None
+    position_state: Optional[PositionState] = None,
+    thresholds: KinematicsThresholds = DEFAULT_KINEMATICS_THRESHOLDS
 ) -> Optional[StrategyProposal]:
     """
     Generate at most one structural kinematics proposal.
 
-    Proposes ENTRY if ALL three conditions are true:
-    1. Velocity is non-zero (velocity != 0)
-    2. Compactness is non-degenerate (compactness_ratio > 0)
-    3. Acceptance is non-zero (acceptance_ratio > 0)
+    Proposes ENTRY if ALL three conditions exceed meaningful thresholds:
+    1. Velocity absolute value >= min_velocity_abs (default 0.1%/sec)
+    2. Compactness >= min_compactness_ratio (default 0.3)
+    3. Acceptance >= min_acceptance_ratio (default 0.5)
 
     Proposes EXIT if position exists and conditions no longer met.
 
-    These are structural existence checks only.
-    No thresholds, no comparisons, no interpretation.
+    Thresholds are calibrated filters on observable facts - NOT predictions.
+    They distinguish meaningful kinematic presence from noise.
 
     Args:
         velocity: A3 primitive output or None
@@ -120,6 +151,7 @@ def generate_kinematics_proposal(
         permission: M6 permission result
         context: Strategy execution context
         position_state: Current position state (from executor)
+        thresholds: Calibrated threshold values (default: KinematicsThresholds())
 
     Returns:
         StrategyProposal if conditions warrant action, None otherwise
@@ -136,7 +168,7 @@ def generate_kinematics_proposal(
             return None
 
         # Primitives exist - check if original entry conditions are still met
-        if not _entry_conditions_met(velocity, compactness, acceptance):
+        if not _entry_conditions_met(velocity, compactness, acceptance, thresholds):
             # Raw event invalidating original entry condition
             return StrategyProposal(
                 strategy_id="EP2-KINEMATICS-V1",
@@ -151,8 +183,8 @@ def generate_kinematics_proposal(
 
     # Rule 3: Position FLAT -> check if should enter
     if position_state == PositionState.FLAT or position_state is None:
-        # Check if entry conditions met
-        if _entry_conditions_met(velocity, compactness, acceptance):
+        # Check if entry conditions met (using calibrated thresholds)
+        if _entry_conditions_met(velocity, compactness, acceptance, thresholds):
             # All conditions met -> emit ENTRY proposal
             return StrategyProposal(
                 strategy_id="EP2-KINEMATICS-V1",

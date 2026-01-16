@@ -36,6 +36,12 @@ class RiskConfig:
     risk_fraction_per_trade: float = 0.02  # 2% max loss per trade
     min_free_margin_pct: float = 0.10  # 10% minimum free margin
 
+    # PnL-based exit thresholds (factual observations, NOT predictions)
+    # These are hard limits on position PnL, enforced regardless of structure
+    stop_loss_pct: float = 0.02  # -2% position loss triggers EXIT
+    take_profit_pct: float = 0.03  # +3% position profit triggers EXIT
+    time_stop_seconds: float = 900.0  # 15 minutes max hold time (0 = disabled)
+
     def validate(self):
         """Validate configuration consistency."""
         assert self.L_target <= self.L_max, "L_target must be <= L_max"

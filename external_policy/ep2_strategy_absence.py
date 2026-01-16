@@ -24,6 +24,31 @@ from runtime.position.types import PositionState
 
 
 # ==============================================================================
+# Threshold Configuration
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AbsenceThresholds:
+    """Calibrated thresholds for meaningful absence entry conditions.
+
+    These filter noise from signal - constitutional thresholds on observable facts.
+    NOT predictions, NOT confidence scores - just minimum values for structural presence.
+    """
+    # Absence duration: minimum seconds of structural absence to be meaningful
+    min_absence_duration: float = 60.0  # 1 minute
+
+    # Persistence duration: minimum seconds of structural persistence
+    min_persistence_duration: float = 300.0  # 5 minutes
+
+    # Absence ratio: maximum ratio (require at least some presence)
+    max_absence_ratio: float = 0.8  # Require at least 20% presence
+
+
+# Default thresholds - can be overridden per-instance
+DEFAULT_ABSENCE_THRESHOLDS = AbsenceThresholds()
+
+
+# ==============================================================================
 # Input/Output Types
 # ==============================================================================
 
@@ -60,13 +85,17 @@ class StrategyProposal:
 
 def _entry_conditions_met(
     absence,
-    persistence
+    persistence,
+    thresholds: AbsenceThresholds = DEFAULT_ABSENCE_THRESHOLDS
 ) -> bool:
     """
-    Check if entry conditions are met (structural existence).
+    Check if entry conditions are met (meaningful structural presence).
+
+    Uses calibrated thresholds to filter noise from signal.
+    Thresholds are factual comparisons, NOT predictions or confidence scores.
 
     Returns:
-        True if absence and persistence primitives show structural presence
+        True if absence and persistence primitives exceed meaningful thresholds
     """
     # Required primitives missing -> conditions not met
     if absence is None:
@@ -74,17 +103,17 @@ def _entry_conditions_met(
     if persistence is None:
         return False
 
-    # Check structural existence conditions
-    # Required Condition 1: Absence exists
-    if not (absence.absence_duration > 0):
+    # Check structural conditions against meaningful thresholds
+    # Required Condition 1: Absence exceeds minimum duration (filters brief gaps)
+    if not (absence.absence_duration >= thresholds.min_absence_duration):
         return False
 
-    # Required Condition 2: Persistence exists
-    if not (persistence.total_persistence_duration > 0):
+    # Required Condition 2: Persistence exceeds minimum duration (filters noise)
+    if not (persistence.total_persistence_duration >= thresholds.min_persistence_duration):
         return False
 
-    # Required Condition 3: Absence is not total
-    if not (absence.absence_ratio < 1.0):
+    # Required Condition 3: Absence ratio below maximum (require some presence)
+    if not (absence.absence_ratio <= thresholds.max_absence_ratio):
         return False
 
     return True
@@ -97,23 +126,24 @@ def generate_absence_proposal(
     persistence,  # StructuralPersistenceDuration | None (B2.1)
     geometry,  # ZonePenetrationDepth | None (A6, optional)
     context: StrategyContext,
-    position_state: Optional[PositionState] = None
+    position_state: Optional[PositionState] = None,
+    thresholds: AbsenceThresholds = DEFAULT_ABSENCE_THRESHOLDS
 ) -> Optional[StrategyProposal]:
     """
     Generate at most one structural absence proposal.
 
-    Proposes ENTRY if ALL required conditions are true:
-    1. Absence exists (absence_duration > 0)
-    2. Persistence exists (total_persistence_duration > 0)
-    3. Absence is not total (absence_ratio < 1.0)
+    Proposes ENTRY if ALL required conditions exceed meaningful thresholds:
+    1. Absence duration >= min_absence_duration (default 60 sec)
+    2. Persistence duration >= min_persistence_duration (default 300 sec)
+    3. Absence ratio <= max_absence_ratio (default 0.8, require 20% presence)
 
     Proposes EXIT if position exists and conditions no longer met.
 
     Optional enrichment:
     - Geometry present (penetration_depth > 0)
 
-    These are structural existence checks only.
-    No thresholds, no comparisons, no interpretation.
+    Thresholds are calibrated filters on observable facts - NOT predictions.
+    They distinguish meaningful structural absence from noise.
 
     Args:
         permission: M6 permission result
@@ -122,6 +152,7 @@ def generate_absence_proposal(
         geometry: A6 primitive output or None (optional)
         context: Strategy execution context
         position_state: Current position state (from executor)
+        thresholds: Calibrated threshold values (default: AbsenceThresholds())
 
     Returns:
         StrategyProposal if conditions warrant action, None otherwise
@@ -138,7 +169,7 @@ def generate_absence_proposal(
             return None
 
         # Primitives exist - check if original entry conditions are still met
-        if not _entry_conditions_met(absence, persistence):
+        if not _entry_conditions_met(absence, persistence, thresholds):
             # Raw event invalidating original entry condition
             return StrategyProposal(
                 strategy_id="EP2-ABSENCE-V1",
@@ -153,8 +184,8 @@ def generate_absence_proposal(
 
     # Rule 3: Position FLAT -> check if should enter
     if position_state == PositionState.FLAT or position_state is None:
-        # Check if entry conditions met
-        if _entry_conditions_met(absence, persistence):
+        # Check if entry conditions met (using calibrated thresholds)
+        if _entry_conditions_met(absence, persistence, thresholds):
             # All required conditions met
             # Check optional geometry enrichment
             justification_ref = "B1.1|B2.1"

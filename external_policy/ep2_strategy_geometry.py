@@ -22,6 +22,31 @@ from runtime.position.types import PositionState
 
 
 # ==============================================================================
+# Threshold Configuration
+# ==============================================================================
+
+@dataclass(frozen=True)
+class GeometryThresholds:
+    """Calibrated thresholds for meaningful entry conditions.
+
+    These filter noise from signal - constitutional thresholds on observable facts.
+    NOT predictions, NOT confidence scores - just minimum values for structural presence.
+    """
+    # Zone penetration: minimum depth as fraction of price (e.g., 0.005 = 0.5%)
+    min_penetration_depth: float = 0.005
+
+    # Traversal compactness: minimum ratio (0-1 scale, e.g., 0.3 = 30% compactness)
+    min_compactness_ratio: float = 0.3
+
+    # Central tendency deviation: minimum absolute deviation as fraction of price
+    min_deviation_value: float = 0.002
+
+
+# Default thresholds - can be overridden per-instance
+DEFAULT_GEOMETRY_THRESHOLDS = GeometryThresholds()
+
+
+# ==============================================================================
 # Input/Output Types
 # ==============================================================================
 
@@ -59,13 +84,17 @@ class StrategyProposal:
 def _entry_conditions_met(
     zone_penetration,
     traversal_compactness,
-    central_tendency_deviation
+    central_tendency_deviation,
+    thresholds: GeometryThresholds = DEFAULT_GEOMETRY_THRESHOLDS
 ) -> bool:
     """
-    Check if entry conditions are met (structural existence).
+    Check if entry conditions are met (meaningful structural presence).
+
+    Uses calibrated thresholds to filter noise from signal.
+    Thresholds are factual comparisons, NOT predictions or confidence scores.
 
     Returns:
-        True if all three geometry primitives show structural presence
+        True if all three geometry primitives exceed meaningful thresholds
     """
     # Any input missing -> conditions not met
     if zone_penetration is None:
@@ -75,17 +104,17 @@ def _entry_conditions_met(
     if central_tendency_deviation is None:
         return False
 
-    # Check structural existence conditions
-    # Condition 1: Zone penetration exists
-    if not (zone_penetration.penetration_depth > 0):
+    # Check structural conditions against meaningful thresholds
+    # Condition 1: Zone penetration exceeds minimum (filters micro-penetrations)
+    if not (zone_penetration.penetration_depth >= thresholds.min_penetration_depth):
         return False
 
-    # Condition 2: Traversal is non-degenerate
-    if not (traversal_compactness.compactness_ratio > 0):
+    # Condition 2: Traversal compactness exceeds minimum (filters degenerate traversals)
+    if not (traversal_compactness.compactness_ratio >= thresholds.min_compactness_ratio):
         return False
 
-    # Condition 3: Deviation is non-zero
-    if not (central_tendency_deviation.deviation_value != 0):
+    # Condition 3: Deviation exceeds minimum (filters noise)
+    if not (abs(central_tendency_deviation.deviation_value) >= thresholds.min_deviation_value):
         return False
 
     return True
@@ -98,20 +127,21 @@ def generate_geometry_proposal(
     central_tendency_deviation,  # CentralTendencyDeviation | None
     context: StrategyContext,
     permission: PermissionOutput,
-    position_state: Optional[PositionState] = None
+    position_state: Optional[PositionState] = None,
+    thresholds: GeometryThresholds = DEFAULT_GEOMETRY_THRESHOLDS
 ) -> Optional[StrategyProposal]:
     """
     Generate at most one structural geometry proposal.
 
-    Proposes ENTRY if ALL three conditions are true:
-    1. Zone penetration exists (depth > 0)
-    2. Traversal is non-degenerate (compactness_ratio > 0)
-    3. Deviation is non-zero (deviation_value != 0)
+    Proposes ENTRY if ALL three conditions exceed meaningful thresholds:
+    1. Zone penetration >= min_penetration_depth (default 0.5%)
+    2. Traversal compactness >= min_compactness_ratio (default 0.3)
+    3. Deviation absolute value >= min_deviation_value (default 0.2%)
 
     Proposes EXIT if position exists and conditions no longer met.
 
-    These are structural existence checks only.
-    No thresholds, no comparisons, no interpretation.
+    Thresholds are calibrated filters on observable facts - NOT predictions.
+    They distinguish meaningful structural presence from noise.
 
     Args:
         zone_penetration: A6 primitive output or None
@@ -120,6 +150,7 @@ def generate_geometry_proposal(
         context: Strategy execution context
         permission: M6 permission result
         position_state: Current position state (from executor)
+        thresholds: Calibrated threshold values (default: GeometryThresholds())
 
     Returns:
         StrategyProposal if conditions warrant action, None otherwise
@@ -136,7 +167,7 @@ def generate_geometry_proposal(
             return None
 
         # Primitives exist - check if original entry conditions are still met
-        if not _entry_conditions_met(zone_penetration, traversal_compactness, central_tendency_deviation):
+        if not _entry_conditions_met(zone_penetration, traversal_compactness, central_tendency_deviation, thresholds):
             # Raw event invalidating original entry condition (MANDATE EMISSION RULES.md Line 164)
             return StrategyProposal(
                 strategy_id="EP2-GEOMETRY-V1",
@@ -151,8 +182,8 @@ def generate_geometry_proposal(
 
     # Rule 3: Position FLAT -> check if should enter
     if position_state == PositionState.FLAT or position_state is None:
-        # Check if entry conditions met
-        if _entry_conditions_met(zone_penetration, traversal_compactness, central_tendency_deviation):
+        # Check if entry conditions met (using calibrated thresholds)
+        if _entry_conditions_met(zone_penetration, traversal_compactness, central_tendency_deviation, thresholds):
             # All conditions met -> emit ENTRY proposal
             return StrategyProposal(
                 strategy_id="EP2-GEOMETRY-V1",

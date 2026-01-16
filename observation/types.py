@@ -16,6 +16,12 @@ from memory.m4_zone_geometry import ZonePenetrationDepth, DisplacementOriginAnch
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_structural_absence import StructuralAbsenceDuration
 
+# Tier B-6: Cascade observation primitives (from Hyperliquid)
+from memory.m4_cascade_proximity import LiquidationCascadeProximity
+from memory.m4_cascade_state import CascadeStateObservation
+from memory.m4_leverage_concentration import LeverageConcentrationRatio
+from memory.m4_open_interest_bias import OpenInterestDirectionalBias
+
 class SystemHaltedException(Exception):
     """Critical Failure: System Invariant Broken."""
     pass
@@ -86,6 +92,12 @@ class M4PrimitiveBundle:
     # Tier B-5 - Node Pattern Detection (from M2 memory nodes)
     order_block: Optional[Any]  # OrderBlockPrimitive
     supply_demand_zone: Optional[Any]  # SupplyDemandZonePrimitive
+
+    # Tier B-6 - Cascade Observation (from Hyperliquid positions + liquidations)
+    liquidation_cascade_proximity: Optional[LiquidationCascadeProximity]
+    cascade_state: Optional[CascadeStateObservation]
+    leverage_concentration_ratio: Optional[LeverageConcentrationRatio]
+    open_interest_directional_bias: Optional[OpenInterestDirectionalBias]
 
 
 @dataclass(frozen=True)

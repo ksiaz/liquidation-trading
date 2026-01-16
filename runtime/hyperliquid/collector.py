@@ -49,6 +49,11 @@ class HyperliquidCollectorConfig:
     # Additional wallets to track (from leaderboard, whale lists, etc.)
     additional_wallets: List[str] = None
 
+    # Dynamic wallet discovery
+    enable_dynamic_discovery: bool = False  # Enable live wallet discovery
+    discovery_min_trade_value: float = 100_000.0  # Min trade value for discovery
+    trade_discovery_interval: float = 900.0  # Seconds between trade scans (15 min)
+
 
 class HyperliquidCollector:
     """
@@ -85,9 +90,14 @@ class HyperliquidCollector:
             default_threshold=self._config.proximity_threshold,
             min_position_value=self._config.min_position_value,
             poll_interval=self._config.wallet_poll_interval,
-            track_system_wallets=self._config.track_hlp_vault
+            track_system_wallets=self._config.track_hlp_vault,
+            use_dynamic_registry=self._config.enable_dynamic_discovery,
+            registry_min_position=self._config.discovery_min_trade_value
         )
         self._tracker = PositionTracker(self._client, tracker_config)
+
+        # Track previous positions for liquidation detection
+        self._previous_positions: Dict[str, Dict[str, float]] = {}  # wallet -> {coin: value}
 
         # Callbacks for external consumers
         self._on_proximity_update: Optional[Callable] = None
@@ -123,6 +133,11 @@ class HyperliquidCollector:
         asyncio.create_task(self._client.run_websocket())
         asyncio.create_task(self._poll_wallets_loop())
         asyncio.create_task(self._log_proximity_loop())
+
+        # Start trade discovery if enabled
+        if self._config.enable_dynamic_discovery:
+            asyncio.create_task(self._trade_discovery_loop())
+            self._logger.info("Trade-based whale discovery enabled")
 
         self._logger.info(f"Hyperliquid collector started - tracking {len(self._tracker._tracked_wallets)} wallets")
 
@@ -163,8 +178,99 @@ class HyperliquidCollector:
 
             await asyncio.sleep(self._config.proximity_log_interval)
 
+    async def _trade_discovery_loop(self):
+        """Periodically scan trades for new whale wallets."""
+        while self._running:
+            try:
+                new_count = await self._tracker.discover_from_live_trades(
+                    coins=DEFAULT_COINS,
+                    min_trade_value=self._config.discovery_min_trade_value
+                )
+                if new_count > 0:
+                    self._logger.info(
+                        f"Trade discovery: found {new_count} new whales, "
+                        f"now tracking {len(self._tracker._tracked_wallets)}"
+                    )
+            except Exception as e:
+                self._logger.debug(f"Trade discovery error: {e}")
+
+            await asyncio.sleep(self._config.trade_discovery_interval)
+
+    def _detect_liquidation(self, wallet_state: WalletState):
+        """
+        Detect potential liquidations by comparing with previous positions.
+
+        Liquidation indicators:
+        1. Position completely gone (full liquidation)
+        2. Position size dropped >50% suddenly (partial liquidation)
+        3. Position value dropped significantly while price stable
+        """
+        wallet = wallet_state.address.lower()
+        current_positions = {
+            coin: {
+                'value': pos.position_value,
+                'size': pos.abs_size,
+                'side': pos.side.value
+            }
+            for coin, pos in wallet_state.positions.items()
+        }
+
+        # Check previous positions
+        previous = self._previous_positions.get(wallet, {})
+
+        for coin, prev_data in previous.items():
+            prev_value = prev_data.get('value', 0)
+            prev_size = prev_data.get('size', 0)
+            prev_side = prev_data.get('side', '')
+
+            if prev_value < 10000:  # Skip small positions
+                continue
+
+            current = current_positions.get(coin)
+
+            # Case 1: Position completely gone
+            if current is None:
+                self._logger.info(
+                    f"LIQUIDATION (full): {wallet[:12]}... {coin} {prev_side} "
+                    f"${prev_value:,.0f} -> CLOSED"
+                )
+                liquidated_value = prev_value
+
+            # Case 2: Position size dropped >50% (partial liquidation)
+            elif current and prev_size > 0:
+                current_size = current.get('size', 0)
+                size_reduction = (prev_size - current_size) / prev_size
+
+                if size_reduction > 0.5:  # >50% reduction
+                    liquidated_value = prev_value - current.get('value', 0)
+                    self._logger.info(
+                        f"LIQUIDATION (partial): {wallet[:12]}... {coin} {prev_side} "
+                        f"size {prev_size:.4f} -> {current_size:.4f} "
+                        f"(-{size_reduction*100:.0f}%, ${liquidated_value:,.0f})"
+                    )
+                else:
+                    continue  # Normal position change, not liquidation
+
+            else:
+                continue
+
+            # Add to discovery if significant
+            if self._config.enable_dynamic_discovery and liquidated_value > 50000:
+                self._tracker.on_liquidation_event(
+                    wallet,
+                    coin,
+                    liquidated_value,
+                    prev_side
+                )
+
+        # Update previous state
+        self._previous_positions[wallet] = current_positions
+
     async def _on_wallet_update(self, wallet_state: WalletState):
         """Handle wallet position update from WebSocket."""
+        # Detect potential liquidations before updating tracker
+        self._detect_liquidation(wallet_state)
+
         self._tracker.on_wallet_update(wallet_state)
 
         # Log individual positions
@@ -191,16 +297,8 @@ class HyperliquidCollector:
         """Handle price update from WebSocket."""
         self._tracker.on_price_update(prices)
 
-        # Recalculate proximity for all tracked coins
-        for coin in DEFAULT_COINS:
-            if coin in prices:
-                proximity = self._tracker.calculate_proximity(
-                    coin,
-                    prices[coin],
-                    self._config.proximity_threshold
-                )
-                if proximity:
-                    await self._on_proximity_calculated(proximity)
+        # Trigger proximity recalculation (updates cache properly)
+        await self._tracker.trigger_proximity_recalc()
 
     async def _on_proximity_calculated(self, proximity: LiquidationProximity):
         """Handle proximity calculation result."""

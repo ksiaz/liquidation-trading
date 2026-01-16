@@ -180,6 +180,11 @@ class CollectorService:
             try:
                 asyncio.create_task(self._hyperliquid_collector.start())
                 self._logger.info("Hyperliquid collector started")
+
+                # Wire up Hyperliquid collector to observation system
+                # This enables M4 cascade primitives to be computed from HL data
+                self._obs.set_hyperliquid_source(self._hyperliquid_collector)
+                self._logger.info("Hyperliquid collector wired to observation system")
             except Exception as e:
                 self._logger.warning(f"Hyperliquid collector start failed: {e}")
 
@@ -550,6 +555,15 @@ class CollectorService:
                         active_primitives.append("directional_continuity")
                     if bundle.trade_burst is not None:
                         active_primitives.append("trade_burst")
+                    # Tier B-6: Cascade observation primitives
+                    if bundle.liquidation_cascade_proximity is not None:
+                        active_primitives.append("liquidation_cascade_proximity")
+                    if bundle.cascade_state is not None:
+                        active_primitives.append("cascade_state")
+                    if bundle.leverage_concentration_ratio is not None:
+                        active_primitives.append("leverage_concentration_ratio")
+                    if bundle.open_interest_directional_bias is not None:
+                        active_primitives.append("open_interest_directional_bias")
 
                 # Try to extract policy name from result (if available)
                 if hasattr(result.action, 'strategy_id') and result.action.strategy_id:
@@ -685,6 +699,11 @@ class CollectorService:
             ('liquidation_density', bundle.liquidation_density),
             ('directional_continuity', bundle.directional_continuity),
             ('trade_burst', bundle.trade_burst),
+            # Tier B-6: Cascade observation primitives (from Hyperliquid)
+            ('liquidation_cascade_proximity', bundle.liquidation_cascade_proximity),
+            ('cascade_state', bundle.cascade_state),
+            ('leverage_concentration_ratio', bundle.leverage_concentration_ratio),
+            ('open_interest_directional_bias', bundle.open_interest_directional_bias),
         ]
 
         for name, value in primitive_fields:
@@ -728,6 +747,11 @@ class CollectorService:
                 if bundle.liquidation_density is not None: primitives_computing += 1
                 if bundle.directional_continuity is not None: primitives_computing += 1
                 if bundle.trade_burst is not None: primitives_computing += 1
+                # Tier B-6: Cascade observation primitives
+                if bundle.liquidation_cascade_proximity is not None: primitives_computing += 1
+                if bundle.cascade_state is not None: primitives_computing += 1
+                if bundle.leverage_concentration_ratio is not None: primitives_computing += 1
+                if bundle.open_interest_directional_bias is not None: primitives_computing += 1
             
             # Phase 6: Collect regime data for logging (use first symbol with regime data)
             regime_state_for_log = None

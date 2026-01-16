@@ -1,7 +1,16 @@
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, TYPE_CHECKING
 from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
+
+# Tier B-6: Cascade observation primitives
+from memory.m4_cascade_proximity import LiquidationCascadeProximity, compute_liquidation_cascade_proximity
+from memory.m4_cascade_state import CascadeStateObservation, compute_cascade_state, CascadePhase
+from memory.m4_leverage_concentration import LeverageConcentrationRatio, compute_leverage_concentration
+from memory.m4_open_interest_bias import OpenInterestDirectionalBias, compute_open_interest_bias
+
+if TYPE_CHECKING:
+    from runtime.hyperliquid.collector import HyperliquidCollector
 
 # M2 Continuity Store (Internal Memory)
 from memory.m2_continuity_store import ContinuityMemoryStore
@@ -109,7 +118,50 @@ class ObservationSystem:
 
         # M5 Access Layer (For primitive computation at snapshot time)
         self._m5_access = MemoryAccess(self._m2_store)
+
+        # Hyperliquid collector (optional, for cascade primitives)
+        self._hl_collector: Optional['HyperliquidCollector'] = None
+
+        # Hyperliquid liquidation tracking for cascade state
+        self._hl_liquidation_timestamps: Dict[str, List[float]] = {}  # symbol -> timestamps
+        self._hl_liquidation_values: Dict[str, List[float]] = {}      # symbol -> values
         
+    def set_hyperliquid_source(self, hl_collector: 'HyperliquidCollector') -> None:
+        """
+        Inject Hyperliquid collector as data source for cascade primitives.
+
+        The collector provides:
+        - Position proximity data (for LiquidationCascadeProximity)
+        - Position leverage data (for LeverageConcentrationRatio)
+        - Position direction data (for OpenInterestDirectionalBias)
+
+        Constitutional compliance: Data flows through M4 primitives, not direct injection.
+        """
+        self._hl_collector = hl_collector
+
+    def record_hl_liquidation(self, symbol: str, timestamp: float, value: float) -> None:
+        """
+        Record Hyperliquid liquidation event for cascade state tracking.
+
+        Args:
+            symbol: Trading symbol
+            timestamp: Event timestamp
+            value: USD value liquidated
+        """
+        if symbol not in self._hl_liquidation_timestamps:
+            self._hl_liquidation_timestamps[symbol] = []
+            self._hl_liquidation_values[symbol] = []
+
+        self._hl_liquidation_timestamps[symbol].append(timestamp)
+        self._hl_liquidation_values[symbol].append(value)
+
+        # Prune old entries (keep last 120 seconds)
+        cutoff = timestamp - 120.0
+        while (self._hl_liquidation_timestamps[symbol] and
+               self._hl_liquidation_timestamps[symbol][0] < cutoff):
+            self._hl_liquidation_timestamps[symbol].pop(0)
+            self._hl_liquidation_values[symbol].pop(0)
+
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
         Push external fact into memory.
@@ -774,6 +826,96 @@ class ObservationSystem:
             # Additional primitive computation failures should not crash snapshot
             pass
 
+        # Tier B-6: Cascade observation primitives (from Hyperliquid)
+        cascade_proximity_primitive = None
+        cascade_state_primitive = None
+        leverage_concentration_primitive = None
+        open_interest_bias_primitive = None
+
+        try:
+            if self._hl_collector:
+                # Convert symbol to Hyperliquid coin format (BTCUSDT -> BTC)
+                hl_coin = symbol.replace('USDT', '').replace('PERP', '')
+
+                # Get proximity data from collector
+                hl_proximity = self._hl_collector.get_proximity(hl_coin)
+
+                if hl_proximity:
+                    # Convert to constitutional M4 primitive
+                    cascade_proximity_primitive = LiquidationCascadeProximity(
+                        symbol=symbol,
+                        price_level=hl_proximity.current_price,
+                        threshold_pct=hl_proximity.threshold_pct,
+                        positions_at_risk_count=hl_proximity.total_positions_at_risk,
+                        aggregate_position_value=hl_proximity.total_value_at_risk,
+                        long_positions_count=hl_proximity.long_positions_count,
+                        long_positions_value=hl_proximity.long_positions_value,
+                        long_closest_price=hl_proximity.long_closest_liquidation,
+                        long_avg_distance_pct=hl_proximity.long_avg_distance_pct,
+                        short_positions_count=hl_proximity.short_positions_count,
+                        short_positions_value=hl_proximity.short_positions_value,
+                        short_closest_price=hl_proximity.short_closest_liquidation,
+                        short_avg_distance_pct=hl_proximity.short_avg_distance_pct,
+                        timestamp=hl_proximity.timestamp
+                    )
+
+                    # Compute cascade state from liquidation events
+                    liq_timestamps = self._hl_liquidation_timestamps.get(symbol, [])
+                    liq_values = self._hl_liquidation_values.get(symbol, [])
+
+                    cascade_state_primitive = compute_cascade_state(
+                        symbol=symbol,
+                        positions_at_risk=hl_proximity.total_positions_at_risk,
+                        liquidation_timestamps=liq_timestamps,
+                        liquidation_values=liq_values,
+                        current_time=self._system_time
+                    )
+
+                # Get position data for leverage and open interest primitives
+                tracker = self._hl_collector._tracker if hasattr(self._hl_collector, '_tracker') else None
+                if tracker:
+                    # Extract positions for coin (HL uses BTC not BTCUSDT)
+                    # Use get_positions method which accesses _positions_by_coin (the aggregated index)
+                    raw_positions = tracker.get_positions(hl_coin)
+                    positions = []
+                    for pos in raw_positions:
+                        positions.append({
+                            'position_size': pos.position_size,
+                            'position_value': pos.position_value,
+                            'leverage': pos.leverage,
+                            'liquidation_price': pos.liquidation_price
+                        })
+                    if not positions:
+                        # Fallback: try directly from wallet_states
+                        for wallet_state in tracker._wallet_states.values():
+                            pos = wallet_state.positions.get(hl_coin)
+                            if pos:
+                                positions.append({
+                                    'position_size': pos.position_size,
+                                    'position_value': pos.position_value,
+                                    'leverage': pos.leverage,
+                                    'liquidation_price': pos.liquidation_price
+                                })
+
+                    if positions:
+                        # Compute leverage concentration
+                        leverage_concentration_primitive = compute_leverage_concentration(
+                            symbol=symbol,
+                            positions=positions,
+                            timestamp=self._system_time
+                        )
+
+                        # Compute open interest bias
+                        open_interest_bias_primitive = compute_open_interest_bias(
+                            symbol=symbol,
+                            positions=positions,
+                            timestamp=self._system_time
+                        )
+
+        except Exception:
+            # Cascade primitive computation failures should not crash snapshot
+            pass
+
         # Return bundle with computed primitives
         return M4PrimitiveBundle(
             symbol=symbol,
@@ -795,5 +937,10 @@ class ObservationSystem:
             directional_continuity=directional_continuity_primitive,
             trade_burst=trade_burst_primitive,
             order_block=order_block_primitive,
-            supply_demand_zone=supply_demand_zone_primitive
+            supply_demand_zone=supply_demand_zone_primitive,
+            # Tier B-6 - Cascade observation primitives
+            liquidation_cascade_proximity=cascade_proximity_primitive,
+            cascade_state=cascade_state_primitive,
+            leverage_concentration_ratio=leverage_concentration_primitive,
+            open_interest_directional_bias=open_interest_bias_primitive
         )

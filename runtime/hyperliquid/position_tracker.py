@@ -24,6 +24,8 @@ from .types import (
     SystemWallets
 )
 from .client import HyperliquidClient
+from .whale_wallets import get_all_tracked_wallets, get_whale_wallets
+from .wallet_registry import WalletRegistry, TrackedWallet
 
 
 @dataclass
@@ -43,6 +45,18 @@ class TrackerConfig:
 
     # Track system wallets (HLP, etc.)
     track_system_wallets: bool = True
+
+    # Track whale wallets from registry
+    track_whale_wallets: bool = True
+
+    # Use dynamic wallet registry (SQLite-based)
+    use_dynamic_registry: bool = False
+
+    # Path to wallet registry database
+    registry_db_path: str = "wallet_registry.db"
+
+    # Minimum position value for dynamic wallets
+    registry_min_position: float = 100_000.0
 
 
 class PositionTracker:
@@ -84,15 +98,180 @@ class PositionTracker:
         # Wallets to track
         self._tracked_wallets: List[str] = []
 
-        # Setup system wallets if enabled
-        if self._config.track_system_wallets:
+        # Dynamic wallet registry (optional)
+        self._wallet_registry: Optional[WalletRegistry] = None
+        if self._config.use_dynamic_registry:
+            self._wallet_registry = WalletRegistry(self._config.registry_db_path)
+
+        # Setup wallets
+        if self._config.use_dynamic_registry:
+            self._setup_from_registry()
+        elif self._config.track_system_wallets:
             self._setup_system_wallets()
 
     def _setup_system_wallets(self):
-        """Add system wallets to tracking list."""
-        system = SystemWallets()
-        self.add_wallet(system.HLP_VAULT)  # Liquidator vault
-        self._logger.info(f"Added HLP vault to tracking: {system.HLP_VAULT[:10]}...")
+        """Add system and whale wallets to tracking list."""
+        from .whale_wallets import get_system_wallets
+
+        # Always load system wallets
+        system_wallets = get_system_wallets()
+        for wallet_info in system_wallets:
+            self.add_wallet(wallet_info.address)
+
+        whale_count = 0
+        # Load whale wallets if enabled
+        if self._config.track_whale_wallets:
+            whale_wallets = get_whale_wallets()
+            for wallet_info in whale_wallets:
+                self.add_wallet(wallet_info.address)
+            whale_count = len(whale_wallets)
+
+        self._logger.info(
+            f"Tracking {len(system_wallets)} system wallets, "
+            f"{whale_count} whale wallets"
+        )
+
+    def _setup_from_registry(self):
+        """Setup wallets from dynamic registry."""
+        if not self._wallet_registry:
+            return
+
+        # Get active wallets above minimum position threshold
+        active_wallets = self._wallet_registry.get_active_wallets(
+            min_position=self._config.registry_min_position
+        )
+
+        for wallet in active_wallets:
+            self.add_wallet(wallet.address)
+
+        self._logger.info(
+            f"Loaded {len(active_wallets)} wallets from dynamic registry"
+        )
+
+    async def refresh_from_registry(self):
+        """
+        Refresh wallet list from dynamic registry.
+
+        Call periodically to pick up newly discovered wallets
+        and remove inactive ones.
+        """
+        if not self._wallet_registry:
+            self._logger.warning("Dynamic registry not enabled")
+            return
+
+        # Get current active wallets
+        active_wallets = self._wallet_registry.get_active_wallets(
+            min_position=self._config.registry_min_position
+        )
+        active_addresses = {w.address for w in active_wallets}
+
+        # Add new wallets
+        for wallet in active_wallets:
+            if wallet.address not in self._tracked_wallets:
+                self.add_wallet(wallet.address)
+                self._logger.info(
+                    f"Added wallet from registry: {wallet.label} "
+                    f"(${wallet.position_value:,.0f})"
+                )
+
+        # Remove wallets no longer in registry
+        to_remove = []
+        for tracked in self._tracked_wallets:
+            if tracked not in active_addresses:
+                # Check if it's a static wallet (don't remove those)
+                from .whale_wallets import get_system_wallets
+                static_addresses = {w.address.lower() for w in get_system_wallets()}
+                if tracked not in static_addresses:
+                    to_remove.append(tracked)
+
+        for addr in to_remove:
+            self.remove_wallet(addr)
+            self._logger.info(f"Removed inactive wallet: {addr[:12]}...")
+
+        self._logger.info(
+            f"Registry refresh: {len(active_wallets)} active, "
+            f"{len(to_remove)} removed"
+        )
+
+    async def discover_new_wallets(self):
+        """
+        Trigger discovery of new whale wallets via Hyperdash scraping.
+
+        Requires Selenium to be installed.
+        """
+        if not self._wallet_registry:
+            self._logger.warning("Dynamic registry not enabled")
+            return
+
+        self._logger.info("Starting wallet discovery from Hyperdash...")
+        await self._wallet_registry.refresh_from_hyperdash()
+
+        # Verify discovered wallets have positions
+        await self._wallet_registry.verify_positions(self._client)
+
+        # Prune inactive
+        pruned = self._wallet_registry.prune_inactive()
+        if pruned > 0:
+            self._logger.info(f"Pruned {pruned} inactive wallets")
+
+        # Refresh tracker
+        await self.refresh_from_registry()
+
+    def get_registry_stats(self) -> Dict:
+        """Get statistics from wallet registry."""
+        if not self._wallet_registry:
+            return {"enabled": False}
+
+        counts = self._wallet_registry.get_wallet_count()
+        tier1 = self._wallet_registry.get_tier1_wallets()
+
+        return {
+            "enabled": True,
+            "wallet_counts": counts,
+            "tier1_count": len(tier1),
+            "total_tracked": len(self._tracked_wallets)
+        }
+
+    async def discover_from_live_trades(
+        self,
+        coins: List[str] = None,
+        min_trade_value: float = 100_000.0
+    ) -> int:
+        """
+        Discover whale addresses from recent large trades.
+
+        Args:
+            coins: Coins to scan (default: majors)
+            min_trade_value: Minimum trade value to trigger discovery
+
+        Returns:
+            Number of new wallets discovered
+        """
+        if not self._wallet_registry:
+            self._logger.warning("Registry not enabled for trade discovery")
+            return 0
+
+        discovered = await self._client.discover_whales_from_trades(
+            coins=coins,
+            min_trade_value=min_trade_value
+        )
+
+        new_count = 0
+        for whale in discovered:
+            added = self._wallet_registry.add_from_large_trade(
+                whale['address'],
+                whale['trade_value'],
+                whale['coin'],
+                whale['side']
+            )
+            if added:
+                self.add_wallet(whale['address'])
+                new_count += 1
+
+        if new_count > 0:
+            self._logger.info(f"Discovered {new_count} whales from live trades")
+
+        return new_count
 
     # =========================================================================
     # Wallet Management
@@ -153,13 +332,109 @@ class PositionTracker:
         self._rebuild_position_index()
         # Note: proximity recalculation happens on price update
 
+        # Live discovery: add large positions to registry
+        if self._wallet_registry:
+            total_value = sum(
+                pos.position_value for pos in wallet_state.positions.values()
+            )
+            if total_value >= self._config.registry_min_position:
+                # Find largest position for notes
+                largest_coin = ""
+                if wallet_state.positions:
+                    largest = max(
+                        wallet_state.positions.values(),
+                        key=lambda p: p.position_value
+                    )
+                    largest_coin = largest.coin
+
+                self._wallet_registry.add_from_position_snapshot(
+                    wallet_state.address,
+                    total_value,
+                    largest_coin
+                )
+
     def on_price_update(self, prices: Dict[str, float]):
         """
         Handle price update.
 
-        Triggers proximity recalculation for all coins.
+        Note: Call trigger_proximity_recalc() after this to recalculate proximity.
+        (Synchronous method cannot call async _recalculate_proximity directly)
         """
         self._prices.update(prices)
+        self._prices_changed = True
+
+    async def trigger_proximity_recalc(self):
+        """Trigger proximity recalculation if prices changed."""
+        if getattr(self, '_prices_changed', False):
+            self._prices_changed = False
+            await self._recalculate_proximity()
+
+    def on_liquidation_event(
+        self,
+        address: str,
+        coin: str,
+        liquidation_value: float,
+        side: str = ""
+    ):
+        """
+        Handle liquidation event - discover whale from liquidation.
+
+        Args:
+            address: Wallet that was liquidated
+            coin: Coin that was liquidated
+            liquidation_value: USD value of liquidation
+            side: LONG or SHORT
+        """
+        if not self._wallet_registry:
+            return
+
+        # Add to registry if large enough
+        added = self._wallet_registry.add_from_liquidation(
+            address,
+            liquidation_value,
+            coin
+        )
+
+        if added:
+            # Also start tracking this wallet
+            self.add_wallet(address)
+            self._logger.info(
+                f"Auto-tracking liquidated whale: {address[:12]}... "
+                f"(${liquidation_value:,.0f} {coin} {side})"
+            )
+
+    def on_large_trade(
+        self,
+        address: str,
+        coin: str,
+        trade_value: float,
+        side: str = ""
+    ):
+        """
+        Handle large trade event - discover whale from trade.
+
+        Args:
+            address: Wallet that made the trade
+            coin: Coin traded
+            trade_value: USD value of trade
+            side: BUY or SELL
+        """
+        if not self._wallet_registry:
+            return
+
+        added = self._wallet_registry.add_from_large_trade(
+            address,
+            trade_value,
+            coin,
+            side
+        )
+
+        if added:
+            self.add_wallet(address)
+            self._logger.info(
+                f"Auto-tracking whale trader: {address[:12]}... "
+                f"(${trade_value:,.0f} {coin} {side})"
+            )
 
     # =========================================================================
     # Position Indexing
@@ -371,7 +646,7 @@ class PositionTracker:
 
     def get_summary(self) -> Dict:
         """Get summary of tracked positions and proximity."""
-        return {
+        summary = {
             'tracked_wallets': len(self._tracked_wallets),
             'total_positions': sum(len(p) for p in self._positions_by_coin.values()),
             'coins_tracked': list(self._positions_by_coin.keys()),
@@ -381,3 +656,67 @@ class PositionTracker:
                 if prox.total_positions_at_risk > 0
             }
         }
+
+        # Add registry stats if enabled
+        if self._wallet_registry:
+            summary['registry'] = self.get_registry_stats()
+
+        return summary
+
+
+# =============================================================================
+# Scheduled Wallet Refresh
+# =============================================================================
+
+import asyncio
+
+async def scheduled_wallet_refresh(
+    tracker: PositionTracker,
+    interval_hours: float = 4.0,
+    discover_new: bool = True,
+    trade_discovery_interval: float = 0.25  # 15 minutes
+):
+    """
+    Background task to periodically refresh wallet registry.
+
+    Args:
+        tracker: PositionTracker with dynamic registry enabled
+        interval_hours: Hours between full refresh cycles (Hyperdash)
+        discover_new: If True, scrape Hyperdash for new wallets
+        trade_discovery_interval: Hours between trade-based discovery
+    """
+    logger = logging.getLogger("WalletRefresh")
+    last_full_refresh = 0
+    last_trade_discovery = 0
+
+    while True:
+        try:
+            now = asyncio.get_event_loop().time()
+
+            # Trade-based discovery (more frequent)
+            if now - last_trade_discovery >= trade_discovery_interval * 3600:
+                new_from_trades = await tracker.discover_from_live_trades()
+                if new_from_trades > 0:
+                    logger.info(f"Trade discovery: {new_from_trades} new whales")
+                last_trade_discovery = now
+
+            # Full refresh cycle (less frequent)
+            if now - last_full_refresh >= interval_hours * 3600:
+                if discover_new:
+                    # Full discovery cycle (requires Selenium)
+                    await tracker.discover_new_wallets()
+                else:
+                    # Just refresh from existing registry
+                    await tracker.refresh_from_registry()
+
+                stats = tracker.get_registry_stats()
+                logger.info(
+                    f"Full refresh complete: {stats.get('total_tracked', 0)} tracked"
+                )
+                last_full_refresh = now
+
+        except Exception as e:
+            logger.error(f"Wallet refresh failed: {e}")
+
+        # Check every 5 minutes
+        await asyncio.sleep(300)

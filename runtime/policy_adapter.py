@@ -337,6 +337,10 @@ class PolicyAdapter:
                 "refill_event": None,
                 "order_block": None,
                 "supply_demand_zone": None,
+                "liquidation_cascade_proximity": None,
+                "cascade_state": None,
+                "leverage_concentration_ratio": None,
+                "open_interest_directional_bias": None,
             }
 
         # Extract primitives from bundle (read-only access)
@@ -354,6 +358,11 @@ class PolicyAdapter:
             "refill_event": bundle.refill_event,
             "order_block": bundle.order_block,
             "supply_demand_zone": bundle.supply_demand_zone,
+            # Tier B-6 - Cascade observation primitives (from Hyperliquid)
+            "liquidation_cascade_proximity": bundle.liquidation_cascade_proximity,
+            "cascade_state": bundle.cascade_state,
+            "leverage_concentration_ratio": bundle.leverage_concentration_ratio,
+            "open_interest_directional_bias": bundle.open_interest_directional_bias,
         }
 
     def _proposals_to_mandates(

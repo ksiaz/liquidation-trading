@@ -77,6 +77,10 @@ class HyperliquidClient:
         # Tracked wallets
         self._tracked_wallets: List[str] = []
 
+        # WebSocket limit - Hyperliquid only allows 10 users per connection
+        self._ws_wallet_limit: int = 10
+        self._ws_subscribed_wallets: List[str] = []  # Currently subscribed via WS
+
         # Cache for mid prices
         self._mid_prices: Dict[str, float] = {}
 
@@ -185,6 +189,88 @@ class HyperliquidClient:
             self._logger.error(f"meta error: {e}")
             return None
 
+    async def get_recent_trades(self, coin: str) -> List[Dict]:
+        """
+        Get recent trades for a coin.
+
+        API: POST /info {"type": "recentTrades", "coin": "BTC"}
+
+        Returns list of trades with 'users' field containing wallet addresses.
+        """
+        try:
+            payload = {"type": "recentTrades", "coin": coin}
+
+            async with self._session.post(
+                f"{self._api_url}/info",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status != 200:
+                    return []
+                return await response.json()
+
+        except Exception as e:
+            self._logger.error(f"recentTrades error: {e}")
+            return []
+
+    async def discover_whales_from_trades(
+        self,
+        coins: List[str] = None,
+        min_trade_value: float = 100_000.0
+    ) -> List[Dict]:
+        """
+        Discover whale addresses from recent large trades.
+
+        Args:
+            coins: List of coins to check (default: major coins)
+            min_trade_value: Minimum USD value to consider whale trade
+
+        Returns:
+            List of {address, trade_value, coin, side} for discovered whales
+        """
+        if coins is None:
+            coins = ["BTC", "ETH", "SOL", "HYPE", "XRP", "DOGE"]
+
+        discovered = []
+        seen_addresses = set()
+
+        for coin in coins:
+            try:
+                trades = await self.get_recent_trades(coin)
+
+                for trade in trades:
+                    px = float(trade.get('px', 0))
+                    sz = float(trade.get('sz', 0))
+                    value = px * sz
+                    users = trade.get('users', [])
+                    side = "BUY" if trade.get('side') == 'B' else "SELL"
+
+                    if value >= min_trade_value:
+                        for addr in users:
+                            if addr and addr not in seen_addresses:
+                                seen_addresses.add(addr)
+                                discovered.append({
+                                    'address': addr,
+                                    'trade_value': value,
+                                    'coin': coin,
+                                    'side': side
+                                })
+
+                await asyncio.sleep(0.05)  # Rate limit
+
+            except Exception as e:
+                self._logger.debug(f"Trade discovery error for {coin}: {e}")
+
+        return discovered
+
+    def set_liquidation_callback(self, callback: Callable):
+        """Set callback for liquidation events."""
+        self._on_liquidation = callback
+
+    def set_trade_callback(self, callback: Callable):
+        """Set callback for trade events."""
+        self._on_trade = callback
+
     # =========================================================================
     # WebSocket Methods
     # =========================================================================
@@ -216,9 +302,18 @@ class HyperliquidClient:
                     # Subscribe to allMids
                     await self._subscribe_all_mids(ws)
 
-                    # Subscribe to tracked wallets
-                    for wallet in self._tracked_wallets:
+                    # Subscribe to tracked wallets (limited to 10 by Hyperliquid)
+                    # Remaining wallets are polled via REST API
+                    self._ws_subscribed_wallets = self._tracked_wallets[:self._ws_wallet_limit]
+                    for wallet in self._ws_subscribed_wallets:
                         await self._subscribe_wallet(ws, wallet)
+
+                    if len(self._tracked_wallets) > self._ws_wallet_limit:
+                        self._logger.info(
+                            f"WebSocket tracking {len(self._ws_subscribed_wallets)} wallets "
+                            f"(limit: {self._ws_wallet_limit}), "
+                            f"{len(self._tracked_wallets) - self._ws_wallet_limit} via REST polling"
+                        )
 
                     # Message loop
                     async for message in ws:
@@ -237,6 +332,15 @@ class HyperliquidClient:
         }
         await ws.send(json.dumps(subscription))
         self._logger.debug("Subscribed to allMids")
+
+    async def _subscribe_liquidations(self, ws):
+        """Subscribe to liquidation feed."""
+        subscription = {
+            "method": "subscribe",
+            "subscription": {"type": "activeAssetCtx"}
+        }
+        await ws.send(json.dumps(subscription))
+        self._logger.debug("Subscribed to liquidations")
 
     async def _subscribe_wallet(self, ws, wallet_address: str):
         """Subscribe to position updates for a wallet."""
@@ -300,10 +404,16 @@ class HyperliquidClient:
     # =========================================================================
 
     def add_tracked_wallet(self, wallet_address: str):
-        """Add a wallet to track for position updates."""
+        """Add a wallet to track for position updates.
+
+        Note: Hyperliquid WebSocket limits to 10 users per connection.
+        First 10 wallets get real-time WebSocket updates.
+        Additional wallets are tracked via REST API polling.
+        """
         if wallet_address not in self._tracked_wallets:
             self._tracked_wallets.append(wallet_address)
-            self._logger.info(f"Tracking wallet: {wallet_address[:10]}...")
+            mode = "WS" if len(self._tracked_wallets) <= self._ws_wallet_limit else "REST"
+            self._logger.info(f"Tracking wallet: {wallet_address[:10]}... ({mode})")
 
     def remove_tracked_wallet(self, wallet_address: str):
         """Remove a wallet from tracking."""
@@ -353,6 +463,15 @@ class HyperliquidClient:
             "withdrawable": "45000.0"
         }
         """
+        # Safe float conversion (handles None values)
+        def safe_float(val, default=0.0):
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
         try:
             positions = {}
             timestamp = time.time()
@@ -366,23 +485,25 @@ class HyperliquidClient:
                 if not coin:
                     continue
 
-                # Parse leverage (can be dict or float)
-                leverage_data = pos.get('leverage', {})
-                if isinstance(leverage_data, dict):
-                    leverage = float(leverage_data.get('value', 1))
+                # Parse leverage (can be dict or float or None)
+                leverage_data = pos.get('leverage')
+                if leverage_data is None:
+                    leverage = 1.0
+                elif isinstance(leverage_data, dict):
+                    leverage = float(leverage_data.get('value') or 1)
                 else:
                     leverage = float(leverage_data) if leverage_data else 1.0
 
                 position = HyperliquidPosition(
                     wallet_address=wallet_address,
                     coin=coin,
-                    entry_price=float(pos.get('entryPx', 0)),
-                    position_size=float(pos.get('szi', 0)),  # Signed
+                    entry_price=safe_float(pos.get('entryPx')),
+                    position_size=safe_float(pos.get('szi')),  # Signed
                     leverage=leverage,
-                    liquidation_price=float(pos.get('liquidationPx', 0)),
-                    margin_used=float(pos.get('marginUsed', 0)),
-                    unrealized_pnl=float(pos.get('unrealizedPnl', 0)),
-                    position_value=float(pos.get('positionValue', 0)),
+                    liquidation_price=safe_float(pos.get('liquidationPx')),
+                    margin_used=safe_float(pos.get('marginUsed')),
+                    unrealized_pnl=safe_float(pos.get('unrealizedPnl')),
+                    position_value=safe_float(pos.get('positionValue')),
                     timestamp=timestamp
                 )
 
@@ -391,14 +512,14 @@ class HyperliquidClient:
                     positions[coin] = position
 
             # Parse account summary
-            margin_summary = data.get('crossMarginSummary', {})
+            margin_summary = data.get('crossMarginSummary') or {}
 
             return WalletState(
                 address=wallet_address,
                 positions=positions,
-                account_value=float(margin_summary.get('accountValue', 0)),
-                total_margin_used=float(margin_summary.get('totalMarginUsed', 0)),
-                withdrawable=float(data.get('withdrawable', 0)),
+                account_value=safe_float(margin_summary.get('accountValue')),
+                total_margin_used=safe_float(margin_summary.get('totalMarginUsed')),
+                withdrawable=safe_float(data.get('withdrawable')),
                 last_updated=timestamp
             )
 

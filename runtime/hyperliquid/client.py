@@ -156,7 +156,8 @@ class HyperliquidClient:
 
                 data = await response.json()
                 mids = {}
-                for coin, price_str in data.get('mids', {}).items():
+                # API returns flat dict {coin: price_str}
+                for coin, price_str in data.items():
                     try:
                         mids[coin] = float(price_str)
                     except:
@@ -188,6 +189,53 @@ class HyperliquidClient:
         except Exception as e:
             self._logger.error(f"meta error: {e}")
             return None
+
+    async def get_asset_volumes(self) -> Dict[str, float]:
+        """
+        Get 24h notional volume for all assets.
+
+        API: POST /info {"type": "metaAndAssetCtxs"}
+
+        Returns:
+            Dict of coin -> 24h notional volume in USD
+        """
+        try:
+            payload = {"type": "metaAndAssetCtxs"}
+
+            async with self._session.post(
+                f"{self._api_url}/info",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status != 200:
+                    return {}
+
+                data = await response.json()
+                volumes = {}
+
+                # Response is [meta, assetCtxs]
+                if isinstance(data, list) and len(data) >= 2:
+                    meta = data[0]
+                    asset_ctxs = data[1]
+
+                    # Get coin names from meta.universe
+                    universe = meta.get('universe', [])
+                    coin_names = [asset.get('name', '') for asset in universe]
+
+                    # Match with asset contexts
+                    for i, ctx in enumerate(asset_ctxs):
+                        if i < len(coin_names):
+                            coin = coin_names[i]
+                            try:
+                                volumes[coin] = float(ctx.get('dayNtlVlm', 0))
+                            except:
+                                pass
+
+                return volumes
+
+        except Exception as e:
+            self._logger.error(f"assetVolumes error: {e}")
+            return {}
 
     async def get_recent_trades(self, coin: str) -> List[Dict]:
         """

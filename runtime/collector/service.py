@@ -43,6 +43,7 @@ from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAg
 # Import Hyperliquid Integration
 try:
     from runtime.hyperliquid.collector import HyperliquidCollector, HyperliquidCollectorConfig
+    from runtime.hyperliquid.whale_wallets import get_wallet_addresses
     HYPERLIQUID_AVAILABLE = True
 except ImportError:
     HYPERLIQUID_AVAILABLE = False
@@ -148,12 +149,31 @@ class CollectorService:
         self._hyperliquid_enabled = False
         if HYPERLIQUID_AVAILABLE:
             try:
+                # Load whale wallet addresses from registry
+                whale_addresses = get_wallet_addresses()
+                self._logger.info(f"Loading {len(whale_addresses)} whale wallets for tracking")
+
+                # Check if indexer should be enabled via environment variable
+                # Default to True to enable blockchain indexer
+                enable_indexer = os.environ.get("ENABLE_HL_INDEXER", "true").lower() == "true"
+
+                self._logger.info(f"Indexer enabled: {enable_indexer}")
+
                 hl_config = HyperliquidCollectorConfig(
                     use_testnet=False,
-                    proximity_threshold=0.005,  # 0.5% threshold
-                    min_position_value=1000.0,
+                    proximity_threshold=0.30,  # 30% threshold (whales keep safe distances)
+                    min_position_value=100.0,  # Lower to $100 to catch more positions
                     wallet_poll_interval=5.0,
-                    track_hlp_vault=True  # Track liquidator vault
+                    track_hlp_vault=True,  # Track liquidator vault
+                    additional_wallets=whale_addresses,  # Load known whale wallets
+                    enable_dynamic_discovery=True,  # Discover wallets from large trades
+                    discovery_min_trade_value=5_000.0,  # Lower to $5k to discover more wallets
+                    trade_discovery_interval=60.0,  # Scan every 60s instead of 15min
+                    # Blockchain indexer (requires: pip install boto3 lz4 msgpack)
+                    enable_indexer=enable_indexer,
+                    indexer_lookback_blocks=500_000,  # ~7 days
+                    indexer_db_path="indexed_wallets.db",
+                    indexer_checkpoint_path="indexer_checkpoint.json"
                 )
                 self._hyperliquid_collector = HyperliquidCollector(
                     db=self._execution_db,

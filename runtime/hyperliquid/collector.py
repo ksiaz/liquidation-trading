@@ -23,6 +23,15 @@ from .position_tracker import PositionTracker, TrackerConfig
 from .types import LiquidationProximity, WalletState, SystemWallets
 from runtime.logging.execution_db import ResearchDatabase
 
+# Optional indexer import
+try:
+    from .indexer import IndexerCoordinator, IndexerConfig
+    HAS_INDEXER = True
+except ImportError:
+    HAS_INDEXER = False
+    IndexerCoordinator = None
+    IndexerConfig = None
+
 
 # Default coins to track (match Binance symbols where possible)
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"]
@@ -53,6 +62,12 @@ class HyperliquidCollectorConfig:
     enable_dynamic_discovery: bool = False  # Enable live wallet discovery
     discovery_min_trade_value: float = 100_000.0  # Min trade value for discovery
     trade_discovery_interval: float = 900.0  # Seconds between trade scans (15 min)
+
+    # Blockchain indexer settings
+    enable_indexer: bool = False  # Enable blockchain indexer for full wallet discovery
+    indexer_lookback_blocks: int = 500_000  # ~7 days of history
+    indexer_db_path: str = "indexed_wallets.db"
+    indexer_checkpoint_path: str = "indexer_checkpoint.json"
 
 
 class HyperliquidCollector:
@@ -106,6 +121,9 @@ class HyperliquidCollector:
         # State tracking
         self._last_proximity_log: Dict[str, float] = {}  # coin -> timestamp
 
+        # Blockchain indexer (optional)
+        self._indexer: Optional['IndexerCoordinator'] = None
+
     async def start(self):
         """Start the Hyperliquid collector."""
         self._running = True
@@ -139,13 +157,57 @@ class HyperliquidCollector:
             asyncio.create_task(self._trade_discovery_loop())
             self._logger.info("Trade-based whale discovery enabled")
 
+        # Start blockchain indexer if enabled
+        if self._config.enable_indexer and HAS_INDEXER:
+            await self._start_indexer()
+        elif self._config.enable_indexer and not HAS_INDEXER:
+            self._logger.warning("Indexer enabled but dependencies not installed (boto3, lz4, msgpack)")
+
         self._logger.info(f"Hyperliquid collector started - tracking {len(self._tracker._tracked_wallets)} wallets")
 
     async def stop(self):
         """Stop the collector."""
         self._running = False
+        if self._indexer:
+            await self._indexer.stop()
         await self._client.stop()
         self._logger.info("Hyperliquid collector stopped")
+
+    async def _start_indexer(self):
+        """Start the blockchain indexer for full wallet discovery."""
+        indexer_config = IndexerConfig(
+            lookback_blocks=self._config.indexer_lookback_blocks,
+            db_path=self._config.indexer_db_path,
+            checkpoint_path=self._config.indexer_checkpoint_path,
+            tier1_interval=5.0,
+            tier2_interval=30.0,
+            tier3_interval=300.0
+        )
+
+        self._indexer = IndexerCoordinator(self._client, indexer_config)
+
+        # Setup callbacks to integrate with position tracker
+        self._indexer.set_position_update_callback(self._on_indexed_position_update)
+        self._indexer.set_wallet_discovered_callback(self._on_wallet_discovered)
+
+        await self._indexer.start()
+        self._logger.info("Blockchain indexer started")
+
+    async def _on_indexed_position_update(self, wallet_state: WalletState):
+        """Handle position update from indexer."""
+        # Forward to position tracker
+        self._tracker.on_wallet_update(wallet_state)
+
+        # Also add to our tracked wallets if not already
+        addr = wallet_state.address.lower()
+        if addr not in self._tracker._tracked_wallets:
+            self._tracker.add_wallet(addr)
+
+    async def _on_wallet_discovered(self, address: str, block_num: int):
+        """Handle new wallet discovered by indexer."""
+        # Add to position tracker for monitoring
+        self._tracker.add_wallet(address)
+        self._logger.debug(f"Indexer discovered wallet: {address[:12]}... (block {block_num})")
 
     async def _load_tracked_wallets(self):
         """Load tracked wallets from database."""
@@ -155,6 +217,7 @@ class HyperliquidCollector:
 
     async def _poll_wallets_loop(self):
         """Periodically poll all tracked wallets."""
+        self._logger.info(f"Poll loop started, tracking {len(self._tracker._tracked_wallets)} wallets")
         while self._running:
             try:
                 await self._tracker.update_all_wallets()
@@ -387,11 +450,17 @@ class HyperliquidCollector:
 
     def get_summary(self) -> Dict:
         """Get collector summary."""
-        return {
+        summary = {
             **self._tracker.get_summary(),
             'running': self._running,
-            'prices_tracked': len(self._client._mid_prices)
+            'prices_tracked': len(self._client._mid_prices),
+            'indexer_enabled': self._indexer is not None
         }
+
+        if self._indexer:
+            summary['indexer'] = self._indexer.get_stats()
+
+        return summary
 
     def set_proximity_callback(self, callback: Callable):
         """Set callback for proximity updates."""

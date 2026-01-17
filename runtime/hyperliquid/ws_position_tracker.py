@@ -398,6 +398,7 @@ class WSPositionTracker:
                 continue
 
             # Fast scan - just comparisons, no math
+            positions_to_remove = []
             for wallet, pos in positions.items():
                 danger_level = pos.check_danger(price)
                 key = f"{wallet}:{coin}"
@@ -412,6 +413,12 @@ class WSPositionTracker:
                         pos.distance_pct = ((price - pos.liq_price) / price) * 100
                     else:
                         pos.distance_pct = ((pos.liq_price - price) / price) * 100
+
+                # LIQUIDATION DETECTION: If position is way past liq price, it's liquidated
+                # Remove from tracking (don't keep updating stale liquidated positions)
+                if pos.distance_pct < -2.0:
+                    positions_to_remove.append((wallet, coin, key))
+                    continue  # Don't update shared state for liquidated positions
 
                 # Update shared state snapshot
                 snapshot = PositionSnapshot(
@@ -446,6 +453,17 @@ class WSPositionTracker:
                     pos.in_danger_zone = False
                     if key in self._danger_positions:
                         del self._danger_positions[key]
+
+            # Remove liquidated positions from all indices
+            for wallet, coin, key in positions_to_remove:
+                if wallet in self._wallet_positions and coin in self._wallet_positions[wallet]:
+                    del self._wallet_positions[wallet][coin]
+                if coin in self._market_positions and wallet in self._market_positions[coin]:
+                    del self._market_positions[coin][wallet]
+                if key in self._danger_positions:
+                    del self._danger_positions[key]
+                self._shared_state.remove_position(wallet, coin)
+                logger.info(f"[WSTracker] Removed liquidated position: {wallet[:8]}...:{coin}")
 
     async def _handle_position_update(self, data: Dict):
         """Handle webData2 user state update."""

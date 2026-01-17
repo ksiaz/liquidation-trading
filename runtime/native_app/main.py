@@ -5083,15 +5083,57 @@ class MainWindow(QMainWindow):
             ws_positions = []
             if HAS_WS_TRACKER and get_shared_state:
                 shared = get_shared_state()
-                # Get ALL positions from shared state, sorted by distance
+                # Get ALL positions from shared state
                 all_snapshots = shared.get_all_positions()
-                # Filter for valid positions (positive distance, meaningful notional)
+                # Filter for positions CLOSE to liquidation:
+                # - Recently updated (within 30s) - removes liquidated/stale positions
+                # - Within 2% of liquidation (the interesting ones)
+                # - Allow -0.5% for calculation drift
+                # - Meaningful notional ($10k+)
+                stale_threshold = now - 30.0  # 30 seconds freshness
                 valid_snapshots = [
                     s for s in all_snapshots
-                    if s.distance_pct > 0 and s.notional >= 10000
+                    if s.updated_at > stale_threshold
+                    and s.distance_pct > -0.5  # Allow small negative for liq price drift
+                    and s.distance_pct <= 2.0  # Only show positions within 2% of liq
+                    and s.notional >= 10000
                 ]
-                # Sort by distance (closest to liquidation first)
-                valid_snapshots.sort(key=lambda s: s.distance_pct)
+
+                # STABILITY: Use stable sort with hysteresis to prevent flickering
+                # Only re-sort if position order has changed significantly (>0.15% difference)
+                if not hasattr(self, '_stable_position_order'):
+                    self._stable_position_order = {}  # key -> last_distance
+
+                # Build current distance map
+                current_distances = {f"{s.wallet}:{s.coin}": s.distance_pct for s in valid_snapshots}
+
+                # Check if we need to re-sort (new positions or significant changes)
+                need_resort = False
+                new_keys = set(current_distances.keys())
+                old_keys = set(self._stable_position_order.keys())
+
+                # Resort if positions added/removed
+                if new_keys != old_keys:
+                    need_resort = True
+                else:
+                    # Resort if any position changed by more than 0.15%
+                    for key, new_dist in current_distances.items():
+                        old_dist = self._stable_position_order.get(key, new_dist)
+                        if abs(new_dist - old_dist) > 0.15:
+                            need_resort = True
+                            break
+
+                if need_resort:
+                    # Full resort
+                    valid_snapshots.sort(key=lambda s: s.distance_pct)
+                    self._stable_position_order = current_distances.copy()
+                else:
+                    # Keep previous order, just update distances
+                    # Sort by stored order (using old distances as sort key)
+                    valid_snapshots.sort(key=lambda s: self._stable_position_order.get(
+                        f"{s.wallet}:{s.coin}", s.distance_pct
+                    ))
+
                 # Convert to UI format (match expected keys for HyperliquidPositionsTable)
                 for snap in valid_snapshots[:25]:
                     ws_positions.append({

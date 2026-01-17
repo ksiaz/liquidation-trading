@@ -27,6 +27,7 @@ import asyncio
 import threading
 import time
 import sqlite3
+import requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -42,6 +43,15 @@ from observation import ObservationSystem, ObservationSnapshot
 from observation.types import ObservationStatus, SystemHaltedException
 from runtime.collector.service import CollectorService, TOP_10_SYMBOLS
 
+# Fade executor import (optional - only used if enabled)
+try:
+    from runtime.hyperliquid.liquidation_fade import LiquidationFadeExecutor, FadeConfig
+    HAS_FADE_EXECUTOR = True
+except ImportError:
+    HAS_FADE_EXECUTOR = False
+    LiquidationFadeExecutor = None
+    FadeConfig = None
+
 
 # ==============================================================================
 # Constants
@@ -49,6 +59,19 @@ from runtime.collector.service import CollectorService, TOP_10_SYMBOLS
 
 DB_PATH = "D:/liquidation-trading/logs/execution.db"
 HL_INDEXED_DB_PATH = "D:/liquidation-trading/indexed_wallets.db"
+
+# Staleness threshold - positions older than this are considered stale
+POSITION_STALENESS_SECONDS = 180  # 3 minutes
+
+
+def get_indexed_db_connection(timeout: float = 5.0) -> sqlite3.Connection:
+    """Get a connection to the indexed wallets database with WAL mode."""
+    conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=timeout)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 COLORS = {
     "background": "#0d0d1a",
@@ -152,54 +175,114 @@ def aggregate_prices(snapshot: ObservationSnapshot) -> Dict[str, Dict]:
     return prices
 
 
+def aggregate_cascade_state_from_hyperliquid() -> Dict:
+    """Aggregate cascade state from Hyperliquid positions (ground truth)."""
+    if not os.path.exists(HL_INDEXED_DB_PATH):
+        return {
+            'phase': 'NO_DATA',
+            'positions_at_risk': 0,
+            'total_at_risk': 0,
+            'closest_pct': None,
+            'closest_symbol': None,
+            'clusters': []
+        }
+
+    try:
+        conn = get_indexed_db_connection()
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+
+        # Get positions close to liquidation (within 10%)
+        cursor = conn.execute("""
+            SELECT coin, side, position_value, distance_to_liq_pct, liquidation_price, entry_price
+            FROM positions
+            WHERE distance_to_liq_pct >= 0 AND distance_to_liq_pct <= 10
+              AND position_value >= 10000
+              AND updated_at >= ?
+            ORDER BY distance_to_liq_pct ASC
+        """, (stale_threshold,))
+
+        positions_at_risk = []
+        for row in cursor.fetchall():
+            positions_at_risk.append({
+                'coin': row[0],
+                'side': row[1],
+                'value': float(row[2]),
+                'dist_pct': float(row[3]),
+                'liq_price': float(row[4]),
+                'entry_price': float(row[5])
+            })
+
+        conn.close()
+
+        if not positions_at_risk:
+            return {
+                'phase': 'NONE',
+                'positions_at_risk': 0,
+                'total_at_risk': 0,
+                'closest_pct': None,
+                'closest_symbol': None,
+                'clusters': []
+            }
+
+        # Aggregate by coin
+        by_coin = {}
+        for pos in positions_at_risk:
+            coin = pos['coin']
+            if coin not in by_coin:
+                by_coin[coin] = {'count': 0, 'value': 0, 'closest': 999}
+            by_coin[coin]['count'] += 1
+            by_coin[coin]['value'] += pos['value']
+            by_coin[coin]['closest'] = min(by_coin[coin]['closest'], pos['dist_pct'])
+
+        # Find closest
+        closest_pos = positions_at_risk[0]  # Already sorted by distance
+        closest_pct = closest_pos['dist_pct']
+        closest_symbol = closest_pos['coin']
+
+        # Determine phase based on proximity
+        if closest_pct < 1.0:
+            phase = 'LIQUIDATING'
+        elif closest_pct < 3.0:
+            phase = 'PROXIMITY'
+        else:
+            phase = 'MONITORING'
+
+        # Find clusters (multiple positions at similar levels for same coin)
+        clusters = []
+        for coin, data in by_coin.items():
+            if data['count'] >= 2 and data['value'] >= 100_000:
+                clusters.append({
+                    'coin': coin,
+                    'count': data['count'],
+                    'value': data['value'],
+                    'closest_pct': data['closest']
+                })
+
+        return {
+            'phase': phase,
+            'positions_at_risk': len(positions_at_risk),
+            'total_at_risk': sum(p['value'] for p in positions_at_risk),
+            'closest_pct': closest_pct,
+            'closest_symbol': closest_symbol,
+            'clusters': sorted(clusters, key=lambda x: x['closest_pct'])
+        }
+
+    except Exception as e:
+        print(f"Error computing cascade state: {e}")
+        return {
+            'phase': 'ERROR',
+            'positions_at_risk': 0,
+            'total_at_risk': 0,
+            'closest_pct': None,
+            'closest_symbol': None,
+            'clusters': []
+        }
+
+
 def aggregate_cascade_state(snapshot: ObservationSnapshot) -> Dict:
-    """Aggregate cascade state across all symbols."""
-    total_at_risk = 0
-    total_positions = 0
-    liquidations_30s = 0
-    closest_liq = None
-    closest_symbol = None
-    phase = "NONE"
-
-    for symbol, bundle in snapshot.primitives.items():
-        if bundle is None:
-            continue
-
-        if bundle.liquidation_cascade_proximity:
-            prox = bundle.liquidation_cascade_proximity
-            total_at_risk += prox.aggregate_position_value
-            total_positions += prox.positions_at_risk_count
-
-            # Track closest liquidation
-            if prox.long_closest_price and prox.price_level:
-                dist = abs(prox.price_level - prox.long_closest_price) / prox.price_level * 100
-                if closest_liq is None or dist < closest_liq:
-                    closest_liq = dist
-                    closest_symbol = symbol.replace("USDT", "")
-
-            if prox.short_closest_price and prox.price_level:
-                dist = abs(prox.short_closest_price - prox.price_level) / prox.price_level * 100
-                if closest_liq is None or dist < closest_liq:
-                    closest_liq = dist
-                    closest_symbol = symbol.replace("USDT", "")
-
-        if bundle.cascade_state:
-            cs = bundle.cascade_state
-            liquidations_30s += cs.liquidations_30s
-            # Use highest phase observed
-            p = cs.phase.name if hasattr(cs.phase, 'name') else str(cs.phase)
-            phase_priority = {"NONE": 0, "PROXIMITY": 1, "LIQUIDATING": 2, "CASCADING": 3, "EXHAUSTED": 4}
-            if phase_priority.get(p, 0) > phase_priority.get(phase, 0):
-                phase = p
-
-    return {
-        'phase': phase,
-        'liquidations_30s': liquidations_30s,
-        'total_at_risk': total_at_risk,
-        'total_positions': total_positions,
-        'closest_pct': closest_liq,
-        'closest_symbol': closest_symbol
-    }
+    """Aggregate cascade state - uses Hyperliquid data for accuracy."""
+    # Use Hyperliquid position data as ground truth
+    return aggregate_cascade_state_from_hyperliquid()
 
 
 def get_orderbook_depth(snapshot: ObservationSnapshot) -> List[Dict]:
@@ -260,7 +343,7 @@ def load_recent_trades(limit: int = 15) -> List[Dict]:
         return []
 
 
-def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, sort_by: str = "impact") -> List[Dict]:
+def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, sort_by: str = "impact", min_value: float = 10000.0) -> List[Dict]:
     """
     Load individual Hyperliquid positions.
 
@@ -268,13 +351,19 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
         limit: Max positions to return
         max_distance_pct: Only show positions within this distance of liquidation
         sort_by: "impact" (size * impact DESC) or "distance" (closest to liq first)
+        min_value: Minimum position value to display (default $50k)
     """
     if not os.path.exists(HL_INDEXED_DB_PATH):
         return []
 
     try:
-        conn = sqlite3.connect(HL_INDEXED_DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_indexed_db_connection()
+
+        # Filter: distance > 0.1% (exclude stale/liquidated), distance < max, value >= min
+        min_distance_pct = 0.1
+
+        # Only show positions updated recently (fresh data)
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
 
         if sort_by == "distance":
             # Sort by distance to liquidation (closest first)
@@ -283,10 +372,11 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
                        position_value, leverage, liquidation_price, margin_used,
                        unrealized_pnl, distance_to_liq_pct, daily_volume, impact_score, updated_at
                 FROM positions
-                WHERE distance_to_liq_pct <= ? AND distance_to_liq_pct < 999
+                WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND distance_to_liq_pct < 999
+                  AND position_value >= ? AND updated_at >= ?
                 ORDER BY distance_to_liq_pct ASC
                 LIMIT ?
-            """, (max_distance_pct, limit))
+            """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
         else:
             # Sort by impact (size * impact, highest first)
             cursor = conn.execute("""
@@ -295,10 +385,11 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
                        unrealized_pnl, distance_to_liq_pct, daily_volume, impact_score, updated_at,
                        (position_value * impact_score) as combined_score
                 FROM positions
-                WHERE distance_to_liq_pct <= ? AND impact_score > 0
+                WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND impact_score > 0
+                  AND position_value >= ? AND updated_at >= ?
                 ORDER BY combined_score DESC
                 LIMIT ?
-            """, (max_distance_pct, limit))
+            """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
 
         positions = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -306,6 +397,301 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
     except Exception as e:
         print(f"Error loading HL positions: {e}")
         return []
+
+
+def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10.0, bucket_size_pct: float = 0.5) -> Dict:
+    """
+    Load and aggregate liquidation levels for heatmap visualization.
+
+    Groups positions by their liquidation price into buckets relative to current price.
+    Returns data structure optimized for heatmap rendering.
+
+    Args:
+        coin: Coin to analyze (e.g., "BTC", "ETH")
+        price_range_pct: How far above/below current price to show (default 10%)
+        bucket_size_pct: Size of each price bucket as % (default 0.5%)
+
+    Returns:
+        Dict with:
+        - current_price: float
+        - buckets: List of {price_level, pct_from_current, long_value, short_value, total_value, position_count}
+        - total_long_value: Total value of long liquidations
+        - total_short_value: Total value of short liquidations
+        - max_bucket_value: Highest value in any bucket (for scaling)
+    """
+    if not os.path.exists(HL_INDEXED_DB_PATH):
+        return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
+
+    try:
+        conn = get_indexed_db_connection()
+
+        # Get current price for the coin (from freshest position)
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+        price_cursor = conn.execute("""
+            SELECT entry_price FROM positions
+            WHERE coin = ? AND entry_price > 0 AND updated_at >= ?
+            ORDER BY updated_at DESC LIMIT 1
+        """, (coin, stale_threshold))
+        price_row = price_cursor.fetchone()
+        if not price_row:
+            conn.close()
+            return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
+
+        current_price = float(price_row['entry_price'])
+
+        # Calculate price range
+        min_price = current_price * (1 - price_range_pct / 100)
+        max_price = current_price * (1 + price_range_pct / 100)
+
+        # Query all positions with liquidation prices in range (only fresh data)
+        cursor = conn.execute("""
+            SELECT side, position_value, liquidation_price
+            FROM positions
+            WHERE coin = ?
+              AND liquidation_price > 0
+              AND liquidation_price BETWEEN ? AND ?
+              AND position_value >= 10000
+              AND updated_at >= ?
+        """, (coin, min_price, max_price, stale_threshold))
+
+        positions = cursor.fetchall()
+        conn.close()
+
+        # Create buckets
+        num_buckets = int(2 * price_range_pct / bucket_size_pct) + 1
+        buckets = []
+
+        for i in range(num_buckets):
+            pct_from_current = -price_range_pct + (i * bucket_size_pct)
+            price_level = current_price * (1 + pct_from_current / 100)
+            buckets.append({
+                "price_level": price_level,
+                "pct_from_current": pct_from_current,
+                "long_value": 0.0,
+                "short_value": 0.0,
+                "total_value": 0.0,
+                "position_count": 0
+            })
+
+        # Aggregate positions into buckets
+        total_long = 0.0
+        total_short = 0.0
+
+        for pos in positions:
+            liq_price = float(pos['liquidation_price'])
+            value = float(pos['position_value'])
+            side = pos['side']
+
+            # Find the right bucket
+            pct_from_current = ((liq_price / current_price) - 1) * 100
+            bucket_idx = int((pct_from_current + price_range_pct) / bucket_size_pct)
+
+            if 0 <= bucket_idx < len(buckets):
+                buckets[bucket_idx]["position_count"] += 1
+                buckets[bucket_idx]["total_value"] += value
+
+                if side == "LONG":
+                    buckets[bucket_idx]["long_value"] += value
+                    total_long += value
+                else:
+                    buckets[bucket_idx]["short_value"] += value
+                    total_short += value
+
+        # Find max bucket value for scaling
+        max_bucket_value = max((b["total_value"] for b in buckets), default=0)
+
+        return {
+            "current_price": current_price,
+            "buckets": buckets,
+            "total_long_value": total_long,
+            "total_short_value": total_short,
+            "max_bucket_value": max_bucket_value,
+            "coin": coin
+        }
+
+    except Exception as e:
+        print(f"Error loading heatmap data: {e}")
+        return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
+
+
+# Global orderbook cache (updated by background thread)
+_orderbook_cache: Dict[str, Dict] = {}
+
+
+def update_orderbook_cache(coin: str, orderbook: Dict):
+    """Update the global orderbook cache (called from async context)."""
+    global _orderbook_cache
+    _orderbook_cache[coin] = orderbook
+
+
+def get_cached_orderbook(coin: str) -> Optional[Dict]:
+    """Get cached orderbook data."""
+    return _orderbook_cache.get(coin)
+
+
+def compute_absorption_analysis(heatmap_data: Dict, orderbook: Optional[Dict]) -> Dict:
+    """
+    Compute absorption analysis comparing liquidation volume vs orderbook depth.
+
+    Returns analysis of whether the book can absorb potential liquidation cascades.
+
+    Key insight:
+    - Liquidation value > Book depth at level → Cascade continues (thin book)
+    - Liquidation value < Book depth at level → Cascade absorbed (thick book)
+    """
+    if not heatmap_data or not heatmap_data.get("buckets"):
+        return {"levels": [], "can_absorb_longs": True, "can_absorb_shorts": True}
+
+    if not orderbook:
+        return {"levels": [], "can_absorb_longs": None, "can_absorb_shorts": None, "no_book_data": True}
+
+    current_price = heatmap_data.get("current_price", 0)
+    bids = orderbook.get("bids", [])
+    asks = orderbook.get("asks", [])
+
+    analysis_levels = []
+    total_long_liq = 0
+    total_short_liq = 0
+    total_bid_depth = 0
+    total_ask_depth = 0
+
+    for bucket in heatmap_data["buckets"]:
+        pct = bucket["pct_from_current"]
+        long_val = bucket["long_value"]
+        short_val = bucket["short_value"]
+
+        # Find orderbook depth at this level
+        bid_depth_at_level = 0
+        ask_depth_at_level = 0
+
+        # For levels below current price, check bid depth (support)
+        if pct < 0:
+            for bid in bids:
+                if bid["pct_from_mid"] >= pct:
+                    bid_depth_at_level = bid["cumulative"]
+            total_long_liq += long_val
+            total_bid_depth = max(total_bid_depth, bid_depth_at_level)
+
+        # For levels above current price, check ask depth (resistance)
+        if pct > 0:
+            for ask in asks:
+                if ask["pct_from_mid"] <= pct:
+                    ask_depth_at_level = ask["cumulative"]
+                else:
+                    break
+            total_short_liq += short_val
+            total_ask_depth = max(total_ask_depth, ask_depth_at_level)
+
+        # Compute absorption ratio
+        if pct < 0 and long_val > 0:
+            absorption_ratio = bid_depth_at_level / long_val if long_val > 0 else float('inf')
+            can_absorb = absorption_ratio >= 1.0
+        elif pct > 0 and short_val > 0:
+            absorption_ratio = ask_depth_at_level / short_val if short_val > 0 else float('inf')
+            can_absorb = absorption_ratio >= 1.0
+        else:
+            absorption_ratio = float('inf')
+            can_absorb = True
+
+        if long_val > 10000 or short_val > 10000:
+            analysis_levels.append({
+                "pct_from_current": pct,
+                "liq_value": long_val if pct < 0 else short_val,
+                "book_depth": bid_depth_at_level if pct < 0 else ask_depth_at_level,
+                "absorption_ratio": min(absorption_ratio, 10.0),  # Cap at 10x
+                "can_absorb": can_absorb,
+                "side": "LONG" if pct < 0 else "SHORT"
+            })
+
+    # Overall absorption assessment
+    can_absorb_longs = total_bid_depth >= total_long_liq * 0.5 if total_long_liq > 0 else True
+    can_absorb_shorts = total_ask_depth >= total_short_liq * 0.5 if total_short_liq > 0 else True
+
+    return {
+        "levels": analysis_levels,
+        "total_long_liq": total_long_liq,
+        "total_short_liq": total_short_liq,
+        "total_bid_depth": total_bid_depth,
+        "total_ask_depth": total_ask_depth,
+        "can_absorb_longs": can_absorb_longs,
+        "can_absorb_shorts": can_absorb_shorts,
+        "long_absorption_ratio": total_bid_depth / total_long_liq if total_long_liq > 0 else float('inf'),
+        "short_absorption_ratio": total_ask_depth / total_short_liq if total_short_liq > 0 else float('inf')
+    }
+
+
+def create_absorption_analysis_for_strategy(
+    coin: str,
+    heatmap_data: Optional[Dict] = None,
+    orderbook: Optional[Dict] = None
+) -> Optional['AbsorptionAnalysis']:
+    """
+    Create AbsorptionAnalysis object for cascade sniper strategy.
+
+    Combines orderbook depth data with liquidation proximity data to compute
+    absorption ratios that determine if book can absorb cascade volume.
+
+    Args:
+        coin: Asset symbol (e.g., "BTC")
+        heatmap_data: Output from load_liquidation_heatmap_data()
+        orderbook: Cached orderbook data from OrderbookRefresher
+
+    Returns:
+        AbsorptionAnalysis for strategy, or None if data insufficient
+    """
+    # Import here to avoid circular import
+    from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis
+
+    # Get orderbook from cache if not provided
+    if orderbook is None:
+        orderbook = get_cached_orderbook(coin)
+
+    if orderbook is None:
+        return None
+
+    # Get heatmap data if not provided
+    if heatmap_data is None:
+        heatmap_data = load_liquidation_heatmap_data(coin)
+
+    if not heatmap_data or not heatmap_data.get("buckets"):
+        # No liquidation data - create analysis with zero liquidation values
+        mid_price = orderbook.get("mid_price", 0)
+        return AbsorptionAnalysis(
+            coin=coin,
+            mid_price=mid_price,
+            bid_depth_2pct=orderbook.get("total_bid_depth", 0),
+            ask_depth_2pct=orderbook.get("total_ask_depth", 0),
+            long_liq_value=0,
+            short_liq_value=0,
+            absorption_ratio_longs=float('inf'),  # No longs to absorb
+            absorption_ratio_shorts=float('inf'),  # No shorts to absorb
+            timestamp=time.time()
+        )
+
+    # Compute absorption using existing function
+    analysis = compute_absorption_analysis(heatmap_data, orderbook)
+
+    mid_price = orderbook.get("mid_price", 0)
+    total_long_liq = analysis.get("total_long_liq", 0)
+    total_short_liq = analysis.get("total_short_liq", 0)
+    total_bid_depth = analysis.get("total_bid_depth", 0)
+    total_ask_depth = analysis.get("total_ask_depth", 0)
+
+    # Compute absorption ratios (avoid division by zero)
+    absorption_ratio_longs = total_bid_depth / total_long_liq if total_long_liq > 0 else float('inf')
+    absorption_ratio_shorts = total_ask_depth / total_short_liq if total_short_liq > 0 else float('inf')
+
+    return AbsorptionAnalysis(
+        coin=coin,
+        mid_price=mid_price,
+        bid_depth_2pct=total_bid_depth,
+        ask_depth_2pct=total_ask_depth,
+        long_liq_value=total_long_liq,
+        short_liq_value=total_short_liq,
+        absorption_ratio_longs=absorption_ratio_longs,
+        absorption_ratio_shorts=absorption_ratio_shorts,
+        timestamp=time.time()
+    )
 
 
 def count_primitives(bundle) -> int:
@@ -327,6 +713,1087 @@ def count_primitives(bundle) -> int:
         bundle.cascade_state,
     ]
     return sum(1 for f in fields if f is not None)
+
+
+# ==============================================================================
+# Background Position Refresher
+# ==============================================================================
+
+class PositionRefresher(threading.Thread):
+    """Background thread that polls Hyperliquid API and updates position data.
+
+    Features:
+    - Normal refresh: All wallets every 30 seconds
+    - ZOOM MODE: Wallets with positions within 0.2% of liquidation get refreshed every 2-3 seconds
+    """
+
+    HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
+    REFRESH_INTERVAL = 10  # seconds for normal refresh (was 30)
+    ZOOM_REFRESH_INTERVAL = 1.5  # seconds for priority wallets (balance speed vs rate limit)
+    ZOOM_THRESHOLD_PCT = 0.5  # positions within this % of liq get priority
+
+    # Core whale wallets (always track these)
+    CORE_WHALES = [
+        '0x023a3d0580a72d352f4c1595e52597c119f9f6a3',  # $27M+ exposure
+        '0x010461c14e146ac35fe42271bdc1134ee31c703a',  # Liquidator $18M
+        '0x0fd468a730d62dc1c0d914d49ec78cfa07b74e4a',  # $9.6M BTC short
+    ]
+
+    # Dynamic wallet list - loaded from database
+    TRACKED_WHALES = []  # Will be populated from DB
+
+    # Minimum position value to track changes
+    MIN_WHALE_POSITION = 50000  # $50k for whale alerts (lowered from $100k)
+    MIN_WALLET_VALUE = 10000  # $10k minimum to track a wallet (lowered from $50k for more retail coverage)
+    MIN_RISKY_POSITION = 5000  # $5k minimum for positions near liquidation
+
+    def __init__(self, db_path: str):
+        super().__init__(daemon=True)
+        self.db_path = db_path
+        self._running = True
+        self._last_refresh = 0
+        self._last_zoom_refresh = 0
+        self._last_wallet_discovery = 0
+        self._priority_wallets: set = set()  # Wallets with positions near liquidation
+        self._zoom_positions: list = []  # Current zoom targets for UI
+        self._zoom_mode = False
+
+        # Whale tracking
+        self._previous_positions: Dict[str, Dict] = {}  # wallet -> {coin: position_data}
+        self._whale_alerts: list = []  # Recent whale activity alerts
+        self._max_alerts = 50  # Keep last N alerts
+
+        # Liquidation callback for fade executor
+        self._on_liquidation = None
+
+        # Dynamic wallet discovery
+        self._discovered_wallets: set = set()  # Wallets found from trades
+        self._load_wallets_from_db()  # Load high-value wallets on init
+
+        # Zone alert tracking (to detect when positions move into danger)
+        self._previous_zones: Dict[str, str] = {}  # "wallet_coin" -> zone
+        self._last_zone_alert = 0
+
+    def set_liquidation_callback(self, callback):
+        """Set callback for liquidation events."""
+        self._on_liquidation = callback
+
+    def _load_wallets_from_db(self):
+        """Load high-value wallets from indexed_wallets database."""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cursor = conn.cursor()
+
+            # Get wallets with significant position value (increased limit for more coverage)
+            cursor.execute("""
+                SELECT DISTINCT address FROM indexed_wallets
+                WHERE position_value > ?
+                ORDER BY position_value DESC
+                LIMIT 200
+            """, (self.MIN_WALLET_VALUE,))
+
+            db_wallets = [row[0] for row in cursor.fetchall()]
+            conn.close()
+
+            # Combine core whales + DB wallets
+            self.TRACKED_WHALES = list(self.CORE_WHALES)
+            for w in db_wallets:
+                if w not in self.TRACKED_WHALES:
+                    self.TRACKED_WHALES.append(w)
+
+            print(f"[PositionRefresher] Loaded {len(self.TRACKED_WHALES)} wallets to track")
+
+        except Exception as e:
+            print(f"[PositionRefresher] Error loading wallets from DB: {e}")
+            self.TRACKED_WHALES = list(self.CORE_WHALES)
+
+    def _discover_wallets_from_trades(self):
+        """Discover new wallets from recent trades across major coins."""
+        try:
+            coins = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'WIF', 'TRUMP', 'NOT', 'PEPE']
+            new_wallets = set()
+
+            for coin in coins:
+                try:
+                    resp = requests.post(
+                        self.HYPERLIQUID_API,
+                        json={'type': 'recentTrades', 'coin': coin},
+                        timeout=5
+                    )
+                    if resp.status_code == 200:
+                        trades = resp.json()
+                        for trade in trades:
+                            users = trade.get('users', [])
+                            for u in users:
+                                if u and u not in self.TRACKED_WHALES:
+                                    new_wallets.add(u)
+                except:
+                    pass
+
+            # Check positions for new wallets, add if significant
+            added = 0
+            for wallet in new_wallets:
+                if wallet in self._discovered_wallets:
+                    continue
+
+                try:
+                    state = self._get_clearinghouse_state(wallet)
+                    if not state:
+                        continue
+
+                    # Calculate total value
+                    total = 0
+                    near_liq = False
+                    for p in state.get('assetPositions', []):
+                        pos = p.get('position', {})
+                        size = abs(float(pos.get('szi', 0)))
+                        entry = float(pos.get('entryPx', 0))
+                        total += size * entry
+
+                        # Check if near liquidation
+                        liq_px = pos.get('liquidationPx')
+                        if liq_px and float(liq_px) > 0:
+                            dist = abs(float(liq_px) - entry) / entry * 100 if entry > 0 else 999
+                            if dist < 10:
+                                near_liq = True
+
+                    if total >= self.MIN_WALLET_VALUE or near_liq:
+                        self.TRACKED_WHALES.append(wallet)
+                        self._discovered_wallets.add(wallet)
+                        added += 1
+                        if near_liq:
+                            print(f"[DISCOVERY] Added {wallet[:10]}... (${total:,.0f}, NEAR LIQ)")
+
+                except:
+                    pass
+
+                if added >= 5:  # Limit additions per cycle
+                    break
+
+            if added > 0:
+                print(f"[DISCOVERY] Added {added} new wallets, now tracking {len(self.TRACKED_WHALES)}")
+
+        except Exception as e:
+            print(f"[DISCOVERY] Error: {e}")
+
+    def _scan_stale_wallets(self):
+        """Scan stale wallets from indexed_wallets DB to find retail positions at risk.
+
+        This method scans wallets that haven't been checked recently and adds
+        any with positions close to liquidation, even if they're small.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cursor = conn.cursor()
+
+            # Get wallets with old position data that might have risky positions
+            cursor.execute("""
+                SELECT address, position_value
+                FROM indexed_wallets
+                WHERE position_value > 5000
+                  AND (last_position_check IS NULL
+                       OR last_position_check < datetime('now', '-2 hours'))
+                ORDER BY position_value DESC
+                LIMIT 30
+            """)
+            stale_wallets = cursor.fetchall()
+            conn.close()
+
+            added = 0
+            risky_found = 0
+
+            for wallet, old_value in stale_wallets:
+                if wallet in self.TRACKED_WHALES or wallet in self._discovered_wallets:
+                    continue
+
+                try:
+                    state = self._get_clearinghouse_state(wallet)
+                    if not state:
+                        continue
+
+                    positions = state.get('assetPositions', [])
+                    active = [p for p in positions if float(p.get('position', {}).get('szi', 0) or 0) != 0]
+
+                    if not active:
+                        continue
+
+                    # Check each position for risk
+                    total_value = 0
+                    has_risky_position = False
+                    has_high_impact = False
+
+                    for p in active:
+                        pos = p.get('position', {})
+                        coin = pos.get('coin', '')
+                        szi = float(pos.get('szi', 0) or 0)
+                        entry = float(pos.get('entryPx', 0) or 0)
+                        liq_str = pos.get('liquidationPx')
+                        liq = float(liq_str) if liq_str else 0
+                        val = abs(szi * entry)
+                        total_value += val
+
+                        if liq > 0 and entry > 0:
+                            # Calculate distance to liquidation
+                            if szi > 0:  # LONG
+                                dist = (entry - liq) / entry * 100
+                            else:  # SHORT
+                                dist = (liq - entry) / entry * 100
+
+                            # Track if close to liquidation (< 10%)
+                            if 0 < dist < 10:
+                                has_risky_position = True
+                                risky_found += 1
+
+                            # Check if it's a shitcoin with potential impact
+                            shitcoins = ['TRUMP', 'WIF', 'PEPE', 'BONK', 'NOT', 'BRETT',
+                                         'FARTCOIN', 'CHILLGUY', 'YZY', 'PUMP', 'XPL', 'KAITO']
+                            if coin in shitcoins and val > 5000:
+                                has_high_impact = True
+
+                    # Add wallet if it has risky positions or high impact shitcoin exposure
+                    if has_risky_position or has_high_impact or total_value >= self.MIN_WALLET_VALUE:
+                        self.TRACKED_WHALES.append(wallet)
+                        self._discovered_wallets.add(wallet)
+                        added += 1
+
+                        if has_risky_position:
+                            print(f"[STALE-SCAN] Added {wallet[:10]}... (${total_value:,.0f}, RISKY POSITION)")
+                        elif has_high_impact:
+                            print(f"[STALE-SCAN] Added {wallet[:10]}... (${total_value:,.0f}, SHITCOIN EXPOSURE)")
+
+                except Exception:
+                    pass
+
+                # Rate limit
+                time.sleep(0.1)
+
+                if added >= 10:  # Limit additions per cycle
+                    break
+
+            if added > 0:
+                print(f"[STALE-SCAN] Scanned stale wallets: added {added}, found {risky_found} risky, now tracking {len(self.TRACKED_WHALES)}")
+
+        except Exception as e:
+            print(f"[STALE-SCAN] Error: {e}")
+
+    def stop(self):
+        self._running = False
+
+    def get_zoom_status(self) -> Dict:
+        """Return current zoom mode status for UI."""
+        return {
+            'active': self._zoom_mode,
+            'priority_wallets': len(self._priority_wallets),
+            'positions': self._zoom_positions.copy()
+        }
+
+    def get_whale_alerts(self) -> list:
+        """Return recent whale activity alerts."""
+        return self._whale_alerts.copy()
+
+    def _detect_whale_changes(self, wallet: str, new_positions: Dict[str, Dict]) -> list:
+        """Compare new positions with previous snapshot, detect changes."""
+        alerts = []
+        wallet_short = wallet[:10] + '...'
+        prev_positions = self._previous_positions.get(wallet, {})
+        now = time.time()
+
+        # Check for new or increased positions
+        for coin, pos in new_positions.items():
+            value = pos.get('value', 0)
+            if value < self.MIN_WHALE_POSITION:
+                continue
+
+            side = pos.get('side', 'LONG')
+            prev = prev_positions.get(coin, {})
+            prev_value = prev.get('value', 0)
+
+            if prev_value == 0:
+                # NEW POSITION
+                alerts.append({
+                    'type': 'NEW',
+                    'wallet': wallet_short,
+                    'coin': coin,
+                    'side': side,
+                    'value': value,
+                    'change_pct': 100,
+                    'timestamp': now,
+                    'msg': f"🆕 {wallet_short} opened {side} {coin} ${value:,.0f}"
+                })
+            elif value > prev_value * 1.2:
+                # INCREASED > 20%
+                change_pct = (value - prev_value) / prev_value * 100
+                alerts.append({
+                    'type': 'INCREASE',
+                    'wallet': wallet_short,
+                    'coin': coin,
+                    'side': side,
+                    'value': value,
+                    'prev_value': prev_value,
+                    'change_pct': change_pct,
+                    'timestamp': now,
+                    'msg': f"📈 {wallet_short} increased {side} {coin} +{change_pct:.0f}% → ${value:,.0f}"
+                })
+
+        # Check for closed positions
+        for coin, prev in prev_positions.items():
+            prev_value = prev.get('value', 0)
+            if prev_value < self.MIN_WHALE_POSITION:
+                continue
+
+            if coin not in new_positions or new_positions[coin].get('value', 0) < prev_value * 0.2:
+                side = prev.get('side', 'LONG')
+                alerts.append({
+                    'type': 'CLOSED',
+                    'wallet': wallet_short,
+                    'coin': coin,
+                    'side': side,
+                    'value': prev_value,
+                    'change_pct': -100,
+                    'timestamp': now,
+                    'msg': f"🔻 {wallet_short} CLOSED {side} {coin} (was ${prev_value:,.0f})"
+                })
+
+        return alerts
+
+    def _track_whales(self):
+        """Track whale wallet positions and detect changes."""
+        # Combine static tracked whales with dynamically discovered liquidators
+        all_tracked = list(self.TRACKED_WHALES)
+        dynamic = getattr(self, '_dynamic_tracked_wallets', set())
+        all_tracked.extend(list(dynamic))
+
+        for wallet in all_tracked:
+            try:
+                state = self._get_clearinghouse_state(wallet)
+                if not state:
+                    continue
+
+                # Build current positions dict
+                new_positions = {}
+                for pos in state.get('assetPositions', []):
+                    p = pos.get('position', {})
+                    coin = p.get('coin', '')
+                    szi = float(p.get('szi', 0))
+                    entry_px = float(p.get('entryPx', 0))
+                    value = abs(szi * entry_px)
+
+                    if value >= self.MIN_WHALE_POSITION:
+                        new_positions[coin] = {
+                            'side': 'LONG' if szi > 0 else 'SHORT',
+                            'value': value,
+                            'size': abs(szi),
+                            'entry_price': entry_px
+                        }
+
+                # Detect changes
+                alerts = self._detect_whale_changes(wallet, new_positions)
+
+                # Store alerts
+                if alerts:
+                    self._whale_alerts.extend(alerts)
+                    # Keep only last N alerts
+                    if len(self._whale_alerts) > self._max_alerts:
+                        self._whale_alerts = self._whale_alerts[-self._max_alerts:]
+
+                    # Print alerts
+                    for alert in alerts:
+                        print(f"[WHALE] {alert['msg']}")
+
+                # Update previous positions
+                self._previous_positions[wallet] = new_positions
+
+            except Exception as e:
+                print(f"[WHALE] Error tracking {wallet[:10]}...: {e}")
+
+    def run(self):
+        """Main refresh loop with priority handling."""
+        print("[PositionRefresher] Started background position refresh")
+        print(f"[PositionRefresher] Tracking {len(self.TRACKED_WHALES)} wallets (from DB + core)")
+
+        last_full_refresh = 0
+        last_zoom_refresh = 0
+        last_whale_track = 0
+        last_discovery = 0
+        last_stale_scan = 0
+        WHALE_TRACK_INTERVAL = 15  # Track whales every 15 seconds
+        DISCOVERY_INTERVAL = 60  # Discover new wallets every 60 seconds
+        STALE_SCAN_INTERVAL = 120  # Scan stale wallets every 2 minutes
+
+        while self._running:
+            now = time.time()
+
+            try:
+                # Priority refresh: zoom wallets every 2-3 seconds
+                if self._priority_wallets and (now - last_zoom_refresh) >= self.ZOOM_REFRESH_INTERVAL:
+                    self._refresh_priority_wallets()
+                    last_zoom_refresh = now
+
+                # Whale tracking: every 15 seconds
+                if (now - last_whale_track) >= WHALE_TRACK_INTERVAL:
+                    self._track_whales()
+                    last_whale_track = now
+
+                # Wallet discovery: every 60 seconds
+                if (now - last_discovery) >= DISCOVERY_INTERVAL:
+                    self._discover_wallets_from_trades()
+                    last_discovery = now
+
+                # Stale wallet scan: every 2 minutes (find retail positions at risk)
+                if (now - last_stale_scan) >= STALE_SCAN_INTERVAL:
+                    self._scan_stale_wallets()
+                    last_stale_scan = now
+
+                # Full refresh: all wallets every 30 seconds
+                if (now - last_full_refresh) >= self.REFRESH_INTERVAL:
+                    self._refresh_positions()
+                    last_full_refresh = now
+                    self._last_refresh = now
+
+            except Exception as e:
+                print(f"[PositionRefresher] Error: {e}")
+
+            # Short sleep for responsive zoom mode
+            time.sleep(0.5)
+
+        print("[PositionRefresher] Stopped")
+
+    def _refresh_priority_wallets(self):
+        """Fast refresh for wallets with positions near liquidation."""
+        if not self._priority_wallets:
+            return
+
+        mid_prices = self._get_all_mids()
+        if not mid_prices:
+            return
+
+        # Get volumes for impact calculation (cache for 60 seconds to reduce API calls)
+        volumes = getattr(self, '_cached_volumes', {})
+        volumes_age = getattr(self, '_volumes_cache_time', 0)
+        if time.time() - volumes_age > 60:
+            volumes = self._get_asset_volumes()
+            self._cached_volumes = volumes
+            self._volumes_cache_time = time.time()
+
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        updated = 0
+        liquidated = []
+
+        # Track position state changes
+        position_changes = getattr(self, '_position_states', {})
+
+        for wallet in list(self._priority_wallets):
+            try:
+                state = self._get_clearinghouse_state(wallet)
+                if state:
+                    positions = state.get('assetPositions', [])
+                    if positions:
+                        self._update_wallet_positions(conn, wallet, state, mid_prices, volumes)
+                        updated += 1
+
+                        # Track detailed position state for liquidation detection
+                        for pos_data in positions:
+                            pos = pos_data.get('position', {})
+                            coin = pos.get('coin', '')
+                            size = abs(float(pos.get('szi', 0)))
+                            key = f"{wallet[:12]}_{coin}"
+
+                            prev_state = position_changes.get(key, {})
+                            prev_size = prev_state.get('size', size)
+
+                            # Detect partial liquidation (size reduced >20%)
+                            if prev_size > 0 and size < prev_size * 0.8:
+                                reduction_pct = ((prev_size - size) / prev_size) * 100
+                                liq_price = pos.get('liquidationPx', 'N/A')
+                                print(f"[ZOOM] ⚠️ PARTIAL LIQ: {wallet[:10]}... {coin} size reduced {reduction_pct:.0f}% ({prev_size:.2f} → {size:.2f})")
+                                print(f"[ZOOM]    Time: {time.strftime('%H:%M:%S')} | Liq price: {liq_price}")
+
+                                self._whale_alerts.append({
+                                    'type': 'PARTIAL_LIQ',
+                                    'wallet': wallet[:10] + '...',
+                                    'coin': coin,
+                                    'reduction_pct': reduction_pct,
+                                    'prev_size': prev_size,
+                                    'new_size': size,
+                                    'timestamp': time.time(),
+                                    'msg': f"⚠️ {coin} partially liquidated -{reduction_pct:.0f}%"
+                                })
+
+                                # Trigger liquidation callback for fade executor
+                                if self._on_liquidation and reduction_pct >= 50:
+                                    # Only trigger for significant partial liquidations (>50% reduced)
+                                    liq_event = {
+                                        'type': 'PARTIAL_LIQUIDATION',
+                                        'coin': coin,
+                                        'wallet': wallet,
+                                        'value': float(pos.get('positionValue', 0)),
+                                        'reduction_pct': reduction_pct,
+                                        'timestamp': time.time()
+                                    }
+                                    try:
+                                        self._on_liquidation(liq_event)
+                                    except Exception as e:
+                                        print(f"[ZOOM] Liquidation callback error: {e}")
+
+                            # Update state
+                            position_changes[key] = {
+                                'size': size,
+                                'value': float(pos.get('positionValue', 0)),
+                                'entry_price': float(pos.get('entryPx', 0)),
+                                'liq_price': pos.get('liquidationPx'),
+                                'last_update': time.time()
+                            }
+                    else:
+                        # Position closed/liquidated!
+                        liquidated.append(wallet)
+                        self._priority_wallets.discard(wallet)
+                        print(f"[ZOOM] ⚡ FULL LIQUIDATION: {wallet[:10]}... at {time.strftime('%H:%M:%S')}")
+
+                        # Trigger liquidation callback for fade executor
+                        if self._on_liquidation:
+                            # Find the coin that was liquidated from zoom positions
+                            for zpos in self._zoom_positions:
+                                if zpos.get('wallet', '').startswith(wallet[:10]):
+                                    liq_event = {
+                                        'type': 'FULL_LIQUIDATION',
+                                        'coin': zpos.get('coin'),
+                                        'wallet': wallet,
+                                        'value': zpos.get('value', 0),
+                                        'liq_price': zpos.get('liq_price', 0),
+                                        'timestamp': time.time()
+                                    }
+                                    try:
+                                        self._on_liquidation(liq_event)
+                                    except Exception as e:
+                                        print(f"[ZOOM] Liquidation callback error: {e}")
+                                    break
+                else:
+                    pass
+            except Exception as e:
+                print(f"[ZOOM] Error polling {wallet[:10]}...: {e}")
+
+        self._position_states = position_changes
+
+        conn.commit()
+        conn.close()
+
+        if liquidated:
+            print(f"[ZOOM] ⚡ LIQUIDATED: {len(liquidated)} positions closed!")
+            # Try to identify liquidators
+            self._identify_liquidators(liquidated)
+
+        if updated > 0:
+            # Update zoom positions list
+            self._update_zoom_positions()
+
+    def _identify_liquidators(self, liquidated_wallets: list):
+        """Identify who liquidated the positions by checking recent trades."""
+        for wallet in liquidated_wallets:
+            try:
+                # Get what coin they had from our zoom positions
+                coin = None
+                for pos in self._zoom_positions:
+                    if pos.get('wallet', '').startswith(wallet[:10]):
+                        coin = pos.get('coin')
+                        break
+
+                if not coin:
+                    continue
+
+                # Get recent trades for that coin
+                response = requests.post(self.HYPERLIQUID_API, json={
+                    'type': 'recentTrades',
+                    'coin': coin
+                }, timeout=5)
+
+                if response.status_code == 200:
+                    trades = response.json()
+                    # Look for trades involving this wallet
+                    for trade in trades[:20]:
+                        users = trade.get('users', [])
+                        if any(wallet.lower().startswith(u[:10].lower()) for u in users):
+                            # Found the liquidation trade
+                            px = trade.get('px')
+                            sz = trade.get('sz')
+                            # The other user is the liquidator
+                            liquidator = [u for u in users if not wallet.lower().startswith(u[:10].lower())]
+                            if liquidator:
+                                liquidator = liquidator[0]
+                                print(f"[ZOOM] ⚡ LIQUIDATOR IDENTIFIED: {liquidator[:12]}...")
+                                print(f"[ZOOM]    Liquidated {coin} @ ${px} size={sz}")
+
+                                # Add to whale alerts
+                                self._whale_alerts.append({
+                                    'type': 'LIQUIDATION',
+                                    'wallet': wallet[:10] + '...',
+                                    'liquidator': liquidator[:12] + '...',
+                                    'coin': coin,
+                                    'price': float(px) if px else 0,
+                                    'size': float(sz) if sz else 0,
+                                    'timestamp': time.time(),
+                                    'msg': f"⚡ {coin} liquidated @ ${px} by {liquidator[:12]}..."
+                                })
+
+                                # Add liquidator to tracked whales for future monitoring
+                                if liquidator not in self.TRACKED_WHALES:
+                                    print(f"[ZOOM] 🎯 Adding liquidator to tracked wallets")
+                                    # Note: This adds to instance, not class
+                                    self._dynamic_tracked_wallets = getattr(self, '_dynamic_tracked_wallets', set())
+                                    self._dynamic_tracked_wallets.add(liquidator)
+                            break
+
+            except Exception as e:
+                print(f"[ZOOM] Error identifying liquidator: {e}")
+
+    def _refresh_positions(self):
+        """Poll positions for all tracked wallets."""
+        if not os.path.exists(self.db_path):
+            return
+
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        cursor = conn.cursor()
+
+        # Cleanup: Delete positions not updated recently (stale/liquidated)
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+        cursor.execute("DELETE FROM positions WHERE updated_at < ?", (stale_threshold,))
+        deleted = cursor.rowcount
+        if deleted > 0:
+            print(f"[PositionRefresher] Cleaned up {deleted} stale positions")
+
+        # Get unique wallets that have positions
+        cursor.execute("SELECT DISTINCT wallet_address FROM positions LIMIT 100")
+        wallets = [row[0] for row in cursor.fetchall()]
+
+        if not wallets:
+            conn.close()
+            return
+
+        # Get all mid prices
+        mid_prices = self._get_all_mids()
+        volumes = self._get_asset_volumes()
+
+        updated = 0
+        for wallet in wallets:
+            try:
+                state = self._get_clearinghouse_state(wallet)
+                if state:
+                    self._update_wallet_positions(conn, wallet, state, mid_prices, volumes)
+                    updated += 1
+            except Exception as e:
+                print(f"[PositionRefresher] Error polling {wallet[:10]}...: {e}")
+
+            # Small delay between requests to avoid rate limiting
+            time.sleep(0.1)
+
+        conn.commit()
+
+        # Identify priority wallets for zoom mode
+        self._identify_priority_wallets(conn)
+
+        conn.close()
+        print(f"[PositionRefresher] Updated {updated} wallets")
+
+    def _identify_priority_wallets(self, conn):
+        """Find wallets with positions close to liquidation and enable zoom mode."""
+        cursor = conn.cursor()
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+
+        # Find positions within zoom threshold (>= 0 to include AT liquidation)
+        cursor.execute("""
+            SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
+            FROM positions
+            WHERE distance_to_liq_pct <= ?
+              AND position_value >= 10000
+              AND updated_at >= ?
+            ORDER BY distance_to_liq_pct ASC
+        """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
+
+        new_priority = set()
+        zoom_positions = []
+
+        for row in cursor.fetchall():
+            wallet, coin, side, value, dist_pct, liq_price = row
+            new_priority.add(wallet)
+            zoom_positions.append({
+                'wallet': wallet[:10] + '...',
+                'coin': coin,
+                'side': side,
+                'value': float(value),
+                'dist_pct': float(dist_pct),
+                'liq_price': float(liq_price)
+            })
+
+        # Update state
+        old_count = len(self._priority_wallets)
+        self._priority_wallets = new_priority
+        self._zoom_positions = zoom_positions
+        self._zoom_mode = len(new_priority) > 0
+
+        # Log changes
+        if len(new_priority) > old_count:
+            print(f"[ZOOM] 🔍 ZOOM MODE ACTIVATED: {len(new_priority)} wallets within {self.ZOOM_THRESHOLD_PCT}% of liquidation")
+            for pos in zoom_positions[:3]:  # Show top 3
+                print(f"[ZOOM]   → {pos['coin']} {pos['side']} ${pos['value']:,.0f} @ {pos['dist_pct']:.2f}%")
+        elif len(new_priority) == 0 and old_count > 0:
+            print(f"[ZOOM] Zoom mode deactivated - no positions near liquidation")
+
+        # Check for zone changes and alert
+        self._check_zone_alerts(conn)
+
+    def _check_zone_alerts(self, conn):
+        """Check for positions entering danger zones and alert."""
+        cursor = conn.cursor()
+
+        # Get all positions with distance data
+        cursor.execute("""
+            SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, impact_score
+            FROM positions
+            WHERE distance_to_liq_pct IS NOT NULL
+              AND distance_to_liq_pct > 0
+              AND position_value > 20000
+            ORDER BY distance_to_liq_pct ASC
+        """)
+
+        current_zones = {}
+        alerts = []
+
+        for row in cursor.fetchall():
+            wallet, coin, side, value, dist, impact = row
+            key = f"{wallet}_{coin}"
+
+            # Determine zone
+            if dist < 1:
+                zone = "DANGER"
+            elif dist < 3:
+                zone = "WARNING"
+            elif dist < 5:
+                zone = "WATCH"
+            else:
+                zone = "SAFE"
+
+            current_zones[key] = zone
+
+            # Check if zone changed
+            prev_zone = self._previous_zones.get(key)
+            if prev_zone and prev_zone != zone:
+                # Zone changed - check if it got worse
+                zone_order = {"SAFE": 0, "WATCH": 1, "WARNING": 2, "DANGER": 3}
+                if zone_order.get(zone, 0) > zone_order.get(prev_zone, 0):
+                    alerts.append({
+                        'coin': coin,
+                        'side': side,
+                        'value': value,
+                        'dist': dist,
+                        'impact': impact or 0,
+                        'from_zone': prev_zone,
+                        'to_zone': zone,
+                        'wallet': wallet[:10] + '...'
+                    })
+
+        # Update tracking
+        self._previous_zones = current_zones
+
+        # Print alerts
+        now = time.time()
+        if alerts and (now - self._last_zone_alert) > 10:  # Rate limit alerts
+            self._last_zone_alert = now
+            print(f"\n{'='*60}")
+            print(f"⚠️  ZONE ALERTS - {len(alerts)} position(s) moved closer to liquidation")
+            print(f"{'='*60}")
+            for alert in alerts:
+                impact_str = f" (impact: {alert['impact']:.0f}%)" if alert['impact'] > 10 else ""
+                print(f"  🔴 {alert['coin']} {alert['side']} ${alert['value']:,.0f}")
+                print(f"     {alert['from_zone']} → {alert['to_zone']} @ {alert['dist']:.2f}%{impact_str}")
+            print(f"{'='*60}\n")
+
+    def _update_zoom_positions(self):
+        """Update zoom position details from database."""
+        if not os.path.exists(self.db_path):
+            return
+
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        cursor = conn.cursor()
+        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+
+        cursor.execute("""
+            SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
+            FROM positions
+            WHERE distance_to_liq_pct <= ?
+              AND position_value >= 10000
+              AND updated_at >= ?
+            ORDER BY distance_to_liq_pct ASC
+        """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
+
+        zoom_positions = []
+        for row in cursor.fetchall():
+            wallet, coin, side, value, dist_pct, liq_price = row
+            zoom_positions.append({
+                'wallet': wallet[:10] + '...',
+                'coin': coin,
+                'side': side,
+                'value': float(value),
+                'dist_pct': float(dist_pct),
+                'liq_price': float(liq_price)
+            })
+
+        self._zoom_positions = zoom_positions
+        conn.close()
+
+    def _get_clearinghouse_state(self, wallet: str) -> Optional[Dict]:
+        """Get clearinghouse state for a wallet."""
+        try:
+            resp = requests.post(
+                self.HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": wallet},
+                timeout=10
+            )
+            return resp.json() if resp.status_code == 200 else None
+        except Exception:
+            return None
+
+    def _get_all_mids(self) -> Dict[str, float]:
+        """Get all mid prices."""
+        try:
+            resp = requests.post(
+                self.HYPERLIQUID_API,
+                json={"type": "allMids"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {k: float(v) for k, v in data.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _get_asset_volumes(self) -> Dict[str, float]:
+        """Get 24h volumes for all assets."""
+        try:
+            resp = requests.post(
+                self.HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) >= 2:
+                    meta = data[0]
+                    asset_ctxs = data[1]
+                    universe = meta.get('universe', [])
+                    volumes = {}
+                    for i, ctx in enumerate(asset_ctxs):
+                        if i < len(universe):
+                            coin = universe[i].get('name', '')
+                            volumes[coin] = float(ctx.get('dayNtlVlm', 0))
+                    return volumes
+        except Exception:
+            pass
+        return {}
+
+    def _update_wallet_positions(self, conn, wallet: str, state: Dict,
+                                  mid_prices: Dict[str, float], volumes: Dict[str, float]):
+        """Update positions for a wallet in the database.
+
+        Also deletes positions that no longer exist (closed or liquidated).
+        """
+        positions = state.get('assetPositions', [])
+
+        # Track which coins have active positions
+        active_coins = set()
+
+        for pos_data in positions:
+            pos = pos_data.get('position', {})
+            coin = pos.get('coin', '')
+            szi = float(pos.get('szi', 0))
+
+            if abs(szi) == 0:
+                continue
+
+            active_coins.add(coin)
+            side = 'LONG' if szi > 0 else 'SHORT'
+            entry_price = float(pos.get('entryPx', 0))
+            position_value = float(pos.get('positionValue', 0))
+            leverage_info = pos.get('leverage', {})
+            leverage = float(leverage_info.get('value', 1)) if isinstance(leverage_info, dict) else 1.0
+            margin_used = float(pos.get('marginUsed', 0))
+            unrealized_pnl = float(pos.get('unrealizedPnl', 0))
+
+            # Get liquidation price
+            liq_price = pos.get('liquidationPx')
+            if liq_price is not None:
+                liq_price = float(liq_price)
+            elif leverage > 0 and entry_price > 0:
+                # Estimate for cross-margin
+                if side == 'LONG':
+                    liq_price = entry_price * (1 - 0.9 / leverage)
+                else:
+                    liq_price = entry_price * (1 + 0.9 / leverage)
+
+            # Calculate distance to liquidation (negative = past liquidation)
+            current_price = mid_prices.get(coin, 0)
+            distance_pct = 999.0
+            if current_price > 0 and liq_price and liq_price > 0:
+                if side == 'LONG':
+                    distance_pct = ((current_price - liq_price) / current_price) * 100
+                else:
+                    distance_pct = ((liq_price - current_price) / current_price) * 100
+                # Don't clamp to 0 - negative means PAST liquidation level
+
+            # Calculate impact score
+            daily_volume = volumes.get(coin, 0)
+            impact_score = (position_value / daily_volume * 100) if daily_volume > 0 else 0
+
+            # Upsert position
+            conn.execute("""
+                INSERT OR REPLACE INTO positions
+                (wallet_address, coin, side, entry_price, position_size, position_value,
+                 leverage, liquidation_price, margin_used, unrealized_pnl,
+                 distance_to_liq_pct, daily_volume, impact_score, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                wallet, coin, side, entry_price, abs(szi), position_value,
+                leverage, liq_price, margin_used, unrealized_pnl,
+                distance_pct, daily_volume, impact_score, time.time()
+            ))
+
+        # Delete positions for this wallet that no longer exist (closed or liquidated)
+        if active_coins:
+            placeholders = ','.join('?' * len(active_coins))
+            conn.execute(f"""
+                DELETE FROM positions
+                WHERE wallet_address = ? AND coin NOT IN ({placeholders})
+            """, (wallet, *active_coins))
+        else:
+            # Wallet has no positions at all - delete all records for this wallet
+            conn.execute("DELETE FROM positions WHERE wallet_address = ?", (wallet,))
+
+
+# ==============================================================================
+# Background Orderbook Refresher
+# ==============================================================================
+
+class OrderbookRefresher(threading.Thread):
+    """Background thread that polls Hyperliquid L2 orderbook data."""
+
+    HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
+    REFRESH_INTERVAL = 2  # seconds - orderbook needs frequent updates
+    COINS = ["BTC", "ETH", "SOL"]
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        """Main refresh loop."""
+        print("[OrderbookRefresher] Started background orderbook refresh")
+        while self._running:
+            try:
+                for coin in self.COINS:
+                    book = self._get_l2_book(coin)
+                    if book:
+                        update_orderbook_cache(coin, book)
+            except Exception as e:
+                print(f"[OrderbookRefresher] Error: {e}")
+
+            # Sleep in small increments
+            for _ in range(self.REFRESH_INTERVAL * 2):
+                if not self._running:
+                    break
+                time.sleep(0.5)
+
+        print("[OrderbookRefresher] Stopped")
+
+    def _get_l2_book(self, coin: str) -> Optional[Dict]:
+        """Get L2 order book for a coin."""
+        try:
+            resp = requests.post(
+                self.HYPERLIQUID_API,
+                json={"type": "l2Book", "coin": coin},
+                timeout=5
+            )
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            levels = data.get("levels", [[], []])
+
+            if len(levels) < 2:
+                return None
+
+            bids_raw = levels[0]
+            asks_raw = levels[1]
+
+            # Calculate mid price
+            if bids_raw and asks_raw:
+                try:
+                    mid_price = (float(bids_raw[0]["px"]) + float(asks_raw[0]["px"])) / 2
+                except (ValueError, KeyError):
+                    mid_price = 0
+            else:
+                mid_price = 0
+
+            # Parse bids
+            bids = []
+            cumulative = 0.0
+            for level in bids_raw[:20]:
+                try:
+                    price = float(level["px"])
+                    size = float(level["sz"])
+                    value = price * size
+                    cumulative += value
+                    pct_from_mid = ((price / mid_price) - 1) * 100 if mid_price > 0 else 0
+                    bids.append({
+                        "price": price,
+                        "size": size,
+                        "value": value,
+                        "cumulative": cumulative,
+                        "pct_from_mid": pct_from_mid
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+            # Parse asks
+            asks = []
+            cumulative = 0.0
+            for level in asks_raw[:20]:
+                try:
+                    price = float(level["px"])
+                    size = float(level["sz"])
+                    value = price * size
+                    cumulative += value
+                    pct_from_mid = ((price / mid_price) - 1) * 100 if mid_price > 0 else 0
+                    asks.append({
+                        "price": price,
+                        "size": size,
+                        "value": value,
+                        "cumulative": cumulative,
+                        "pct_from_mid": pct_from_mid
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+            return {
+                "coin": coin,
+                "mid_price": mid_price,
+                "bids": bids,
+                "asks": asks,
+                "total_bid_depth": bids[-1]["cumulative"] if bids else 0,
+                "total_ask_depth": asks[-1]["cumulative"] if asks else 0,
+                "timestamp": time.time()
+            }
+
+        except Exception as e:
+            print(f"[OrderbookRefresher] Error fetching {coin}: {e}")
+            return None
 
 
 # ==============================================================================
@@ -490,8 +1957,8 @@ class HyperliquidPositionsTable(QTableWidget):
 
     def __init__(self):
         super().__init__()
-        self.setColumnCount(6)
-        self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Dist %", "Impact"])
+        self.setColumnCount(7)
+        self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Liq Price", "Dist %", "Impact"])
 
         # Style
         self.setStyleSheet(f"""
@@ -557,22 +2024,48 @@ class HyperliquidPositionsTable(QTableWidget):
             value_item.setFont(QFont("Consolas", 9, QFont.Bold))
             self.setItem(row, 3, value_item)
 
-            # Distance %
+            # Liquidation Price - high precision for accurate tracking
+            liq_price = pos.get('liquidation_price', 0)
+            if liq_price and liq_price > 0:
+                if liq_price >= 10000:
+                    liq_text = f"${liq_price:,.0f}"  # BTC: $91,312
+                elif liq_price >= 100:
+                    liq_text = f"${liq_price:,.2f}"  # SOL: $187.42
+                elif liq_price >= 1:
+                    liq_text = f"${liq_price:.4f}"   # XRP: $2.0712
+                elif liq_price >= 0.01:
+                    liq_text = f"${liq_price:.5f}"   # SHIB: $0.00002
+                else:
+                    liq_text = f"${liq_price:.6f}"   # Tiny shitcoins
+            else:
+                liq_text = "--"
+            liq_item = QTableWidgetItem(liq_text)
+            liq_item.setFont(QFont("Consolas", 9))
+            liq_item.setForeground(QColor(COLORS['warning']))
+            self.setItem(row, 4, liq_item)
+
+            # Distance % (negative = past liquidation)
             dist = pos.get('distance_to_liq_pct', 999)
-            dist_item = QTableWidgetItem(f"{dist:.1f}%")
+            if dist < 0:
+                dist_item = QTableWidgetItem("⚡ LIQ!")
+                dist_item.setForeground(QColor("#ff0000"))  # Bright red
+            elif dist < 0.1:
+                dist_item = QTableWidgetItem(f"⚠️ {dist:.2f}%")
+                dist_item.setForeground(QColor(COLORS['short']))  # Red - critical
+            else:
+                dist_item = QTableWidgetItem(f"{dist:.1f}%")
+                # Color by proximity
+                if dist < 1.0:
+                    dist_item.setForeground(QColor(COLORS['short']))  # Red - critical
+                elif dist < 3.0:
+                    dist_item.setForeground(QColor(COLORS['critical']))  # Orange
+                elif dist < 5.0:
+                    dist_item.setForeground(QColor(COLORS['warning']))  # Yellow
+                else:
+                    dist_item.setForeground(QColor(COLORS['text_dim']))
             dist_item.setFont(QFont("Consolas", 9))
 
-            # Color by proximity
-            if dist < 1.0:
-                dist_item.setForeground(QColor(COLORS['short']))  # Red - critical
-            elif dist < 3.0:
-                dist_item.setForeground(QColor(COLORS['critical']))  # Orange
-            elif dist < 5.0:
-                dist_item.setForeground(QColor(COLORS['warning']))  # Yellow
-            else:
-                dist_item.setForeground(QColor(COLORS['text_dim']))
-
-            self.setItem(row, 4, dist_item)
+            self.setItem(row, 5, dist_item)
 
             # Impact Score (% of daily volume)
             impact = pos.get('impact_score', 0)
@@ -595,9 +2088,352 @@ class HyperliquidPositionsTable(QTableWidget):
             else:
                 impact_item.setForeground(QColor(COLORS['text']))
 
-            self.setItem(row, 5, impact_item)
+            self.setItem(row, 6, impact_item)
 
         self.resizeRowsToContents()
+
+
+class LiquidationHeatmapWidget(QFrame):
+    """
+    Visual heatmap showing liquidation level concentrations.
+
+    Displays horizontal bars at each price level showing:
+    - Red bars (left): Short liquidations (above current price)
+    - Green bars (right): Long liquidations (below current price)
+    - Bar width proportional to $ value at that level
+    - Current price marked with horizontal line
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(f"background-color: {COLORS['panel_bg']}; border-radius: 4px;")
+        self.setMinimumHeight(300)
+        self.setMinimumWidth(250)
+
+        self._data = None
+        self._coin = "BTC"
+        self._price_range = 5.0  # +/- 5% from current price
+        self._bucket_size = 0.25  # 0.25% buckets
+
+        # Layout
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        # Header with coin selector
+        header_layout = QHBoxLayout()
+
+        title = QLabel("LIQUIDATION HEATMAP")
+        title.setFont(QFont("Consolas", 9, QFont.Bold))
+        title.setStyleSheet(f"color: {COLORS['header']};")
+        header_layout.addWidget(title)
+
+        header_layout.addStretch()
+
+        # Coin buttons
+        self.coin_buttons = {}
+        for coin in ["BTC", "ETH", "SOL"]:
+            btn = QPushButton(coin)
+            btn.setCheckable(True)
+            btn.setChecked(coin == self._coin)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['header']};
+                    color: #000;
+                    border: none;
+                    padding: 2px 6px;
+                    font-size: 9px;
+                    font-weight: bold;
+                    border-radius: 2px;
+                }}
+                QPushButton:!checked {{
+                    background-color: {COLORS['panel_bg']};
+                    color: {COLORS['text_dim']};
+                    border: 1px solid {COLORS['border']};
+                }}
+            """)
+            btn.clicked.connect(lambda checked, c=coin: self._set_coin(c))
+            header_layout.addWidget(btn)
+            self.coin_buttons[coin] = btn
+
+        layout.addLayout(header_layout)
+
+        # Summary row
+        self.summary_label = QLabel("Loading...")
+        self.summary_label.setFont(QFont("Consolas", 8))
+        self.summary_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        layout.addWidget(self.summary_label)
+
+        # Absorption status row
+        self.absorption_label = QLabel("")
+        self.absorption_label.setFont(QFont("Consolas", 8))
+        self.absorption_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        layout.addWidget(self.absorption_label)
+
+        # Scroll area for heatmap bars
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"""
+            QScrollArea {{
+                border: none;
+                background-color: {COLORS['panel_bg']};
+            }}
+            QScrollBar:vertical {{
+                background-color: {COLORS['panel_bg']};
+                width: 8px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {COLORS['border']};
+                border-radius: 4px;
+            }}
+        """)
+
+        self.heatmap_container = QWidget()
+        self.heatmap_layout = QVBoxLayout()
+        self.heatmap_layout.setContentsMargins(0, 0, 0, 0)
+        self.heatmap_layout.setSpacing(1)
+        self.heatmap_container.setLayout(self.heatmap_layout)
+        scroll.setWidget(self.heatmap_container)
+
+        layout.addWidget(scroll)
+
+        # Legend
+        legend_layout = QHBoxLayout()
+        legend_layout.setSpacing(10)
+
+        long_legend = QLabel("■ Long Liqs (below)")
+        long_legend.setFont(QFont("Consolas", 8))
+        long_legend.setStyleSheet(f"color: {COLORS['long']};")
+        legend_layout.addWidget(long_legend)
+
+        short_legend = QLabel("■ Short Liqs (above)")
+        short_legend.setFont(QFont("Consolas", 8))
+        short_legend.setStyleSheet(f"color: {COLORS['short']};")
+        legend_layout.addWidget(short_legend)
+
+        legend_layout.addStretch()
+        layout.addLayout(legend_layout)
+
+        self.setLayout(layout)
+
+    def _set_coin(self, coin: str):
+        """Change the selected coin."""
+        self._coin = coin
+        for c, btn in self.coin_buttons.items():
+            btn.setChecked(c == coin)
+        self.refresh_data()
+
+    def refresh_data(self):
+        """Reload heatmap data from database and compute absorption analysis."""
+        self._data = load_liquidation_heatmap_data(
+            coin=self._coin,
+            price_range_pct=self._price_range,
+            bucket_size_pct=self._bucket_size
+        )
+
+        # Get orderbook for absorption analysis
+        orderbook = get_cached_orderbook(self._coin)
+        self._absorption = compute_absorption_analysis(self._data, orderbook)
+
+        self._render_heatmap()
+
+    def _render_heatmap(self):
+        """Render the heatmap visualization."""
+        # Clear existing bars
+        while self.heatmap_layout.count():
+            item = self.heatmap_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._data or not self._data.get("buckets"):
+            no_data = QLabel("No liquidation data available")
+            no_data.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 20px;")
+            no_data.setAlignment(Qt.AlignCenter)
+            self.heatmap_layout.addWidget(no_data)
+            self.summary_label.setText("No data")
+            return
+
+        current_price = self._data["current_price"]
+        max_value = self._data["max_bucket_value"]
+        total_long = self._data["total_long_value"]
+        total_short = self._data["total_short_value"]
+
+        # Update summary
+        self.summary_label.setText(
+            f"{self._coin} @ ${current_price:,.0f} | "
+            f"Longs: {format_value(total_long)} | "
+            f"Shorts: {format_value(total_short)}"
+        )
+
+        # Update absorption status
+        if hasattr(self, '_absorption') and self._absorption:
+            abs_data = self._absorption
+            if abs_data.get('no_book_data'):
+                self.absorption_label.setText("Book: No data")
+                self.absorption_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+            else:
+                bid_depth = abs_data.get('total_bid_depth', 0)
+                ask_depth = abs_data.get('total_ask_depth', 0)
+                can_absorb_longs = abs_data.get('can_absorb_longs', True)
+                can_absorb_shorts = abs_data.get('can_absorb_shorts', True)
+
+                # Build status text
+                long_status = "OK" if can_absorb_longs else "THIN"
+                short_status = "OK" if can_absorb_shorts else "THIN"
+
+                long_color = COLORS['long'] if can_absorb_longs else COLORS['short']
+                short_color = COLORS['long'] if can_absorb_shorts else COLORS['short']
+
+                self.absorption_label.setText(
+                    f"Book: Bids {format_value(bid_depth)} ({long_status}) | "
+                    f"Asks {format_value(ask_depth)} ({short_status})"
+                )
+
+                # Color based on worst case
+                if not can_absorb_longs or not can_absorb_shorts:
+                    self.absorption_label.setStyleSheet(f"color: {COLORS['warning']}; font-weight: bold;")
+                else:
+                    self.absorption_label.setStyleSheet(f"color: {COLORS['long']};")
+        else:
+            self.absorption_label.setText("Book: Loading...")
+
+        if max_value == 0:
+            no_data = QLabel("No positions in range")
+            no_data.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 20px;")
+            no_data.setAlignment(Qt.AlignCenter)
+            self.heatmap_layout.addWidget(no_data)
+            return
+
+        # Render bars from highest price to lowest (top to bottom)
+        buckets = sorted(self._data["buckets"], key=lambda b: -b["pct_from_current"])
+
+        for bucket in buckets:
+            pct = bucket["pct_from_current"]
+            price = bucket["price_level"]
+            long_val = bucket["long_value"]
+            short_val = bucket["short_value"]
+            total = bucket["total_value"]
+
+            # Skip empty buckets
+            if total < 1000:
+                continue
+
+            # Create row widget
+            row = QWidget()
+            row.setFixedHeight(18)
+            row_layout = QHBoxLayout()
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+
+            # Price label (left side)
+            if price >= 1000:
+                price_text = f"${price:,.0f}"
+            elif price >= 1:
+                price_text = f"${price:.2f}"
+            else:
+                price_text = f"${price:.4f}"
+
+            pct_text = f"{pct:+.1f}%"
+            price_label = QLabel(f"{pct_text}")
+            price_label.setFixedWidth(45)
+            price_label.setFont(QFont("Consolas", 8))
+            price_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            # Highlight current price level
+            if abs(pct) < self._bucket_size:
+                price_label.setStyleSheet(f"color: {COLORS['header']}; font-weight: bold;")
+            elif pct > 0:
+                price_label.setStyleSheet(f"color: {COLORS['short']};")  # Above = shorts get liquidated
+            else:
+                price_label.setStyleSheet(f"color: {COLORS['long']};")  # Below = longs get liquidated
+
+            row_layout.addWidget(price_label)
+
+            # Bar container (center)
+            bar_container = QWidget()
+            bar_container.setFixedHeight(14)
+            bar_layout = QHBoxLayout()
+            bar_layout.setContentsMargins(0, 0, 0, 0)
+            bar_layout.setSpacing(0)
+
+            # Calculate bar widths (max 100px each side)
+            max_bar_width = 80
+            long_width = int((long_val / max_value) * max_bar_width) if max_value > 0 else 0
+            short_width = int((short_val / max_value) * max_bar_width) if max_value > 0 else 0
+
+            # Short bar (left side, red) - shorts liquidate above current price
+            short_bar = QFrame()
+            short_bar.setFixedSize(max_bar_width, 12)
+            if short_width > 0 and pct > 0:  # Only show shorts above current price
+                intensity = min(255, int(150 + (short_val / max_value) * 105))
+                short_bar.setStyleSheet(f"""
+                    background: qlineargradient(x1:1, y1:0, x2:0, y2:0,
+                        stop:0 rgba({intensity}, 68, 68, 255),
+                        stop:{short_width/max_bar_width:.2f} rgba({intensity}, 68, 68, 255),
+                        stop:{short_width/max_bar_width + 0.01:.2f} transparent);
+                    border-radius: 2px;
+                """)
+            else:
+                short_bar.setStyleSheet("background: transparent;")
+            bar_layout.addWidget(short_bar)
+
+            # Center marker (current price line)
+            center = QFrame()
+            center.setFixedSize(2, 14)
+            if abs(pct) < self._bucket_size:
+                center.setStyleSheet(f"background-color: {COLORS['header']};")
+            else:
+                center.setStyleSheet(f"background-color: {COLORS['border']};")
+            bar_layout.addWidget(center)
+
+            # Long bar (right side, green) - longs liquidate below current price
+            long_bar = QFrame()
+            long_bar.setFixedSize(max_bar_width, 12)
+            if long_width > 0 and pct < 0:  # Only show longs below current price
+                intensity = min(255, int(150 + (long_val / max_value) * 105))
+                long_bar.setStyleSheet(f"""
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 rgba(68, {intensity}, 68, 255),
+                        stop:{long_width/max_bar_width:.2f} rgba(68, {intensity}, 68, 255),
+                        stop:{long_width/max_bar_width + 0.01:.2f} transparent);
+                    border-radius: 2px;
+                """)
+            else:
+                long_bar.setStyleSheet("background: transparent;")
+            bar_layout.addWidget(long_bar)
+
+            bar_container.setLayout(bar_layout)
+            row_layout.addWidget(bar_container)
+
+            # Value label (right side)
+            value_label = QLabel(format_value(total))
+            value_label.setFixedWidth(50)
+            value_label.setFont(QFont("Consolas", 8))
+            value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+            if total >= 1_000_000:
+                value_label.setStyleSheet(f"color: {COLORS['short']}; font-weight: bold;")
+            elif total >= 100_000:
+                value_label.setStyleSheet(f"color: {COLORS['warning']};")
+            else:
+                value_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+            row_layout.addWidget(value_label)
+
+            row.setLayout(row_layout)
+            self.heatmap_layout.addWidget(row)
+
+        # Add stretch at bottom
+        self.heatmap_layout.addStretch()
+
+    def update_data(self, data: Dict = None):
+        """Update with new data or refresh from database."""
+        if data:
+            self._data = data
+            self._render_heatmap()
+        else:
+            self.refresh_data()
 
 
 class CascadeStateWidget(QFrame):
@@ -640,6 +2476,14 @@ class CascadeStateWidget(QFrame):
         self.closest_label.setStyleSheet(f"color: {COLORS['warning']};")
         layout.addWidget(self.closest_label)
 
+        # Zoom mode indicator
+        self.zoom_label = QLabel("")
+        self.zoom_label.setFont(QFont("Consolas", 9, QFont.Bold))
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        self.zoom_label.setStyleSheet(f"color: {COLORS['header']}; background-color: #1a3a3a; padding: 3px; border-radius: 3px;")
+        self.zoom_label.hide()  # Hidden by default
+        layout.addWidget(self.zoom_label)
+
         self.setLayout(layout)
 
     def update_data(self, state: Dict):
@@ -650,26 +2494,551 @@ class CascadeStateWidget(QFrame):
         # Color by phase
         phase_colors = {
             "NONE": COLORS['idle'],
+            "NO_DATA": COLORS['idle'],
+            "MONITORING": COLORS['text_dim'],
             "PROXIMITY": COLORS['warning'],
             "LIQUIDATING": COLORS['critical'],
             "CASCADING": COLORS['short'],
-            "EXHAUSTED": COLORS['long'],
+            "ERROR": COLORS['short'],
         }
         color = phase_colors.get(phase, COLORS['idle'])
         self.phase_label.setStyleSheet(f"color: {color}; padding: 5px;")
 
-        self.liq_label.setText(f"Liquidations (30s): {state.get('liquidations_30s', 0)}")
+        positions_at_risk = state.get('positions_at_risk', 0)
+        self.liq_label.setText(f"Positions at risk: {positions_at_risk}")
         self.total_label.setText(
-            f"Total at risk: {format_value(state.get('total_at_risk', 0))} "
-            f"({state.get('total_positions', 0)} pos)"
+            f"Value at risk: {format_value(state.get('total_at_risk', 0))}"
         )
 
         closest = state.get('closest_pct')
         closest_sym = state.get('closest_symbol')
         if closest is not None and closest_sym:
-            self.closest_label.setText(f"Closest: {closest_sym} ({closest:.2f}%)")
+            self.closest_label.setText(f"Closest: {closest_sym} ({closest:.1f}%)")
+            # Color based on proximity
+            if closest < 1.0:
+                self.closest_label.setStyleSheet(f"color: {COLORS['short']}; font-weight: bold;")
+            elif closest < 3.0:
+                self.closest_label.setStyleSheet(f"color: {COLORS['warning']};")
+            else:
+                self.closest_label.setStyleSheet(f"color: {COLORS['text_dim']};")
         else:
             self.closest_label.setText("Closest: --")
+            self.closest_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+    def update_zoom_status(self, zoom_status: Dict):
+        """Update zoom mode indicator."""
+        if zoom_status.get('active'):
+            count = zoom_status.get('priority_wallets', 0)
+            positions = zoom_status.get('positions', [])
+            if positions:
+                top_pos = positions[0]
+                self.zoom_label.setText(
+                    f"🔍 ZOOM: {count} wallet(s) | {top_pos['coin']} {top_pos['dist_pct']:.2f}%"
+                )
+            else:
+                self.zoom_label.setText(f"🔍 ZOOM: {count} wallet(s)")
+            self.zoom_label.setStyleSheet(
+                f"color: {COLORS['warning']}; background-color: #3a2a1a; "
+                f"padding: 3px; border-radius: 3px; font-weight: bold;"
+            )
+            self.zoom_label.show()
+        else:
+            self.zoom_label.hide()
+
+
+class CascadeWarningWidget(QFrame):
+    """Panel showing cascade warnings - positions that will enter danger zone with price movement."""
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(f"background-color: {COLORS['panel_bg']}; border-radius: 4px;")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+
+        # Title row
+        title_row = QHBoxLayout()
+        title = QLabel("⚠️ CASCADE WARNING")
+        title.setFont(QFont("Consolas", 9, QFont.Bold))
+        title.setStyleSheet(f"color: {COLORS['warning']};")
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        self.refresh_btn = QPushButton("↻")
+        self.refresh_btn.setFixedSize(20, 20)
+        self.refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['border']};
+                color: {COLORS['text']};
+                border: none;
+                border-radius: 3px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['header']};
+            }}
+        """)
+        self.refresh_btn.clicked.connect(self._refresh_cascade_data)
+        title_row.addWidget(self.refresh_btn)
+        layout.addLayout(title_row)
+
+        # Summary labels - separate LONG (drop) and SHORT (rise) risk
+        self.summary_longs = QLabel("▼ 5% drop: $0 LONGS at risk")
+        self.summary_longs.setFont(QFont("Consolas", 9))
+        self.summary_longs.setStyleSheet(f"color: {COLORS['short']};")
+        layout.addWidget(self.summary_longs)
+
+        self.summary_shorts = QLabel("▲ 5% rise: $0 SHORTS at risk")
+        self.summary_shorts.setFont(QFont("Consolas", 9))
+        self.summary_shorts.setStyleSheet(f"color: {COLORS['long']};")
+        layout.addWidget(self.summary_shorts)
+
+        self.summary_cascade = QLabel("Cascade risk: $0")
+        self.summary_cascade.setFont(QFont("Consolas", 8))
+        self.summary_cascade.setStyleSheet(f"color: {COLORS['warning']};")
+        layout.addWidget(self.summary_cascade)
+
+        # Coin breakdown table
+        self.coin_table = QTableWidget()
+        self.coin_table.setColumnCount(4)
+        self.coin_table.setHorizontalHeaderLabels(["Coin", "Move", "Value", "Impact"])
+        self.coin_table.setMaximumHeight(120)
+        self.coin_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['panel_bg']};
+                color: {COLORS['text']};
+                border: none;
+                font-size: 10px;
+            }}
+            QHeaderView::section {{
+                background-color: #1a1a2a;
+                color: {COLORS['header']};
+                font-weight: bold;
+                padding: 2px;
+                border: none;
+                font-size: 9px;
+            }}
+            QTableWidget::item {{
+                padding: 2px;
+            }}
+        """)
+        self.coin_table.horizontalHeader().setStretchLastSection(True)
+        self.coin_table.verticalHeader().setVisible(False)
+        self.coin_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.coin_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.coin_table)
+
+        self.setLayout(layout)
+
+        # Cache for cascade data
+        self._cascade_data = []
+        self._last_refresh = 0
+
+    def _refresh_cascade_data(self):
+        """Refresh cascade warning data from database.
+
+        Improved calculation:
+        1. Separates LONG (affected by drops) vs SHORT (affected by rises)
+        2. Uses current price for value calculation
+        3. Calculates cascade risk (high impact positions trigger more liquidations)
+        """
+        import sqlite3
+        import time
+
+        try:
+            conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5)
+            cursor = conn.cursor()
+
+            # Get all positions with liquidation info
+            cursor.execute("""
+                SELECT coin, side, position_size, entry_price, liquidation_price,
+                       impact_score, daily_volume
+                FROM positions
+                WHERE liquidation_price IS NOT NULL
+                  AND liquidation_price > 0
+                  AND position_size != 0
+            """)
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Get current prices
+            resp = requests.post(
+                'https://api.hyperliquid.xyz/info',
+                json={'type': 'allMids'},
+                timeout=5
+            )
+            mids = resp.json() if resp.status_code == 200 else {}
+
+            # Separate tracking for LONGS (drop risk) and SHORTS (rise risk)
+            longs_5pct = 0  # LONGS at risk from 5% drop
+            shorts_5pct = 0  # SHORTS at risk from 5% rise
+            cascade_risk = 0  # High-impact positions that trigger cascades
+
+            targets_by_coin = {}
+
+            for coin, side, size, entry, liq_px, impact, daily_vol in rows:
+                current = float(mids.get(coin, 0))
+                if current <= 0 or not size:
+                    continue
+
+                # Calculate current value (use current price, not entry)
+                current_value = abs(float(size) * current)
+                if current_value < 10000:  # Skip small positions
+                    continue
+
+                # Calculate distance to liquidation
+                dist_now = abs(current - liq_px) / current * 100
+                if dist_now < 3:  # Already in danger zone, skip
+                    continue
+
+                impact = impact or 0
+
+                # Calculate move needed to bring position to 3% from liq
+                target_dist = 3.0
+                if side == 'LONG':
+                    # LONG liquidates when price DROPS
+                    # liq_px is below current price
+                    price_at_danger = liq_px / (1 - target_dist / 100)
+                    move_needed = (current - price_at_danger) / current * 100
+
+                    if 0 < move_needed <= 5:
+                        longs_5pct += current_value
+                        # High impact positions add to cascade risk
+                        if impact > 20:
+                            cascade_risk += current_value * (impact / 100)
+                else:
+                    # SHORT liquidates when price RISES
+                    # liq_px is above current price
+                    price_at_danger = liq_px / (1 + target_dist / 100)
+                    move_needed = (price_at_danger - current) / current * 100
+
+                    if 0 < move_needed <= 5:
+                        shorts_5pct += current_value
+                        if impact > 20:
+                            cascade_risk += current_value * (impact / 100)
+
+                if move_needed < 0 or move_needed > 15:
+                    continue
+
+                # Track by coin for table
+                if coin not in targets_by_coin:
+                    targets_by_coin[coin] = {
+                        'long_value': 0, 'short_value': 0,
+                        'min_move': 100, 'impact': 0, 'side': side
+                    }
+
+                if side == 'LONG':
+                    targets_by_coin[coin]['long_value'] += current_value
+                else:
+                    targets_by_coin[coin]['short_value'] += current_value
+
+                targets_by_coin[coin]['min_move'] = min(targets_by_coin[coin]['min_move'], move_needed)
+                targets_by_coin[coin]['impact'] = max(targets_by_coin[coin]['impact'], impact)
+
+            # Update UI - separate LONG and SHORT risk
+            self.summary_longs.setText(f"▼ 5% drop: ${longs_5pct:,.0f} LONGS")
+            self.summary_shorts.setText(f"▲ 5% rise: ${shorts_5pct:,.0f} SHORTS")
+            self.summary_cascade.setText(f"⚡ Cascade risk: ${cascade_risk:,.0f}")
+
+            # Color based on risk level
+            if longs_5pct > 5_000_000:
+                self.summary_longs.setStyleSheet(f"color: {COLORS['short']}; font-weight: bold;")
+            elif longs_5pct > 1_000_000:
+                self.summary_longs.setStyleSheet(f"color: {COLORS['critical']};")
+            else:
+                self.summary_longs.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+            if shorts_5pct > 5_000_000:
+                self.summary_shorts.setStyleSheet(f"color: {COLORS['long']}; font-weight: bold;")
+            elif shorts_5pct > 1_000_000:
+                self.summary_shorts.setStyleSheet(f"color: {COLORS['warning']};")
+            else:
+                self.summary_shorts.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+            if cascade_risk > 1_000_000:
+                self.summary_cascade.setStyleSheet(f"color: {COLORS['critical']}; font-weight: bold;")
+            else:
+                self.summary_cascade.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+            # Update table - show total value and dominant side
+            for coin in targets_by_coin:
+                data = targets_by_coin[coin]
+                data['value'] = data['long_value'] + data['short_value']
+                # Show which side dominates
+                if data['long_value'] > data['short_value']:
+                    data['side'] = 'L'
+                else:
+                    data['side'] = 'S'
+
+            sorted_coins = sorted(targets_by_coin.items(), key=lambda x: x[1]['value'], reverse=True)[:8]
+            self.coin_table.setRowCount(len(sorted_coins))
+
+            for i, (coin, data) in enumerate(sorted_coins):
+                # Coin with side indicator
+                coin_text = f"{coin} {data['side']}"
+                self.coin_table.setItem(i, 0, QTableWidgetItem(coin_text))
+                self.coin_table.setItem(i, 1, QTableWidgetItem(f"{data['min_move']:.1f}%"))
+                self.coin_table.setItem(i, 2, QTableWidgetItem(f"${data['value']/1000:.0f}k"))
+                self.coin_table.setItem(i, 3, QTableWidgetItem(f"{data['impact']:.0f}%"))
+
+                # Color by side
+                if data['side'] == 'L':
+                    self.coin_table.item(i, 0).setForeground(QColor(COLORS['short']))
+                else:
+                    self.coin_table.item(i, 0).setForeground(QColor(COLORS['long']))
+
+                # Color high impact red
+                if data['impact'] > 30:
+                    self.coin_table.item(i, 3).setForeground(QColor(COLORS['short']))
+                elif data['impact'] > 10:
+                    self.coin_table.item(i, 3).setForeground(QColor(COLORS['warning']))
+
+                # Color small moves orange
+                if data['min_move'] < 3:
+                    self.coin_table.item(i, 1).setForeground(QColor(COLORS['critical']))
+
+            self._last_refresh = time.time()
+
+        except Exception as e:
+            print(f"[CascadeWarning] Error: {e}")
+
+    def showEvent(self, event):
+        """Refresh data when widget becomes visible."""
+        super().showEvent(event)
+        if time.time() - self._last_refresh > 30:
+            self._refresh_cascade_data()
+
+
+class WhaleBiasWidget(QFrame):
+    """Panel showing whale long/short bias for major coins."""
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(f"background-color: {COLORS['panel_bg']}; border-radius: 4px;")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+
+        # Title row
+        title_row = QHBoxLayout()
+        title = QLabel("📊 WHALE BIAS")
+        title.setFont(QFont("Consolas", 9, QFont.Bold))
+        title.setStyleSheet(f"color: {COLORS['header']};")
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        self.refresh_btn = QPushButton("↻")
+        self.refresh_btn.setFixedSize(20, 20)
+        self.refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['border']};
+                color: {COLORS['text']};
+                border: none;
+                border-radius: 3px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['header']};
+            }}
+        """)
+        self.refresh_btn.clicked.connect(self._refresh_bias_data)
+        title_row.addWidget(self.refresh_btn)
+        layout.addLayout(title_row)
+
+        # Summary label
+        self.summary_label = QLabel("Loading whale positioning...")
+        self.summary_label.setFont(QFont("Consolas", 8))
+        self.summary_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        layout.addWidget(self.summary_label)
+
+        # Bias table
+        self.bias_table = QTableWidget()
+        self.bias_table.setColumnCount(5)
+        self.bias_table.setHorizontalHeaderLabels(["Coin", "Long $", "Short $", "Bias", "Signal"])
+        self.bias_table.setMaximumHeight(140)
+        self.bias_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['panel_bg']};
+                color: {COLORS['text']};
+                border: none;
+                font-size: 10px;
+            }}
+            QHeaderView::section {{
+                background-color: #1a1a2a;
+                color: {COLORS['header']};
+                font-weight: bold;
+                padding: 2px;
+                border: none;
+                font-size: 9px;
+            }}
+            QTableWidget::item {{
+                padding: 2px;
+            }}
+        """)
+        self.bias_table.horizontalHeader().setStretchLastSection(True)
+        self.bias_table.verticalHeader().setVisible(False)
+        self.bias_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.bias_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.bias_table)
+
+        # Retail sentiment row
+        self.retail_label = QLabel("Retail: -- wallets tracked")
+        self.retail_label.setFont(QFont("Consolas", 8))
+        self.retail_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        layout.addWidget(self.retail_label)
+
+        self.setLayout(layout)
+
+        # Cache
+        self._last_refresh = 0
+        self._bias_data = {}
+
+    def _refresh_bias_data(self):
+        """Refresh whale bias data from database."""
+        import sqlite3
+        import time
+
+        try:
+            conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            cursor = conn.cursor()
+
+            # Get bias for major coins
+            coins = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE']
+            bias_data = []
+
+            for coin in coins:
+                cursor.execute("""
+                    SELECT
+                        SUM(CASE WHEN side='LONG' THEN ABS(position_value) ELSE 0 END) as long_val,
+                        SUM(CASE WHEN side='SHORT' THEN ABS(position_value) ELSE 0 END) as short_val,
+                        COUNT(DISTINCT wallet_address) as wallet_count
+                    FROM positions
+                    WHERE coin = ?
+                """, (coin,))
+                row = cursor.fetchone()
+
+                long_val = float(row[0] or 0)
+                short_val = float(row[1] or 0)
+                total = long_val + short_val
+
+                if total > 0:
+                    long_pct = long_val / total * 100
+                    short_pct = short_val / total * 100
+
+                    # Determine signal
+                    if short_pct > 75:
+                        signal = "🔥 SQUEEZE"
+                        signal_color = COLORS['long']
+                    elif short_pct > 60:
+                        signal = "↗ BEARISH"
+                        signal_color = COLORS['short']
+                    elif long_pct > 75:
+                        signal = "⚠ DUMP RISK"
+                        signal_color = COLORS['short']
+                    elif long_pct > 60:
+                        signal = "↘ BULLISH"
+                        signal_color = COLORS['long']
+                    else:
+                        signal = "→ NEUTRAL"
+                        signal_color = COLORS['text_dim']
+
+                    bias_data.append({
+                        'coin': coin,
+                        'long_val': long_val,
+                        'short_val': short_val,
+                        'long_pct': long_pct,
+                        'short_pct': short_pct,
+                        'signal': signal,
+                        'signal_color': signal_color,
+                        'wallets': row[2] or 0
+                    })
+
+            # Get retail wallet count (small wallets <$100k)
+            cursor.execute("""
+                SELECT COUNT(DISTINCT wallet_address)
+                FROM positions
+                WHERE ABS(position_value) < 100000
+            """)
+            retail_count = cursor.fetchone()[0] or 0
+
+            # Get total tracked wallets
+            cursor.execute("SELECT COUNT(DISTINCT wallet_address) FROM positions")
+            total_wallets = cursor.fetchone()[0] or 0
+
+            conn.close()
+
+            # Update table
+            self.bias_table.setRowCount(len(bias_data))
+            for i, data in enumerate(bias_data):
+                # Coin
+                item = QTableWidgetItem(data['coin'])
+                item.setTextAlignment(Qt.AlignCenter)
+                self.bias_table.setItem(i, 0, item)
+
+                # Long value
+                long_str = f"${data['long_val']/1e6:.1f}M" if data['long_val'] >= 1e6 else f"${data['long_val']/1e3:.0f}k"
+                item = QTableWidgetItem(long_str)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setForeground(QColor(COLORS['long']))
+                self.bias_table.setItem(i, 1, item)
+
+                # Short value
+                short_str = f"${data['short_val']/1e6:.1f}M" if data['short_val'] >= 1e6 else f"${data['short_val']/1e3:.0f}k"
+                item = QTableWidgetItem(short_str)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                item.setForeground(QColor(COLORS['short']))
+                self.bias_table.setItem(i, 2, item)
+
+                # Bias bar (text representation)
+                bias_str = f"L:{data['long_pct']:.0f}% S:{data['short_pct']:.0f}%"
+                item = QTableWidgetItem(bias_str)
+                item.setTextAlignment(Qt.AlignCenter)
+                # Color based on dominant side
+                if data['short_pct'] > 60:
+                    item.setForeground(QColor(COLORS['short']))
+                elif data['long_pct'] > 60:
+                    item.setForeground(QColor(COLORS['long']))
+                self.bias_table.setItem(i, 3, item)
+
+                # Signal
+                item = QTableWidgetItem(data['signal'])
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setForeground(QColor(data['signal_color']))
+                self.bias_table.setItem(i, 4, item)
+
+            # Update summary
+            total_long = sum(d['long_val'] for d in bias_data)
+            total_short = sum(d['short_val'] for d in bias_data)
+            if total_long + total_short > 0:
+                overall_short_pct = total_short / (total_long + total_short) * 100
+                self.summary_label.setText(
+                    f"Overall: {overall_short_pct:.0f}% SHORT | {total_wallets} wallets"
+                )
+                if overall_short_pct > 65:
+                    self.summary_label.setStyleSheet(f"color: {COLORS['short']};")
+                elif overall_short_pct < 35:
+                    self.summary_label.setStyleSheet(f"color: {COLORS['long']};")
+                else:
+                    self.summary_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+
+            # Update retail label
+            self.retail_label.setText(f"Retail (<$100k): {retail_count} wallets tracked")
+
+            self._last_refresh = time.time()
+            self._bias_data = bias_data
+
+        except Exception as e:
+            print(f"[WhaleBias] Error: {e}")
+
+    def showEvent(self, event):
+        """Refresh data when widget becomes visible."""
+        super().showEvent(event)
+        if time.time() - self._last_refresh > 30:
+            self._refresh_bias_data()
 
 
 class PositionsPnLWidget(QTableWidget):
@@ -937,6 +3306,17 @@ class MainWindow(QMainWindow):
         self.obs_system = ObservationSystem(TOP_10_SYMBOLS)
         self.collector = CollectorService(self.obs_system, warmup_duration_sec=0)
 
+        # 1.5 Start background position refresher for Hyperliquid
+        self.position_refresher = PositionRefresher(HL_INDEXED_DB_PATH)
+        self.position_refresher.start()
+
+        # 1.6 Start background orderbook refresher for absorption analysis
+        self.orderbook_refresher = OrderbookRefresher()
+        self.orderbook_refresher.start()
+
+        # 1.7 Initialize Liquidation Fade Executor (dry run by default)
+        self._init_fade_executor()
+
         # 2. UI Setup
         self.stack = QStackedWidget()
         self.red_screen = RedScreenOfDeath()
@@ -1068,6 +3448,14 @@ class MainWindow(QMainWindow):
         self.cascade_widget = CascadeStateWidget()
         left_layout.addWidget(self.cascade_widget, stretch=1)
 
+        # Cascade Warning Panel (future liquidation targets)
+        self.cascade_warning = CascadeWarningWidget()
+        left_layout.addWidget(self.cascade_warning, stretch=2)
+
+        # Whale Bias Panel (long/short positioning)
+        self.whale_bias = WhaleBiasWidget()
+        left_layout.addWidget(self.whale_bias, stretch=2)
+
         # Primitives status
         self.primitives_row = PrimitivesStatusRow()
         left_layout.addWidget(self.primitives_row)
@@ -1102,9 +3490,32 @@ class MainWindow(QMainWindow):
         pos_group.setLayout(pos_layout)
         right_layout.addWidget(pos_group)
 
+        # Liquidation Heatmap
+        heatmap_group = QGroupBox("LIQUIDATION LEVELS")
+        heatmap_group.setFont(QFont("Consolas", 9, QFont.Bold))
+        heatmap_group.setStyleSheet(f"""
+            QGroupBox {{
+                color: {COLORS['warning']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                margin-top: 8px;
+                padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+            }}
+        """)
+        heatmap_layout = QVBoxLayout()
+        self.liquidation_heatmap = LiquidationHeatmapWidget()
+        heatmap_layout.addWidget(self.liquidation_heatmap)
+        heatmap_group.setLayout(heatmap_layout)
+        right_layout.addWidget(heatmap_group, stretch=3)
+
         # Order Book Depth
         self.orderbook_widget = OrderBookDepthWidget()
-        right_layout.addWidget(self.orderbook_widget)
+        right_layout.addWidget(self.orderbook_widget, stretch=1)
 
         # Trade History
         trade_group = QGroupBox("TRADE HISTORY")
@@ -1209,9 +3620,30 @@ class MainWindow(QMainWindow):
             hl_positions = load_hyperliquid_positions(limit=25, sort_by=self.hl_sort_mode)
             self.hl_positions_table.update_data(hl_positions)
 
+            # Update liquidation heatmap (every 5 seconds)
+            now = time.time()
+            if not hasattr(self, '_last_heatmap_refresh'):
+                self._last_heatmap_refresh = 0
+            if now - self._last_heatmap_refresh > 5.0:
+                self.liquidation_heatmap.refresh_data()
+                self._last_heatmap_refresh = now
+
             # Update cascade state
             cascade_state = aggregate_cascade_state(snapshot)
             self.cascade_widget.update_data(cascade_state)
+
+            # Update zoom mode status
+            if hasattr(self, 'position_refresher'):
+                zoom_status = self.position_refresher.get_zoom_status()
+                self.cascade_widget.update_zoom_status(zoom_status)
+
+            # Update cascade warning (every 30 seconds)
+            if hasattr(self, 'cascade_warning') and time.time() - self.cascade_warning._last_refresh > 30:
+                self.cascade_warning._refresh_cascade_data()
+
+            # Update whale bias (every 30 seconds)
+            if hasattr(self, 'whale_bias') and time.time() - self.whale_bias._last_refresh > 30:
+                self.whale_bias._refresh_bias_data()
 
             # Update order book depth
             depth = get_orderbook_depth(snapshot)
@@ -1236,8 +3668,165 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"UI Error: {e}")
 
+    def _init_fade_executor(self):
+        """Initialize the Liquidation Fade Executor (dry run mode by default)."""
+        self.fade_executor = None
+
+        if not HAS_FADE_EXECUTOR:
+            print("[FADE] Executor not available (import failed)")
+            return
+
+        # Create executor in dry run mode (no real orders)
+        config = FadeConfig(
+            min_liquidation_value=30_000,  # $30k minimum to fade
+            max_distance_pct=0.5,  # Only positions within 0.5% of liq
+            position_size_usd=500,  # $500 position size
+            take_profit_pct=0.4,  # 0.4% take profit
+            stop_loss_pct=0.3,  # 0.3% stop loss (before breakeven)
+            # Trailing TP / Breakeven protection
+            breakeven_trigger_pct=0.15,  # Move SL to breakeven when +0.15%
+            trailing_tp_enabled=True,  # Enable trailing take profit
+            trailing_distance_pct=0.1,  # Trail 0.1% behind peak price
+            max_concurrent_fades=2,  # Max 2 simultaneous fades
+            cooldown_seconds=60,  # 1 minute cooldown per coin
+            # CRITICAL: Impact filter to avoid traps
+            max_impact_pct=5.0,  # Skip if position/volume > 5%
+            min_orderbook_ratio=3.0,  # Skip if book depth < 3x position
+        )
+
+        self.fade_executor = LiquidationFadeExecutor(
+            config=config,
+            dry_run=True  # IMPORTANT: Start in dry run mode
+        )
+
+        # Connect to position refresher for liquidation detection
+        if hasattr(self, 'position_refresher'):
+            self.position_refresher.set_liquidation_callback(self._on_liquidation_detected)
+
+        # Set up liquidator exit callback
+        self.fade_executor.set_liquidator_exit_callback(self._on_liquidator_exit)
+
+        # Track the whale liquidator wallet (NOT position holder)
+        LIQUIDATOR_WALLET = '0x010461c14e146ac35fe42271bdc1134ee31c703a'
+        self.fade_executor.track_liquidator(LIQUIDATOR_WALLET)
+
+        # Start periodic check for liquidator exits (every 30 seconds)
+        self._liquidator_check_timer = QTimer(self)
+        self._liquidator_check_timer.timeout.connect(self._check_liquidator_exits)
+        self._liquidator_check_timer.start(30_000)  # 30 seconds
+
+        self.fade_executor.start()
+        print("[FADE] Executor initialized in DRY RUN mode")
+        print("[FADE] Config: $30k min, 0.4% TP, 0.3% SL")
+        print("[FADE] Breakeven: +0.15% triggers, then trail 0.1%")
+        print("[FADE] Impact filter: max 5% impact, min 3x book depth")
+        print(f"[FADE] Tracking liquidator: {LIQUIDATOR_WALLET[:10]}...")
+
+    def _on_liquidation_detected(self, event: Dict):
+        """Callback when liquidation is detected by position refresher."""
+        if not self.fade_executor:
+            return
+
+        coin = event.get('coin', '')
+        wallet = event.get('wallet', '')
+        value = event.get('value', 0)
+
+        # Log the detection
+        print(f"[FADE_SIGNAL] {coin} liquidation detected! Value: ${value:,.0f}")
+
+        # Update mid prices cache in executor
+        mid_prices = self.position_refresher._get_all_mids()
+        self.fade_executor.update_mid_prices(mid_prices)
+
+        # Trigger fade execution (async)
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        asyncio.create_task(self.fade_executor.on_liquidation(event))
+
+    def _on_liquidator_exit(self, exit_event: Dict):
+        """Callback when tracked liquidator exits a position."""
+        coin = exit_event.get('coin', '')
+        reduction_pct = exit_event.get('reduction_pct', 0)
+        is_full = exit_event.get('is_full_exit', False)
+        side = exit_event.get('side', '')
+        entry = exit_event.get('entry', 0)
+
+        action = "CLOSED" if is_full else f"REDUCED {reduction_pct:.0f}%"
+        print(f"\n{'='*60}")
+        print(f"[LIQUIDATOR EXIT] {coin} {side} position {action}")
+        print(f"[LIQUIDATOR EXIT] Entry was: ${entry:.6f}")
+        print(f"{'='*60}\n")
+
+        # If we have an active fade on this coin, consider exiting too
+        if self.fade_executor and coin in self.fade_executor._active_fades:
+            trade = self.fade_executor._active_fades[coin]
+            current_price = self.fade_executor._mid_prices.get(coin, 0)
+            if current_price > 0:
+                profit_pct = ((current_price - trade.entry_price) / trade.entry_price) * 100
+                print(f"[FADE] We have active {coin} position, profit: {profit_pct:+.2f}%")
+                # If liquidator exits and we're in profit, consider following
+                if profit_pct > 0:
+                    print(f"[FADE] Consider following liquidator exit!")
+
+    @Slot()
+    def _check_liquidator_exits(self):
+        """Periodic check for liquidator position changes."""
+        if not self.fade_executor:
+            return
+
+        try:
+            exits = self.fade_executor.check_liquidator_exits()
+            if exits:
+                print(f"[LIQUIDATOR] Detected {len(exits)} position change(s)")
+        except Exception as e:
+            print(f"[LIQUIDATOR] Check error: {e}")
+
+    def closeEvent(self, event):
+        """Clean up on window close."""
+        print("Shutting down...")
+        if hasattr(self, '_liquidator_check_timer'):
+            self._liquidator_check_timer.stop()
+        if hasattr(self, 'fade_executor') and self.fade_executor:
+            self.fade_executor.stop()
+        if hasattr(self, 'position_refresher'):
+            self.position_refresher.stop()
+        if hasattr(self, 'orderbook_refresher'):
+            self.orderbook_refresher.stop()
+        event.accept()
+
+
+def kill_existing_instances():
+    """Kill any existing instances of this app before starting."""
+    import subprocess
+    current_pid = os.getpid()
+    try:
+        # Find and kill other Python processes running main.py
+        result = subprocess.run(
+            ['wmic', 'process', 'where', "name='python.exe'", 'get', 'processid,commandline'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if 'native_app' in line.lower() and 'main.py' in line.lower():
+                parts = line.strip().split()
+                for part in parts:
+                    if part.isdigit():
+                        pid = int(part)
+                        if pid != current_pid:
+                            print(f"[STARTUP] Killing existing instance PID {pid}")
+                            subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+    except Exception as e:
+        print(f"[STARTUP] Could not check for existing instances: {e}")
+
 
 def main():
+    # Ensure single instance
+    kill_existing_instances()
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

@@ -31,6 +31,9 @@ except ImportError:
     Exchange = None
     Info = None
 
+# Paper trade persistence
+from .paper_trade_store import PaperTradeStore
+
 
 class FadeStatus(Enum):
     """Status of a fade trade."""
@@ -160,6 +163,10 @@ class LiquidationFadeExecutor:
         self._tracked_liquidators: Dict[str, Dict] = {}  # wallet -> {coin -> position_snapshot}
         self._liquidator_exit_callback: Optional[Callable] = None
 
+        # Paper trade persistence
+        self._store = PaperTradeStore()
+        self._trade_ids: Dict[str, str] = {}  # coin -> trade_id in DB
+
         if not HAS_SDK and not dry_run:
             self._logger.warning(
                 "hyperliquid-python-sdk not installed. "
@@ -168,6 +175,9 @@ class LiquidationFadeExecutor:
 
     def initialize(self) -> bool:
         """Initialize SDK connection."""
+        # Load active trades from DB
+        self._load_active_trades()
+
         if self.dry_run:
             self._logger.info("[DRY_RUN] Executor initialized in dry run mode")
             return True
@@ -201,6 +211,33 @@ class LiquidationFadeExecutor:
         except Exception as e:
             self._logger.error(f"Failed to initialize SDK: {e}")
             return False
+
+    def _load_active_trades(self):
+        """Load active trades from DB on startup."""
+        stored_trades = self._store.get_active_trades()
+        if not stored_trades:
+            return
+
+        for stored in stored_trades:
+            # Convert StoredTrade back to FadeTrade
+            trade = FadeTrade(
+                coin=stored.coin,
+                entry_price=stored.entry_price,
+                entry_time=stored.entry_time,
+                size=stored.size,
+                liquidated_wallet=stored.liquidated_wallet,
+                liquidation_value=stored.liquidation_value,
+                take_profit_price=stored.take_profit_price,
+                stop_loss_price=stored.stop_loss_price,
+                status=FadeStatus(stored.status.upper()) if stored.status else FadeStatus.ENTERED,
+                highest_price=stored.highest_price,
+                breakeven_triggered=stored.breakeven_triggered,
+                original_stop_loss=stored.original_stop_loss
+            )
+            self._active_fades[stored.coin] = trade
+            self._trade_ids[stored.coin] = stored.trade_id
+
+        self._logger.info(f"[STARTUP] Loaded {len(stored_trades)} active trades from DB")
 
     def start(self):
         """Start the executor."""
@@ -361,6 +398,7 @@ class LiquidationFadeExecutor:
         1. From activeAssetCtx: OI drop signals liquidation
         2. From userEvents: Direct liquidation event with details
         3. From trades: Large trade at support level
+        4. From WS position tracker: Pre-liquidation danger signal
         """
         if not self._running:
             return
@@ -371,6 +409,9 @@ class LiquidationFadeExecutor:
         if event_type == 'LIQUIDATION':
             # Direct liquidation event from userEvents
             await self._handle_direct_liquidation(event)
+        elif event_type == 'WS_DANGER_SIGNAL':
+            # Pre-liquidation signal from WebSocket position tracker
+            await self._handle_ws_danger_signal(event)
         elif event.get('is_liquidation_signal'):
             # OI-based liquidation signal from activeAssetCtx
             await self._handle_oi_liquidation(event)
@@ -439,6 +480,38 @@ class LiquidationFadeExecutor:
                 liquidation_value=liquidation_value,
                 liquidated_wallet=""
             )
+
+    async def _handle_ws_danger_signal(self, event: Dict):
+        """Handle pre-liquidation danger signal from WebSocket position tracker.
+
+        This is called when a position enters the CRITICAL danger zone (within 0.5% of liq).
+        The idea is to prepare for the liquidation cascade BEFORE it happens.
+        """
+        coin = event.get('coin')
+        value = event.get('position_value', 0)
+        wallet = event.get('wallet', '')
+        side = event.get('side', '')
+        distance_pct = event.get('distance_pct', 0)
+        danger_level = event.get('danger_level', 0)
+
+        # Only execute fade for significant positions
+        if not coin or value < self.config.min_liquidation_value:
+            self._logger.debug(
+                f"[WS_DANGER] Skipped {coin}: value ${value:,.0f} below min ${self.config.min_liquidation_value:,.0f}"
+            )
+            return
+
+        # Log the pre-liquidation signal
+        self._logger.info(
+            f"[WS_DANGER] {coin} {side} ${value:,.0f} @ {distance_pct:.2f}% from liq (level={danger_level})"
+        )
+
+        # Execute fade - the liquidation is imminent
+        await self._execute_fade(
+            coin=coin,
+            liquidation_value=value,
+            liquidated_wallet=wallet
+        )
 
     async def _handle_position_close(self, event: Dict):
         """Handle position close event (from position tracking)."""
@@ -529,6 +602,10 @@ class LiquidationFadeExecutor:
         # Track active fade
         self._active_fades[coin] = trade
         self._cooldowns[coin] = time.time()
+
+        # Persist to DB
+        trade_id = self._store.save_trade(trade)
+        self._trade_ids[coin] = trade_id
 
         # Callback
         if self._on_fade_entry:
@@ -666,6 +743,12 @@ class LiquidationFadeExecutor:
         # Move to history
         del self._active_fades[trade.coin]
         self._fade_history.append(trade)
+
+        # Update DB
+        if trade.coin in self._trade_ids:
+            trade_id = self._trade_ids.pop(trade.coin)
+            self._store.update_trade(trade_id, trade)
+            self._store.update_daily_stats(trade.pnl)
 
         # Place close order
         if not self.dry_run:
@@ -840,16 +923,31 @@ class LiquidationFadeExecutor:
 
     def get_stats(self) -> Dict:
         """Get executor statistics."""
-        total_trades = len(self._fade_history)
-        winning_trades = sum(1 for t in self._fade_history if t.pnl and t.pnl > 0)
-        total_pnl = sum(t.pnl or 0 for t in self._fade_history)
+        # Session stats (in-memory)
+        session_trades = len(self._fade_history)
+        session_wins = sum(1 for t in self._fade_history if t.pnl and t.pnl > 0)
+        session_pnl = sum(t.pnl or 0 for t in self._fade_history)
+
+        # All-time stats from DB
+        all_time = self._store.get_all_time_stats()
+        daily = self._store.get_daily_stats()
 
         return {
             'active_fades': len(self._active_fades),
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'win_rate': winning_trades / total_trades if total_trades > 0 else 0,
-            'total_pnl': total_pnl,
-            'daily_pnl': self._daily_pnl,
+            # Session
+            'session_trades': session_trades,
+            'session_wins': session_wins,
+            'session_pnl': session_pnl,
+            'session_win_rate': session_wins / session_trades if session_trades > 0 else 0,
+            # Daily
+            'daily_trades': daily['total_trades'],
+            'daily_pnl': daily['total_pnl'],
+            'daily_win_rate': daily['win_rate'],
+            # All-time
+            'total_trades': all_time['total_trades'],
+            'total_pnl': all_time['total_pnl'],
+            'all_time_win_rate': all_time['win_rate'],
+            'largest_win': all_time['largest_win'],
+            'largest_loss': all_time['largest_loss'],
             'is_running': self._running
         }

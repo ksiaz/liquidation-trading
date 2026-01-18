@@ -115,6 +115,16 @@ class DangerSignal:
     timestamp: float = field(default_factory=time.time)
 
 
+@dataclass
+class AccountSummary:
+    """Cross-margin account summary for proper liquidation price calculation."""
+    wallet: str
+    account_value: float  # Total equity from crossMarginSummary
+    total_notional: float  # Sum of all position notionals
+    total_margin_used: float  # Margin used across all positions
+    updated_at: float = 0.0
+
+
 class WSPositionTracker:
     """
     Manages multiple WebSocket connections for user state tracking.
@@ -163,6 +173,10 @@ class WSPositionTracker:
 
         # Danger tracking
         self._danger_positions: Dict[str, TrackedPosition] = {}  # key = wallet:coin
+
+        # Account summaries for cross-margin liquidation calculation
+        # Key = wallet address, Value = AccountSummary with equity/margin data
+        self._account_summaries: Dict[str, AccountSummary] = {}
 
         # Liquidation tracking - positions that were closed while in danger zone
         # Key = "wallet:coin", Value = timestamp when detected
@@ -519,6 +533,61 @@ class WSPositionTracker:
                 self._liquidated_positions[key] = time.time()
                 print(f"[WSTracker] ⚠️ LIQUIDATED - Removed: {wallet[:10]}...:{coin} (distance was {dist:.2f}%)")
 
+    def _calculate_cross_margin_liq_price(
+        self, wallet: str, entry_price: float, size: float, leverage: float
+    ) -> float:
+        """
+        Calculate liquidation price for cross-margin position using account-level data.
+
+        Formula from Hyperliquid docs:
+        liq_price = price - side × margin_available / position_size / (1 - maintenance_lev × side)
+
+        Where:
+        - margin_available = account_value - maintenance_margin_required
+        - maintenance_margin_required ≈ 5% of total notional
+
+        Falls back to leverage-based estimate if account data unavailable.
+        """
+        summary = self._account_summaries.get(wallet)
+
+        if not summary or summary.account_value <= 0:
+            # Fallback: estimate from leverage (less accurate)
+            buffer = 0.9  # 90% of theoretical max to be conservative
+            if size > 0:  # LONG
+                return entry_price * (1 - buffer / leverage)
+            else:  # SHORT
+                return entry_price * (1 + buffer / leverage)
+
+        # Calculate margin available
+        # Maintenance margin is ~5% of total notional (varies by asset)
+        maintenance_margin = abs(summary.total_notional) * 0.05
+        margin_available = summary.account_value - maintenance_margin
+
+        if margin_available <= 0:
+            # No spare margin - position is already close to liquidation
+            # Fall back to very tight estimate
+            if size > 0:
+                return entry_price * 0.99  # 1% below entry
+            else:
+                return entry_price * 1.01  # 1% above entry
+
+        # Apply the formula
+        side = 1 if size > 0 else -1
+        maintenance_lev = 0.05  # 5% maintenance = 20x max leverage at liquidation
+
+        try:
+            liq_price = entry_price - side * margin_available / abs(size) / (1 - maintenance_lev * side)
+            # Sanity check: liq price must be positive and reasonable
+            if liq_price <= 0:
+                return entry_price * (0.5 if size > 0 else 1.5)
+            return liq_price
+        except (ZeroDivisionError, ValueError):
+            # Fallback on math errors
+            if size > 0:
+                return entry_price * 0.9
+            else:
+                return entry_price * 1.1
+
     async def _handle_position_update(self, data: Dict):
         """Handle webData2 user state update."""
         user = data.get('user')
@@ -528,6 +597,24 @@ class WSPositionTracker:
             return
 
         self._stats['position_updates'] += 1
+
+        # Extract cross-margin summary for proper liquidation calculation
+        cross_margin = clearinghouse.get('crossMarginSummary', {})
+        if cross_margin:
+            try:
+                account_value = float(cross_margin.get('accountValue', 0))
+                total_ntl = float(cross_margin.get('totalNtlPos', 0))
+                total_margin = float(cross_margin.get('totalMarginUsed', 0))
+
+                self._account_summaries[user] = AccountSummary(
+                    wallet=user,
+                    account_value=account_value,
+                    total_notional=total_ntl,
+                    total_margin_used=total_margin,
+                    updated_at=time.time()
+                )
+            except (ValueError, TypeError):
+                pass  # Keep existing summary if parsing fails
 
         # Track which coins this wallet has
         new_coins: Set[str] = set()
@@ -572,10 +659,15 @@ class WSPositionTracker:
             if leverage <= 0:
                 leverage = 20
 
-            # If API returns no liq price (null), the position is well-collateralized
-            # with no meaningful liquidation risk - skip it
+            # If API returns no liq price (null), calculate using account-level data
+            # This happens for cross-margin positions or well-collateralized positions
             if liq_price <= 0:
-                continue
+                liq_price = self._calculate_cross_margin_liq_price(
+                    wallet=user,
+                    entry_price=entry_price,
+                    size=szi,
+                    leverage=leverage
+                )
 
             # Check if this position was recently liquidated - don't re-add during cooldown
             key = f"{user}:{coin}"
@@ -963,8 +1055,10 @@ class HybridPositionTracker:
         """Start hybrid tracking."""
         self._running = True
 
-        # Start with top 50 wallets on WS (will rebalance later)
-        await self.ws_tracker.start(initial_wallets[:50])
+        # Start with ALL danger wallets on WS for fastest detection
+        # Don't artificially limit - positions close to liquidation need real-time tracking
+        max_ws_wallets = min(len(initial_wallets), 100)  # Reasonable limit for WS connections
+        await self.ws_tracker.start(initial_wallets[:max_ws_wallets])
 
         # Set full wallet universe
         await self.prioritizer.set_wallet_universe(initial_wallets)
@@ -972,7 +1066,7 @@ class HybridPositionTracker:
         # Start rebalance loop
         asyncio.create_task(self._rebalance_loop())
 
-        logger.info(f"[HybridTracker] Started with {len(initial_wallets)} wallets")
+        logger.info(f"[HybridTracker] Started with {len(initial_wallets)} wallets ({max_ws_wallets} on WS)")
 
     async def stop(self):
         """Stop hybrid tracking."""

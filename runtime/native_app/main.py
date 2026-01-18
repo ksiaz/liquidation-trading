@@ -5300,7 +5300,7 @@ class MainWindow(QMainWindow):
 
                 # PRIORITY: Get wallets with positions close to liquidation FIRST
                 danger_wallets = self._get_danger_wallets()
-                print(f"[WSTracker] Found {len(danger_wallets)} wallets with positions <5% from liq")
+                print(f"[WSTracker] Found {len(danger_wallets)} wallets with positions <10% from liq")
 
                 # Then add remaining tracked wallets
                 all_wallets = list(self.position_refresher.TRACKED_WHALES)
@@ -5395,16 +5395,18 @@ class MainWindow(QMainWindow):
         pass
 
     def _get_danger_wallets(self) -> list:
-        """Get wallets with positions close to liquidation (within 5%)."""
+        """Get wallets with positions close to liquidation (within 10%)."""
         try:
             conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5)
             cursor = conn.cursor()
+            # Expanded threshold (10%) and limit (100) for faster detection
+            # This catches positions that might enter danger zone soon
             cursor.execute("""
                 SELECT DISTINCT wallet_address
                 FROM positions
-                WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < 5
+                WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < 10
                 ORDER BY distance_to_liq_pct ASC
-                LIMIT 30
+                LIMIT 100
             """)
             wallets = [row[0] for row in cursor.fetchall()]
             conn.close()

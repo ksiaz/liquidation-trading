@@ -144,14 +144,16 @@ def fetch_live_positions_near_liq(
             return []
 
         conn = get_indexed_db_connection(timeout=2.0)
+        # Wider filter for candidates, we'll recalculate live
+        # Include small positions if very close to liq (<2%)
         cursor = conn.execute("""
             SELECT DISTINCT wallet_address, coin, liquidation_price, side
             FROM positions
             WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < ?
-              AND position_value >= ?
+              AND (position_value >= ? OR distance_to_liq_pct < 2)
             ORDER BY distance_to_liq_pct ASC
             LIMIT 100
-        """, (max_distance_pct * 2, min_value / 2))  # Wider filter, we'll recalculate
+        """, (max_distance_pct * 2, min_value / 2))
 
         db_positions = list(cursor.fetchall())
         wallets_to_check = set(row['wallet_address'] for row in db_positions)
@@ -222,9 +224,10 @@ def fetch_live_positions_near_liq(
                         distance_pct = 999.0
 
                     # Filter by distance and value
+                    # Prioritize proximity - show small positions if very close to liq (<2%)
                     if distance_pct <= 0 or distance_pct > max_distance_pct:
                         continue
-                    if position_value < min_value:
+                    if position_value < min_value and distance_pct >= 2:
                         continue
 
                     live_positions.append({
@@ -633,6 +636,7 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
 
         if sort_by == "distance":
             # Sort by distance to liquidation (closest first)
+            # Prioritize proximity - show small positions if very close to liq (<2%)
             cursor = conn.execute("""
                 SELECT wallet_address, coin, side, entry_price, position_size,
                        position_value, leverage, liquidation_price, margin_used,
@@ -640,12 +644,13 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
                        liq_touched, liq_breached, recent_high, recent_low
                 FROM positions
                 WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND distance_to_liq_pct < 999
-                  AND position_value >= ? AND updated_at >= ?
+                  AND (position_value >= ? OR distance_to_liq_pct < 2) AND updated_at >= ?
                 ORDER BY distance_to_liq_pct ASC
                 LIMIT ?
             """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
         else:
             # Sort by impact (size * impact, highest first)
+            # Prioritize proximity - show small positions if very close to liq (<2%)
             cursor = conn.execute("""
                 SELECT wallet_address, coin, side, entry_price, position_size,
                        position_value, leverage, liquidation_price, margin_used,
@@ -654,7 +659,7 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
                        (position_value * impact_score) as combined_score
                 FROM positions
                 WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND impact_score > 0
-                  AND position_value >= ? AND updated_at >= ?
+                  AND (position_value >= ? OR distance_to_liq_pct < 2) AND updated_at >= ?
                 ORDER BY combined_score DESC
                 LIMIT ?
             """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
@@ -1899,12 +1904,13 @@ class PositionRefresher(threading.Thread):
         cursor = conn.cursor()
 
         # Get all positions with distance data
+        # Prioritize proximity - show small positions if very close to liq (<2%)
         cursor.execute("""
             SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, impact_score
             FROM positions
             WHERE distance_to_liq_pct IS NOT NULL
               AND distance_to_liq_pct > 0
-              AND position_value > 20000
+              AND (position_value > 20000 OR distance_to_liq_pct < 2)
             ORDER BY distance_to_liq_pct ASC
         """)
 

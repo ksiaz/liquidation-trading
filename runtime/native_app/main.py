@@ -4407,7 +4407,7 @@ class QuickTradePanel(QFrame):
         row1.addWidget(self.ghost_check)
         layout.addLayout(row1)
 
-        # Row 2: Size presets + custom
+        # Row 2: Size presets (% of account) + custom $
         row2 = QHBoxLayout()
         row2.setSpacing(4)
         lbl = QLabel("Size:")
@@ -4415,9 +4415,10 @@ class QuickTradePanel(QFrame):
         row2.addWidget(lbl)
 
         self._size_buttons = {}
-        for size in ['$500', '$1K', '$2K', '$5K']:
-            btn = QPushButton(size)
-            btn.setFixedSize(40, 22)
+        self._size_pct_mode = True  # Track if using % mode
+        for pct in ['5%', '10%', '25%', '50%']:
+            btn = QPushButton(pct)
+            btn.setFixedSize(36, 22)
             btn.setFont(QFont("Consolas", 8))
             btn.setCheckable(True)
             btn.setStyleSheet(f"""
@@ -4432,13 +4433,15 @@ class QuickTradePanel(QFrame):
                     color: {COLORS['background']};
                 }}
             """)
-            btn.clicked.connect(lambda checked, s=size: self._on_size_preset(s))
+            btn.clicked.connect(lambda checked, s=pct: self._on_size_preset(s))
             row2.addWidget(btn)
-            self._size_buttons[size] = btn
-        self._size_buttons['$1K'].setChecked(True)
+            self._size_buttons[pct] = btn
+        self._size_buttons['10%'].setChecked(True)
 
+        # Custom $ input
         self.size_input = QLineEdit("1000")
-        self.size_input.setFixedWidth(55)
+        self.size_input.setFixedWidth(50)
+        self.size_input.setPlaceholderText("$")
         self.size_input.setStyleSheet(f"""
             QLineEdit {{
                 background-color: {COLORS['background']};
@@ -4449,6 +4452,7 @@ class QuickTradePanel(QFrame):
                 font-size: 10px;
             }}
         """)
+        self.size_input.textChanged.connect(self._on_custom_size)
         row2.addWidget(self.size_input)
         row2.addStretch()
         layout.addLayout(row2)
@@ -4505,18 +4509,74 @@ class QuickTradePanel(QFrame):
         row3.addStretch()
         layout.addLayout(row3)
 
-        # Row 4: Entry options
+        # Row 4: Order type (Market/Limit) + Price input
         row4 = QHBoxLayout()
-        row4.setSpacing(8)
+        row4.setSpacing(4)
 
-        self.market_check = QCheckBox("Market")
-        self.market_check.setChecked(True)
-        self.market_check.setStyleSheet(f"color: {COLORS['text']}; font-size: 10px;")
-        row4.addWidget(self.market_check)
+        lbl = QLabel("Type:")
+        lbl.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 10px;")
+        row4.addWidget(lbl)
 
-        self.tick_check = QCheckBox("Enter on Tick")
-        self.tick_check.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 10px;")
-        row4.addWidget(self.tick_check)
+        self.market_btn = QPushButton("Market")
+        self.market_btn.setFixedSize(50, 22)
+        self.market_btn.setFont(QFont("Consolas", 8))
+        self.market_btn.setCheckable(True)
+        self.market_btn.setChecked(True)
+        self.market_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['background']};
+                color: {COLORS['text_dim']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 2px;
+            }}
+            QPushButton:checked {{
+                background-color: {COLORS['header']};
+                color: {COLORS['background']};
+            }}
+        """)
+        self.market_btn.clicked.connect(self._on_market_selected)
+        row4.addWidget(self.market_btn)
+
+        self.limit_btn = QPushButton("Limit")
+        self.limit_btn.setFixedSize(50, 22)
+        self.limit_btn.setFont(QFont("Consolas", 8))
+        self.limit_btn.setCheckable(True)
+        self.limit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['background']};
+                color: {COLORS['text_dim']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 2px;
+            }}
+            QPushButton:checked {{
+                background-color: {COLORS['warning']};
+                color: {COLORS['background']};
+            }}
+        """)
+        self.limit_btn.clicked.connect(self._on_limit_selected)
+        row4.addWidget(self.limit_btn)
+
+        # Price input (for limit orders)
+        self.price_label = QLabel("@")
+        self.price_label.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 10px;")
+        self.price_label.setVisible(False)
+        row4.addWidget(self.price_label)
+
+        self.price_input = QLineEdit()
+        self.price_input.setFixedWidth(70)
+        self.price_input.setPlaceholderText("Price")
+        self.price_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {COLORS['background']};
+                color: {COLORS['warning']};
+                border: 1px solid {COLORS['warning']};
+                border-radius: 2px;
+                padding: 2px;
+                font-size: 10px;
+            }}
+        """)
+        self.price_input.setVisible(False)
+        row4.addWidget(self.price_input)
 
         row4.addStretch()
         layout.addLayout(row4)
@@ -4578,14 +4638,51 @@ class QuickTradePanel(QFrame):
         # State
         self._current_coin = "BTC"
         self._current_size = 1000.0
+        self._current_pct = 10  # Default 10% of account
+        self._account_balance = 10000.0  # Will be updated externally
+        self._is_market = True
 
-    def _on_size_preset(self, size_str: str):
-        """Handle size preset button click."""
-        sizes = {'$500': 500, '$1K': 1000, '$2K': 2000, '$5K': 5000}
-        self._current_size = sizes.get(size_str, 1000)
+    def _on_size_preset(self, pct_str: str):
+        """Handle size preset button click (% of account)."""
+        pcts = {'5%': 5, '10%': 10, '25%': 25, '50%': 50}
+        self._current_pct = pcts.get(pct_str, 10)
+        self._size_pct_mode = True
+        # Calculate $ value from % of account
+        self._current_size = self._account_balance * (self._current_pct / 100)
         self.size_input.setText(str(int(self._current_size)))
         for s, btn in self._size_buttons.items():
-            btn.setChecked(s == size_str)
+            btn.setChecked(s == pct_str)
+
+    def _on_custom_size(self, text: str):
+        """Handle custom $ size input - deselects % buttons."""
+        if text:
+            self._size_pct_mode = False
+            for btn in self._size_buttons.values():
+                btn.setChecked(False)
+
+    def _on_market_selected(self):
+        """Select market order type."""
+        self._is_market = True
+        self.market_btn.setChecked(True)
+        self.limit_btn.setChecked(False)
+        self.price_label.setVisible(False)
+        self.price_input.setVisible(False)
+
+    def _on_limit_selected(self):
+        """Select limit order type."""
+        self._is_market = False
+        self.market_btn.setChecked(False)
+        self.limit_btn.setChecked(True)
+        self.price_label.setVisible(True)
+        self.price_input.setVisible(True)
+
+    def set_account_balance(self, balance: float):
+        """Update account balance for % calculations."""
+        self._account_balance = balance
+        # Recalculate size if in % mode
+        if self._size_pct_mode:
+            self._current_size = balance * (self._current_pct / 100)
+            self.size_input.setText(str(int(self._current_size)))
 
     def _on_lev_changed(self, value: int):
         """Handle leverage slider change."""
@@ -4617,34 +4714,64 @@ class QuickTradePanel(QFrame):
         """Set the trade executor."""
         self._executor = executor
 
-    def _get_params(self) -> tuple:
+    def _get_params(self) -> dict:
         """Get current trade parameters."""
         try:
             size = float(self.size_input.text())
-            leverage = self.lev_slider.value()
-            return size, leverage
         except ValueError:
-            return 1000.0, 5
+            size = 1000.0
+
+        leverage = self.lev_slider.value()
+        order_type = "MARKET" if self._is_market else "LIMIT"
+
+        # Get limit price if applicable
+        limit_price = None
+        if not self._is_market:
+            try:
+                limit_price = float(self.price_input.text())
+            except ValueError:
+                limit_price = None
+
+        return {
+            'size': size,
+            'leverage': leverage,
+            'order_type': order_type,
+            'limit_price': limit_price
+        }
 
     def _on_long_clicked(self):
         """Handle LONG button click."""
-        size, lev = self._get_params()
+        params = self._get_params()
         symbol = f"{self._current_coin}USDT"
         ghost = self.ghost_check.isChecked()
-        print(f"[QuickTrade] LONG {symbol} size=${size} lev={lev}x (ghost={ghost})")
+
+        if params['order_type'] == 'LIMIT' and params['limit_price']:
+            print(f"[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})")
+        else:
+            print(f"[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})")
 
         if hasattr(self, '_executor') and self._executor and hasattr(self._executor, 'enter_position'):
-            self._executor.enter_position(symbol, "LONG", size, lev, ghost=ghost)
+            self._executor.enter_position(
+                symbol, "LONG", params['size'], params['leverage'],
+                ghost=ghost, order_type=params['order_type'], limit_price=params['limit_price']
+            )
 
     def _on_short_clicked(self):
         """Handle SHORT button click."""
-        size, lev = self._get_params()
+        params = self._get_params()
         symbol = f"{self._current_coin}USDT"
         ghost = self.ghost_check.isChecked()
-        print(f"[QuickTrade] SHORT {symbol} size=${size} lev={lev}x (ghost={ghost})")
+
+        if params['order_type'] == 'LIMIT' and params['limit_price']:
+            print(f"[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})")
+        else:
+            print(f"[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})")
 
         if hasattr(self, '_executor') and self._executor and hasattr(self._executor, 'enter_position'):
-            self._executor.enter_position(symbol, "SHORT", size, lev, ghost=ghost)
+            self._executor.enter_position(
+                symbol, "SHORT", params['size'], params['leverage'],
+                ghost=ghost, order_type=params['order_type'], limit_price=params['limit_price']
+            )
 
     def _on_close_clicked(self):
         """Handle CLOSE button click."""

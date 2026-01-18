@@ -642,6 +642,24 @@ class LiquidationFadeExecutor:
         if coin in self._active_fades:
             return False
 
+        # SANITY CHECK: Verify position still exists in shared state
+        # This prevents trading on already-liquidated positions (race condition)
+        try:
+            from runtime.hyperliquid.shared_state import get_shared_state
+            state = get_shared_state()
+            positions = state.get_market_positions(coin)
+            # Must have at least one danger position in this coin
+            danger_positions = [p for p in positions if p.danger_level >= 2]
+            if not danger_positions:
+                self._logger.warning(
+                    f"[FADE] Skipped {coin}: No danger positions found "
+                    "(position may have been liquidated)"
+                )
+                return False
+        except Exception as e:
+            self._logger.debug(f"[FADE] Position check failed for {coin}: {e}")
+            # On error, allow fade to proceed (fail open for edge cases)
+
         return True
 
     async def _place_market_order(

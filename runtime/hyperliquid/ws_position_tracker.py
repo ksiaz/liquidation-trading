@@ -518,16 +518,10 @@ class WSPositionTracker:
             if leverage <= 0:
                 leverage = 20
 
-            # Calculate isolated liquidation price if not provided by API
-            # This happens for cross-margin positions
+            # Skip cross-margin positions (no reliable liq price)
+            # Cross-margin uses entire account balance, so API returns liq=None
             if liq_price <= 0:
-                if szi > 0:  # LONG
-                    liq_price = entry_price * (1 - 0.9 / leverage)
-                    liq_price = max(0, liq_price)
-                else:  # SHORT
-                    liq_price = entry_price * (1 + 0.9 / leverage)
-
-            if liq_price <= 0:
+                # Don't fake a liq price - just skip cross-margin positions
                 continue
 
             # Skip zombie positions (already breached)

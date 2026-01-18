@@ -457,11 +457,12 @@ def aggregate_cascade_state_from_hyperliquid() -> Dict:
         stale_threshold = time.time() - POSITION_STALENESS_SECONDS
 
         # Get positions close to liquidation (within 10%)
+        # Prioritize proximity over value - show small positions if very close to liq
         cursor = conn.execute("""
             SELECT coin, side, position_value, distance_to_liq_pct, liquidation_price, entry_price
             FROM positions
             WHERE distance_to_liq_pct >= 0 AND distance_to_liq_pct <= 10
-              AND position_value >= 10000
+              AND (position_value >= 10000 OR distance_to_liq_pct < 2)
               AND updated_at >= ?
             ORDER BY distance_to_liq_pct ASC
         """, (stale_threshold,))
@@ -744,15 +745,16 @@ def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10
         max_price = current_price * (1 + price_range_pct / 100)
 
         # Query all positions with liquidation prices in range (only fresh data)
+        # Include small positions if they're very close to current price
         cursor = conn.execute("""
             SELECT side, position_value, liquidation_price
             FROM positions
             WHERE coin = ?
               AND liquidation_price > 0
               AND liquidation_price BETWEEN ? AND ?
-              AND position_value >= 10000
+              AND (position_value >= 10000 OR ABS(liquidation_price - ?) / ? * 100 < 2)
               AND updated_at >= ?
-        """, (coin, min_price, max_price, stale_threshold))
+        """, (coin, min_price, max_price, current_price, current_price, stale_threshold))
 
         positions = cursor.fetchall()
         conn.close()
@@ -1849,12 +1851,13 @@ class PositionRefresher(threading.Thread):
 
         # Find positions within zoom threshold (close to liquidation)
         # Only include positions where 0 < distance <= threshold (actually close to liq)
+        # Prioritize proximity - show small positions if very close to liq
         cursor.execute("""
             SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
             FROM positions
             WHERE distance_to_liq_pct > 0
               AND distance_to_liq_pct <= ?
-              AND position_value >= 10000
+              AND (position_value >= 10000 OR distance_to_liq_pct < 2)
               AND updated_at >= ?
             ORDER BY distance_to_liq_pct ASC
         """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
@@ -1967,12 +1970,13 @@ class PositionRefresher(threading.Thread):
         cursor = conn.cursor()
         stale_threshold = time.time() - POSITION_STALENESS_SECONDS
 
+        # Prioritize proximity - show small positions if very close to liq
         cursor.execute("""
             SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
             FROM positions
             WHERE distance_to_liq_pct > 0
               AND distance_to_liq_pct <= ?
-              AND position_value >= 10000
+              AND (position_value >= 10000 OR distance_to_liq_pct < 2)
               AND updated_at >= ?
             ORDER BY distance_to_liq_pct ASC
         """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
@@ -5135,14 +5139,14 @@ class MainWindow(QMainWindow):
                 # - Recently updated (within 30s) - removes liquidated/stale positions
                 # - Within 5% of liquidation (gives wider view)
                 # - distance > 0 (positions at/past liq are removed by WS tracker)
-                # - Meaningful notional ($10k+)
+                # - Meaningful notional ($10k+) OR very close to liquidation (<2%)
                 stale_threshold = now - 30.0  # 30 seconds freshness
                 valid_snapshots = [
                     s for s in all_snapshots
                     if s.updated_at > stale_threshold
                     and s.distance_pct > 0  # Must be above liq price (WS tracker removes at <=0)
                     and s.distance_pct <= 5.0  # Show positions within 5% of liq (wider view)
-                    and s.notional >= 10000
+                    and (s.notional >= 10000 or s.distance_pct < 2.0)  # Prioritize proximity over value
                 ]
 
                 # STABILITY: Use stable sort with hysteresis to prevent flickering

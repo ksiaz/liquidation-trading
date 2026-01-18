@@ -52,6 +52,7 @@ from external_policy.ep2_effcs_strategy import generate_effcs_proposal
 from external_policy.ep2_strategy_cascade_sniper import (
     generate_cascade_sniper_proposal,
     ProximityData,
+    AbsorptionAnalysis,
     EntryMode as CascadeSniperEntryMode
 )
 from runtime.liquidations import LiquidationBurst
@@ -108,7 +109,8 @@ class PolicyAdapter:
         regime_metrics: Optional[Any] = None,  # RegimeMetrics from regime classifier
         current_price: Optional[float] = None,  # Current price from collector
         hl_proximity: Optional[ProximityData] = None,  # Hyperliquid proximity data
-        liquidation_burst: Optional[LiquidationBurst] = None  # Recent Binance liquidations
+        liquidation_burst: Optional[LiquidationBurst] = None,  # Recent Binance liquidations
+        absorption: Optional[AbsorptionAnalysis] = None  # Order book absorption analysis
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -124,6 +126,7 @@ class PolicyAdapter:
             current_price: Current market price
             hl_proximity: Hyperliquid liquidation proximity data (Phase 6)
             liquidation_burst: Recent Binance liquidation burst (Phase 6)
+            absorption: Order book absorption analysis (Phase 6)
 
         Returns:
             List of Mandates (possibly empty)
@@ -160,36 +163,48 @@ class PolicyAdapter:
             timestamp=timestamp
         )
 
-        # DEBUG: Log primitive availability
-        print(f"DEBUG PolicyAdapter: Generating mandates for {symbol}")
-        print(f"DEBUG PolicyAdapter: Primitives available:")
-        for key, value in primitives.items():
-            if value is not None:
-                print(f"  - {key}: {type(value).__name__}")
+        # DEBUG: Log primitive availability (disabled - too verbose)
+        # print(f"DEBUG PolicyAdapter: Generating mandates for {symbol}")
+        # print(f"DEBUG PolicyAdapter: Primitives available:")
+        # for key, value in primitives.items():
+        #     if value is not None:
+        #         print(f"  - {key}: {type(value).__name__}")
 
         # Invoke frozen external policies
         proposals: List[StrategyProposal] = []
 
         if self.config.enable_geometry:
+            # Create context with current_price for zone break detection
+            geometry_context = StrategyContext(
+                context_id=f"{symbol}_{timestamp}",
+                timestamp=timestamp,
+                current_price=current_price
+            )
             proposal = generate_geometry_proposal(
+                # Pattern primitive (B5) - supply/demand zone with confirmation
+                supply_demand_zone=primitives.get("supply_demand_zone"),
+                context=geometry_context,
+                permission=permission,
+                position_state=position_state,
+                # Instantaneous primitives as fallback (with stability requirement)
                 zone_penetration=primitives.get("zone_penetration"),
                 traversal_compactness=primitives.get("traversal_compactness"),
-                central_tendency_deviation=primitives.get("central_tendency_deviation"),
-                context=context,
-                permission=permission,
-                position_state=position_state
+                central_tendency_deviation=primitives.get("central_tendency_deviation")
             )
             if proposal:
                 proposals.append(proposal)
 
         if self.config.enable_kinematics:
             proposal = generate_kinematics_proposal(
-                velocity=primitives.get("price_traversal_velocity"),
-                compactness=primitives.get("traversal_compactness"),
-                acceptance=primitives.get("price_acceptance_ratio"),
+                # Pattern primitive (B5) - order block with confirmation
+                order_block=primitives.get("order_block"),
                 permission=permission,
                 context=context,
-                position_state=position_state
+                position_state=position_state,
+                # Instantaneous primitives as fallback (with stability requirement)
+                velocity=primitives.get("price_traversal_velocity"),
+                compactness=primitives.get("traversal_compactness"),
+                acceptance=primitives.get("price_acceptance_ratio")
             )
             if proposal:
                 proposals.append(proposal)
@@ -280,7 +295,8 @@ class PolicyAdapter:
                 liquidations=liquidation_burst,
                 context=context,
                 position_state=position_state,
-                entry_mode=entry_mode
+                entry_mode=entry_mode,
+                absorption=absorption  # Pass orderbook absorption analysis
             )
             if proposal:
                 proposals.append(proposal)
@@ -288,9 +304,9 @@ class PolicyAdapter:
         # Convert proposals to mandates (pure normalization)
         mandates = self._proposals_to_mandates(proposals, symbol, timestamp)
 
-        # DEBUG: Log results
-        print(f"DEBUG PolicyAdapter: Generated {len(proposals)} proposals → {len(mandates)} mandates")
+        # Only log when mandates are generated (not empty cycles)
         if len(mandates) > 0:
+            print(f"[PolicyAdapter] {symbol}: {len(proposals)} proposals → {len(mandates)} mandates")
             for mandate in mandates:
                 print(f"  - Mandate: {mandate.type.name}")
 

@@ -48,6 +48,17 @@ try:
 except ImportError:
     HYPERLIQUID_AVAILABLE = False
 
+# Import Cascade Sniper types for absorption analysis
+from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis, ProximityData
+
+# Import Validation modules for data integrity and manipulation detection
+from runtime.validation import (
+    DataValidator,
+    ManipulationDetector,
+    StopHuntDetector,
+    LiquidityType
+)
+
 # Constants
 TOP_10_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
@@ -84,7 +95,7 @@ class CollectorService:
             enable_effcs=True,           # NEW: EFFCS strategy (EXPANSION regime)
             # Phase 6: Cascade Sniper (Hyperliquid proximity)
             enable_cascade_sniper=True,  # NEW: Cascade sniper (liquidation proximity)
-            cascade_sniper_entry_mode="ABSORPTION_REVERSAL"  # Conservative: enter on reversal
+            cascade_sniper_entry_mode="CASCADE_MOMENTUM"  # Aggressive: ride the cascade
         ))
         self.arbitrator = MandateArbitrator()
         self.executor = ExecutionController(RiskConfig())
@@ -184,6 +195,18 @@ class CollectorService:
             except Exception as e:
                 self._logger.warning(f"Hyperliquid collector init failed: {e}")
 
+        # Phase 7: Validation and Manipulation Detection
+        self._data_validator = DataValidator()
+        self._manipulation_detector = ManipulationDetector()
+        self._stop_hunt_detector = StopHuntDetector()
+        self._logger.info("Validation and manipulation detection initialized")
+
+        # Diagnostic logging configuration
+        self._diag_enabled = True  # Enable comprehensive diagnostic output
+        self._diag_coins = TOP_10_SYMBOLS  # All symbols for diagnostics
+        self._diag_interval = 5  # Log diagnostics every N cycles
+        self._diag_cycle_count = 0
+
     async def start(self):
         """Start all collectors."""
         self._running = True
@@ -262,7 +285,6 @@ class CollectorService:
             elapsed = timestamp - self._startup_time
             if elapsed < self._warmup_duration_sec:
                 # Still in warm-up - allow observation layer to build state
-                print(f"DEBUG M6: Still in warmup - {elapsed:.1f}s / {self._warmup_duration_sec}s")
                 return
             elif not self._warmup_complete:
                 # Warm-up just completed
@@ -295,7 +317,6 @@ class CollectorService:
                     liquidation_calc = self._liquidation_calculators.get(symbol)
 
                     if not all([vwap_calc, atr_calc, orderflow_calc, liquidation_calc]):
-                        print(f"DEBUG Regime: {symbol} - Calculators not ready: VWAP={vwap_calc is not None}, ATR={atr_calc is not None}, Orderflow={orderflow_calc is not None}, Liq={liquidation_calc is not None}")
                         continue  # Calculators not initialized yet
 
                     # Compute regime metrics
@@ -307,11 +328,9 @@ class CollectorService:
 
                     # Check if all metrics available
                     if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
-                        print(f"DEBUG Regime: {symbol} - Metrics not ready: VWAP_dist={vwap_distance}, ATR_5m={atr_5m}, ATR_30m={atr_30m}, OFI={orderflow_imbalance}, Liq_Z={liquidation_zscore}")
                         continue  # Metrics not ready yet
 
                     # Create regime metrics object
-                    print(f"DEBUG Regime: {symbol} - Metrics ready! VWAP_dist={vwap_distance:.2f}, ATR_5m={atr_5m:.2f}, ATR_30m={atr_30m:.2f}, OFI={orderflow_imbalance:.3f}, Liq_Z={liquidation_zscore:.2f}")
                     regime_metrics = RegimeMetrics(
                         vwap_distance=vwap_distance,
                         atr_5m=atr_5m,
@@ -322,7 +341,6 @@ class CollectorService:
 
                     # Classify regime
                     regime_state = classify_regime(regime_metrics)
-                    print(f"DEBUG Regime: {symbol} - Regime classified as {regime_state.name}")
 
                     # Phase 6: Log regime transitions
                     prev_regime = self._prev_regime_states.get(symbol)
@@ -388,9 +406,67 @@ class CollectorService:
                     # Phase 6: Get Hyperliquid proximity data (convert symbol to coin)
                     # BTCUSDT -> BTC, ETHUSDT -> ETH
                     hl_proximity = None
+                    absorption = None
                     if self._hyperliquid_enabled and self._hyperliquid_collector:
                         coin = symbol.replace('USDT', '')
                         hl_proximity = self._hyperliquid_collector.get_proximity(coin)
+
+                        # Phase 6: Compute absorption analysis from orderbook + proximity
+                        absorption = self._compute_absorption(coin, hl_proximity)
+
+                        # Comprehensive diagnostic logging for ALL coins
+                        if self._diag_enabled and hl_proximity:
+                            # Get cascade state from strategy
+                            from external_policy.ep2_strategy_cascade_sniper import get_cascade_state
+                            cascade_state = get_cascade_state(symbol)
+
+                            # Update stop hunt detector with proximity data
+                            stop_hunt = self._stop_hunt_detector.update_cluster(
+                                symbol=symbol,
+                                current_price=current_price or 0,
+                                long_positions_count=hl_proximity.long_positions_count,
+                                long_positions_value=hl_proximity.long_positions_value,
+                                long_closest_liq=hl_proximity.long_closest_liquidation,
+                                short_positions_count=hl_proximity.short_positions_count,
+                                short_positions_value=hl_proximity.short_positions_value,
+                                short_closest_liq=hl_proximity.short_closest_liquidation,
+                                timestamp=timestamp
+                            )
+
+                            # Check manipulation on orderbook updates
+                            if hasattr(self._hyperliquid_collector, '_client'):
+                                orderbook = self._hyperliquid_collector._client.get_orderbook(coin)
+                                if orderbook:
+                                    manipulation_alert = self._manipulation_detector.update_orderbook(symbol, orderbook)
+                                    if manipulation_alert:
+                                        print(f"[MANIPULATION] {manipulation_alert}")
+
+                            # Log diagnostic every N cycles
+                            self._diag_cycle_count += 1
+                            if self._diag_cycle_count % self._diag_interval == 0:
+                                print(f"\n[DIAG] {coin}:")
+                                print(f"  Proximity: {hl_proximity.total_positions_at_risk} pos, ${hl_proximity.total_value_at_risk:,.0f}")
+                                if absorption:
+                                    print(f"  Absorption: longs={absorption.absorption_ratio_longs:.2f}x, shorts={absorption.absorption_ratio_shorts:.2f}x")
+                                print(f"  State: {cascade_state.value}")
+
+                                # Log stop hunt status
+                                if stop_hunt:
+                                    print(f"  Cluster: {stop_hunt.direction.value} ${stop_hunt.total_value:,.0f} @ {stop_hunt.cluster_price:.2f}")
+                                    print(f"    Type: {stop_hunt.liquidity_type.value} (conf={stop_hunt.confidence:.0%})")
+
+                                # Check for active hunt
+                                active_hunt = self._stop_hunt_detector.get_active_hunt(symbol)
+                                if active_hunt:
+                                    print(f"  HUNT: {active_hunt.phase.value} | Reversal: {active_hunt.reversal_pct:.2f}%")
+                                    if active_hunt.suggested_entry:
+                                        print(f"    Entry: {active_hunt.suggested_entry} @ {active_hunt.price_current:.2f}")
+                                        print(f"    Stop: {active_hunt.stop_loss_price:.2f}, Target: {active_hunt.target_price:.2f}")
+
+                                # Check circuit breaker status
+                                if self._manipulation_detector.is_circuit_breaker_active(symbol):
+                                    remaining = self._manipulation_detector.get_circuit_breaker_remaining(symbol)
+                                    print(f"  ⚠️ CIRCUIT BREAKER ACTIVE: {remaining:.0f}s remaining")
 
                     # Phase 6: Get liquidation burst data
                     liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
@@ -405,7 +481,8 @@ class CollectorService:
                         regime_metrics=regime_metrics,  # Phase 5: Pass regime metrics
                         current_price=current_price,  # Phase 5: Pass current price
                         hl_proximity=hl_proximity,  # Phase 6: Hyperliquid proximity
-                        liquidation_burst=liquidation_burst  # Phase 6: Liquidation burst
+                        liquidation_burst=liquidation_burst,  # Phase 6: Liquidation burst
+                        absorption=absorption  # Phase 6: Order book absorption analysis
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -506,26 +583,76 @@ class CollectorService:
             self._logger.debug(f"M6 execution cycle exception: {e}")
             pass
 
+    def _compute_absorption(
+        self,
+        coin: str,
+        proximity: ProximityData
+    ) -> AbsorptionAnalysis:
+        """
+        Compute absorption analysis from orderbook + proximity data.
+
+        Compares orderbook depth vs liquidation value at risk to determine
+        if cascade can be absorbed.
+
+        Args:
+            coin: Asset symbol (e.g., "BTC")
+            proximity: Hyperliquid proximity data
+
+        Returns:
+            AbsorptionAnalysis for strategy, or None if data insufficient
+        """
+        if not self._hyperliquid_collector:
+            return None
+
+        # Get orderbook from Hyperliquid client
+        orderbook = self._hyperliquid_collector._client.get_orderbook(coin)
+        if orderbook is None:
+            return None
+
+        mid_price = orderbook.get('mid_price', 0)
+        total_bid_depth = orderbook.get('total_bid_depth', 0)
+        total_ask_depth = orderbook.get('total_ask_depth', 0)
+
+        # Get liquidation values from proximity data
+        long_liq_value = 0.0
+        short_liq_value = 0.0
+        if proximity:
+            long_liq_value = proximity.long_positions_value
+            short_liq_value = proximity.short_positions_value
+
+        # Compute absorption ratios
+        # Long liquidations sell into bids → bid_depth / long_liq_value
+        # Short liquidations buy into asks → ask_depth / short_liq_value
+        absorption_ratio_longs = total_bid_depth / long_liq_value if long_liq_value > 0 else float('inf')
+        absorption_ratio_shorts = total_ask_depth / short_liq_value if short_liq_value > 0 else float('inf')
+
+        return AbsorptionAnalysis(
+            coin=coin,
+            mid_price=mid_price,
+            bid_depth_2pct=total_bid_depth,
+            ask_depth_2pct=total_ask_depth,
+            long_liq_value=long_liq_value,
+            short_liq_value=short_liq_value,
+            absorption_ratio_longs=absorption_ratio_longs,
+            absorption_ratio_shorts=absorption_ratio_shorts,
+            timestamp=time.time()
+        )
+
     def _process_ghost_trades(self):
         """Process ghost trades based on new execution results.
 
         Checks execution log for new successful ENTRY/EXIT actions
         and executes corresponding ghost trades.
         """
-        print(f"DEBUG: _process_ghost_trades called")
         try:
             execution_log = self.executor.get_execution_log()
-            print(f"DEBUG: execution_log has {len(execution_log)} entries")
 
             # Process new execution results since last check
             new_results = execution_log[self._last_execution_index:]
-            print(f"DEBUG: Processing {len(new_results)} new results (last_index={self._last_execution_index})")
 
             for idx, result in enumerate(new_results):
-                print(f"DEBUG: Processing result {idx}: action={result.action.name}, symbol={result.symbol}, success={result.success}")
                 # Only process successful actions for symbols in TOP_10
                 if not result.success or result.symbol not in TOP_10_SYMBOLS:
-                    print(f"DEBUG: Skipping result {idx}: not successful or not in TOP_10_SYMBOLS")
                     continue
 
                 # Get cycle context from result (captured at execution time)
@@ -591,27 +718,14 @@ class CollectorService:
 
                 # Handle ENTRY actions
                 if result.action.name == "ENTRY":
-                    print(f"DEBUG: Processing ENTRY action for {result.symbol}")
-
                     # Query position state machine to get actual direction
-                    # (executor hardcodes LONG for now, but this will work when direction is added to mandates)
-                    # Default to LONG if position doesn't exist or has no direction
                     side = "LONG"
-                    print(f"DEBUG: Initialized side = {side}")
-
                     try:
                         position = self.executor.state_machine.get_position(result.symbol)
-                        print(f"DEBUG: Got position = {position}")
                         if position and hasattr(position, 'direction') and position.direction:
                             side = position.direction.value if hasattr(position.direction, 'value') else str(position.direction)
-                            print(f"DEBUG: Updated side from position = {side}")
-                    except Exception as e:
-                        print(f"DEBUG: Exception getting position direction: {e}")
-                        # Use default LONG if anything fails
+                    except Exception:
                         pass
-
-                    print(f"DEBUG: Final side value before open_position = {side}")
-                    print(f"DEBUG: About to call ghost_tracker.open_position with side={side}")
 
                     success, error, trade = self.ghost_tracker.open_position(
                         symbol=result.symbol,
@@ -621,17 +735,11 @@ class CollectorService:
                         active_primitives=active_primitives
                     )
 
-                    print(f"DEBUG: open_position returned: success={success}, error={error}")
-
                     if success and trade:
-                        print(f"DEBUG: About to print GHOST ENTRY with side={side}")
                         print(f"GHOST: ENTRY {result.symbol} {side} {trade.quantity:.4f} @ ${trade.price:,.2f} [{len(active_primitives or [])} primitives]")
                     else:
                         print(f"GHOST: ENTRY_REJECTED {result.symbol} - {error}")
-
-                        # Log rejection
                         if snapshot:
-                            print(f"DEBUG: About to log_rejection with side={side}")
                             self.ghost_tracker.log_rejection(
                                 cycle_id=cycle_id or 0,
                                 timestamp=result.timestamp,
@@ -642,7 +750,6 @@ class CollectorService:
                                 policy_name=policy_name,
                                 triggering_primitives=active_primitives
                             )
-                            print(f"DEBUG: log_rejection completed")
 
                 # Handle EXIT actions
                 elif result.action.name == "EXIT":
@@ -968,8 +1075,8 @@ class CollectorService:
         """Connect to Binance Filtered Stream with exponential backoff reconnection."""
         import websockets
 
-        # Reduce stream count to avoid Windows socket limits (test with fewer symbols)
-        test_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Start with 3 symbols instead of 10
+        # Use all TOP_10_SYMBOLS for full liquidation coverage
+        test_symbols = TOP_10_SYMBOLS  # All 10 symbols for cascade detection
 
         streams = [
             f"{s.lower()}@aggTrade" for s in test_symbols
@@ -1116,6 +1223,15 @@ class CollectorService:
                                                 price=price,
                                                 quantity=quantity
                                             )
+
+                                            # Phase 7: Record to entry quality scorer for exhaustion detection
+                                            # This feeds the data-driven entry quality filter
+                                            try:
+                                                from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
+                                                liq_value = price * quantity
+                                                record_liquidation_event(symbol, side, liq_value, timestamp)
+                                            except ImportError:
+                                                pass  # Module not available
                                     except:
                                         pass
                                 elif 'kline' in stream:

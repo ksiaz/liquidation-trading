@@ -553,8 +553,8 @@ class ObservationSystem:
             # Get trade data from M1
             trades = list(self._m1.raw_trades.get(symbol, []))
 
-            # DEBUG: Log trade count
-            print(f"DEBUG Governance: Computing primitives for {symbol}, trades={len(trades)}, min_required={_MIN_TRADES_FOR_KINEMATICS}")
+            # DEBUG: Log trade count (disabled - too verbose)
+            # print(f"DEBUG Governance: Computing primitives for {symbol}, trades={len(trades)}, min_required={_MIN_TRADES_FOR_KINEMATICS}")
 
             if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
                 # Extract price sequence

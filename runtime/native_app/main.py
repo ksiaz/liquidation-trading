@@ -4747,14 +4747,15 @@ class QuickTradePanel(QFrame):
 
     def _on_long_clicked(self):
         """Handle LONG button click."""
+        import sys
         params = self._get_params()
         symbol = f"{self._current_coin}USDT"
         ghost = self.ghost_check.isChecked()
 
         if params['order_type'] == 'LIMIT' and params['limit_price']:
-            print(f"[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})")
+            print(f"\n{'='*50}\n[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})\n{'='*50}", flush=True)
         else:
-            print(f"[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})")
+            print(f"\n{'='*50}\n[QuickTrade] LONG {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})\n{'='*50}", flush=True)
 
         if hasattr(self, '_executor') and self._executor and hasattr(self._executor, 'enter_position'):
             self._executor.enter_position(
@@ -4764,14 +4765,15 @@ class QuickTradePanel(QFrame):
 
     def _on_short_clicked(self):
         """Handle SHORT button click."""
+        import sys
         params = self._get_params()
         symbol = f"{self._current_coin}USDT"
         ghost = self.ghost_check.isChecked()
 
         if params['order_type'] == 'LIMIT' and params['limit_price']:
-            print(f"[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})")
+            print(f"\n{'='*50}\n[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x @ {params['limit_price']} (ghost={ghost})\n{'='*50}", flush=True)
         else:
-            print(f"[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})")
+            print(f"\n{'='*50}\n[QuickTrade] SHORT {symbol} size=${params['size']:.0f} lev={params['leverage']}x MARKET (ghost={ghost})\n{'='*50}", flush=True)
 
         if hasattr(self, '_executor') and self._executor and hasattr(self._executor, 'enter_position'):
             self._executor.enter_position(

@@ -4092,6 +4092,12 @@ class TradingChartWidget(QFrame):
 
         top_row.addStretch()
 
+        # Current coin label (prominent display of selected coin)
+        self._coin_label = QLabel("BTC")
+        self._coin_label.setFont(QFont("Consolas", 14, QFont.Bold))
+        self._coin_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 0 10px;")
+        top_row.addWidget(self._coin_label)
+
         # Current price label
         self._price_label = QLabel("$0.00")
         self._price_label.setFont(QFont("Consolas", 12, QFont.Bold))
@@ -4131,6 +4137,7 @@ class TradingChartWidget(QFrame):
     def _on_coin_clicked(self, coin: str):
         """Handle coin button click."""
         self._current_coin = coin
+        self._coin_label.setText(coin)  # Update prominent coin label
         for c, btn in self._coin_buttons.items():
             btn.setChecked(c == coin)
         # Enable fast refresh for selected symbol (1 second updates)

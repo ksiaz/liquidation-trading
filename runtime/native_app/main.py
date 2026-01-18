@@ -660,6 +660,39 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
 
         positions = [dict(row) for row in cursor.fetchall()]
         conn.close()
+
+        # ZOMBIE FILTER: Validate positions against current prices
+        # This prevents showing positions that have been liquidated since last DB update
+        if positions:
+            try:
+                import requests
+                url = 'https://api.hyperliquid.xyz/info'
+                payload = {'type': 'allMids'}
+                response = requests.post(url, json=payload, timeout=5)
+                if response.status_code == 200:
+                    mids = response.json()
+                    filtered = []
+                    for pos in positions:
+                        coin = pos.get('coin', '')
+                        liq_price = pos.get('liquidation_price', 0)
+                        side = pos.get('side', '')
+                        current_price = float(mids.get(coin, 0))
+
+                        if current_price > 0 and liq_price > 0:
+                            # Check if position is past liquidation
+                            if side == 'LONG' and current_price <= liq_price:
+                                # Long position liquidated (price below liq)
+                                print(f"[ZOMBIE] Filtering out liquidated LONG {coin}: price ${current_price:.4f} <= liq ${liq_price:.4f}")
+                                continue
+                            elif side == 'SHORT' and current_price >= liq_price:
+                                # Short position liquidated (price above liq)
+                                print(f"[ZOMBIE] Filtering out liquidated SHORT {coin}: price ${current_price:.4f} >= liq ${liq_price:.4f}")
+                                continue
+                        filtered.append(pos)
+                    positions = filtered
+            except Exception as e:
+                pass  # On error, return unfiltered (fail open)
+
         return positions
     except Exception as e:
         print(f"Error loading HL positions: {e}")
@@ -5203,8 +5236,32 @@ class MainWindow(QMainWindow):
                 self._last_good_positions = db_positions
             elif self._last_good_positions:
                 # Use cached good data to prevent flickering
-                positions_to_show = self._last_good_positions
-                current_count = cached_count
+                # But validate against current prices to filter zombies
+                cached_positions = self._last_good_positions
+                try:
+                    import requests
+                    url = 'https://api.hyperliquid.xyz/info'
+                    payload = {'type': 'allMids'}
+                    resp = requests.post(url, json=payload, timeout=3)
+                    if resp.status_code == 200:
+                        mids = resp.json()
+                        filtered = []
+                        for pos in cached_positions:
+                            coin = pos.get('coin', '')
+                            liq = pos.get('liquidation_price') or pos.get('liq_price', 0)
+                            side = pos.get('side', '')
+                            curr = float(mids.get(coin, 0))
+                            if curr > 0 and liq > 0:
+                                if side == 'LONG' and curr <= liq:
+                                    continue  # Zombie LONG
+                                if side == 'SHORT' and curr >= liq:
+                                    continue  # Zombie SHORT
+                            filtered.append(pos)
+                        cached_positions = filtered
+                except:
+                    pass  # Fail open on error
+                positions_to_show = cached_positions
+                current_count = len(cached_positions)
                 source = "CACHED"
             else:
                 # Fallback to whatever we have (only on first load)

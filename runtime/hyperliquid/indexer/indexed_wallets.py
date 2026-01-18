@@ -162,6 +162,22 @@ class IndexedWalletStore:
             conn.execute("ALTER TABLE positions ADD COLUMN impact_score REAL DEFAULT 0")
         except:
             pass
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN liq_touched INTEGER DEFAULT 0")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN liq_breached INTEGER DEFAULT 0")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN recent_high REAL DEFAULT 0")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE positions ADD COLUMN recent_low REAL DEFAULT 0")
+        except:
+            pass
 
         # Index for fast liquidation proximity queries
         conn.execute("""
@@ -482,6 +498,22 @@ class IndexedWalletStore:
         count = cursor.fetchone()[0]
         conn.close()
         return count
+
+    def get_wallet_positions(self, wallet_address: str) -> List[Dict]:
+        """Get all positions for a specific wallet."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("""
+            SELECT wallet_address, coin, side, entry_price, position_size,
+                   position_value, leverage, liquidation_price, margin_used,
+                   unrealized_pnl, distance_to_liq_pct, daily_volume, impact_score, updated_at
+            FROM positions
+            WHERE wallet_address = ?
+            ORDER BY distance_to_liq_pct ASC
+        """, (wallet_address.lower(),))
+        results = [dict(row) for row in cursor]
+        conn.close()
+        return results
 
     # =========================================================================
     # Querying

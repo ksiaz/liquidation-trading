@@ -41,9 +41,15 @@ class PollerConfig:
     tier2_threshold: float = 100_000    # $100k
 
     # Polling intervals (seconds)
+    tier0_interval: float = 3.0    # DANGER ZONE: every 3s (proximity-based)
     tier1_interval: float = 5.0    # High-value: every 5s
     tier2_interval: float = 30.0   # Medium-value: every 30s
     tier3_interval: float = 300.0  # Low-value: every 5 min
+
+    # Proximity thresholds (% distance to liquidation)
+    # Positions closer than these get upgraded to faster polling
+    proximity_tier0: float = 5.0   # <5% from liq -> poll every 3s
+    proximity_tier1: float = 10.0  # <10% from liq -> poll every 5s
 
     # Batch settings
     batch_size: int = 50  # Wallets per batch
@@ -183,8 +189,23 @@ class BatchPositionPoller:
         self._scheduled_addresses.discard(addr)
         # Note: Item stays in heap but will be skipped
 
-    def _classify_tier(self, position_value: float) -> int:
-        """Classify wallet into polling tier based on position value."""
+    def _classify_tier(self, position_value: float, min_liq_distance: float = 100.0) -> int:
+        """
+        Classify wallet into polling tier based on position value AND liquidation proximity.
+
+        Proximity overrides value-based tier:
+        - Tier 0: <5% from liquidation (DANGER ZONE)
+        - Tier 1: <10% from liq OR >$1M position
+        - Tier 2: >$100k position
+        - Tier 3: Everything else
+        """
+        # PRIORITY: Proximity-based classification (danger zone)
+        if min_liq_distance <= self.config.proximity_tier0:
+            return 0  # DANGER ZONE - poll very fast
+        elif min_liq_distance <= self.config.proximity_tier1:
+            return 1  # Approaching danger - poll fast
+
+        # Fallback: Value-based classification
         if position_value >= self.config.tier1_threshold:
             return 1
         elif position_value >= self.config.tier2_threshold:
@@ -194,12 +215,31 @@ class BatchPositionPoller:
 
     def _get_interval(self, tier: int) -> float:
         """Get polling interval for tier."""
-        if tier == 1:
+        if tier == 0:
+            return self.config.tier0_interval  # DANGER ZONE
+        elif tier == 1:
             return self.config.tier1_interval
         elif tier == 2:
             return self.config.tier2_interval
         else:
             return self.config.tier3_interval
+
+    def _get_min_liq_distance(self, wallet_address: str) -> float:
+        """Get minimum liquidation distance for any position in this wallet."""
+        try:
+            # Query the store for this wallet's positions
+            positions = self._store.get_wallet_positions(wallet_address)
+            if not positions:
+                return 100.0  # No positions, assume safe
+
+            min_dist = 100.0
+            for pos in positions:
+                dist = pos.get('distance_to_liq_pct', 100.0)
+                if dist is not None and 0 < dist < min_dist:
+                    min_dist = dist
+            return min_dist
+        except Exception:
+            return 100.0  # On error, assume safe
 
     # =========================================================================
     # Polling Loop
@@ -262,12 +302,17 @@ class BatchPositionPoller:
                 # Save individual positions with liquidation data
                 await self._save_individual_positions(state)
 
-                # Check for tier change
-                new_tier = self._classify_tier(total_value)
+                # Get minimum liquidation distance for proximity-based tier
+                min_liq_dist = self._get_min_liq_distance(task.address)
+
+                # Check for tier change (now includes proximity)
+                new_tier = self._classify_tier(total_value, min_liq_dist)
                 if new_tier != task.tier:
-                    self._logger.debug(
+                    tier_names = {0: 'DANGER', 1: 'HIGH', 2: 'MEDIUM', 3: 'LOW'}
+                    self._logger.info(
                         f"Wallet {task.address[:10]}... tier change: "
-                        f"{task.tier} -> {new_tier} (${total_value:,.0f})"
+                        f"{tier_names.get(task.tier, task.tier)} -> {tier_names.get(new_tier, new_tier)} "
+                        f"(${total_value:,.0f}, {min_liq_dist:.1f}% from liq)"
                     )
 
                 # Track positions

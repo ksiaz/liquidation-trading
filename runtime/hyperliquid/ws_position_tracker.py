@@ -537,6 +537,12 @@ class WSPositionTracker:
                 if szi < 0 and current_price > liq_price:  # Short above liq
                     continue
 
+            # Check if liq price changed (for debugging)
+            old_pos = self._wallet_positions.get(user, {}).get(coin)
+            if old_pos and abs(old_pos.liq_price - liq_price) > 0.0001:
+                pct_change = ((liq_price - old_pos.liq_price) / old_pos.liq_price) * 100
+                print(f"[WSTracker] 📊 LIQ PRICE CHANGED: {coin} {old_pos.liq_price:.6f} → {liq_price:.6f} ({pct_change:+.2f}%)")
+
             # Create/update position
             position = TrackedPosition(
                 wallet=user,

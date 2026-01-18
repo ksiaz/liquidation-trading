@@ -118,6 +118,9 @@ class SharedPositionState:
             self._stats['updates'] += 1
             self._stats['last_update'] = time.time()
 
+            # Invalidate cache - force rebuild on next read
+            self._cache_time = 0
+
     def update_positions_batch(self, positions: List[PositionSnapshot]):
         """Bulk update positions (more efficient)."""
         with self._lock:
@@ -134,6 +137,9 @@ class SharedPositionState:
             self._stats['updates'] += len(positions)
             self._stats['last_update'] = time.time()
 
+            # Invalidate cache - force rebuild on next read
+            self._cache_time = 0
+
     def remove_position(self, wallet: str, coin: str):
         """Remove closed position."""
         with self._lock:
@@ -145,6 +151,9 @@ class SharedPositionState:
             key = f"{wallet}:{coin}"
             if key in self._danger_positions:
                 del self._danger_positions[key]
+
+            # Invalidate cache - force rebuild on next read
+            self._cache_time = 0
 
     def add_alert(self, alert: DangerAlert):
         """Add danger zone alert."""

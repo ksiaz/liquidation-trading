@@ -146,6 +146,8 @@ class WSPositionTracker:
         self._connections: Dict[int, asyncio.Task] = {}
         self._conn_wallets: Dict[int, List[str]] = {}  # conn_id -> wallets
         self._wallet_to_conn: Dict[str, int] = {}  # wallet -> conn_id
+        self._conn_websockets: Dict[int, Any] = {}  # conn_id -> WebSocket instance
+        self._subscribe_queue: Dict[int, List[str]] = defaultdict(list)  # conn_id -> wallets to subscribe
 
         # POSITION-CENTRIC indexing (key optimization)
         self._market_positions: Dict[str, Dict[str, TrackedPosition]] = defaultdict(dict)
@@ -161,6 +163,11 @@ class WSPositionTracker:
 
         # Danger tracking
         self._danger_positions: Dict[str, TrackedPosition] = {}  # key = wallet:coin
+
+        # Liquidation tracking - positions that were closed while in danger zone
+        # Key = "wallet:coin", Value = timestamp when detected
+        self._liquidated_positions: Dict[str, float] = {}
+        self._liquidation_cooldown = 300  # 5 minutes - don't re-add liquidated positions
 
         # Stats
         self._stats = {
@@ -232,6 +239,7 @@ class WSPositionTracker:
 
     async def subscribe_wallet(self, wallet: str) -> bool:
         """Add wallet to tracking. Returns True if added."""
+        wallet = wallet.lower()
         if wallet in self._wallet_to_conn:
             return False  # Already tracked
 
@@ -240,7 +248,9 @@ class WSPositionTracker:
             if len(wallets) < self.MAX_USERS_PER_CONN:
                 wallets.append(wallet)
                 self._wallet_to_conn[wallet] = conn_id
-                # TODO: Send subscribe message to existing connection
+                # Queue subscribe message for this connection
+                self._subscribe_queue[conn_id].append(wallet)
+                logger.info(f"[WSTracker] Queued wallet {wallet[:10]}... for conn {conn_id}")
                 return True
 
         # All connections full - would need to add new connection
@@ -251,9 +261,14 @@ class WSPositionTracker:
             self._connections[new_conn_id] = asyncio.create_task(
                 self._run_connection(new_conn_id, [wallet])
             )
+            logger.info(f"[WSTracker] Created new conn {new_conn_id} for wallet {wallet[:10]}...")
             return True
 
         return False  # At capacity
+
+    def get_tracked_wallets(self) -> List[str]:
+        """Get list of all wallets currently tracked on WebSocket."""
+        return list(self._wallet_to_conn.keys())
 
     async def unsubscribe_wallet(self, wallet: str) -> bool:
         """Remove wallet from tracking."""
@@ -286,6 +301,7 @@ class WSPositionTracker:
                     close_timeout=10
                 ) as ws:
                     retry_count = 0  # Reset on successful connect
+                    self._conn_websockets[conn_id] = ws  # Store WS reference for dynamic subscription
                     print(f"[WSTracker] Conn {conn_id} CONNECTED with {len(wallets)} wallets")
 
                     # Subscribe to allMids (price feed)
@@ -294,17 +310,17 @@ class WSPositionTracker:
                         'subscription': {'type': 'allMids'}
                     }))
 
-                    # Subscribe to each user's state
+                    # Subscribe to each user's state and events
                     for wallet in wallets:
-                        await ws.send(json.dumps({
-                            'method': 'subscribe',
-                            'subscription': {'type': 'webData2', 'user': wallet}
-                        }))
+                        await self._send_wallet_subscriptions(ws, wallet)
 
-                    # Message loop
+                    # Message loop with periodic queue check
                     async for msg in ws:
                         if not self._running:
                             break
+
+                        # Process any queued subscriptions for this connection
+                        await self._process_subscribe_queue(conn_id, ws)
 
                         start_time = time.perf_counter()
                         await self._handle_message(msg)
@@ -318,6 +334,40 @@ class WSPositionTracker:
                 delay = min(2 ** retry_count, 60)
                 logger.warning(f"[WSTracker] Conn {conn_id} error: {e}, retry in {delay}s")
                 await asyncio.sleep(delay)
+            finally:
+                # Clean up WebSocket reference on disconnect
+                if conn_id in self._conn_websockets:
+                    del self._conn_websockets[conn_id]
+
+    async def _send_wallet_subscriptions(self, ws, wallet: str):
+        """Send subscription messages for a wallet (webData2 + userEvents)."""
+        # Position updates
+        await ws.send(json.dumps({
+            'method': 'subscribe',
+            'subscription': {'type': 'webData2', 'user': wallet}
+        }))
+        # Liquidation events (definitive confirmation)
+        await ws.send(json.dumps({
+            'method': 'subscribe',
+            'subscription': {'type': 'userEvents', 'user': wallet}
+        }))
+
+    async def _process_subscribe_queue(self, conn_id: int, ws):
+        """Process any queued wallet subscriptions for this connection."""
+        if conn_id not in self._subscribe_queue:
+            return
+
+        queue = self._subscribe_queue[conn_id]
+        while queue:
+            wallet = queue.pop(0)
+            try:
+                await self._send_wallet_subscriptions(ws, wallet)
+                print(f"[WSTracker] Subscribed to wallet {wallet[:10]}... on conn {conn_id}")
+            except Exception as e:
+                logger.error(f"[WSTracker] Failed to subscribe {wallet[:10]}...: {e}")
+                # Put back in queue for retry
+                queue.insert(0, wallet)
+                break
 
     async def _handle_message(self, msg: str):
         """Route message to appropriate handler."""
@@ -329,6 +379,8 @@ class WSPositionTracker:
                 await self._handle_price_update(data.get('data', {}))
             elif channel == 'webData2':
                 await self._handle_position_update(data.get('data', {}))
+            elif channel == 'userEvents':
+                await self._handle_user_events(data.get('data', {}))
         except Exception as e:
             logger.error(f"[WSTracker] Message error: {e}")
 
@@ -463,6 +515,8 @@ class WSPositionTracker:
                 if key in self._danger_positions:
                     del self._danger_positions[key]
                 self._shared_state.remove_position(wallet, coin)
+                # Add to liquidation cooldown to prevent re-adding from stale webData2
+                self._liquidated_positions[key] = time.time()
                 print(f"[WSTracker] ⚠️ LIQUIDATED - Removed: {wallet[:10]}...:{coin} (distance was {dist:.2f}%)")
 
     async def _handle_position_update(self, data: Dict):
@@ -523,6 +577,16 @@ class WSPositionTracker:
             if liq_price <= 0:
                 continue
 
+            # Check if this position was recently liquidated - don't re-add during cooldown
+            key = f"{user}:{coin}"
+            if key in self._liquidated_positions:
+                liq_time = self._liquidated_positions[key]
+                if time.time() - liq_time < self._liquidation_cooldown:
+                    continue  # Still in cooldown, skip this position
+                else:
+                    # Cooldown expired, allow position (it's a new position)
+                    del self._liquidated_positions[key]
+
             # Skip zombie positions (already breached)
             if current_price > 0:
                 if szi > 0 and current_price < liq_price:  # Long below liq
@@ -573,14 +637,21 @@ class WSPositionTracker:
         # Remove closed positions
         old_coins = set(self._wallet_positions.get(user, {}).keys())
         for closed_coin in old_coins - new_coins:
+            key = f"{user}:{closed_coin}"
+
+            # Check if this was a danger zone position - if so, it was likely liquidated
+            was_in_danger = key in self._danger_positions
+            if was_in_danger:
+                self._liquidated_positions[key] = time.time()
+                print(f"[WSTracker] 💀 FORCE LIQUIDATED: {user[:10]}...:{closed_coin} (was in danger zone)")
+
             if closed_coin in self._wallet_positions.get(user, {}):
                 del self._wallet_positions[user][closed_coin]
             if user in self._market_positions.get(closed_coin, {}):
                 del self._market_positions[closed_coin][user]
 
             # Remove from danger tracking
-            key = f"{user}:{closed_coin}"
-            if key in self._danger_positions:
+            if was_in_danger:
                 del self._danger_positions[key]
 
             # Remove from shared state
@@ -589,6 +660,62 @@ class WSPositionTracker:
         # Callback for external processing
         if self._on_position_update:
             self._on_position_update(user, clearinghouse)
+
+    async def _handle_user_events(self, data: Dict):
+        """
+        Handle userEvents - DEFINITIVE liquidation confirmation.
+
+        This is the authoritative source for liquidation events.
+        When we receive a liquidation event, the position is 100% liquidated.
+        """
+        user = data.get('user', '')
+        if not user:
+            return
+
+        # Check for liquidation event
+        if 'liquidation' in data:
+            liq_data = data['liquidation']
+
+            # Extract liquidated positions
+            liquidated_positions = liq_data.get('liquidatedPositions', [])
+            notional = float(liq_data.get('liquidated_ntl_pos', 0))
+
+            print(f"\n{'='*60}")
+            print(f"[WSTracker] 💀 LIQUIDATION CONFIRMED via userEvents")
+            print(f"[WSTracker] User: {user[:16]}...")
+            print(f"[WSTracker] Notional: ${notional:,.0f}")
+
+            # Remove each liquidated position
+            for liq_pos in liquidated_positions:
+                coin = liq_pos.get('coin', '')
+                size = float(liq_pos.get('szi', 0))
+
+                if not coin:
+                    continue
+
+                side = 'LONG' if size > 0 else 'SHORT'
+                print(f"[WSTracker] Position: {coin} {side} size={abs(size):,.2f}")
+
+                key = f"{user}:{coin}"
+
+                # Remove from all indices
+                if user in self._wallet_positions and coin in self._wallet_positions[user]:
+                    del self._wallet_positions[user][coin]
+                if coin in self._market_positions and user in self._market_positions[coin]:
+                    del self._market_positions[coin][user]
+                if key in self._danger_positions:
+                    del self._danger_positions[key]
+
+                # Remove from shared state
+                self._shared_state.remove_position(user, coin)
+
+                # Add to liquidation cooldown
+                self._liquidated_positions[key] = time.time()
+
+            print(f"{'='*60}\n")
+
+            # Track stats
+            self._stats['liquidations_confirmed'] = self._stats.get('liquidations_confirmed', 0) + 1
 
     def _emit_signal(self, pos: TrackedPosition, danger_level: int):
         """Emit danger signal to shared state and callback."""
@@ -651,8 +778,34 @@ class WSPositionTracker:
             'markets_tracked': len(self._market_positions),
             'positions_tracked': sum(len(p) for p in self._market_positions.values()),
             'danger_positions': len(self._danger_positions),
+            'recent_liquidations': len(self._liquidated_positions),
             **self._stats
         }
+
+    def get_recent_liquidations(self, since_seconds: float = 300) -> List[Dict[str, Any]]:
+        """Get positions liquidated within the last N seconds."""
+        cutoff = time.time() - since_seconds
+        results = []
+        for key, liq_time in self._liquidated_positions.items():
+            if liq_time >= cutoff:
+                parts = key.split(':')
+                if len(parts) == 2:
+                    results.append({
+                        'wallet': parts[0],
+                        'coin': parts[1],
+                        'liquidated_at': liq_time,
+                        'seconds_ago': time.time() - liq_time
+                    })
+        return sorted(results, key=lambda x: x['liquidated_at'], reverse=True)
+
+    def cleanup_old_liquidations(self):
+        """Remove liquidation entries older than cooldown period."""
+        cutoff = time.time() - self._liquidation_cooldown
+        old_keys = [k for k, t in self._liquidated_positions.items() if t < cutoff]
+        for key in old_keys:
+            del self._liquidated_positions[key]
+        if old_keys:
+            print(f"[WSTracker] Cleaned up {len(old_keys)} old liquidation entries")
 
 
 class WalletPrioritizer:
@@ -828,9 +981,17 @@ class HybridPositionTracker:
 
     async def _rebalance_loop(self):
         """Periodically rebalance WS vs REST wallets."""
+        cleanup_counter = 0
         while self._running:
             try:
                 await self.prioritizer.rebalance()
+
+                # Cleanup old liquidation entries every 60 seconds (12 iterations)
+                cleanup_counter += 1
+                if cleanup_counter >= 12:
+                    self.ws_tracker.cleanup_old_liquidations()
+                    cleanup_counter = 0
+
             except Exception as e:
                 logger.error(f"[HybridTracker] Rebalance error: {e}")
 
@@ -853,5 +1014,6 @@ class HybridPositionTracker:
         return {
             'ws_tracker': self.ws_tracker.get_connection_stats(),
             'prioritizer': self.prioritizer.get_status(),
-            'rest_queue_size': len(self._rest_wallets_queue)
+            'rest_queue_size': len(self._rest_wallets_queue),
+            'recent_liquidations': self.ws_tracker.get_recent_liquidations(300)  # Last 5 min
         }

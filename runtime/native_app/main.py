@@ -1034,6 +1034,9 @@ class PositionRefresher(threading.Thread):
         # Liquidation callback for fade executor
         self._on_liquidation = None
 
+        # Wallet discovery callback (for WSTracker sync)
+        self._on_wallet_discovered = None
+
         # Dynamic wallet discovery
         self._discovered_wallets: set = set()  # Wallets found from trades
         self._load_wallets_from_db()  # Load high-value wallets on init
@@ -1045,6 +1048,10 @@ class PositionRefresher(threading.Thread):
     def set_liquidation_callback(self, callback):
         """Set callback for liquidation events."""
         self._on_liquidation = callback
+
+    def set_wallet_discovery_callback(self, callback):
+        """Set callback for newly discovered wallets (for WSTracker sync)."""
+        self._on_wallet_discovered = callback
 
     def _load_wallets_from_db(self):
         """Load high-value wallets from indexed_wallets database."""
@@ -1137,6 +1144,9 @@ class PositionRefresher(threading.Thread):
                         added += 1
                         if near_liq:
                             print(f"[DISCOVERY] Added {wallet[:10]}... (${total:,.0f}, NEAR LIQ)")
+                        # Notify WSTracker of new wallet
+                        if self._on_wallet_discovered:
+                            self._on_wallet_discovered(wallet)
 
                 except:
                     pass
@@ -1234,6 +1244,10 @@ class PositionRefresher(threading.Thread):
                             print(f"[STALE-SCAN] Added {wallet[:10]}... (${total_value:,.0f}, RISKY POSITION)")
                         elif has_high_impact:
                             print(f"[STALE-SCAN] Added {wallet[:10]}... (${total_value:,.0f}, SHITCOIN EXPOSURE)")
+
+                        # Notify WSTracker of new wallet
+                        if self._on_wallet_discovered:
+                            self._on_wallet_discovered(wallet)
 
                 except Exception:
                     pass
@@ -5268,10 +5282,14 @@ class MainWindow(QMainWindow):
 
     def _init_ws_tracker(self):
         """Initialize WebSocket-based position tracker for sub-50ms latency."""
+        # Store reference to event loop for cross-thread scheduling
+        self._ws_loop = None
+
         def run_ws_tracker():
             """Run the async WS tracker in a separate thread with its own event loop."""
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._ws_loop = loop  # Store reference for cross-thread access
 
             try:
                 # Create tracker with callbacks
@@ -5299,6 +5317,25 @@ class MainWindow(QMainWindow):
                 print(f"[WSTracker] Error: {e}")
             finally:
                 loop.close()
+
+        def on_wallet_discovered(wallet: str):
+            """Callback for newly discovered wallets - subscribes them to WSTracker."""
+            if self._ws_loop and self.ws_tracker:
+                # Schedule async subscribe on the WS tracker's event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self.ws_tracker.ws_tracker.subscribe_wallet(wallet),
+                    self._ws_loop
+                )
+                try:
+                    # Wait briefly for result (non-blocking with timeout)
+                    result = future.result(timeout=1.0)
+                    if result:
+                        print(f"[WSTracker] Dynamically subscribed to new wallet: {wallet[:10]}...")
+                except Exception as e:
+                    print(f"[WSTracker] Failed to subscribe {wallet[:10]}...: {e}")
+
+        # Set the discovery callback
+        self.position_refresher.set_wallet_discovery_callback(on_wallet_discovered)
 
         # Start in background thread
         self._ws_tracker_thread = threading.Thread(target=run_ws_tracker, daemon=True)

@@ -414,9 +414,9 @@ class WSPositionTracker:
                     else:
                         pos.distance_pct = ((pos.liq_price - price) / price) * 100
 
-                # LIQUIDATION DETECTION: If position is way past liq price, it's liquidated
-                # Remove from tracking (don't keep updating stale liquidated positions)
-                if pos.distance_pct < -2.0:
+                # LIQUIDATION DETECTION: If price reached/crossed liq price, remove immediately
+                # distance <= 0 means liq price was touched or breached
+                if pos.distance_pct <= 0:
                     positions_to_remove.append((wallet, coin, key, pos.distance_pct))
                     continue  # Don't update shared state for liquidated positions
 

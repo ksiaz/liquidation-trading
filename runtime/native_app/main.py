@@ -5088,13 +5088,13 @@ class MainWindow(QMainWindow):
                 # Filter for positions CLOSE to liquidation:
                 # - Recently updated (within 30s) - removes liquidated/stale positions
                 # - Within 2% of liquidation (the interesting ones)
-                # - Allow -0.5% for calculation drift
+                # - distance > 0 (positions at/past liq are removed by WS tracker)
                 # - Meaningful notional ($10k+)
                 stale_threshold = now - 30.0  # 30 seconds freshness
                 valid_snapshots = [
                     s for s in all_snapshots
                     if s.updated_at > stale_threshold
-                    and s.distance_pct > -0.5  # Allow small negative for liq price drift
+                    and s.distance_pct > 0  # Must be above liq price (WS tracker removes at <=0)
                     and s.distance_pct <= 2.0  # Only show positions within 2% of liq
                     and s.notional >= 10000
                 ]

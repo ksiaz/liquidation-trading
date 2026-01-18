@@ -204,17 +204,12 @@ def fetch_live_positions_near_liq(
                     leverage = float(leverage_info.get('value', 1)) if isinstance(leverage_info, dict) else 1.0
                     unrealized_pnl = float(pos.get('unrealizedPnl', 0))
 
-                    # Get liquidation price - estimate if null (cross-margin)
-                    if liq_str is not None:
-                        liq_price = float(liq_str)
-                    elif leverage > 0 and entry_price > 0:
-                        # Estimate for cross-margin positions
-                        if side == 'LONG':
-                            liq_price = entry_price * (1 - 0.9 / leverage)
-                        else:
-                            liq_price = entry_price * (1 + 0.9 / leverage)
-                    else:
-                        liq_price = 0
+                    # If no liq price from API, position is well-collateralized - skip
+                    if liq_str is None:
+                        continue
+                    liq_price = float(liq_str)
+                    if liq_price <= 0:
+                        continue
 
                     # Calculate LIVE distance
                     current_price = mids.get(coin, 0)
@@ -2066,16 +2061,13 @@ class PositionRefresher(threading.Thread):
             margin_used = float(pos.get('marginUsed', 0))
             unrealized_pnl = float(pos.get('unrealizedPnl', 0))
 
-            # Get liquidation price
+            # If no liq price from API, position is well-collateralized - skip
             liq_price = pos.get('liquidationPx')
-            if liq_price is not None:
-                liq_price = float(liq_price)
-            elif leverage > 0 and entry_price > 0:
-                # Estimate for cross-margin
-                if side == 'LONG':
-                    liq_price = entry_price * (1 - 0.9 / leverage)
-                else:
-                    liq_price = entry_price * (1 + 0.9 / leverage)
+            if liq_price is None:
+                continue
+            liq_price = float(liq_price)
+            if liq_price <= 0:
+                continue
 
             # Calculate distance to liquidation (negative = past liquidation)
             current_price = mid_prices.get(coin, 0)

@@ -518,10 +518,9 @@ class WSPositionTracker:
             if leverage <= 0:
                 leverage = 20
 
-            # Skip cross-margin positions (no reliable liq price)
-            # Cross-margin uses entire account balance, so API returns liq=None
+            # If API returns no liq price (null), the position is well-collateralized
+            # with no meaningful liquidation risk - skip it
             if liq_price <= 0:
-                # Don't fake a liq price - just skip cross-margin positions
                 continue
 
             # Skip zombie positions (already breached)

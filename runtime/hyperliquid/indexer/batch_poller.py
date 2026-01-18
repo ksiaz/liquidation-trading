@@ -338,17 +338,8 @@ class BatchPositionPoller:
             # Determine side from signed size
             side = "LONG" if pos.position_size > 0 else "SHORT"
 
-            # Calculate liquidation price if not provided (cross-margin longs)
+            # If API returns no liq price, position is well-collateralized - skip it
             liq_price = pos.liquidation_price
-            if (liq_price is None or liq_price <= 0) and current_price > 0 and pos.leverage > 0:
-                # Approximate: for longs, liq = entry * (1 - 1/leverage)
-                # for shorts, liq = entry * (1 + 1/leverage)
-                if side == "LONG":
-                    liq_price = pos.entry_price * (1 - 0.9 / pos.leverage)
-                else:
-                    liq_price = pos.entry_price * (1 + 0.9 / pos.leverage)
-
-            # Skip if still no valid liquidation price
             if liq_price is None or liq_price <= 0:
                 continue
 

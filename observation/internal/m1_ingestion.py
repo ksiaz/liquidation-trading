@@ -32,6 +32,10 @@ class M1IngestionEngine:
         # Recent price tracking per symbol (for absorption detection)
         self.recent_prices: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=10))
 
+        # Hyperliquid buffers
+        self.hl_positions: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=trade_buffer_size))
+        self.hl_liquidations: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=liquidation_buffer_size))
+
         # Counters
         self.counters = {
             'trades': 0,
@@ -39,6 +43,8 @@ class M1IngestionEngine:
             'klines': 0,
             'oi': 0,
             'depth': 0,
+            'hl_positions': 0,
+            'hl_liquidations': 0,
             'errors': 0
         }
 
@@ -173,3 +179,93 @@ class M1IngestionEngine:
             'trades': {s: list(d) for s, d in self.raw_trades.items()},
             'liquidations': {s: list(d) for s, d in self.raw_liquidations.items()}
         }
+
+    # =========================================================================
+    # Hyperliquid Normalization (Tier 1 - Confirmed Facts)
+    # =========================================================================
+
+    def normalize_hl_position(self, symbol: str, payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Hyperliquid position event (Tier 1 - confirmed fact).
+
+        This is factual data from the exchange - no transformation, just format.
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            payload: Position data with keys:
+                - wallet_address: Wallet address
+                - position_size: Signed size (positive=long, negative=short)
+                - entry_price: Entry price
+                - liquidation_price: Liquidation trigger price
+                - leverage: Leverage multiplier
+                - margin_used: Margin used (USD)
+                - position_value: Position value (USD)
+                - timestamp: Event timestamp
+
+        Returns:
+            Normalized event dict or None on error
+        """
+        try:
+            position_size = float(payload.get('position_size', 0))
+            side = 'LONG' if position_size > 0 else 'SHORT'
+
+            event = {
+                'timestamp': float(payload.get('timestamp', 0)),
+                'symbol': symbol,
+                'wallet_address': payload.get('wallet_address', ''),
+                'position_size': position_size,
+                'entry_price': float(payload.get('entry_price', 0)),
+                'liquidation_price': float(payload.get('liquidation_price', 0)),
+                'leverage': float(payload.get('leverage', 1)),
+                'margin_used': float(payload.get('margin_used', 0)),
+                'position_value': float(payload.get('position_value', 0)),
+                'side': side,
+                'event_type': 'HL_POSITION',
+                'exchange': 'HYPERLIQUID'
+            }
+            self.hl_positions[symbol].append(event)
+            self.counters['hl_positions'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def normalize_hl_liquidation(self, symbol: str, payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Hyperliquid liquidation event (Tier 1 - confirmed fact).
+
+        This is factual data from the exchange - liquidation confirmed.
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            payload: Liquidation data with keys:
+                - wallet_address: Wallet address
+                - liquidated_size: Size liquidated
+                - price: Liquidation price
+                - side: Position side that was liquidated
+                - timestamp: Event timestamp
+                - value: USD value liquidated
+
+        Returns:
+            Normalized event dict or None on error
+        """
+        try:
+            event = {
+                'timestamp': float(payload.get('timestamp', 0)),
+                'symbol': symbol,
+                'wallet_address': payload.get('wallet_address', ''),
+                'liquidated_size': abs(float(payload.get('liquidated_size', 0))),
+                'liquidation_price': float(payload.get('price', 0)),
+                'side': payload.get('side', 'UNKNOWN'),
+                'value': float(payload.get('value', 0)),
+                'event_type': 'HL_LIQUIDATION',
+                'exchange': 'HYPERLIQUID'
+            }
+            self.hl_liquidations[symbol].append(event)
+            self.counters['hl_liquidations'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None

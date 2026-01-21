@@ -191,6 +191,10 @@ class StopHuntDetector:
         Returns:
             LiquidityCluster if significant cluster detected, None otherwise
         """
+        # Guard against division by zero
+        if not current_price or current_price <= 0:
+            return None
+
         # Check for LONG cluster (can be hunted downward)
         long_cluster = None
         if (long_positions_count >= self.MIN_CLUSTER_POSITIONS and

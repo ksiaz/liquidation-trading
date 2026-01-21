@@ -6,6 +6,25 @@
 
 ---
 
+## 🚀 Progressive Disclosure System (PRIORITY)
+
+**IMPORTANT: Use `.claude/` directory for efficient context loading.**
+
+- **Skills:** `.claude/skills/` - Load on-demand workflows (testing, database, analysis, validation, system-audit)
+- **Memory:** `.claude/memory/` - Load constitutional summaries before full docs (96% token savings)
+- **Tools:** `.claude/tools/` - Tool registry and capabilities
+
+**Usage Pattern:**
+1. Discover: `ls .claude/skills/` or `grep -r "keyword" .claude/memory/`
+2. Frontmatter: `head -7 .claude/skills/[skill]/SKILL.md` (~100 tokens)
+3. Full content: `cat .claude/skills/[skill]/SKILL.md` only if relevant (~2-5k tokens)
+
+**Token Savings:** 85-96% reduction vs loading full constitutional docs upfront
+
+**See:** `.claude/README.md` for complete usage guide
+
+---
+
 ## 📚 Constitutional Authority Documents
 
 This file consolidates rules from:

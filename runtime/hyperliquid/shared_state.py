@@ -31,6 +31,8 @@ class PositionSnapshot:
     leverage: float
     danger_level: int = 0  # 0=safe, 1=watch, 2=warning, 3=critical
     updated_at: float = 0.0
+    opened_at: float = 0.0  # When position was actually opened (from userFills API)
+    discovered_at: float = 0.0  # When we first saw this position
 
 
 @dataclass

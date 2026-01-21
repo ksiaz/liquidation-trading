@@ -23,6 +23,14 @@ from runtime.hyperliquid.shared_state import (
     get_shared_state, SharedPositionState, PositionSnapshot, DangerAlert
 )
 
+# Node client for instant position validation (no rate limits)
+try:
+    from runtime.hyperliquid.node_client import get_node_client, has_position as node_has_position
+    HAS_NODE_CLIENT = True
+except ImportError:
+    HAS_NODE_CLIENT = False
+    node_has_position = None
+
 logger = logging.getLogger(__name__)
 
 WS_URL = 'wss://api.hyperliquid.xyz/ws'
@@ -51,6 +59,10 @@ class TrackedPosition:
 
     # Flags
     in_danger_zone: bool = False
+
+    # Position timing (for opportunity freshness detection)
+    opened_at: float = 0.0  # When position was actually opened (from userFills API, ms timestamp)
+    discovered_at: float = 0.0  # When we first saw this position (our timestamp)
 
     def __post_init__(self):
         """Precompute trigger prices once on position creation."""
@@ -183,6 +195,17 @@ class WSPositionTracker:
         self._liquidated_positions: Dict[str, float] = {}
         self._liquidation_cooldown = 300  # 5 minutes - don't re-add liquidated positions
 
+        # Position open times cache - Key = "wallet:coin", Value = timestamp (ms) when position opened
+        # This tracks the actual trade time from userFills API, not when we discovered it
+        self._position_open_times: Dict[str, float] = {}
+        self._open_time_fetch_queue: List[tuple] = []  # (wallet, coin) pairs to fetch
+        self._last_fills_fetch: Dict[str, float] = {}  # wallet -> last fetch time (rate limit)
+
+        # Liquidation history validation cache
+        # Key = "wallet:coin", Value = (timestamp, is_liquidated)
+        self._liq_history_cache: Dict[str, tuple] = {}
+        self._validation_queue: List[tuple] = []  # (wallet, coin, side, liq_price) to validate
+
         # Stats
         self._stats = {
             'ws_messages': 0,
@@ -212,6 +235,294 @@ class WSPositionTracker:
         """Performance stats."""
         return self._stats
 
+    def _get_position_open_time(self, wallet: str, coin: str) -> float:
+        """
+        Get when a position was opened (from cache or queue for fetch).
+
+        Returns timestamp in milliseconds, or 0 if unknown.
+        """
+        key = f"{wallet}:{coin}"
+
+        # Check cache first
+        if key in self._position_open_times:
+            return self._position_open_times[key]
+
+        # Queue for async fetch (don't block)
+        if (wallet, coin) not in self._open_time_fetch_queue:
+            self._open_time_fetch_queue.append((wallet, coin))
+
+        return 0.0  # Unknown for now
+
+    async def _fetch_position_open_times(self):
+        """
+        Background task to fetch position open times from userFills API.
+        Rate-limited to avoid API abuse.
+        """
+        import requests
+        from datetime import datetime
+
+        queue_size = len(self._open_time_fetch_queue)
+        if not self._open_time_fetch_queue:
+            return
+
+        print(f"[OPEN_TIME] Queue has {queue_size} items, have {len(self._position_open_times)} cached open times")
+
+        # Process up to 5 wallets per cycle
+        wallets_to_fetch = set()
+        items_to_process = self._open_time_fetch_queue[:20]
+
+        for wallet, coin in items_to_process:
+            # Rate limit: 1 fetch per wallet per 60 seconds
+            last_fetch = self._last_fills_fetch.get(wallet, 0)
+            if time.time() - last_fetch >= 60:
+                wallets_to_fetch.add(wallet)
+
+        if not wallets_to_fetch:
+            return
+
+        url = 'https://api.hyperliquid.xyz/info'
+
+        # Use synchronous requests to avoid Windows async DNS issues
+        for wallet in list(wallets_to_fetch)[:5]:  # Max 5 per cycle
+            try:
+                resp = requests.post(url, json={
+                    'type': 'userFills',
+                    'user': wallet
+                }, timeout=5)
+
+                if resp.status_code == 200:
+                    fills = resp.json()
+                    self._last_fills_fetch[wallet] = time.time()
+
+                    # Process fills to find position open times
+                    # Group fills by coin, find earliest fill that would open current position
+                    coin_fills: Dict[str, List] = defaultdict(list)
+                    for fill in fills:
+                        coin_fills[fill.get('coin', '')].append(fill)
+
+                    # For each coin, find the most recent position-opening fill
+                    for coin, coin_fill_list in coin_fills.items():
+                        key = f"{wallet}:{coin}"
+                        if key in self._position_open_times:
+                            continue  # Already have it
+
+                        # Sort by time descending
+                        coin_fill_list.sort(key=lambda f: f.get('time', 0), reverse=True)
+
+                        # Find the fill that opened the current position
+                        # (most recent fill is a good approximation)
+                        if coin_fill_list:
+                            open_time = coin_fill_list[0].get('time', 0)  # ms timestamp
+                            self._position_open_times[key] = open_time
+                            open_time_str = datetime.fromtimestamp(open_time/1000).strftime('%Y-%m-%d %H:%M')
+                            print(f"[OPEN_TIME] Got open time for {wallet[:10]}...:{coin} = {open_time_str}")
+
+                            # Remove from queue
+                            if (wallet, coin) in self._open_time_fetch_queue:
+                                self._open_time_fetch_queue.remove((wallet, coin))
+
+            except Exception as e:
+                print(f"[OPEN_TIME] Error fetching fills for {wallet[:10]}...: {e}")
+
+    async def _check_position_liquidated_by_history(
+        self, coin: str, side: str, liq_price: float, opened_at_ms: float
+    ) -> bool:
+        """
+        Check if a position was likely liquidated by checking price history.
+
+        For LONG: liquidated if any candle LOW < liq_price since opened
+        For SHORT: liquidated if any candle HIGH > liq_price since opened
+
+        Returns True if position was likely liquidated.
+        """
+        import requests
+
+        if liq_price <= 0 or opened_at_ms <= 0:
+            return False  # Can't validate without liq price or open time
+
+        # Calculate time range - from position open to now
+        now_ms = int(time.time() * 1000)
+        start_ms = int(opened_at_ms)
+
+        # Don't check positions opened less than 1 minute ago
+        if now_ms - start_ms < 60000:
+            return False
+
+        url = 'https://api.hyperliquid.xyz/info'
+
+        try:
+            # Use synchronous requests to avoid Windows async DNS issues
+            resp = requests.post(url, json={
+                'type': 'candleSnapshot',
+                'req': {
+                    'coin': coin,
+                    'interval': '1m',
+                    'startTime': start_ms,
+                    'endTime': now_ms
+                }
+            }, timeout=10)
+
+            if resp.status_code != 200:
+                return False
+
+            candles = resp.json()
+            if not candles:
+                print(f"[VALIDATOR] No candles returned for {coin}")
+                return False
+
+            print(f"[VALIDATOR] Checking {len(candles)} candles for {side} {coin}, liq_price={liq_price:.6f}")
+            # Check each candle for liquidation
+            for candle in candles:
+                # Candle format: {t, T, s, i, o, c, h, l, v, n}
+                # t=open time, h=high, l=low
+                try:
+                    high = float(candle.get('h', 0))
+                    low = float(candle.get('l', 0))
+
+                    if side == 'LONG':
+                        # LONG liquidated if price went below liq_price
+                        if low > 0 and low <= liq_price:
+                            return True
+                    else:  # SHORT
+                        # SHORT liquidated if price went above liq_price
+                        if high > 0 and high >= liq_price:
+                            return True
+                except (ValueError, TypeError):
+                    continue
+
+            return False
+
+        except Exception as e:
+            return False  # Fail open - assume not liquidated if check fails
+
+    async def _is_position_valid(
+        self, wallet: str, coin: str, side: str, liq_price: float
+    ) -> bool:
+        """
+        Validate if a position is real (not already liquidated).
+
+        Checks:
+        1. Node state (instant - no rate limits)
+        2. Price history since position opened (fallback)
+        3. Cache to avoid repeated API calls
+
+        Returns True if position appears valid, False if likely liquidated.
+        """
+        key = f"{wallet}:{coin}"
+
+        # FAST PATH: Check node state first (instant, no rate limits)
+        if HAS_NODE_CLIENT:
+            try:
+                # Node tells us if wallet still has ANY position for this coin
+                if not node_has_position(wallet, coin):
+                    print(f"[WSTracker] ⚡ NODE: Position gone - {wallet[:10]}...:{coin}")
+                    self._liq_history_cache[key] = (time.time(), True)
+                    return False
+            except Exception as e:
+                pass  # Fall through to other checks
+
+        # Check cache (valid for 5 minutes)
+        if key in self._liq_history_cache:
+            cache_time, is_liquidated = self._liq_history_cache[key]
+            if time.time() - cache_time < 300:  # 5 min cache
+                return not is_liquidated
+
+        # Get position open time
+        opened_at = self._position_open_times.get(key, 0)
+        if opened_at <= 0:
+            # No open time yet - can't validate, assume valid
+            return True
+
+        # Check price history
+        is_liquidated = await self._check_position_liquidated_by_history(
+            coin, side, liq_price, opened_at
+        )
+
+        # Cache result
+        self._liq_history_cache[key] = (time.time(), is_liquidated)
+
+        if is_liquidated:
+            print(f"[WSTracker] ⚠️ ZOMBIE DETECTED: {wallet[:10]}...:{coin} - price crossed liq since open")
+
+        return not is_liquidated
+
+    async def _run_open_time_fetcher(self):
+        """Background task to periodically fetch position open times."""
+        print("[OPEN_TIME] Starting open time fetcher task")
+        while self._running:
+            try:
+                await self._fetch_position_open_times()
+            except Exception as e:
+                print(f"[OPEN_TIME] ERROR: {type(e).__name__}: {e}")
+            await asyncio.sleep(10)  # Check every 10 seconds
+
+    async def _run_position_validator(self):
+        """Background task to validate positions against price history."""
+        # Wait a bit for positions to accumulate and open times to be fetched
+        print("[VALIDATOR] Starting validator task, waiting 30s for positions to accumulate...")
+        await asyncio.sleep(30)
+        print("[VALIDATOR] Initial wait complete, beginning validation loop")
+
+        while self._running:
+            try:
+                await self._validate_all_positions()
+            except Exception as e:
+                print(f"[VALIDATOR] ERROR in validation: {type(e).__name__}: {e}")
+            await asyncio.sleep(60)  # Validate every 60 seconds
+
+    async def _validate_all_positions(self):
+        """Validate all tracked positions against price history."""
+        positions_to_remove = []
+        total_positions = sum(len(coins) for coins in self._wallet_positions.values())
+        positions_with_open_time = len(self._position_open_times)
+
+        print(f"[VALIDATOR] Starting validation: {total_positions} positions, {positions_with_open_time} have open times")
+
+        # Get all current positions
+        for wallet, coins in list(self._wallet_positions.items()):
+            for coin, pos in list(coins.items()):
+                key = f"{wallet}:{coin}"
+
+                # Skip if no open time yet
+                if key not in self._position_open_times:
+                    continue
+
+                # Check if already validated recently
+                if key in self._liq_history_cache:
+                    cache_time, is_liquidated = self._liq_history_cache[key]
+                    if time.time() - cache_time < 300:  # 5 min cache
+                        if is_liquidated:
+                            positions_to_remove.append((wallet, coin, key))
+                        continue
+
+                # Validate position
+                is_valid = await self._is_position_valid(
+                    wallet, coin, pos.side, pos.liq_price
+                )
+
+                if not is_valid:
+                    positions_to_remove.append((wallet, coin, key))
+
+        # Remove zombie positions
+        for wallet, coin, key in positions_to_remove:
+            if wallet in self._wallet_positions and coin in self._wallet_positions[wallet]:
+                del self._wallet_positions[wallet][coin]
+            if coin in self._market_positions and wallet in self._market_positions[coin]:
+                del self._market_positions[coin][wallet]
+            if key in self._danger_positions:
+                del self._danger_positions[key]
+
+            # Add to liquidated cache to prevent re-adding
+            self._liquidated_positions[key] = time.time()
+
+            # Remove from shared state
+            self._shared_state.remove_position(wallet, coin)
+
+            print(f"[WSTracker] 🗑️ REMOVED ZOMBIE: {wallet[:10]}...:{coin} (price crossed liq in history)")
+
+        if positions_to_remove:
+            print(f"[WSTracker] Validated positions: removed {len(positions_to_remove)} zombies")
+
     async def start(self, initial_wallets: List[str]):
         """Start tracking positions for initial wallet set."""
         self._running = True
@@ -238,11 +549,25 @@ class WSPositionTracker:
                     self._run_connection(i, wallet_batch)
                 )
 
+        # Start background task to fetch position open times
+        self._open_time_task = asyncio.create_task(self._run_open_time_fetcher())
+
+        # Start background task to validate positions against price history
+        self._validator_task = asyncio.create_task(self._run_position_validator())
+
         logger.info(f"[WSTracker] Started {num_conns} connections for {len(initial_wallets)} wallets")
 
     async def stop(self):
         """Stop all connections gracefully."""
         self._running = False
+
+        # Cancel open time fetcher task
+        if hasattr(self, '_open_time_task') and self._open_time_task:
+            self._open_time_task.cancel()
+
+        # Cancel validator task
+        if hasattr(self, '_validator_task') and self._validator_task:
+            self._validator_task.cancel()
 
         for task in self._connections.values():
             task.cancel()
@@ -499,7 +824,9 @@ class WSPositionTracker:
                     distance_pct=pos.distance_pct,
                     leverage=pos.leverage,
                     danger_level=danger_level,
-                    updated_at=time.time()
+                    updated_at=time.time(),
+                    opened_at=pos.opened_at,
+                    discovered_at=pos.discovered_at
                 )
                 self._shared_state.update_position(snapshot)
 
@@ -650,6 +977,15 @@ class WSPositionTracker:
 
             current_price = self._mid_prices.get(coin, 0)
 
+            # If no cached price, fetch from shared state (which may have API prices)
+            if current_price <= 0:
+                current_price = self._shared_state.get_mid_price(coin)
+
+            # Still no price? Skip this position - we can't validate without current price
+            # This prevents zombie positions from slipping through when price cache misses
+            if current_price <= 0:
+                continue
+
             # Get leverage
             leverage_data = pos_data.get('leverage', {})
             try:
@@ -658,6 +994,15 @@ class WSPositionTracker:
                 leverage = 20
             if leverage <= 0:
                 leverage = 20
+
+            # SANITY CHECK: liq_price should be within reasonable range of entry_price
+            # Cross-margin positions can have high ratios (account-level liq), so we only
+            # filter truly impossible ratios (>1000x = liq price 1000x away from entry)
+            if liq_price > 0 and entry_price > 0:
+                ratio = liq_price / entry_price
+                if ratio > 1000 or ratio < 0.001:  # More than 1000x difference is corrupt
+                    # Silently skip extremely corrupt data
+                    continue
 
             # If API returns no liq price (null), calculate using account-level data
             # This happens for cross-margin positions or well-collateralized positions
@@ -686,24 +1031,78 @@ class WSPositionTracker:
                 if szi < 0 and current_price > liq_price:  # Short above liq
                     continue
 
-            # Check if liq price changed (for debugging)
+            # Debug: Only log significant liq price changes (>1%)
             old_pos = self._wallet_positions.get(user, {}).get(coin)
-            if old_pos and abs(old_pos.liq_price - liq_price) > 0.0001:
+            if old_pos and old_pos.liq_price > 0:
                 pct_change = ((liq_price - old_pos.liq_price) / old_pos.liq_price) * 100
-                print(f"[WSTracker] 📊 LIQ PRICE CHANGED: {coin} {old_pos.liq_price:.6f} → {liq_price:.6f} ({pct_change:+.2f}%)")
+                if abs(pct_change) > 1.0:  # Only log >1% changes
+                    print(f"[WSTracker] 📊 LIQ PRICE CHANGED: {coin} {old_pos.liq_price:.6f} → {liq_price:.6f} ({pct_change:+.2f}%)")
+
+            # Get position timing info
+            key = f"{user}:{coin}"
+            now = time.time()
+
+            # Check if this is a new position (we haven't seen before)
+            is_new_position = coin not in self._wallet_positions.get(user, {})
+
+            # Get/preserve discovered_at time
+            if is_new_position:
+                discovered_at = now
+            else:
+                # Preserve existing discovered_at
+                old_pos = self._wallet_positions[user][coin]
+                discovered_at = old_pos.discovered_at if old_pos.discovered_at > 0 else now
+
+            # Get opened_at from cache (may be 0 if not fetched yet)
+            opened_at = self._get_position_open_time(user, coin)
 
             # Create/update position
+            side = 'LONG' if szi > 0 else 'SHORT'
+            notional = abs(szi) * current_price if current_price > 0 else 0
+
+            # FILTER: Skip positions smaller than $5000 (too small to matter, wastes API calls)
+            MIN_NOTIONAL = 5000
+            if notional < MIN_NOTIONAL:
+                continue
+
             position = TrackedPosition(
                 wallet=user,
                 coin=coin,
-                side='LONG' if szi > 0 else 'SHORT',
+                side=side,
                 size=abs(szi),
                 entry_price=entry_price,
                 liq_price=liq_price,
-                notional=abs(szi) * current_price if current_price > 0 else 0,
+                notional=notional,
                 leverage=leverage,
-                current_price=current_price
+                current_price=current_price,
+                opened_at=opened_at,
+                discovered_at=discovered_at
             )
+
+            # IMMEDIATE ZOMBIE CHECK: If price has crossed liq, skip this position
+            if current_price > 0 and liq_price > 0:
+                if side == 'LONG' and current_price <= liq_price:
+                    # LONG position: liquidated when price drops to/below liq_price
+                    print(f"[WSTracker] 🗑️ ZOMBIE FILTERED: {user[:10]}...:{coin} LONG - price ${current_price:.4f} <= liq ${liq_price:.4f}")
+                    self._liquidated_positions[key] = time.time()
+                    # Remove from tracking if it exists
+                    if coin in self._wallet_positions.get(user, {}):
+                        del self._wallet_positions[user][coin]
+                    if user in self._market_positions.get(coin, {}):
+                        del self._market_positions[coin][user]
+                    self._shared_state.remove_position(user, coin)
+                    continue
+                elif side == 'SHORT' and current_price >= liq_price:
+                    # SHORT position: liquidated when price rises to/above liq_price
+                    print(f"[WSTracker] 🗑️ ZOMBIE FILTERED: {user[:10]}...:{coin} SHORT - price ${current_price:.4f} >= liq ${liq_price:.4f}")
+                    self._liquidated_positions[key] = time.time()
+                    # Remove from tracking if it exists
+                    if coin in self._wallet_positions.get(user, {}):
+                        del self._wallet_positions[user][coin]
+                    if user in self._market_positions.get(coin, {}):
+                        del self._market_positions[coin][user]
+                    self._shared_state.remove_position(user, coin)
+                    continue
 
             # Update both indices
             self._wallet_positions[user][coin] = position
@@ -722,7 +1121,9 @@ class WSPositionTracker:
                 distance_pct=position.distance_pct,
                 leverage=position.leverage,
                 danger_level=position.check_danger(position.current_price) if position.current_price > 0 else 0,
-                updated_at=time.time()
+                updated_at=now,
+                opened_at=opened_at,
+                discovered_at=discovered_at
             )
             self._shared_state.update_position(snapshot)
 

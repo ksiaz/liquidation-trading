@@ -56,12 +56,22 @@ class HyperliquidPosition:
         """
         Calculate percentage distance from current price to liquidation.
 
+        Direction-aware: positive means safe, negative means crossed (liquidated).
+
+        For LONG: price above liq = positive (safe)
+        For SHORT: price below liq = positive (safe)
+
         Returns:
-            Positive percentage (0.005 = 0.5%)
+            Signed percentage (0.005 = 0.5% safe, -0.005 = crossed by 0.5%)
         """
         if current_price <= 0:
             return float('inf')
-        return abs(current_price - self.liquidation_price) / current_price
+        if self.side == PositionSide.LONG:
+            # LONG: liquidated when price drops below liq_price
+            return (current_price - self.liquidation_price) / current_price
+        else:
+            # SHORT: liquidated when price rises above liq_price
+            return (self.liquidation_price - current_price) / current_price
 
 
 @dataclass(frozen=True)

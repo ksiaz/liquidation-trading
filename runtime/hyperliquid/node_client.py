@@ -143,6 +143,65 @@ class NodeClient:
         except:
             return False
 
+    def get_active_wallets(self) -> List[str]:
+        """Get list of wallets with open perp positions from node state.
+
+        Returns list of wallet addresses (e.g., ['0x123...', '0x456...'])
+        """
+        try:
+            resp = requests.get(
+                f"{self.base_url}/active_wallets",
+                timeout=30.0  # Longer timeout for large data
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('wallets', [])
+        except Exception as e:
+            print(f"[NodeClient] Error getting active wallets: {e}")
+        return []
+
+    def get_position_sizes(self) -> Dict[str, Dict[str, Dict]]:
+        """Get all position sizes from node state.
+
+        Returns dict of wallet -> coin -> {side, size, asset_id}
+        e.g., {'0x123...': {'BTC': {'side': 'LONG', 'size': 1.5, 'asset_id': 0}}}
+        """
+        try:
+            resp = requests.get(
+                f"{self.base_url}/position_sizes",
+                timeout=60.0  # Long timeout for large data transfer
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            print(f"[NodeClient] Error getting position sizes: {e}")
+        return {}
+
+    def get_wallet_positions(self, wallet: str) -> Dict[str, Dict]:
+        """Get position sizes for a specific wallet.
+
+        Returns dict of coin -> {side, size, asset_id}
+        e.g., {'BTC': {'side': 'LONG', 'size': 1.5, 'asset_id': 0}}
+        """
+        try:
+            resp = requests.get(
+                f"{self.base_url}/positions/{wallet}",
+                timeout=15.0  # Longer timeout if cache needs refresh
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('positions', {})
+        except Exception as e:
+            print(f"[NodeClient] Error getting wallet positions: {e}")
+        return {}
+
+    def has_position(self, wallet: str, coin: str = None) -> bool:
+        """Check if a wallet has an open position (optionally for specific coin)."""
+        positions = self.get_wallet_positions(wallet)
+        if coin:
+            return coin in positions
+        return len(positions) > 0
+
 
 # Singleton instance
 _node_client: Optional[NodeClient] = None
@@ -169,6 +228,26 @@ def get_node_trades(limit: int = 100) -> List[Dict]:
 def get_node_health() -> Optional[NodeStatus]:
     """Convenience function to get node health."""
     return get_node_client().get_health()
+
+
+def get_active_wallets() -> List[str]:
+    """Convenience function to get wallets with positions."""
+    return get_node_client().get_active_wallets()
+
+
+def get_position_sizes() -> Dict[str, Dict[str, Dict]]:
+    """Convenience function to get all position sizes."""
+    return get_node_client().get_position_sizes()
+
+
+def get_wallet_positions(wallet: str) -> Dict[str, Dict]:
+    """Convenience function to get positions for a wallet."""
+    return get_node_client().get_wallet_positions(wallet)
+
+
+def has_position(wallet: str, coin: str = None) -> bool:
+    """Convenience function to check if wallet has position."""
+    return get_node_client().has_position(wallet, coin)
 
 
 if __name__ == "__main__":
@@ -198,3 +277,15 @@ if __name__ == "__main__":
     print(f"\nLast {len(trades)} trades:")
     for trade in trades[:5]:
         print(f"  {trade.get('coin', '?')} {trade.get('side')} {trade.get('size')} @ {trade.get('price')}")
+
+    # Get active wallets
+    wallets = client.get_active_wallets()
+    print(f"\nActive wallets with positions: {len(wallets)}")
+    print(f"  Sample: {wallets[:3]}")
+
+    # Get position for first wallet
+    if wallets:
+        positions = client.get_wallet_positions(wallets[0])
+        print(f"\nPositions for {wallets[0][:16]}...:")
+        for coin, pos in positions.items():
+            print(f"  {coin}: {pos['side']} {pos['size']:.4f}")

@@ -22,6 +22,7 @@ from .client import HyperliquidClient, ClientConfig
 from .position_tracker import PositionTracker, TrackerConfig
 from .types import LiquidationProximity, WalletState, SystemWallets
 from runtime.logging.execution_db import ResearchDatabase
+from memory.m4_cascade_momentum import CascadeMomentumTracker, MomentumPhase, phase_to_string
 
 # Optional indexer import
 try:
@@ -121,6 +122,9 @@ class HyperliquidCollector:
         # State tracking
         self._last_proximity_log: Dict[str, float] = {}  # coin -> timestamp
 
+        # Cascade momentum tracker for exhaustion detection
+        self._momentum_tracker = CascadeMomentumTracker()
+
         # Blockchain indexer (optional)
         self._indexer: Optional['IndexerCoordinator'] = None
 
@@ -144,6 +148,7 @@ class HyperliquidCollector:
         # Setup callbacks
         self._client.set_position_callback(self._on_wallet_update)
         self._client.set_mids_callback(self._on_price_update)
+        self._client.set_liquidation_callback(self._on_liquidation_event)
         self._tracker.set_proximity_callback(self._on_proximity_calculated)
         self._tracker.set_cascade_callback(self._on_cascade_detected)
 
@@ -362,6 +367,66 @@ class HyperliquidCollector:
 
         # Trigger proximity recalculation (updates cache properly)
         await self._tracker.trigger_proximity_recalc()
+
+    async def _on_liquidation_event(self, event: Dict):
+        """Handle real-time asset context update from WebSocket.
+
+        Uses CascadeMomentumTracker to detect:
+        - Cascade building (accelerating OI drops)
+        - Cascade exhaustion (decelerating, then idle)
+        """
+        coin = event.get('coin', 'UNKNOWN')
+        oi_change_pct = event.get('oi_change_pct', 0)
+        is_liq_signal = event.get('is_liquidation_signal', False)
+        mark_price = event.get('mark_price')
+
+        # Track state for phase transition logging
+        if not hasattr(self, '_last_phase'):
+            self._last_phase = {}
+
+        # Record event in momentum tracker
+        observation = self._momentum_tracker.record_event(
+            coin=coin,
+            oi_change_pct=oi_change_pct,
+            is_liquidation_signal=is_liq_signal
+        )
+
+        # Detect phase transitions
+        prev_phase = self._last_phase.get(coin)
+        current_phase = observation.phase
+
+        if prev_phase != current_phase:
+            self._last_phase[coin] = current_phase
+
+            # Log significant phase transitions
+            if current_phase == MomentumPhase.ACCELERATING:
+                self._logger.warning(
+                    f"[CASCADE_BUILDING] {coin}: Rate={observation.oi_change_rate_5s:.3f}%/s, "
+                    f"Accel={observation.acceleration:.4f}"
+                )
+
+            elif current_phase == MomentumPhase.DECELERATING:
+                self._logger.info(
+                    f"[CASCADE_SLOWING] {coin}: Rate={observation.oi_change_rate_5s:.3f}%/s, "
+                    f"Peak was {observation.peak_rate:.3f}%/s, "
+                    f"Duration={observation.cascade_duration_sec:.1f}s"
+                )
+
+            elif current_phase == MomentumPhase.EXHAUSTED:
+                self._logger.warning(
+                    f"[CASCADE_EXHAUSTED] {coin} @ {mark_price}: "
+                    f"Total OI dropped={observation.total_oi_dropped:.2f}%, "
+                    f"Duration={observation.cascade_duration_sec:.1f}s, "
+                    f"Peak rate={observation.peak_rate:.3f}%/s"
+                )
+
+        # Log active cascade metrics periodically
+        if current_phase in (MomentumPhase.ACCELERATING, MomentumPhase.STEADY):
+            if observation.liquidation_signals_5s >= 2:
+                self._logger.info(
+                    f"[CASCADE_ACTIVE] {coin}: {observation.liquidation_signals_5s} signals/5s, "
+                    f"Rate={observation.oi_change_rate_5s:.3f}%/s"
+                )
 
     async def _on_proximity_calculated(self, proximity: LiquidationProximity):
         """Handle proximity calculation result."""

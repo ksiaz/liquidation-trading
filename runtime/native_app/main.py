@@ -74,6 +74,42 @@ except ImportError:
     LiquidationFadeExecutor = None
     FadeConfig = None
 
+# Node client for direct blockchain data (no rate limits)
+try:
+    from runtime.hyperliquid.node_client import get_node_client, get_node_mids
+    HAS_NODE_CLIENT = True
+    print("[STARTUP] Node client available - unlimited data access")
+except ImportError:
+    HAS_NODE_CLIENT = False
+    get_node_client = None
+    get_node_mids = None
+
+
+def fetch_mids_fast() -> dict:
+    """Fetch mid prices - prefer node, fallback to API."""
+    # Try node first (no rate limits, faster)
+    if HAS_NODE_CLIENT:
+        try:
+            mids = get_node_mids()
+            if mids and len(mids) > 50:  # Node returned good data
+                return mids
+        except Exception as e:
+            pass  # Fall through to API
+
+    # Fallback to public API
+    try:
+        resp = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={'type': 'allMids'},
+            timeout=3
+        )
+        if resp.status_code == 200:
+            return {k: float(v) for k, v in resp.json().items()}
+    except:
+        pass
+
+    return {}
+
 
 # ==============================================================================
 # Constants
@@ -1035,8 +1071,8 @@ class PositionRefresher(threading.Thread):
     """
 
     HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
-    REFRESH_INTERVAL = 10  # seconds for normal refresh (was 30)
-    ZOOM_REFRESH_INTERVAL = 1.0  # 1 second for priority wallets - user requirement
+    REFRESH_INTERVAL = 5  # seconds for normal refresh (faster!)
+    ZOOM_REFRESH_INTERVAL = 0.5  # 500ms for priority wallets - maximum speed
     ZOOM_THRESHOLD_PCT = 5.0  # positions within this % of liq get priority refresh
     CRITICAL_THRESHOLD_PCT = 1.0  # positions within 1% get highest priority
 
@@ -2515,8 +2551,8 @@ class HyperliquidPositionsTable(QTableWidget):
 
     def __init__(self):
         super().__init__()
-        self.setColumnCount(7)
-        self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Liq Price", "Dist %", "Impact"])
+        self.setColumnCount(8)
+        self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Liq Price", "Dist %", "Age", "Impact"])
 
         # Style
         self.setStyleSheet(f"""
@@ -2545,13 +2581,14 @@ class HyperliquidPositionsTable(QTableWidget):
 
         # Set column widths - prioritize Coin and critical data visibility
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.setColumnWidth(0, 70)   # Address (narrow)
-        self.setColumnWidth(1, 75)   # Coin (important!)
-        self.setColumnWidth(2, 50)   # Side
-        self.setColumnWidth(3, 60)   # Value
-        self.setColumnWidth(4, 75)   # Liq Price
-        self.setColumnWidth(5, 50)   # Dist %
-        self.setColumnWidth(6, 65)   # Price/Impact
+        self.setColumnWidth(0, 65)   # Address (narrow)
+        self.setColumnWidth(1, 70)   # Coin (important!)
+        self.setColumnWidth(2, 45)   # Side
+        self.setColumnWidth(3, 55)   # Value
+        self.setColumnWidth(4, 70)   # Liq Price
+        self.setColumnWidth(5, 45)   # Dist %
+        self.setColumnWidth(6, 45)   # Age (new!)
+        self.setColumnWidth(7, 55)   # Price/Impact
         self.verticalHeader().setVisible(False)
         self.setSelectionMode(QAbstractItemView.NoSelection)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2565,9 +2602,9 @@ class HyperliquidPositionsTable(QTableWidget):
         # Check if using live data (WS source)
         is_live_data = positions and positions[0].get('is_live', False)
         if is_live_data:
-            self.setHorizontalHeaderLabels(["🔴 LIVE", "Coin", "Side", "Value", "Liq Price", "Dist %", "Price"])
+            self.setHorizontalHeaderLabels(["🔴 LIVE", "Coin", "Side", "Value", "Liq Price", "Dist %", "Age", "Price"])
         else:
-            self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Liq Price", "Dist %", "Impact"])
+            self.setHorizontalHeaderLabels(["Address", "Coin", "Side", "Value", "Liq Price", "Dist %", "Age", "Impact"])
 
         for row, pos in enumerate(positions):
             # Address (shortened) - show LIVE indicator for live data
@@ -2655,6 +2692,47 @@ class HyperliquidPositionsTable(QTableWidget):
 
             self.setItem(row, 5, dist_item)
 
+            # Position Age - how long ago position was opened
+            opened_at = pos.get('opened_at', 0)  # ms timestamp
+            discovered_at = pos.get('discovered_at', 0)  # our timestamp (seconds)
+
+            if opened_at > 0:
+                # Use actual open time (from userFills API)
+                age_seconds = time.time() - (opened_at / 1000)  # Convert ms to seconds
+            elif discovered_at > 0:
+                # Fallback to discovery time
+                age_seconds = time.time() - discovered_at
+            else:
+                age_seconds = 0
+
+            if age_seconds > 0:
+                if age_seconds < 60:
+                    age_text = f"{int(age_seconds)}s"
+                elif age_seconds < 3600:
+                    age_text = f"{int(age_seconds / 60)}m"
+                elif age_seconds < 86400:
+                    age_text = f"{age_seconds / 3600:.1f}h"
+                else:
+                    age_text = f"{age_seconds / 86400:.1f}d"
+
+                # Color by age - older positions may have stale opportunities
+                age_item = QTableWidgetItem(age_text)
+                age_item.setFont(QFont("Consolas", 9))
+                if age_seconds < 300:  # < 5 min = fresh
+                    age_item.setForeground(QColor(COLORS['long']))  # Green
+                elif age_seconds < 3600:  # < 1 hour
+                    age_item.setForeground(QColor(COLORS['text']))
+                elif age_seconds < 86400:  # < 1 day
+                    age_item.setForeground(QColor(COLORS['warning']))  # Yellow
+                else:
+                    age_item.setForeground(QColor(COLORS['text_dim']))  # Old
+            else:
+                age_item = QTableWidgetItem("--")
+                age_item.setFont(QFont("Consolas", 9))
+                age_item.setForeground(QColor(COLORS['text_dim']))
+
+            self.setItem(row, 6, age_item)
+
             # Impact Score (% of daily volume) OR Current Price (for live data)
             if pos.get('is_live') and pos.get('current_price'):
                 # Show current price for live data
@@ -2694,7 +2772,7 @@ class HyperliquidPositionsTable(QTableWidget):
                 else:
                     impact_item.setForeground(QColor(COLORS['text']))
 
-            self.setItem(row, 6, impact_item)
+            self.setItem(row, 7, impact_item)
 
         self.resizeRowsToContents()
 
@@ -4301,6 +4379,28 @@ class TradingChartWidget(QFrame):
             rows = cursor.fetchall()
             conn.close()
 
+            # Filter out zombie positions (price has crossed liq - already liquidated)
+            # Real-time validation against current price
+            valid_rows = []
+            for row in rows:
+                liq_price = row['liquidation_price']
+                side = row['side']
+
+                if current_price <= 0 or liq_price <= 0:
+                    continue
+
+                # Check if position is still valid (price hasn't crossed liq)
+                if side == 'LONG' and current_price < liq_price:
+                    # LONG position: price below liq means liquidated
+                    continue
+                if side == 'SHORT' and current_price > liq_price:
+                    # SHORT position: price above liq means liquidated
+                    continue
+
+                valid_rows.append(row)
+
+            rows = valid_rows
+
             # Create hash of current liq levels to detect changes
             liq_data = [(row['liquidation_price'], row['position_value'], row['side']) for row in rows]
             liq_hash = str(hash(tuple(liq_data)))
@@ -5334,7 +5434,9 @@ class MainWindow(QMainWindow):
                         'leverage': snap.leverage,
                         'danger_level': snap.danger_level,
                         'is_live': True,  # Mark as live WS data
-                        'source': 'WS'
+                        'source': 'WS',
+                        'opened_at': snap.opened_at,  # When position was opened (ms)
+                        'discovered_at': snap.discovered_at  # When we discovered it (seconds)
                     })
 
             # Fallback to REST-based data if WS has few positions
@@ -5428,10 +5530,10 @@ class MainWindow(QMainWindow):
 
             # Update trading chart
             # - 1 second when fast_refresh_mode enabled (user clicked a symbol)
-            # - 3 seconds for normal background refresh
+            # - 2 seconds for normal background refresh
             if not hasattr(self, '_last_chart_refresh'):
                 self._last_chart_refresh = 0
-            chart_interval = 1.0 if getattr(self.trading_chart, '_fast_refresh_mode', False) else 3.0
+            chart_interval = 0.5 if getattr(self.trading_chart, '_fast_refresh_mode', False) else 2.0
             if now - self._last_chart_refresh > chart_interval:
                 self.trading_chart.refresh_chart()
                 self._last_chart_refresh = now

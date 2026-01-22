@@ -2,37 +2,72 @@
 
 Monitors risk invariants and emits mandates when violations detected.
 Per RISK_EXPOSURE_MATHEMATICS.md Section 4, 11.
+
+Extended with PnL-based exit conditions (stop-loss, take-profit):
+- Stop-loss: Exit when position loss exceeds threshold
+- Take-profit: Exit when position profit exceeds threshold
+
+These are factual observations on PnL, NOT predictions.
 """
 
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 from decimal import Decimal
 
 from runtime.arbitration.types import Mandate, MandateType
-from runtime.position.types import Position, PositionState
+from runtime.position.types import Position, PositionState, Direction
 from .calculator import RiskCalculator
 from .types import RiskConfig, AccountState
 
 
 class RiskMonitor:
     """Monitors risk invariants and emits protective mandates.
-    
+
     Enforces (Section 3-4):
     - I-L1: Total leverage ≤ L_max
     - I-L2: Per-symbol leverage ≤ L_symbol_max
     - I-LA1: D_liq ≥ D_min_safe (per symbol)
     - I-LA2: R_liq ≥ R_liq_min (portfolio)
-    
+
+    PnL-based exits (factual thresholds, not predictions):
+    - Stop-loss: Exit when position PnL% < -stop_loss_pct
+    - Take-profit: Exit when position PnL% > +take_profit_pct
+
     Emits mandates (Section 11):
-    - EXIT: Critical liquidation risk
+    - EXIT: Critical liquidation risk OR PnL threshold crossed
     - REDUCE: Approaching limits
     - BLOCK: Hard limits violated
     """
-    
+
     def __init__(self, config: RiskConfig):
         """Initialize with risk configuration."""
         self.config = config
         self.calculator = RiskCalculator(config)
+
+    def _calculate_pnl_pct(
+        self,
+        position: Position,
+        mark_price: Decimal
+    ) -> Optional[float]:
+        """Calculate position PnL as percentage of entry.
+
+        Returns:
+            PnL percentage (positive = profit, negative = loss)
+            None if position has no entry price
+        """
+        if position.entry_price is None or position.entry_price == 0:
+            return None
+
+        if position.direction == Direction.LONG:
+            # LONG: profit when price goes up
+            pnl_pct = float((mark_price - position.entry_price) / position.entry_price)
+        elif position.direction == Direction.SHORT:
+            # SHORT: profit when price goes down
+            pnl_pct = float((position.entry_price - mark_price) / position.entry_price)
+        else:
+            return None
+
+        return pnl_pct
     
     def check_and_emit(
         self,
@@ -110,7 +145,32 @@ class RiskMonitor:
                         timestamp=timestamp
                     )
                 )
-            
+
+            # Check PnL-based stop-loss and take-profit (factual thresholds)
+            pnl_pct = self._calculate_pnl_pct(position, mark_prices[symbol])
+            if pnl_pct is not None:
+                # Stop-loss: position loss exceeds threshold
+                if pnl_pct < -self.config.stop_loss_pct:
+                    mandates.append(
+                        Mandate(
+                            symbol=symbol,
+                            type=MandateType.EXIT,
+                            authority=9.5,  # High priority (below critical liquidation)
+                            timestamp=timestamp
+                        )
+                    )
+
+                # Take-profit: position profit exceeds threshold
+                elif pnl_pct > self.config.take_profit_pct:
+                    mandates.append(
+                        Mandate(
+                            symbol=symbol,
+                            type=MandateType.EXIT,
+                            authority=7.5,  # Moderate priority (profit-taking)
+                            timestamp=timestamp
+                        )
+                    )
+
             # Check I-L2: Per-symbol leverage
             symbol_exposure = pos_risk.exposure
             max_symbol_exposure = account.equity * Decimal(str(self.config.L_symbol_max))

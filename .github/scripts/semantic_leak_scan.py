@@ -1,291 +1,185 @@
 #!/usr/bin/env python3
 """
-Semantic Leak Scanner - Directory-Scoped Rule-Class Detection
-Purpose: Detect forbidden semantic terms with context-aware enforcement
-Authority: DIRECTORY_SCOPED_SEMANTIC_RULES.md, AD-001
-
-Version: 2.0 (Rule-Class Aware)
+Semantic Leak Scanner
+Purpose: Detect forbidden semantic terms in code using directory-scoped regex rules
+Authority: CI_ENFORCEMENT_DESIGN.md, DIRECTORY_SCOPED_EXCEPTION_FRAMEWORK.md
 """
 
 import re
 import sys
-import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
-from dataclasses import dataclass
-from enum import Enum
+from typing import Dict, List, Tuple
 
 # ==============================================================================
-# RULE CLASSIFICATION
+# RULE SETS (Directory-Scoped)
 # ==============================================================================
 
-class RuleClass(Enum):
-    """Semantic rule classifications per DIRECTORY_SCOPED_SEMANTIC_RULES.md"""
-    EVAL = "evaluative"
-    INTENT = "action-implying"
-    QUALITY = "confidence/correctness"
-    STRUCTURAL_METRIC = "numeric-descriptor"
-    AGGREGATION = "statistical-operation"
-    TEMPORAL_PARAMETER = "duration-threshold"
-    DESCRIPTIVE_STATE = "binary-fact"
-
-# ==============================================================================
-# PATTERN DEFINITIONS (Classified by Rule Class)
-# ==============================================================================
-
-# EVAL - Forbidden everywhere
-R1_EVAL = re.compile(
-    r'\b(strong|weak|good|bad|healthy|optimal|ideal|better|worse|'
-    r'valid|invalid|correct|incorrect|reliable|accurate|'
-    r'significant|normal|abnormal|momentum|reversal|bullish|bearish)\b',
+# R1: Linguistic Leaks (observation/types.py, observation/governance.py)
+R1_LINGUISTIC = re.compile(
+    r'\b(signal|strength|confidence|quality|health|ready|valid|good|bad|'
+    r'stale|fresh|live|active|flowing|pressure|baseline|opportunity|bias|'
+    r'setup|weak|strong|support|resistance|validated|confirmed|normal|'
+    r'abnormal|significant|momentum|reversal|bullish|bearish)\b',
     re.IGNORECASE
 )
 
-# STRUCTURAL_METRIC - Context-dependent (allowed in observation/memory)
-R2_STRUCTURAL_METRIC = re.compile(
-    r'\b(max|min|sum|count|avg|mean|total|delta)_\w+|'
-    r'\w+_(penetration|velocity|duration|span|deviation|compactness|anchor|absence)',
+# R2: Structural Indicators
+R2_STRUCTURAL = re.compile(
+    r'\b(is|has|can|should|must|may)_\w+|'
+    r'\b(recent|lag|delay|outdated|fresh|stale|window|rolling|cooldown|debounce)|'
+    r'\b(triggered|caused|due_to|because|led_to|response_to|result_of)|'
+    r'\b(threshold|limit|max|min|safe|danger|warning|critical)_',
     re.IGNORECASE
 )
 
-# AGGREGATION - Context-dependent (allowed in observation/memory)
-R3_AGGREGATION = re.compile(
-    r'\blen\(|\.count\(|max\(|min\(|sum\(|mean\(|'
-    r'\b(if|while)\s+len\(',
+# R4: Log Message Purity (runtime/)
+R4_LOG_MESSAGES = re.compile(
+    r'logger\.(info|warning|error|debug)\s*\([^)]*'
+    r'(start|starting|connect|connecting|process|processing|analyz|detect|'
+    r'live|flowing|active|healthy|ready|working|successful|failed|error|'
+    r'problem|issue|warning|good|bad)',
     re.IGNORECASE
 )
 
-# TEMPORAL_PARAMETER - Context-dependent (allowed in observation/memory)
-R4_TEMPORAL_PARAM = re.compile(
-    r'\b(threshold|window|duration|timeout|delay|cooldown|debounce)\s*[=:]',
+# R5: UI Text Purity (runtime/)
+R5_UI_TEXT = re.compile(
+    r'setText\s*\([^)]*'
+    r'(pressure|signal|strength|confidence|health|ready|warm|valid|good|bad|'
+    r'detecting|analyzing|processing|active|live|flowing|setup|opportunity)|'
+    r'setWindowTitle\s*\([^)]*'
+    r'(detector|analyzer|predictor|signal|pressure|peak|opportunity)',
     re.IGNORECASE
 )
 
-# INTENT - Forbidden in observation/memory
-R5_INTENT = re.compile(
-    r'\b(should|must|ready|actionable|executable|tradeable)\b',
-    re.IGNORECASE
-)
-
-# QUALITY - Forbidden in observation/memory
-R6_QUALITY = re.compile(
-    r'\b(confidence|quality|health)\s*[=:]',
-    re.IGNORECASE
+# R6: M6 Interpretation Ban (runtime/m6_executor.py)
+R6_M6_INTERPRETATION = re.compile(
+    r'if\s+\w+\.(counters|promoted_events|symbols_active)|'
+    r'(logger|print|log)\s*\(|'
+    r'^class\s+\w+:|'
+    r'self\.\w+\s*=|'
+    r'\bwhile\s+|\bfor\s+\w+\s+in\b|'
+    r'try:.*except.*(continue|pass|return\s+default)',
+    re.IGNORECASE | re.MULTILINE
 )
 
 # ==============================================================================
-# DIRECTORY-SCOPED RULES
+# EXCEPTIONS (with constitutional justification)
 # ==============================================================================
 
-DIRECTORY_RULES: Dict[str, Dict[str, Set[RuleClass]]] = {
-    'observation/': {
-        'allowed': {
-            RuleClass.STRUCTURAL_METRIC,
-            RuleClass.AGGREGATION,
-            RuleClass.TEMPORAL_PARAMETER,
-            RuleClass.DESCRIPTIVE_STATE
-        },
-        'forbidden': {
-            RuleClass.EVAL,
-            RuleClass.INTENT,
-            RuleClass.QUALITY
-        }
+# Format: {filepath: {line_number: "justification"}}
+EXCEPTIONS: Dict[str, Dict[int, str]] = {
+    'observation/governance.py': {
+        # Structural thresholds (factual boundaries, not interpretation)
+        86: "Structural config: time window for price correlation in seconds",
+        # Trade handling - Binance API semantic field names
+        309: "Binance API semantic: is_taker_sell indicates trade aggressor side",
+        321: "Parameter passing Binance API field to M2 store",
+        328: "Local variable derived from Binance trade side field",
+        # Orderbook primitive parameters
+        428: "Structural parameter: minimum consumption size threshold",
+        439: "Structural parameter: minimum consumption size threshold",
+        445: "Data access: recent_prices is collection name, not semantic claim",
+        464: "Structural parameter: maximum price movement percentage",
+        475: "Structural parameter: minimum refill size threshold",
+        486: "Structural parameter: minimum refill size threshold",
+        # Debug logging with structural parameter
+        505: "Debug logging with structural constant name",
+        # Clustering parameter
+        599: "Structural parameter: maximum gap percentage for clustering",
     },
-    'memory/': {
-        'allowed': {
-            RuleClass.STRUCTURAL_METRIC,
-            RuleClass.AGGREGATION,
-            RuleClass.DESCRIPTIVE_STATE
-        },
-        'forbidden': {
-            RuleClass.EVAL,
-            RuleClass.INTENT,
-            RuleClass.QUALITY,
-            RuleClass.TEMPORAL_PARAMETER
-        }
+    'runtime/collector/service.py': {
+        165: "Factual error logging: reports initialization exception",
+        182: "Factual status logging: reports collector task created",
+        184: "Factual error logging: reports start exception",
+        290: "Factual error logging: reports exception occurred, no interpretation",
+        319: "Factual error logging: reports classification exception",
+        1203: "Factual error logging: reports stop exception",
     },
-    'runtime/': {
-        'allowed': {
-            RuleClass.STRUCTURAL_METRIC,
-            RuleClass.AGGREGATION
-        },
-        'forbidden': {
-            RuleClass.EVAL,
-            RuleClass.INTENT,
-            RuleClass.QUALITY
-        }
-    },
-    'ui/': {
-        'allowed': set(),
-        'forbidden': '__ALL__'
-    }
-}
-
-# Default: Strict (fail-closed)
-DEFAULT_RULES = {
-    'allowed': set(),
-    'forbidden': '__ALL__'
 }
 
 # ==============================================================================
-# FILE-TO-RULES MAPPING (with Rule Classes)
+# FILE-TO-RULES MAPPING
 # ==============================================================================
 
-RULES: Dict[str, List[Tuple[str, re.Pattern, RuleClass]]] = {
+RULES: Dict[str, List[Tuple[str, re.Pattern]]] = {
     'observation/types.py': [
-        ('R1-EVAL', R1_EVAL, RuleClass.EVAL),
-        ('R2-STRUCTURAL_METRIC', R2_STRUCTURAL_METRIC, RuleClass.STRUCTURAL_METRIC),
-        ('R3-AGGREGATION', R3_AGGREGATION, RuleClass.AGGREGATION),
-        ('R4-TEMPORAL_PARAM', R4_TEMPORAL_PARAM, RuleClass.TEMPORAL_PARAMETER),
-        ('R5-INTENT', R5_INTENT, RuleClass.INTENT),
-        ('R6-QUALITY', R6_QUALITY, RuleClass.QUALITY),
+        ('R1-Linguistic', R1_LINGUISTIC),
+        ('R2-Structural', R2_STRUCTURAL),
     ],
     'observation/governance.py': [
-        ('R1-EVAL', R1_EVAL, RuleClass.EVAL),
-        ('R2-STRUCTURAL_METRIC', R2_STRUCTURAL_METRIC, RuleClass.STRUCTURAL_METRIC),
-        ('R3-AGGREGATION', R3_AGGREGATION, RuleClass.AGGREGATION),
-        ('R4-TEMPORAL_PARAM', R4_TEMPORAL_PARAM, RuleClass.TEMPORAL_PARAMETER),
-        ('R5-INTENT', R5_INTENT, RuleClass.INTENT),
-        ('R6-QUALITY', R6_QUALITY, RuleClass.QUALITY),
+        ('R1-Linguistic', R1_LINGUISTIC),
+        ('R2-Structural', R2_STRUCTURAL),
+    ],
+    'runtime/collector/service.py': [
+        ('R4-LogMessages', R4_LOG_MESSAGES),
+    ],
+    'runtime/native_app/main.py': [
+        ('R4-LogMessages', R4_LOG_MESSAGES),
+        ('R5-UIText', R5_UI_TEXT),
+    ],
+    'runtime/m6_executor.py': [
+        ('R6-M6Interpretation', R6_M6_INTERPRETATION),
     ],
 }
 
 # ==============================================================================
-# VIOLATION DATACLASS
+# SCANNER
 # ==============================================================================
 
-@dataclass
-class Violation:
-    filepath: str
-    line_num: int
-    rule_name: str
-    rule_class: RuleClass
-    line_content: str
-    verdict: str
-    reason: str
-
-# ==============================================================================
-# SCANNER LOGIC
-# ==============================================================================
-
-def get_directory_rules(filepath: str) -> dict:
-    """Get rule set for directory (fail-closed)."""
-    for dir_prefix in DIRECTORY_RULES:
-        if filepath.startswith(dir_prefix):
-            return DIRECTORY_RULES[dir_prefix]
-    return DEFAULT_RULES
-
-def get_violation_reason(filepath: str, rule_class: RuleClass) -> str:
-    """Generate human-readable reason for violation."""
-    if filepath.startswith('observation/'):
-        if rule_class == RuleClass.EVAL:
-            return "Observation layer must not make evaluative judgments"
-        elif rule_class == RuleClass.INTENT:
-            return "Observation describes facts, execution decides actions"
-        elif rule_class == RuleClass.QUALITY:
-            return "Observations are measurements, not assessments"
-    elif filepath.startswith('memory/'):
-        if rule_class == RuleClass.EVAL:
-            return "Memory layer must not evaluate or interpret"
-        elif rule_class == RuleClass.TEMPORAL_PARAMETER:
-            return "Memory stores state, observation defines temporal parameters"
-    elif filepath.startswith('runtime/'):
-        if rule_class == RuleClass.EVAL:
-            return "Runtime must not use evaluative language"
-        elif rule_class == RuleClass.INTENT:
-            return "Intent only allowed in audited mandate emission"
-    elif filepath.startswith('ui/'):
-        return "UI must display facts only, no semantic terms allowed"
-    
-    return f"{rule_class.value} is forbidden in this directory"
-
-def scan_file(
-    filepath: Path,
-    rules: List[Tuple[str, re.Pattern, RuleClass]],
-    repo_root: Path
-) -> List[Violation]:
+def scan_file(filepath: Path, rules: List[Tuple[str, re.Pattern]], rel_path: str) -> List[Tuple[int, str, str]]:
     """
-    Scan file with rule-class awareness.
-    
+    Scan a file for violations.
+
+    Args:
+        filepath: Absolute path to file
+        rules: List of (rule_name, pattern) tuples to check
+        rel_path: Relative path from repo root (for exception lookup)
+
     Returns:
-        List of violations (only forbidden patterns)
+        List of (line_number, rule_name, line_content)
     """
     violations = []
-    rel_path = str(filepath.relative_to(repo_root)).replace('\\', '/')  # Normalize to forward slashes
-    dir_rules = get_directory_rules(rel_path)
-    
+    exceptions = EXCEPTIONS.get(rel_path, {})
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
-                # Skip comment-only lines
+                # Skip comment-only lines (comments are constitutionally allowed internally)
                 stripped = line.strip()
                 if stripped.startswith('#'):
                     continue
-                
-                for rule_name, pattern, rule_class in rules:
+
+                # Check if this line has an approved exception
+                if line_num in exceptions:
+                    continue  # Skip - exception approved
+
+                for rule_name, pattern in rules:
                     if pattern.search(line):
-                        # Check if allowed in this directory
-                        if rule_class in dir_rules['allowed']:
-                            # Allowed - don't report
-                            continue
-                        elif dir_rules['forbidden'] == '__ALL__' or rule_class in dir_rules['forbidden']:
-                            # Forbidden - report it
-                            violations.append(Violation(
-                                filepath=rel_path,
-                                line_num=line_num,
-                                rule_name=rule_name,
-                                rule_class=rule_class,
-                                line_content=line.strip(),
-                                verdict="FORBIDDEN",
-                                reason=get_violation_reason(rel_path, rule_class)
-                            ))
-                        else:
-                            # Not explicitly allowed = forbidden (fail-closed)
-                            violations.append(Violation(
-                                filepath=rel_path,
-                                line_num=line_num,
-                                rule_name=rule_name,
-                                rule_class=rule_class,
-                                line_content=line.strip(),
-                                verdict="FORBIDDEN",
-                                reason=f"{rule_class.value} not explicitly allowed in this directory"
-                            ))
+                        violations.append((line_num, rule_name, line.strip()))
     except FileNotFoundError:
-        pass
+        pass  # File doesn't exist, skip
     except Exception as e:
         print(f"Error reading {filepath}: {e}", file=sys.stderr)
-    
+
     return violations
+
 
 def main():
     """Main entry point."""
-    # Parse arguments (keep for backward compatibility, but no longer used)
-    parser = argparse.ArgumentParser(description='Semantic Leak Scanner (Rule-Class Aware)')
-    parser.add_argument(
-        '--exclude-paths',
-        type=str,
-        help='[DEPRECATED] Use directory-scoped rules instead'
-    )
-    args = parser.parse_args()
-    
-    if args.exclude_paths:
-        print("⚠️  --exclude-paths is deprecated. Scanner now uses directory-scoped rules.")
-        print("    See: docs/DIRECTORY_SCOPED_SEMANTIC_RULES.md")
-    
     all_violations = {}
-    
-    # Get repository root
+
+    # Get repository root (assume script is in .github/scripts/)
     repo_root = Path(__file__).parent.parent.parent
-    
+
     # Scan each configured file
     for rel_path, rules in RULES.items():
         filepath = repo_root / rel_path
-        
+
         if not filepath.exists():
-            continue
-        
-        violations = scan_file(filepath, rules, repo_root)
-        
+            continue  # Skip if file doesn't exist
+
+        violations = scan_file(filepath, rules, rel_path)
+
         if violations:
             all_violations[rel_path] = violations
     
@@ -297,22 +191,20 @@ def main():
         
         for filepath, violations in all_violations.items():
             print(f"\n{filepath}:")
-            for v in violations:
-                print(f"  Line {v.line_num}: [{v.rule_name}] [{v.rule_class.value}]")
-                print(f"    {v.line_content}")
-                print(f"  Verdict: {v.verdict}")
-                print(f"  Reason: {v.reason}")
+            for line_num, rule_name, line_content in violations:
+                print(f"  Line {line_num}: [{rule_name}]")
+                print(f"    {line_content}")
         
         print("\n" + "=" * 80)
         print(f"Total violations: {sum(len(v) for v in all_violations.values())}")
         print("=" * 80)
-        print("\nSee: docs/DIRECTORY_SCOPED_SEMANTIC_RULES.md")
-        print("See: docs/ARCHITECTURAL_DECISIONS.md (AD-001)")
+        print("\nSee: docs/SEMANTIC_LEAK_EXHAUSTIVE_AUDIT.md")
+        print("See: docs/ADVERSARIAL_CODE_EXAMPLES.md")
         
-        sys.exit(1)
+        sys.exit(1)  # Fail CI
     
     print("[OK] No semantic leaks detected")
-    sys.exit(0)
+    sys.exit(0)  # Pass
 
 
 if __name__ == '__main__':

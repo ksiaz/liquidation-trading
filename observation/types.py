@@ -15,12 +15,12 @@ from enum import Enum, auto
 from memory.m4_zone_geometry import ZonePenetrationDepth, DisplacementOriginAnchor
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_structural_absence import StructuralAbsenceDuration
-from memory.m4_structural_persistence import StructuralPersistenceDuration
-from memory.m4_price_distribution import PriceAcceptanceRatio, CentralTendencyDeviation
-from memory.m4_orderbook import RestingSizeAtPrice, OrderConsumption, AbsorptionEvent, RefillEvent
-from memory.m4_liquidation_density import LiquidationDensity
-from memory.m4_directional_continuity import DirectionalContinuity
-from memory.m4_trade_burst import TradeBurst
+
+# Tier B-6: Cascade observation primitives (from Hyperliquid)
+from memory.m4_cascade_proximity import LiquidationCascadeProximity
+from memory.m4_cascade_state import CascadeStateObservation
+from memory.m4_leverage_concentration import LeverageConcentrationRatio
+from memory.m4_open_interest_bias import OpenInterestDirectionalBias
 
 class SystemHaltedException(Exception):
     """Critical Failure: System Invariant Broken."""
@@ -28,7 +28,6 @@ class SystemHaltedException(Exception):
 
 class ObservationStatus(Enum):
     UNINITIALIZED = auto()
-    ACTIVE = auto()
     FAILED = auto()
 
 @dataclass(frozen=True)
@@ -62,10 +61,9 @@ class M4PrimitiveBundle:
     # Tier A - Traversal Kinematics
     price_traversal_velocity: Optional[PriceTraversalVelocity]
     traversal_compactness: Optional[TraversalCompactness]
-    price_acceptance_ratio: Optional[PriceAcceptanceRatio]
 
-    # Tier A - Central Tendency
-    central_tendency_deviation: Optional[CentralTendencyDeviation]
+    # Tier A - Central Tendency (when implemented)
+    central_tendency_deviation: Optional[Any]  # CentralTendencyDeviation
 
     # Tier B-1 - Structural Absence
     structural_absence_duration: Optional[StructuralAbsenceDuration]
@@ -73,18 +71,33 @@ class M4PrimitiveBundle:
     event_non_occurrence_counter: Optional[Any]  # EventNonOccurrenceCounter (when implemented)
 
     # Tier B-2 - Structural Persistence
-    structural_persistence_duration: Optional[StructuralPersistenceDuration]
+    structural_persistence_duration: Optional[Any]  # StructuralPersistenceDuration
 
-    # Order Book Primitives (Phase OB)
-    resting_size: Optional[RestingSizeAtPrice]
-    order_consumption: Optional[OrderConsumption]
-    absorption_event: Optional[AbsorptionEvent]
-    refill_event: Optional[RefillEvent]
+    # Tier B-2.1 - Order Book Primitives (validation target)
+    resting_size: Optional[Any]  # RestingSizeAtPrice
+    order_consumption: Optional[Any]  # OrderConsumption
+    absorption_event: Optional[Any]  # AbsorptionEvent
+    refill_event: Optional[Any]  # RefillEvent
 
-    # Additional Primitives (Phase MP/DC/TB/LD)
-    liquidation_density: Optional[LiquidationDensity]
-    directional_continuity: Optional[DirectionalContinuity]
-    trade_burst: Optional[TradeBurst]
+    # Tier B-2.2 - Price Acceptance
+    price_acceptance_ratio: Optional[Any]  # PriceAcceptanceRatio
+
+    # Tier B-3 - Liquidation Clustering
+    liquidation_density: Optional[Any]  # LiquidationDensity
+
+    # Tier B-4 - Trade Flow
+    directional_continuity: Optional[Any]  # DirectionalContinuity
+    trade_burst: Optional[Any]  # TradeBurst
+
+    # Tier B-5 - Node Pattern Detection (from M2 memory nodes)
+    order_block: Optional[Any]  # OrderBlockPrimitive
+    supply_demand_zone: Optional[Any]  # SupplyDemandZonePrimitive
+
+    # Tier B-6 - Cascade Observation (from Hyperliquid positions + liquidations)
+    liquidation_cascade_proximity: Optional[LiquidationCascadeProximity]
+    cascade_state: Optional[CascadeStateObservation]
+    leverage_concentration_ratio: Optional[LeverageConcentrationRatio]
+    open_interest_directional_bias: Optional[OpenInterestDirectionalBias]
 
 
 @dataclass(frozen=True)

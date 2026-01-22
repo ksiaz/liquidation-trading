@@ -4,6 +4,13 @@ Replay Harness Tests - Determinism & Validation
 Tests for replay harness v1.0 correctness and bit-reproducibility.
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Configure temp directories to use D drive
+import runtime.env_setup  # noqa: F401
+
 import pytest
 from pathlib import Path
 import tempfile

@@ -1,7 +1,16 @@
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, TYPE_CHECKING
 from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
+
+# Tier B-6: Cascade observation primitives
+from memory.m4_cascade_proximity import LiquidationCascadeProximity, compute_liquidation_cascade_proximity
+from memory.m4_cascade_state import CascadeStateObservation, compute_cascade_state, CascadePhase
+from memory.m4_leverage_concentration import LeverageConcentrationRatio, compute_leverage_concentration
+from memory.m4_open_interest_bias import OpenInterestDirectionalBias, compute_open_interest_bias
+
+if TYPE_CHECKING:
+    from runtime.hyperliquid.collector import HyperliquidCollector
 
 # M2 Continuity Store (Internal Memory)
 from memory.m2_continuity_store import ContinuityMemoryStore
@@ -9,12 +18,92 @@ from memory.m2_continuity_store import ContinuityMemoryStore
 # M5 Access Layer (For M4 primitive computation)
 from memory.m5_access import MemoryAccess
 
+# Order book primitives
+from memory.m4_orderbook_primitives import (
+    RestingSizeAtPrice,
+    compute_resting_size,
+    detect_order_consumption,
+    detect_absorption_event,
+    detect_refill_event
+)
+
+# Zone geometry primitives
+from memory.m4_zone_geometry import (
+    ZonePenetrationDepth,
+    compute_zone_penetration_depth,
+    DisplacementOriginAnchor,
+    identify_displacement_origin_anchor
+)
+
+# Traversal kinematics primitives
+from memory.m4_traversal_kinematics import (
+    PriceTraversalVelocity,
+    compute_price_traversal_velocity,
+    TraversalCompactness,
+    compute_traversal_compactness
+)
+
+# Price distribution primitives
+from memory.m4_price_distribution import (
+    CentralTendencyDeviation,
+    compute_central_tendency_deviation,
+    PriceAcceptanceRatio,
+    compute_price_acceptance_ratio
+)
+
+# Traversal voids primitives
+from memory.m4_traversal_voids import (
+    TraversalVoidSpan,
+    compute_traversal_void_span
+)
+
+# Structural absence primitives
+from memory.m4_structural_absence import (
+    StructuralAbsenceDuration,
+    compute_structural_absence_duration
+)
+
+# Structural persistence primitives
+from memory.m4_structural_persistence import (
+    StructuralPersistenceDuration,
+    compute_structural_persistence_duration
+)
+
+# Event absence primitives
+from memory.m4_event_absence import (
+    EventNonOccurrenceCounter,
+    compute_event_non_occurrence_counter
+)
+
+# Liquidation clustering primitives
+from memory.m4_liquidation_clustering import (
+    LiquidationDensity,
+    compute_liquidation_density
+)
+
+# Trade flow primitives
+from memory.m4_trade_flow import (
+    DirectionalContinuity,
+    compute_directional_continuity,
+    TradeBurst,
+    compute_trade_burst
+)
+
+# Detection thresholds (structural boundaries, not interpretation)
+_OB_SIZE_CHANGE_THRESHOLD = 0.1  # Minimum size delta to record (contract units)
+_OB_PRICE_STABILITY_PCT = 1.0     # Maximum price movement for absorption (percentage)
+_OB_PRICE_WINDOW_SEC = 2.0        # Time window for price correlation (seconds)
+
+# Zone geometry parameters (structural boundaries)
+_ZONE_BAND_PCT = 0.5  # Zone width as percentage of current price
+_MIN_TRADES_FOR_KINEMATICS = 10  # Minimum trades needed for velocity/compactness
+
 class ObservationSystem:
     """
     The sealed Observation System.
     """
 
-    def __init__(self, allowed_symbols: List[str], event_logger=None):
+    def __init__(self, allowed_symbols: List[str]):
         self._allowed_symbols = set(allowed_symbols)
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
@@ -24,23 +113,71 @@ class ObservationSystem:
         self._m1 = M1IngestionEngine()
         self._m3 = M3TemporalEngine()
 
-        # M2 Memory Store (with event logger for research)
-        self._m2_store = ContinuityMemoryStore(event_logger=event_logger)
+        # M2 Memory Store (STUB: Not populated yet)
+        self._m2_store = ContinuityMemoryStore()
 
         # M5 Access Layer (For primitive computation at snapshot time)
         self._m5_access = MemoryAccess(self._m2_store)
+
+        # Hyperliquid collector (optional, for cascade primitives)
+        self._hl_collector: Optional['HyperliquidCollector'] = None
+
+        # Hyperliquid liquidation tracking for cascade state
+        self._hl_liquidation_timestamps: Dict[str, List[float]] = {}  # symbol -> timestamps
+        self._hl_liquidation_values: Dict[str, List[float]] = {}      # symbol -> values
         
+    def set_hyperliquid_source(self, hl_collector: 'HyperliquidCollector') -> None:
+        """
+        Inject Hyperliquid collector as data source for cascade primitives.
+
+        The collector provides:
+        - Position proximity data (for LiquidationCascadeProximity)
+        - Position leverage data (for LeverageConcentrationRatio)
+        - Position direction data (for OpenInterestDirectionalBias)
+
+        Constitutional compliance: Data flows through M4 primitives, not direct injection.
+        """
+        self._hl_collector = hl_collector
+
+    def record_hl_liquidation(self, symbol: str, timestamp: float, value: float) -> None:
+        """
+        Record Hyperliquid liquidation event for cascade state tracking.
+
+        Args:
+            symbol: Trading symbol
+            timestamp: Event timestamp
+            value: USD value liquidated
+        """
+        if symbol not in self._hl_liquidation_timestamps:
+            self._hl_liquidation_timestamps[symbol] = []
+            self._hl_liquidation_values[symbol] = []
+
+        self._hl_liquidation_timestamps[symbol].append(timestamp)
+        self._hl_liquidation_values[symbol].append(value)
+
+        # Prune old entries (keep last 120 seconds)
+        cutoff = timestamp - 120.0
+        while (self._hl_liquidation_timestamps[symbol] and
+               self._hl_liquidation_timestamps[symbol][0] < cutoff):
+            self._hl_liquidation_timestamps[symbol].pop(0)
+            self._hl_liquidation_values[symbol].pop(0)
+
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
         Push external fact into memory.
         """
+        # Only log TRADE events to reduce verbosity
+        if event_type == 'TRADE':
+            print(f"DEBUG Governance: TRADE ingest - symbol={symbol}, timestamp={timestamp}, system_time={self._system_time}")
+
         if self._status == ObservationStatus.FAILED:
             return # Dead system accepts no input
-            
+
         # Invariant B: Causality (No future data, no ancient history without backfill flag)
         # Tolerance: 30 seconds lag, 5 seconds future (clock skew)
         if timestamp < self._system_time - 30.0:
             # Drop ancient history (Log warning?)
+            print(f"DEBUG Governance: DROPPING {event_type} for {symbol} - timestamp {timestamp} < system_time {self._system_time} - 30")
             return
         # Future data tolerance: 5 seconds
         # Accept but do not modify system time
@@ -62,9 +199,7 @@ class ObservationSystem:
             elif event_type == 'OI':
                 self._m1.record_oi(symbol)
             elif event_type == 'DEPTH':
-                normalized_event = self._m1.normalize_depth_update(symbol, payload)
-            elif event_type == 'MARK_PRICE':
-                normalized_event = self._m1.normalize_mark_price(symbol, payload)
+                normalized_event = self._m1.normalize_depth(symbol, payload)
 
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
@@ -75,58 +210,24 @@ class ObservationSystem:
                     quantity=normalized_event['quantity'],
                     side=normalized_event['side']
                 )
-                
-                # Phase 5.4: Feed M2 with trade
-                self._m2_store.ingest_trade(
-                    symbol=normalized_event['symbol'],
-                    price=normalized_event['price'],
-                    side=normalized_event['side'],
-                    volume=normalized_event['quantity'],
-                    is_buyer_maker=normalized_event.get('is_buyer_maker', False),
-                    timestamp=normalized_event['timestamp']
-                )
-            
-            # Phase 5.4: Feed M2 with liquidation
+
+                # M2 Population: Associate trade with nearby nodes
+                self._associate_trade_with_nodes(normalized_event)
+
+            # M2 Population: Create/update nodes from liquidations
             if normalized_event and event_type == 'LIQUIDATION':
-                self._m2_store.ingest_liquidation(
-                    symbol=normalized_event['symbol'],
-                    price=normalized_event['price'],
-                    side=normalized_event['side'],
-                    volume=normalized_event.get('quantity', 0.0),
-                    timestamp=normalized_event['timestamp']
-                )
+                self._create_or_update_node_from_liquidation(normalized_event)
 
-            # Phase OB: Feed M2 with order book updates
+            # Update M2 nodes with orderbook state if it's a depth event
             if normalized_event and event_type == 'DEPTH':
-                # Update M2 order book state for bids
-                for price, size in normalized_event['bids']:
-                    self._m2_store.update_orderbook_state(
-                        symbol=symbol,
-                        price=price,
-                        size=size,
-                        side='bid',
-                        timestamp=normalized_event['timestamp']
-                    )
-
-                # Update M2 order book state for asks
-                for price, size in normalized_event['asks']:
-                    self._m2_store.update_orderbook_state(
-                        symbol=symbol,
-                        price=price,
-                        size=size,
-                        side='ask',
-                        timestamp=normalized_event['timestamp']
-                    )
-
-            # Phase MP: Feed M2 with mark/index price updates
-            if normalized_event and event_type == 'MARK_PRICE':
-                self._m2_store.update_mark_price_state(
+                self._m2_store.update_orderbook_state(
                     symbol=normalized_event['symbol'],
-                    mark_price=normalized_event['mark_price'],
-                    index_price=normalized_event.get('index_price'),
-                    timestamp=normalized_event['timestamp']
+                    timestamp=normalized_event['timestamp'],
+                    bid_size=normalized_event['bid_size'],
+                    ask_size=normalized_event['ask_size'],
+                    best_bid_price=normalized_event['best_bid_price'],
+                    best_ask_price=normalized_event['best_ask_price']
                 )
-
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -135,6 +236,10 @@ class ObservationSystem:
         """
         Force memory system to recognize time passage.
         """
+        # Only log first few times or significant changes
+        if self._system_time == 0.0 or new_timestamp - self._system_time > 10:
+            print(f"DEBUG Governance: advance_time - old={self._system_time}, new={new_timestamp}")
+
         if self._status == ObservationStatus.FAILED:
             return
 
@@ -142,28 +247,31 @@ class ObservationSystem:
             # Invariant A: Time Monotonicity
             self._trigger_failure(f"Time Regression: {new_timestamp} < {self._system_time}")
             return
-            
-        self._system_time = new_timestamp
-        
-        # System Init Transition
-        # print(f"DEBUG: advance_time called. Status={self._status}")
-        if True: # FORCE ACTIVE
-            self._status = ObservationStatus.ACTIVE
-            # print(f"DEBUG: Status is now {self._status}")  # Commented out - too verbose
 
+        # M2 Lifecycle Management: Update node states every 10 seconds
+        prev_interval = int(self._system_time / 10.0)
+        new_interval = int(new_timestamp / 10.0)
+
+        if new_interval > prev_interval:
+            try:
+                # Apply decay to all nodes
+                self._m2_store.decay_nodes(new_timestamp)
+                # Update node states (ACTIVE → DORMANT → ARCHIVED)
+                self._m2_store.update_memory_states(new_timestamp)
+            except Exception as e:
+                self._trigger_failure(f"M2 Lifecycle Failure: {e}")
+
+        self._system_time = new_timestamp
         self._update_liveness()
-        
+
+        # Note: Status remains UNINITIALIZED until failure (per EPISTEMIC_CONSTITUTION)
+        # UNINITIALIZED means "no failure detected", not "not ready"
+
         # Trigger M3 to close windows
         try:
             self._m3.advance_time(new_timestamp)
         except Exception as e:
             self._trigger_failure(f"M3 Temporal Failure: {e}")
-        
-        # Phase 5.4: Trigger M2 decay cycle
-        try:
-            self._m2_store.advance_time(new_timestamp)
-        except Exception as e:
-            self._trigger_failure(f"M2 Decay Failure: {e}")
 
     def query(self, query_spec: Dict) -> Any:
         """
@@ -191,10 +299,101 @@ class ObservationSystem:
         # But 'advance_time' is called by the runtime loop using Wall Clock.
         # So 'new_timestamp' IS effectively Wall Clock (or Data Clock).
         # We need to rely on the Runtime to push time frequently.
-        # If Runtime stops pushing, 'query' won't know unless we verify against machine time 
+        # If Runtime stops pushing, 'query' won't know unless we verify against machine time
         # inside query (which violates isolation but is necessary for safety).
         # Compromise: Check lag against machine time in Query Guard.
         pass
+
+    def _create_or_update_node_from_liquidation(self, normalized_event: Dict) -> None:
+        """Create or update M2 node from liquidation event.
+
+        Args:
+            normalized_event: Normalized liquidation event from M1
+        """
+        symbol = normalized_event['symbol']
+        price = normalized_event['price']
+        side = normalized_event['side']
+        timestamp = normalized_event['timestamp']
+        volume = normalized_event.get('quote_qty', 0.0)
+
+        # Generate node ID: {symbol}_{side}_{price_bucket}
+        # Price bucket: round to 0.1% precision
+        import math
+        price_precision = max(1, int(-math.log10(price * 0.001)))
+        price_bucket = round(price, price_precision)
+        node_id = f"{symbol}_{side}_{price_bucket}"
+
+        # Check if node exists
+        existing_node = self._m2_store.get_node(node_id)
+
+        if existing_node:
+            # Update existing node
+            self._m2_store.record_liquidation_at_node(node_id, timestamp, side)
+        else:
+            # Create new node
+            price_band = price * 0.001  # 10 bps (0.1%)
+            self._m2_store.add_or_update_node(
+                node_id=node_id,
+                symbol=symbol,
+                price_center=price_bucket,
+                price_band=price_band,
+                side="both",  # Liquidations can trigger in either direction
+                timestamp=timestamp,
+                creation_reason="liquidation",
+                initial_strength=0.5,
+                volume=volume
+            )
+
+    def _associate_trade_with_nodes(self, normalized_event: Dict) -> None:
+        """Associate trade with nearby M2 nodes.
+
+        Updates nodes that overlap with the trade price.
+        Creates new node if trade is large and no nearby nodes exist.
+
+        Args:
+            normalized_event: Normalized trade event from M1
+        """
+        symbol = normalized_event['symbol']
+        price = normalized_event['price']
+        timestamp = normalized_event['timestamp']
+        volume = normalized_event.get('quote_qty', 0.0)
+        side = normalized_event['side']  # FIX: Extract 'side' - used at lines 316, 326
+        is_taker_sell = normalized_event['side'] == 'SELL'
+
+        # Find nodes near this price
+        nearby_nodes = self._m2_store.get_nodes_near_price(symbol, price)
+
+        if nearby_nodes:
+            # Update all nearby nodes with trade evidence
+            for node in nearby_nodes:
+                self._m2_store.record_trade_at_node(
+                    node_id=node.id,
+                    timestamp=timestamp,
+                    volume=volume,
+                    is_buyer_maker=is_taker_sell  # is_taker_sell = is_buyer_maker (same semantic)
+                )
+        elif volume >= 1000.0:  # Large trade threshold: $1000
+            # Create new node from large trade
+            import math
+            price_precision = max(1, int(-math.log10(price * 0.001)))
+            price_bucket = round(price, price_precision)
+            orderbook_face = "bid_face" if is_taker_sell else "ask_face"
+            node_id = f"{symbol}_{side}_{price_bucket}"
+
+            # Only create if doesn't exist
+            if not self._m2_store.get_node(node_id):
+                price_band = price * 0.001  # 10 bps
+                self._m2_store.add_or_update_node(
+                    node_id=node_id,
+                    symbol=symbol,
+                    price_center=price_bucket,
+                    price_band=price_band,
+                    side=side,
+                    timestamp=timestamp,
+                    creation_reason="large_trade",
+                    initial_strength=0.3,
+                    volume=volume
+                )
 
     def _get_snapshot(self) -> ObservationSnapshot:
         """Construct public snapshot from internal states.
@@ -233,378 +432,515 @@ class ObservationSystem:
 
         Authority: ANNEX_M4_PRIMITIVE_FLOW.md
         """
-        # Phase 6.1, 6.2, 6.3: M4 Primitive Computation (Complete Bundle)
+        # Initialize all primitives to None
+        resting_size_primitive = None
+        consumption_primitive = None
+        absorption_primitive = None
+        refill_primitive = None
+
         try:
-            # Import M4 computation functions
-            from memory.m4_zone_geometry import compute_zone_penetration_depth, identify_displacement_origin_anchor
-            from memory.m4_traversal_kinematics import compute_price_traversal_velocity, compute_traversal_compactness
-            from memory.m4_structural_absence import compute_structural_absence_duration
-            from memory.m4_structural_persistence import compute_structural_persistence_duration
-            from memory.m4_event_absence import compute_event_non_occurrence_counter
-            from memory.m4_price_distribution import compute_central_tendency_deviation, compute_price_acceptance_ratio
-            from memory.m4_traversal_voids import compute_traversal_void_span
-            from memory.m4_orderbook import (
-                compute_resting_size,
-                detect_order_consumption,
-                detect_absorption_event,
-                detect_refill_event
-            )
-            from memory.m4_liquidation_density import compute_liquidation_density
-            from memory.m4_directional_continuity import compute_directional_continuity
-            from memory.m4_trade_burst import compute_trade_burst
-            
-            # Query M2 for active nodes (symbol-filtered)
-            active_nodes = self._m2_store.get_active_nodes(symbol=symbol)
+            # Get current and previous depth snapshots
+            current_depth = self._m1.latest_depth.get(symbol)
+            previous_depth = self._m1.previous_depth.get(symbol)
 
-            # Query M3 for recent price history
-            recent_prices = self._m3.get_recent_prices(symbol=symbol, max_count=100)
+            if current_depth:
+                # Extract current state
+                current_bid = current_depth.get('bid_size', 0.0)
+                current_ask = current_depth.get('ask_size', 0.0)
+                best_bid = current_depth.get('best_bid_price')
+                best_ask = current_depth.get('best_ask_price')
+                current_ts = current_depth.get('timestamp', self._system_time)
 
-            # Initialize primitives
-            zone_penetration = None
-            displacement_origin_anchor = None
-            price_traversal_velocity = None
-            traversal_compactness = None
-            price_acceptance_ratio = None
-            central_tendency_deviation = None
-            structural_absence_duration = None
-            structural_persistence_duration = None
-            traversal_void_span = None
-            event_non_occurrence_counter = None
-            resting_size_primitive = None
-            order_consumption_primitive = None
-            absorption_event_primitive = None
-            refill_event_primitive = None
-            liquidation_density_primitive = None
-            directional_continuity_primitive = None
-            trade_burst_primitive = None
-            
-            # 1. ZONE PENETRATION (Phase 6.1)
-            if len(active_nodes) > 0 and len(recent_prices) > 0:
-                max_penetration_result = None
-                max_penetration_depth = 0.0
-                for node in active_nodes:
-                    zone_low = node.price_center - node.price_band / 2
-                    zone_high = node.price_center + node.price_band / 2
-
-                    result = compute_zone_penetration_depth(
-                        zone_id=node.id,
-                        zone_low=zone_low,
-                        zone_high=zone_high,
-                        traversal_prices=recent_prices
+                # Compute resting size
+                if current_bid > 0 or current_ask > 0:
+                    resting_size_primitive = compute_resting_size(
+                        bid_size=current_bid,
+                        ask_size=current_ask,
+                        best_bid_price=best_bid,
+                        best_ask_price=best_ask,
+                        timestamp=current_ts
                     )
 
-                    if result is not None and result.penetration_depth > max_penetration_depth:
-                        max_penetration_depth = result.penetration_depth
-                        max_penetration_result = result
+                # Detect consumption and refill if we have previous state
+                if previous_depth:
+                    prev_bid = previous_depth.get('bid_size', 0.0)
+                    prev_ask = previous_depth.get('ask_size', 0.0)
+                    prev_ts = previous_depth.get('timestamp', 0.0)
 
-                if max_penetration_result is not None:
-                    zone_penetration = max_penetration_result
+                    # Skip if timestamps are identical (duplicate update)
+                    if prev_ts < current_ts:
+                        # Detect bid consumption
+                        if prev_bid > 0 and best_bid:
+                            consumption_primitive = detect_order_consumption(
+                                previous_size=prev_bid,
+                                current_size=current_bid,
+                                side='bid',
+                                price_level=best_bid,
+                                timestamp=current_ts,
+                                min_consumption_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
 
-            # 2. DISPLACEMENT ORIGIN ANCHOR (Phase 6.3)
-            if len(recent_prices) >= 3:
-                # Use pre-traversal window (first 50% of prices)
-                mid_point = len(recent_prices) // 2
-                pre_traversal_prices = recent_prices[:mid_point]
-                # Approximate timestamps (M3 doesn't expose them)
-                pre_traversal_timestamps = [
-                    self._system_time - (len(pre_traversal_prices) - i) * 0.1
-                    for i in range(len(pre_traversal_prices))
-                ]
-                
-                if len(pre_traversal_prices) > 0:
-                    anchor = identify_displacement_origin_anchor(
-                        traversal_id=f"{symbol}_current",
-                        pre_traversal_prices=pre_traversal_prices,
-                        pre_traversal_timestamps=pre_traversal_timestamps
-                    )
-                    displacement_origin_anchor = anchor.anchor_dwell_time
-            
-            # 3. PRICE TRAVERSAL VELOCITY (Phase 6.2)
-            if len(recent_prices) >= 2:
-                # Use first and last price in current window
-                # Timestamps would require M3 to expose them, so we approximate with system time
-                # For now, assume 1 second window (M3 default)
-                velocity_result = compute_price_traversal_velocity(
-                    traversal_id=f"{symbol}_current",
-                    price_start=recent_prices[0],
-                    price_end=recent_prices[-1],
-                    ts_start=self._system_time - 1.0,  # Approximate window
-                    ts_end=self._system_time
-                )
-                price_traversal_velocity = velocity_result.velocity
-            
-            # 4. TRAVERSAL COMPACTNESS (Phase 6.3)
-            if len(recent_prices) >= 2:
-                compactness_result = compute_traversal_compactness(
-                    traversal_id=f"{symbol}_current",
-                    ordered_prices=recent_prices
-                )
-                traversal_compactness = compactness_result.compactness_ratio
+                        # Detect ask consumption if no bid consumption
+                        if consumption_primitive is None and prev_ask > 0 and best_ask:
+                            consumption_primitive = detect_order_consumption(
+                                previous_size=prev_ask,
+                                current_size=current_ask,
+                                side='ask',
+                                price_level=best_ask,
+                                timestamp=current_ts,
+                                min_consumption_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
 
-            # 4b. PRICE ACCEPTANCE RATIO (Phase MISSING)
-            # Requires OHLC candle from M3
-            candle = self._m3.get_current_candle(symbol)
-            if candle is not None:
-                try:
-                    acceptance_result = compute_price_acceptance_ratio(
-                        candle_open=candle['open'],
-                        candle_high=candle['high'],
-                        candle_low=candle['low'],
-                        candle_close=candle['close']
-                    )
-                    price_acceptance_ratio = acceptance_result
-                except ValueError:
-                    # Invalid candle structure, skip
-                    pass
+                        # Detect absorption (consumption + price stability)
+                        if consumption_primitive:
+                            # Get price before/after from recent trades
+                            prices = list(self._m1.recent_prices.get(symbol, []))
+                            if len(prices) >= 2:
+                                # Find prices around previous and current timestamps
+                                price_before = None
+                                price_after = None
 
-            # 5. CENTRAL TENDENCY DEVIATION (Phase 6.3)
-            if len(recent_prices) > 0 and len(active_nodes) > 0:
-                # Central tendency = average of node centers
-                central_tendency = sum(node.price_center for node in active_nodes) / len(active_nodes)
-                current_price = recent_prices[-1]
-                
-                deviation_result = compute_central_tendency_deviation(
-                    price=current_price,
-                    central_tendency=central_tendency
-                )
-                central_tendency_deviation = deviation_result.deviation_value
-            
-            # 6. STRUCTURAL ABSENCE DURATION (Phase 6.2)
-            if len(active_nodes) > 0:
-                # Collect all presence intervals from nodes and compute absence
-                all_presence_intervals = []
-                earliest_observation = None
-                for node in active_nodes:
-                    presence_intervals = node.get_presence_intervals(self._system_time)
-                    all_presence_intervals.extend(presence_intervals)
-                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
-                        earliest_observation = node.first_seen_ts
+                                for ts, price in prices:
+                                    if ts <= prev_ts + _OB_PRICE_WINDOW_SEC:
+                                        price_before = price
+                                    if ts <= current_ts and ts > prev_ts:
+                                        price_after = price
 
-                if len(all_presence_intervals) > 0 and earliest_observation is not None:
-                    try:
-                        from memory.m4_structural_absence import compute_structural_absence_duration
-                        absence_result = compute_structural_absence_duration(
-                            observation_start_ts=earliest_observation,
-                            observation_end_ts=self._system_time,
-                            presence_intervals=tuple(all_presence_intervals)
-                        )
-                        structural_absence_duration = absence_result
-                    except ValueError as e:
-                        # Invalid intervals, skip
-                        if symbol == "BTCUSDT":
-                            print(f"DEBUG: structural_absence_duration failed for {symbol}: {e}")
-                        pass
+                                if price_before and price_after:
+                                    absorption_primitive = detect_absorption_event(
+                                        consumed_size=consumption_primitive.consumed_size,
+                                        price_before=price_before,
+                                        price_after=price_after,
+                                        side=consumption_primitive.side,
+                                        timestamp=current_ts,
+                                        max_price_movement_pct=_OB_PRICE_STABILITY_PCT
+                                    )
 
-            # 6b. STRUCTURAL PERSISTENCE DURATION (Phase MISSING)
-            if len(active_nodes) > 0:
-                # Collect all presence intervals from all nodes
-                all_presence_intervals = []
-                earliest_observation = None
-                for node in active_nodes:
-                    presence_intervals = node.get_presence_intervals(self._system_time)
-                    all_presence_intervals.extend(presence_intervals)
-                    if earliest_observation is None or node.first_seen_ts < earliest_observation:
-                        earliest_observation = node.first_seen_ts
+                        # Detect refill (size increase)
+                        if prev_bid > 0 and best_bid:
+                            refill_primitive = detect_refill_event(
+                                previous_size=prev_bid,
+                                current_size=current_bid,
+                                side='bid',
+                                price_level=best_bid,
+                                timestamp=current_ts,
+                                min_refill_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
 
-                if len(all_presence_intervals) > 0 and earliest_observation is not None:
-                    try:
-                        persistence_result = compute_structural_persistence_duration(
-                            observation_start_ts=earliest_observation,
-                            observation_end_ts=self._system_time,
-                            presence_intervals=tuple(all_presence_intervals)
-                        )
-                        structural_persistence_duration = persistence_result
-                    except ValueError as e:
-                        # Invalid intervals, skip (but log for debugging)
-                        if symbol == "BTCUSDT" and len(all_presence_intervals) > 0:
-                            print(f"DEBUG: structural_persistence_duration failed for {symbol}: {e}")
-                        pass
+                        # Detect ask refill if no bid refill
+                        if refill_primitive is None and prev_ask > 0 and best_ask:
+                            refill_primitive = detect_refill_event(
+                                previous_size=prev_ask,
+                                current_size=current_ask,
+                                side='ask',
+                                price_level=best_ask,
+                                timestamp=current_ts,
+                                min_refill_threshold=_OB_SIZE_CHANGE_THRESHOLD
+                            )
 
-            # 7. TRAVERSAL VOID SPAN (Phase 6.3)
-            if len(active_nodes) > 0:
-                # Collect all interaction timestamps from nodes
-                interaction_timestamps = []
-                for node in active_nodes:
-                    interaction_timestamps.extend(node.interaction_timestamps)
-                
-                if len(interaction_timestamps) > 0:
-                    # Define observation window
-                    earliest_interaction = min(interaction_timestamps)
-                    observation_window = (earliest_interaction, self._system_time)
-                    
-                    void_result = compute_traversal_void_span(
-                        observation_start_ts=observation_window[0],
-                        observation_end_ts=observation_window[1],
-                        traversal_timestamps=tuple(interaction_timestamps)
-                    )
-                    traversal_void_span = void_result.max_void_duration
-            
-            # 8. EVENT NON-OCCURRENCE COUNTER (Phase 6.2)
-            # Simplified: Count expected nodes vs observed liquidations
-            # This is a placeholder implementation
-            if len(active_nodes) > 0:
-                # For each active node, we expected reinforcement events
-                # Non-occurrence = nodes that haven't been interacted with recently
-                stale_threshold = 60.0  # 60 seconds
-                stale_count = sum(
-                    1 for node in active_nodes
-                    if (self._system_time - node.last_interaction_ts) > stale_threshold
-                )
-                if stale_count > 0:
-                    event_non_occurrence_counter = stale_count
-
-            # 9. RESTING SIZE (Order Book - Phase OB)
-            if len(active_nodes) > 0:
-                # Get node with most recent order book update
-                ob_nodes = [n for n in active_nodes if n.last_orderbook_update_ts is not None]
-                if ob_nodes:
-                    latest_ob_node = max(ob_nodes, key=lambda n: n.last_orderbook_update_ts)
-                    resting_size_primitive = compute_resting_size(latest_ob_node)
-
-                    # 10. ORDER CONSUMPTION (Phase OB-2)
-                    # Detect consumption on bid side
-                    if latest_ob_node.previous_resting_size_bid > 0:
-                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
-                        consumption = detect_order_consumption(
-                            latest_ob_node,
-                            latest_ob_node.previous_resting_size_bid,
-                            latest_ob_node.resting_size_bid,
-                            duration
-                        )
-                        if consumption:
-                            order_consumption_primitive = consumption
-
-                    # Also check ask side consumption
-                    if latest_ob_node.previous_resting_size_ask > 0 and order_consumption_primitive is None:
-                        duration = self._system_time - latest_ob_node.last_orderbook_update_ts
-                        consumption = detect_order_consumption(
-                            latest_ob_node,
-                            latest_ob_node.previous_resting_size_ask,
-                            latest_ob_node.resting_size_ask,
-                            duration
-                        )
-                        if consumption:
-                            order_consumption_primitive = consumption
-
-                    # 11. ABSORPTION EVENT (Phase OB-2)
-                    # Detect absorption if consumption occurred with price stability
-                    if order_consumption_primitive is not None and len(recent_prices) >= 2:
-                        absorption = detect_absorption_event(
-                            node=latest_ob_node,
-                            price_start=recent_prices[0],
-                            price_end=recent_prices[-1],
-                            consumed_size=order_consumption_primitive.consumed_size,
-                            duration=order_consumption_primitive.duration,
-                            trade_count=latest_ob_node.trade_execution_count
-                        )
-                        if absorption:
-                            absorption_event_primitive = absorption
-
-                    # 12. REFILL EVENT (Phase OB-2)
-                    # Detect refill on bid side
-                    if latest_ob_node.previous_resting_size_bid > 0:
-                        refill = detect_refill_event(
-                            node=latest_ob_node,
-                            previous_size=latest_ob_node.previous_resting_size_bid,
-                            current_size=latest_ob_node.resting_size_bid,
-                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
-                        )
-                        if refill:
-                            refill_event_primitive = refill
-
-                    # Also check ask side refill
-                    if latest_ob_node.previous_resting_size_ask > 0 and refill_event_primitive is None:
-                        refill = detect_refill_event(
-                            node=latest_ob_node,
-                            previous_size=latest_ob_node.previous_resting_size_ask,
-                            current_size=latest_ob_node.resting_size_ask,
-                            duration=self._system_time - latest_ob_node.last_orderbook_update_ts if latest_ob_node.last_orderbook_update_ts else 0.0
-                        )
-                        if refill:
-                            refill_event_primitive = refill
-
-            # 13. DIRECTIONAL CONTINUITY (Phase 4.3)
-            if len(recent_prices) >= 2:
-                directional_continuity = compute_directional_continuity(recent_prices)
-                if directional_continuity:
-                    directional_continuity_primitive = directional_continuity
-
-            # 14. LIQUIDATION DENSITY (Phase 6.4)
-            if len(active_nodes) > 0 and len(recent_prices) >= 2:
-                # Collect liquidation volumes from active nodes
-                liquidation_volumes = []
-                for node in active_nodes:
-                    if node.liquidation_proximity_count > 0:
-                        # Use volume_total as proxy for liquidation volume
-                        liquidation_volumes.append(node.volume_total)
-
-                if liquidation_volumes and len(recent_prices) >= 2:
-                    density = compute_liquidation_density(
-                        liquidation_volumes=liquidation_volumes,
-                        price_start=recent_prices[0],
-                        price_end=recent_prices[-1]
-                    )
-                    if density:
-                        liquidation_density_primitive = density
-
-            # 15. TRADE BURST (Phase 5.4)
-            if len(active_nodes) > 0:
-                # Sum trade execution counts across active nodes
-                total_trade_count = sum(node.trade_execution_count for node in active_nodes)
-                # Use system time to estimate window duration
-                if len(recent_prices) >= 2:
-                    # Approximate window duration (1 second default)
-                    window_duration = 1.0
-                    burst = compute_trade_burst(
-                        trade_count=total_trade_count,
-                        window_duration=window_duration,
-                        baseline=10  # Mechanical baseline: 10 trades
-                    )
-                    if burst:
-                        trade_burst_primitive = burst
-
-            # Return complete bundle
-            return M4PrimitiveBundle(
-                symbol=symbol,
-                zone_penetration=zone_penetration,
-                displacement_origin_anchor=displacement_origin_anchor,
-                price_traversal_velocity=price_traversal_velocity,
-                traversal_compactness=traversal_compactness,
-                price_acceptance_ratio=price_acceptance_ratio,
-                central_tendency_deviation=central_tendency_deviation,
-                structural_absence_duration=structural_absence_duration,
-                structural_persistence_duration=structural_persistence_duration,
-                traversal_void_span=traversal_void_span,
-                event_non_occurrence_counter=event_non_occurrence_counter,
-                resting_size=resting_size_primitive,
-                order_consumption=order_consumption_primitive,
-                absorption_event=absorption_event_primitive,
-                refill_event=refill_event_primitive,
-                liquidation_density=liquidation_density_primitive,
-                directional_continuity=directional_continuity_primitive,
-                trade_burst=trade_burst_primitive
-            )
-            
         except Exception as e:
             # Computation failures should not crash snapshot creation
             # Return None primitives and continue
-            return M4PrimitiveBundle(
-                symbol=symbol,
-                zone_penetration=None,
-                displacement_origin_anchor=None,
-                price_traversal_velocity=None,
-                traversal_compactness=None,
-                price_acceptance_ratio=None,
-                central_tendency_deviation=None,
-                structural_absence_duration=None,
-                structural_persistence_duration=None,
-                traversal_void_span=None,
-                event_non_occurrence_counter=None,
-                resting_size=None,
-                order_consumption=None,
-                absorption_event=None,
-                refill_event=None,
-                liquidation_density=None,
-                directional_continuity=None,
-                trade_burst=None
+            pass
+
+        # Initialize zone geometry and kinematics primitives to None
+        zone_penetration_primitive = None
+        traversal_velocity_primitive = None
+        traversal_compactness_primitive = None
+        central_tendency_primitive = None
+
+        try:
+            # Get trade data from M1
+            trades = list(self._m1.raw_trades.get(symbol, []))
+
+            # DEBUG: Log trade count (disabled - too verbose)
+            # print(f"DEBUG Governance: Computing primitives for {symbol}, trades={len(trades)}, min_required={_MIN_TRADES_FOR_KINEMATICS}")
+
+            if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
+                # Extract price sequence
+                prices = [t['price'] for t in trades]
+                timestamps = [t['timestamp'] for t in trades]
+
+                # Compute traversal velocity (first to last)
+                first_price = prices[0]
+                last_price = prices[-1]
+                first_ts = timestamps[0]
+                last_ts = timestamps[-1]
+
+                if last_ts > first_ts:
+                    traversal_velocity_primitive = compute_price_traversal_velocity(
+                        traversal_id=f"{symbol}_{int(self._system_time)}",
+                        price_start=first_price,
+                        price_end=last_price,
+                        ts_start=first_ts,
+                        ts_end=last_ts
+                    )
+
+                # Compute traversal compactness
+                if len(prices) >= 2:
+                    traversal_compactness_primitive = compute_traversal_compactness(
+                        traversal_id=f"{symbol}_{int(self._system_time)}",
+                        ordered_prices=prices
+                    )
+
+                # Compute zone penetration using dynamic zone around current price
+                current_price = last_price
+                zone_width = current_price * (_ZONE_BAND_PCT / 100.0)
+                zone_low = current_price - zone_width
+                zone_high = current_price + zone_width
+
+                zone_penetration_primitive = compute_zone_penetration_depth(
+                    zone_id=f"{symbol}_zone_{int(self._system_time)}",
+                    zone_low=zone_low,
+                    zone_high=zone_high,
+                    traversal_prices=prices
+                )
+
+                # Compute central tendency deviation
+                if len(prices) >= 3:
+                    mean_price = sum(prices) / len(prices)
+                    central_tendency_primitive = compute_central_tendency_deviation(
+                        price=current_price,
+                        central_tendency=mean_price
+                    )
+
+        except Exception as e:
+            # Computation failures should not crash snapshot creation
+            # Return None primitives and continue
+            pass
+
+        # Detect patterns from M2 nodes
+        order_block_primitive = None
+        supply_demand_zone_primitive = None
+
+        try:
+            from memory.m4_node_patterns import (
+                detect_order_block,
+                detect_supply_demand_zone,
+                find_node_clusters
             )
+
+            # Get M2 nodes for this symbol
+            active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+
+            if active_nodes:
+                # Detect order blocks from individual nodes
+                # Find strongest order block candidate
+                order_blocks = []
+                for node in active_nodes:
+                    ob = detect_order_block(node, self._system_time)
+                    if ob:
+                        order_blocks.append(ob)
+
+                # Return strongest order block (highest interaction density)
+                if order_blocks:
+                    order_block_primitive = max(
+                        order_blocks,
+                        key=lambda ob: ob.interactions_per_hour
+                    )
+
+                # Detect supply/demand zones from node clusters
+                if len(active_nodes) >= 3:
+                    # Get current price for displacement detection
+                    current_price = None
+                    if trades:
+                        current_price = trades[-1]['price']
+
+                    if current_price:
+                        # Find clusters
+                        clusters = find_node_clusters(active_nodes, max_gap_pct=0.2)
+
+                        # Detect zones from clusters
+                        zones = []
+                        for cluster in clusters:
+                            zone = detect_supply_demand_zone(
+                                cluster,
+                                current_price,
+                                self._system_time
+                            )
+                            if zone:
+                                zones.append(zone)
+
+                        # Return strongest zone (highest total volume)
+                        if zones:
+                            supply_demand_zone_primitive = max(
+                                zones,
+                                key=lambda z: z.total_volume
+                            )
+
+        except Exception as e:
+            # Pattern detection failures should not crash snapshot
+            pass
+
+        # Initialize additional primitives to None
+        displacement_origin_primitive = None
+        traversal_void_primitive = None
+        price_acceptance_primitive = None
+        liquidation_density_primitive = None
+        directional_continuity_primitive = None
+        trade_burst_primitive = None
+        structural_absence_primitive = None
+        structural_persistence_primitive = None
+        event_non_occurrence_primitive = None
+
+        try:
+            # Get trade data from M1 (may already be fetched above)
+            if 'trades' not in locals():
+                trades = list(self._m1.raw_trades.get(symbol, []))
+
+            if len(trades) >= _MIN_TRADES_FOR_KINEMATICS:
+                # Extract sequences
+                prices = [t['price'] for t in trades]
+                timestamps = [t['timestamp'] for t in trades]
+                trade_sides = [t.get('side', 'UNKNOWN') for t in trades]
+
+                # Displacement origin anchor: use first half as pre-traversal
+                if len(prices) >= 4:
+                    mid_idx = len(prices) // 2
+                    pre_traversal_prices = prices[:mid_idx]
+                    pre_traversal_timestamps = timestamps[:mid_idx]
+
+                    displacement_origin_primitive = identify_displacement_origin_anchor(
+                        traversal_id=f"{symbol}_displacement_{int(self._system_time)}",
+                        pre_traversal_prices=pre_traversal_prices,
+                        pre_traversal_timestamps=pre_traversal_timestamps
+                    )
+
+                # Traversal void span: find gaps between trades
+                if len(timestamps) >= 2:
+                    observation_start = timestamps[0]
+                    observation_end = timestamps[-1]
+
+                    if observation_end > observation_start:
+                        traversal_void_primitive = compute_traversal_void_span(
+                            observation_start_ts=observation_start,
+                            observation_end_ts=observation_end,
+                            traversal_timestamps=tuple(timestamps)
+                        )
+
+                # Price acceptance ratio: compute OHLC from trades
+                if len(prices) >= 2:
+                    candle_open = prices[0]
+                    candle_close = prices[-1]
+                    candle_high = max(prices)
+                    candle_low = min(prices)
+
+                    price_acceptance_primitive = compute_price_acceptance_ratio(
+                        candle_open=candle_open,
+                        candle_high=candle_high,
+                        candle_low=candle_low,
+                        candle_close=candle_close
+                    )
+
+                # Directional continuity: analyze trade direction consistency
+                if len(trade_sides) >= 2:
+                    # Filter out UNKNOWN sides
+                    valid_sides = [s for s in trade_sides if s in ('BUY', 'SELL')]
+                    if len(valid_sides) >= 2:
+                        directional_continuity_primitive = compute_directional_continuity(
+                            trade_sides=valid_sides
+                        )
+
+                # Trade burst: find maximum trade density window
+                if len(timestamps) >= 2:
+                    trade_burst_primitive = compute_trade_burst(
+                        trade_timestamps=timestamps,
+                        burst_window_sec=1.0
+                    )
+
+            # Liquidation density: analyze liquidation clustering
+            liquidations = list(self._m1.raw_liquidations.get(symbol, []))
+            if len(liquidations) >= 2 and len(trades) >= 1:
+                # Use current price as center
+                current_price = trades[-1]['price'] if trades else None
+                if current_price:
+                    # Use 1% price window for liquidation clustering
+                    price_window = current_price * 0.01
+
+                    # Format liquidations for compute function
+                    liq_list = [
+                        {'price': liq['price'], 'volume': liq.get('quantity', 0.0)}
+                        for liq in liquidations
+                    ]
+
+                    liquidation_density_primitive = compute_liquidation_density(
+                        liquidations=liq_list,
+                        price_center=current_price,
+                        price_window=price_window
+                    )
+
+            # Structural absence/persistence: measure M2 node presence over observation window
+            if len(timestamps) >= 2:
+                observation_start = timestamps[0]
+                observation_end = timestamps[-1]
+
+                if observation_end > observation_start:
+                    # Get active M2 nodes for this symbol
+                    active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+
+                    if len(active_nodes) > 0:
+                        # Build presence intervals from M2 nodes
+                        # Each node contributes an interval from first_seen to last_interaction
+                        presence_intervals = []
+                        for node in active_nodes:
+                            # Only include intervals that overlap with observation window
+                            interval_start = max(node.first_seen_ts, observation_start)
+                            interval_end = min(node.last_interaction_ts, observation_end)
+
+                            if interval_start < interval_end:
+                                presence_intervals.append((interval_start, interval_end))
+
+                        if len(presence_intervals) > 0:
+                            # Compute structural persistence (how long nodes were present)
+                            structural_persistence_primitive = compute_structural_persistence_duration(
+                                observation_start_ts=observation_start,
+                                observation_end_ts=observation_end,
+                                presence_intervals=tuple(presence_intervals)
+                            )
+
+                            # Compute structural absence (how long nodes were absent)
+                            structural_absence_primitive = compute_structural_absence_duration(
+                                observation_start_ts=observation_start,
+                                observation_end_ts=observation_end,
+                                presence_intervals=tuple(presence_intervals)
+                            )
+
+            # Event non-occurrence counter: track expected symbols vs observed symbols
+            # This is computed once per cycle, not per symbol, so we'll check if symbol is first
+            if symbol == self._symbols[0]:  # Only compute once per cycle
+                # Expected: all symbols we're tracking
+                expected_symbol_ids = tuple(self._symbols)
+
+                # Observed: symbols with ≥1 trade in M1 buffer
+                observed_symbol_ids = tuple(
+                    sym for sym in self._symbols
+                    if len(list(self._m1.raw_trades.get(sym, []))) > 0
+                )
+
+                event_non_occurrence_primitive = compute_event_non_occurrence_counter(
+                    expected_event_ids=expected_symbol_ids,
+                    observed_event_ids=observed_symbol_ids
+                )
+
+        except Exception as e:
+            # Additional primitive computation failures should not crash snapshot
+            pass
+
+        # Tier B-6: Cascade observation primitives (from Hyperliquid)
+        cascade_proximity_primitive = None
+        cascade_state_primitive = None
+        leverage_concentration_primitive = None
+        open_interest_bias_primitive = None
+
+        try:
+            if self._hl_collector:
+                # Convert symbol to Hyperliquid coin format (BTCUSDT -> BTC)
+                hl_coin = symbol.replace('USDT', '').replace('PERP', '')
+
+                # Get proximity data from collector
+                hl_proximity = self._hl_collector.get_proximity(hl_coin)
+
+                if hl_proximity:
+                    # Convert to constitutional M4 primitive
+                    cascade_proximity_primitive = LiquidationCascadeProximity(
+                        symbol=symbol,
+                        price_level=hl_proximity.current_price,
+                        threshold_pct=hl_proximity.threshold_pct,
+                        positions_at_risk_count=hl_proximity.total_positions_at_risk,
+                        aggregate_position_value=hl_proximity.total_value_at_risk,
+                        long_positions_count=hl_proximity.long_positions_count,
+                        long_positions_value=hl_proximity.long_positions_value,
+                        long_closest_price=hl_proximity.long_closest_liquidation,
+                        long_avg_distance_pct=hl_proximity.long_avg_distance_pct,
+                        short_positions_count=hl_proximity.short_positions_count,
+                        short_positions_value=hl_proximity.short_positions_value,
+                        short_closest_price=hl_proximity.short_closest_liquidation,
+                        short_avg_distance_pct=hl_proximity.short_avg_distance_pct,
+                        timestamp=hl_proximity.timestamp
+                    )
+
+                    # Compute cascade state from liquidation events
+                    liq_timestamps = self._hl_liquidation_timestamps.get(symbol, [])
+                    liq_values = self._hl_liquidation_values.get(symbol, [])
+
+                    cascade_state_primitive = compute_cascade_state(
+                        symbol=symbol,
+                        positions_at_risk=hl_proximity.total_positions_at_risk,
+                        liquidation_timestamps=liq_timestamps,
+                        liquidation_values=liq_values,
+                        current_time=self._system_time
+                    )
+
+                # Get position data for leverage and open interest primitives
+                tracker = self._hl_collector._tracker if hasattr(self._hl_collector, '_tracker') else None
+                if tracker:
+                    # Extract positions for coin (HL uses BTC not BTCUSDT)
+                    # Use get_positions method which accesses _positions_by_coin (the aggregated index)
+                    raw_positions = tracker.get_positions(hl_coin)
+                    positions = []
+                    for pos in raw_positions:
+                        positions.append({
+                            'position_size': pos.position_size,
+                            'position_value': pos.position_value,
+                            'leverage': pos.leverage,
+                            'liquidation_price': pos.liquidation_price
+                        })
+                    if not positions:
+                        # Fallback: try directly from wallet_states
+                        for wallet_state in tracker._wallet_states.values():
+                            pos = wallet_state.positions.get(hl_coin)
+                            if pos:
+                                positions.append({
+                                    'position_size': pos.position_size,
+                                    'position_value': pos.position_value,
+                                    'leverage': pos.leverage,
+                                    'liquidation_price': pos.liquidation_price
+                                })
+
+                    if positions:
+                        # Compute leverage concentration
+                        leverage_concentration_primitive = compute_leverage_concentration(
+                            symbol=symbol,
+                            positions=positions,
+                            timestamp=self._system_time
+                        )
+
+                        # Compute open interest bias
+                        open_interest_bias_primitive = compute_open_interest_bias(
+                            symbol=symbol,
+                            positions=positions,
+                            timestamp=self._system_time
+                        )
+
+        except Exception:
+            # Cascade primitive computation failures should not crash snapshot
+            pass
+
+        # Return bundle with computed primitives
+        return M4PrimitiveBundle(
+            symbol=symbol,
+            zone_penetration=zone_penetration_primitive,
+            displacement_origin_anchor=displacement_origin_primitive,
+            price_traversal_velocity=traversal_velocity_primitive,
+            traversal_compactness=traversal_compactness_primitive,
+            central_tendency_deviation=central_tendency_primitive,
+            structural_absence_duration=structural_absence_primitive,
+            traversal_void_span=traversal_void_primitive,
+            event_non_occurrence_counter=event_non_occurrence_primitive,
+            structural_persistence_duration=structural_persistence_primitive,
+            resting_size=resting_size_primitive,
+            order_consumption=consumption_primitive,
+            absorption_event=absorption_primitive,
+            refill_event=refill_primitive,
+            price_acceptance_ratio=price_acceptance_primitive,
+            liquidation_density=liquidation_density_primitive,
+            directional_continuity=directional_continuity_primitive,
+            trade_burst=trade_burst_primitive,
+            order_block=order_block_primitive,
+            supply_demand_zone=supply_demand_zone_primitive,
+            # Tier B-6 - Cascade observation primitives
+            liquidation_cascade_proximity=cascade_proximity_primitive,
+            cascade_state=cascade_state_primitive,
+            leverage_concentration_ratio=leverage_concentration_primitive,
+            open_interest_directional_bias=open_interest_bias_primitive
+        )

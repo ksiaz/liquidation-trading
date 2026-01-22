@@ -25,7 +25,7 @@ class EnrichedLiquidityMemoryNode:
     
     # IDENTITY
     id: str
-    symbol: str  # Partitioning key for multi-symbol support
+    symbol: str
     price_center: float
     price_band: float
     side: Literal["bid", "ask", "both"]
@@ -73,22 +73,6 @@ class EnrichedLiquidityMemoryNode:
     # METADATA
     last_decay_application_ts: float = 0.0
 
-    # ORDER BOOK STATE (Phase OB-1)
-    resting_size_bid: float = 0.0
-    resting_size_ask: float = 0.0
-    last_orderbook_update_ts: Optional[float] = None
-    orderbook_update_count: int = 0
-
-    # ORDER BOOK TEMPORAL TRACKING (Phase OB-2)
-    previous_resting_size_bid: float = 0.0
-    previous_resting_size_ask: float = 0.0
-
-    # MARK/INDEX PRICE STATE (Phase MP-1)
-    last_mark_price: Optional[float] = None
-    last_index_price: Optional[float] = None
-    last_mark_price_ts: Optional[float] = None
-    mark_price_update_count: int = 0
-
     # M3: TEMPORAL EVIDENCE ORDERING (Phase M3 extension)
     # Sequence buffer for chronological token ordering
     sequence_buffer: 'SequenceBuffer' = None  # type: ignore
@@ -98,9 +82,11 @@ class EnrichedLiquidityMemoryNode:
     motif_strength: dict = field(default_factory=dict)  # {motif_tuple: strength}
     total_sequences_observed: int = 0
 
-    # PRESENCE INTERVAL TRACKING (for structural_persistence_duration)
-    presence_intervals: List[Tuple[float, float]] = field(default_factory=list)  # [(start, end), ...]
-    current_presence_start: Optional[float] = None  # When current ACTIVE period started
+    # ORDER BOOK STATE (for B-2.1 primitives)
+    # Tracks observed resting size at this price level
+    last_observed_bid_size: float = 0.0
+    last_observed_ask_size: float = 0.0
+    last_orderbook_update_ts: Optional[float] = None
     
     def __post_init__(self):
         """Validate invariants."""
@@ -108,15 +94,11 @@ class EnrichedLiquidityMemoryNode:
         assert 0.0 <= self.confidence <= 1.0, f"Confidence must be [0,1], got {self.confidence}"
         assert self.price_band > 0, f"Price band must be positive, got {self.price_band}"
         assert self.first_seen_ts <= self.last_interaction_ts
-
+        
         # Initialize M3 sequence buffer if not set (backward compatibility)
         if self.sequence_buffer is None:
             from memory.m3_sequence_buffer import SequenceBuffer
             self.sequence_buffer = SequenceBuffer()
-
-        # Initialize presence tracking if node is active
-        if self.active and self.current_presence_start is None:
-            self.current_presence_start = self.first_seen_ts
     
     def record_orderbook_appearance(self, timestamp: float):
         """Record orderbook appearance evidence."""
@@ -170,21 +152,34 @@ class EnrichedLiquidityMemoryNode:
         self.last_interaction_ts = timestamp
         self.interaction_timestamps.append(timestamp)
         self._update_temporal_stats()
+
+    def update_orderbook_state(self, timestamp: float, bid_size: float, ask_size: float):
+        """Update observed resting size at this price level.
+
+        Args:
+            timestamp: Observation timestamp
+            bid_size: Observed bid size at this price level
+            ask_size: Observed ask size at this price level
+        """
+        self.last_observed_bid_size = bid_size
+        self.last_observed_ask_size = ask_size
+        self.last_orderbook_update_ts = timestamp
+
+        if bid_size > 0 or ask_size > 0:
+            self.record_orderbook_appearance(timestamp)
     
     def apply_decay(self, current_timestamp: float, current_price: float = None):
         """Apply time-based decay."""
         if not self.active:
             return
-
+        
         time_elapsed = current_timestamp - self.last_interaction_ts
         decay_factor = max(0.0, 1.0 - (self.decay_rate * time_elapsed))
         self.strength *= decay_factor
-
+        
         if self.strength < 0.01:
-            # Transition from ACTIVE to DORMANT/ARCHIVED
-            self._end_presence_interval(current_timestamp)
             self.active = False
-
+        
         self.last_decay_application_ts = current_timestamp
     
     def apply_enhanced_decay(self, current_timestamp: float, current_price: float = None) -> dict:
@@ -246,45 +241,6 @@ class EnrichedLiquidityMemoryNode:
         lower = self.price_center - (self.price_band / 2)
         upper = self.price_center + (self.price_band / 2)
         return lower <= price <= upper
-
-    def _end_presence_interval(self, end_timestamp: float) -> None:
-        """
-        End current presence interval when node becomes inactive.
-
-        Args:
-            end_timestamp: When the presence ended
-        """
-        if self.current_presence_start is not None:
-            self.presence_intervals.append((self.current_presence_start, end_timestamp))
-            self.current_presence_start = None
-
-    def _start_presence_interval(self, start_timestamp: float) -> None:
-        """
-        Start new presence interval when node becomes active.
-
-        Args:
-            start_timestamp: When the presence started
-        """
-        if self.current_presence_start is None:
-            self.current_presence_start = start_timestamp
-
-    def get_presence_intervals(self, current_timestamp: float) -> Tuple[Tuple[float, float], ...]:
-        """
-        Get all presence intervals including current active period if applicable.
-
-        Args:
-            current_timestamp: Current time for computing active interval end
-
-        Returns:
-            Tuple of (start, end) intervals
-        """
-        intervals = list(self.presence_intervals)
-
-        # Include current active period if node is active
-        if self.active and self.current_presence_start is not None:
-            intervals.append((self.current_presence_start, current_timestamp))
-
-        return tuple(intervals)
     
     def age_seconds(self, current_timestamp: float) -> float:
         """Get age in seconds."""

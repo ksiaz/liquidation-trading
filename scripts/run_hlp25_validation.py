@@ -27,6 +27,9 @@ from analysis.validators import (
     AbsorptionValidator,
     OIConcentrationValidator,
     CrossAssetValidator,
+    FundingSettlementValidator,
+    ManipulationValidator,
+    FundingLeadValidator,
     ValidationResult
 )
 
@@ -137,6 +140,9 @@ def run_validation(db_path: str, days: int = 30, verbose: bool = False) -> list:
         AbsorptionValidator(),
         OIConcentrationValidator(),
         CrossAssetValidator(),
+        FundingSettlementValidator(),
+        ManipulationValidator(),
+        FundingLeadValidator(),
     ]
 
     results = []

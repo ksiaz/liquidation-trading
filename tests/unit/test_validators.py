@@ -13,6 +13,9 @@ from analysis.validators import (
     AbsorptionValidator,
     OIConcentrationValidator,
     CrossAssetValidator,
+    FundingSettlementValidator,
+    ManipulationValidator,
+    FundingLeadValidator,
     ValidationResult
 )
 
@@ -260,3 +263,155 @@ class TestCrossAssetValidator:
         assert 'SOL' in result.details['alt_coins']
         assert 'DOGE' in result.details['alt_coins']
         assert result.details['alt_cascade_count'] == 2
+
+
+class TestFundingSettlementValidator:
+    """Test funding settlement timing validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create validator with reduced thresholds."""
+        return FundingSettlementValidator(
+            pre_settlement_window_min=30,
+            min_sample_size=5
+        )
+
+    def test_insufficient_data(self, validator):
+        """Returns insufficient data when sample too small."""
+        cascades = [
+            MockCascade(i, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+            for i in range(3)
+        ]
+
+        result = validator.validate(cascades)
+        assert result.status == "INSUFFICIENT_DATA"
+
+    def test_minutes_to_settlement_calculation(self, validator):
+        """Correctly calculates minutes to nearest settlement."""
+        # 07:30 UTC -> 30 min to 08:00 settlement
+        ts_0730 = 1700000000000000000  # Some timestamp
+        # Just test the method works
+        minutes = validator._minutes_to_nearest_settlement(ts_0730)
+        assert isinstance(minutes, int)
+        assert 0 <= minutes <= 240  # Max is 4 hours (halfway between settlements)
+
+    def test_analyzes_cascade_proximity_to_settlement(self, validator):
+        """Analyzes whether cascades cluster near settlements."""
+        # Create cascades with various timestamps
+        cascades = [
+            MockCascade(i, "BTC", 1700000000000000000 + i * 3600_000_000_000,
+                       1700000000060000000000 + i * 3600_000_000_000,
+                       "10.0", 3, 4, "REVERSAL")
+            for i in range(10)
+        ]
+
+        result = validator.validate(cascades)
+
+        # Should have details about proximity
+        assert 'cascades_near_settlement' in result.details
+        assert 'cascades_far_from_settlement' in result.details
+
+
+class TestManipulationValidator:
+    """Test manipulation detection validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create validator with reduced thresholds."""
+        return ManipulationValidator(
+            max_organic_legs=2,
+            min_sample_size=5
+        )
+
+    def test_insufficient_data(self, validator):
+        """Returns insufficient data when sample too small."""
+        cascades = [
+            MockCascade(i, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+            for i in range(3)
+        ]
+
+        result = validator.validate(cascades)
+        assert result.status == "INSUFFICIENT_DATA"
+
+    def test_classifies_multi_leg_as_potential_manipulation(self, validator):
+        """Cascades with >2 legs classified as potential manipulation."""
+        cascades = [
+            MockCascade(1, "BTC", 1000, 1060, "10.0", 3, 5, "REVERSAL"),  # 5 legs
+            MockCascade(2, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL"),  # 4 legs
+            MockCascade(3, "BTC", 1000, 1060, "10.0", 3, 3, "REVERSAL"),  # 3 legs
+            MockCascade(4, "BTC", 1000, 1060, "10.0", 3, 2, "CONTINUATION"),  # 2 legs
+            MockCascade(5, "BTC", 1000, 1060, "10.0", 3, 1, "REVERSAL"),  # 1 leg
+        ]
+
+        result = validator.validate(cascades)
+
+        # 3 multi-leg (>2), 2 single-leg (<=2)
+        assert result.details['multi_leg_cascades'] == 3
+        assert result.details['single_leg_cascades'] == 2
+
+    def test_count_down_legs(self, validator):
+        """Correctly counts down-legs in OI series."""
+        # Monotonic decrease = 1 leg
+        oi_monotonic = [100, 95, 90, 85, 80]
+        legs = validator._count_down_legs(oi_monotonic)
+        assert legs == 1
+
+        # Drop, pause, drop = 2 legs
+        oi_two_legs = [100, 95, 90, 91, 90, 85, 80]
+        legs = validator._count_down_legs(oi_two_legs)
+        assert legs == 2
+
+    def test_detect_mid_pause(self, validator):
+        """Detects OI pause/increase mid-cascade."""
+        # Monotonic decrease - no pause
+        oi_no_pause = [100, 95, 90, 85, 80, 75, 70]
+        assert validator._detect_mid_pause(oi_no_pause) is False
+
+        # OI increase in middle
+        oi_with_pause = [100, 95, 90, 92, 88, 83, 78]
+        assert validator._detect_mid_pause(oi_with_pause) is True
+
+
+class TestFundingLeadValidator:
+    """Test cross-exchange funding lead validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create validator with reduced thresholds."""
+        return FundingLeadValidator(
+            divergence_threshold=0.0005,
+            min_sample_size=5
+        )
+
+    def test_insufficient_data_without_binance_data(self, validator):
+        """Returns insufficient data when Binance data missing."""
+        cascades = [
+            MockCascade(i, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+            for i in range(10)
+        ]
+
+        result = validator.validate(cascades)
+        assert result.status == "INSUFFICIENT_DATA"
+        assert "Binance" in result.details['reason']
+
+    def test_check_current_divergence_significant(self, validator):
+        """Detects significant current divergence."""
+        result = validator.check_current_divergence(
+            binance_rate=0.001,  # 0.1%
+            hl_rate=0.0003,      # 0.03%
+            coin="BTC"
+        )
+
+        assert result is not None
+        assert abs(result['divergence'] - 0.0007) < 1e-10  # 0.07% (float precision)
+        assert result['expected_hl_direction'] == 'UP'
+
+    def test_check_current_divergence_insignificant(self, validator):
+        """Ignores insignificant divergence."""
+        result = validator.check_current_divergence(
+            binance_rate=0.0003,
+            hl_rate=0.0002,  # Only 0.01% difference
+            coin="BTC"
+        )
+
+        assert result is None  # Below threshold

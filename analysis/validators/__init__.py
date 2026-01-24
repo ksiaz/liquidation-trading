@@ -10,6 +10,9 @@ from .wave_structure import WaveStructureValidator
 from .absorption import AbsorptionValidator
 from .oi_concentration import OIConcentrationValidator
 from .cross_asset import CrossAssetValidator
+from .funding_settlement import FundingSettlementValidator
+from .manipulation import ManipulationValidator
+from .funding_lead import FundingLeadValidator
 
 __all__ = [
     'HypothesisValidator',
@@ -17,5 +20,8 @@ __all__ = [
     'WaveStructureValidator',
     'AbsorptionValidator',
     'OIConcentrationValidator',
-    'CrossAssetValidator'
+    'CrossAssetValidator',
+    'FundingSettlementValidator',
+    'ManipulationValidator',
+    'FundingLeadValidator'
 ]

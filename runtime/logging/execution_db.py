@@ -714,6 +714,54 @@ class ResearchDatabase:
             )
         """)
 
+        # Table: HLP23 threshold configurations
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_threshold_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                value REAL NOT NULL,
+                method TEXT NOT NULL,
+                date_set TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                sharpe_ratio REAL,
+                win_rate REAL,
+                trades_per_month REAL,
+                validation_sharpe REAL,
+                validation_degradation_pct REAL,
+                status TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                sensitivity_range_pct REAL,
+                is_robust INTEGER DEFAULT 0,
+                next_review_date TEXT,
+                regime TEXT,
+                strategy_name TEXT,
+                version INTEGER DEFAULT 1,
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Threshold optimization history
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_threshold_optimization_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                threshold_name TEXT NOT NULL,
+                run_ts INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                optimal_value REAL NOT NULL,
+                in_sample_sharpe REAL,
+                out_of_sample_sharpe REAL,
+                degradation_pct REAL,
+                is_robust INTEGER DEFAULT 0,
+                grid_min REAL,
+                grid_max REAL,
+                grid_step REAL,
+                candidates_json TEXT,
+                sensitivity_json TEXT,
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # HLP24 table indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
@@ -746,6 +794,15 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_waves_cascade ON hl_cascade_waves(cascade_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_name ON hl_validation_results(hypothesis_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_ts ON hl_validation_results(run_ts)")
+
+        # HLP23 threshold indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_name ON hl_threshold_configs(name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_status ON hl_threshold_configs(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_regime ON hl_threshold_configs(regime)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_strategy ON hl_threshold_configs(strategy_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_review ON hl_threshold_configs(next_review_date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_name ON hl_threshold_optimization_runs(threshold_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_ts ON hl_threshold_optimization_runs(run_ts)")
 
         self.conn.commit()
     
@@ -2246,6 +2303,242 @@ class ResearchDatabase:
         query += " ORDER BY run_ts DESC"
 
         cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # HLP23 Threshold Management Methods
+
+    def log_threshold_config(
+        self,
+        name: str,
+        value: float,
+        method: str,
+        date_set: str,
+        rationale: str,
+        sharpe_ratio: float = None,
+        win_rate: float = None,
+        trades_per_month: float = None,
+        validation_sharpe: float = None,
+        validation_degradation_pct: float = None,
+        status: str = 'HYPOTHESIS',
+        is_robust: bool = False,
+        next_review_date: str = None,
+        regime: str = None,
+        strategy_name: str = None,
+        version: int = 1,
+        notes: str = None
+    ) -> int:
+        """Log a threshold configuration.
+
+        Args:
+            name: Threshold name (e.g., 'oi_spike_threshold')
+            value: Threshold value
+            method: Discovery method (GRID_SEARCH, ROC_ANALYSIS, etc.)
+            date_set: ISO date when threshold was set
+            rationale: Explanation for this threshold
+            sharpe_ratio: In-sample Sharpe ratio
+            win_rate: In-sample win rate
+            trades_per_month: Expected trades per month
+            validation_sharpe: Out-of-sample Sharpe ratio
+            validation_degradation_pct: Performance degradation percentage
+            status: HYPOTHESIS, VALIDATED, OVERFITTED, DEPRECATED, ACTIVE
+            is_robust: Whether threshold passed sensitivity analysis
+            next_review_date: ISO date for next review
+            regime: Optional regime this threshold applies to
+            strategy_name: Strategy this threshold belongs to
+            version: Version number
+            notes: Additional notes
+
+        Returns:
+            Row ID of inserted config
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_threshold_configs (
+                name, value, method, date_set, rationale,
+                sharpe_ratio, win_rate, trades_per_month,
+                validation_sharpe, validation_degradation_pct,
+                status, is_robust, next_review_date,
+                regime, strategy_name, version, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            name, value, method, date_set, rationale,
+            sharpe_ratio, win_rate, trades_per_month,
+            validation_sharpe, validation_degradation_pct,
+            status, 1 if is_robust else 0, next_review_date,
+            regime, strategy_name, version, notes
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_active_threshold(
+        self,
+        name: str,
+        regime: str = None
+    ) -> Optional[Dict]:
+        """Get the most recent active threshold for a name.
+
+        Args:
+            name: Threshold name
+            regime: Optional regime filter
+
+        Returns:
+            Threshold config dict or None
+        """
+        cursor = self.conn.cursor()
+
+        query = """
+            SELECT * FROM hl_threshold_configs
+            WHERE name = ? AND status IN ('ACTIVE', 'VALIDATED', 'HYPOTHESIS')
+        """
+        params = [name]
+
+        if regime:
+            query += " AND (regime = ? OR regime IS NULL)"
+            params.append(regime)
+
+        query += " ORDER BY created_at DESC LIMIT 1"
+
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_threshold_history(
+        self,
+        name: str,
+        limit: int = 10
+    ) -> List[Dict]:
+        """Get history of threshold values.
+
+        Args:
+            name: Threshold name
+            limit: Maximum records to return
+
+        Returns:
+            List of threshold configs ordered by date
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM hl_threshold_configs
+            WHERE name = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (name, limit))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_thresholds_due_for_review(self) -> List[Dict]:
+        """Get thresholds past their review date.
+
+        Returns:
+            List of threshold configs needing review
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            SELECT * FROM hl_threshold_configs
+            WHERE next_review_date IS NOT NULL
+            AND next_review_date <= ?
+            AND status NOT IN ('DEPRECATED')
+            ORDER BY next_review_date ASC
+        """, (now,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_thresholds_for_strategy(
+        self,
+        strategy_name: str
+    ) -> List[Dict]:
+        """Get all active thresholds for a strategy.
+
+        Args:
+            strategy_name: Strategy name
+
+        Returns:
+            List of threshold configs
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM hl_threshold_configs
+            WHERE strategy_name = ?
+            AND status IN ('ACTIVE', 'VALIDATED', 'HYPOTHESIS')
+            ORDER BY name ASC
+        """, (strategy_name,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def log_optimization_run(
+        self,
+        threshold_name: str,
+        run_ts: int,
+        method: str,
+        optimal_value: float,
+        in_sample_sharpe: float = None,
+        out_of_sample_sharpe: float = None,
+        degradation_pct: float = None,
+        is_robust: bool = False,
+        grid_min: float = None,
+        grid_max: float = None,
+        grid_step: float = None,
+        candidates_json: str = None,
+        sensitivity_json: str = None,
+        notes: str = None
+    ) -> int:
+        """Log a threshold optimization run.
+
+        Args:
+            threshold_name: Name of threshold optimized
+            run_ts: Timestamp of run
+            method: Optimization method
+            optimal_value: Discovered optimal value
+            in_sample_sharpe: In-sample performance
+            out_of_sample_sharpe: Out-of-sample performance
+            degradation_pct: Performance degradation
+            is_robust: Whether threshold is robust
+            grid_min: Grid search minimum
+            grid_max: Grid search maximum
+            grid_step: Grid search step
+            candidates_json: JSON of all candidates tested
+            sensitivity_json: JSON of sensitivity analysis
+            notes: Additional notes
+
+        Returns:
+            Row ID of inserted run
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_threshold_optimization_runs (
+                threshold_name, run_ts, method, optimal_value,
+                in_sample_sharpe, out_of_sample_sharpe, degradation_pct,
+                is_robust, grid_min, grid_max, grid_step,
+                candidates_json, sensitivity_json, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            threshold_name, run_ts, method, optimal_value,
+            in_sample_sharpe, out_of_sample_sharpe, degradation_pct,
+            1 if is_robust else 0, grid_min, grid_max, grid_step,
+            candidates_json, sensitivity_json, notes
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_optimization_history(
+        self,
+        threshold_name: str,
+        limit: int = 10
+    ) -> List[Dict]:
+        """Get optimization history for a threshold.
+
+        Args:
+            threshold_name: Threshold name
+            limit: Maximum records
+
+        Returns:
+            List of optimization runs
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM hl_threshold_optimization_runs
+            WHERE threshold_name = ?
+            ORDER BY run_ts DESC
+            LIMIT ?
+        """, (threshold_name, limit))
         return [dict(row) for row in cursor.fetchall()]
 
     def close(self):

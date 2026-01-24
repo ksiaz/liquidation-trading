@@ -16,6 +16,8 @@ from analysis.validators import (
     FundingSettlementValidator,
     ManipulationValidator,
     FundingLeadValidator,
+    BasisValidator,
+    SequencingValidator,
     ValidationResult
 )
 
@@ -415,3 +417,118 @@ class TestFundingLeadValidator:
         )
 
         assert result is None  # Below threshold
+
+
+class TestBasisValidator:
+    """Test spot-perp basis validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create validator with reduced thresholds."""
+        return BasisValidator(min_sample_size=5)
+
+    def test_insufficient_data(self, validator):
+        """Returns insufficient data when sample too small."""
+        cascades = [
+            MockCascade(i, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+            for i in range(3)
+        ]
+
+        result = validator.validate(cascades)
+        assert result.status == "INSUFFICIENT_DATA"
+
+    def test_calculate_basis(self, validator):
+        """Correctly calculates basis from prices."""
+        # Perp at discount (100 vs 102 spot = -1.96% discount)
+        basis = validator.calculate_basis(perp_price=100.0, spot_price=102.0)
+        assert abs(basis - (-0.0196)) < 0.001
+
+        # Perp at premium (105 vs 100 spot = 5% premium)
+        basis = validator.calculate_basis(perp_price=105.0, spot_price=100.0)
+        assert abs(basis - 0.05) < 0.001
+
+    def test_categorize_basis(self, validator):
+        """Correctly categorizes basis values."""
+        assert validator.categorize_basis(-0.01) == "LIQUIDATION_PRESSURE"
+        assert validator.categorize_basis(-0.003) == "MILD_SELLING"
+        assert validator.categorize_basis(0.0) == "NEUTRAL"
+        assert validator.categorize_basis(0.003) == "MILD_BUYING"
+        assert validator.categorize_basis(0.01) == "FOMO_PREMIUM"
+
+    def test_proxy_validation_with_cascades(self, validator):
+        """Proxy validation using cascade severity."""
+        cascades = [
+            MockCascade(1, "BTC", 1000, 1060, "20.0", 3, 4, "CONTINUATION"),  # Severe
+            MockCascade(2, "BTC", 1000, 1060, "18.0", 3, 4, "CONTINUATION"),  # Severe
+            MockCascade(3, "BTC", 1000, 1060, "16.0", 3, 4, "REVERSAL"),  # Severe
+            MockCascade(4, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL"),  # Mild
+            MockCascade(5, "BTC", 1000, 1060, "8.0", 3, 4, "REVERSAL"),  # Mild
+        ]
+
+        result = validator.validate(cascades)
+
+        # Should have some analysis
+        assert 'severe_cascades' in result.details
+        assert 'mild_cascades' in result.details
+
+
+class TestSequencingValidator:
+    """Test event sequencing validator."""
+
+    @pytest.fixture
+    def validator(self):
+        """Create validator with reduced thresholds."""
+        return SequencingValidator(min_sample_size=5)
+
+    def test_insufficient_data(self, validator):
+        """Returns insufficient data when sample too small."""
+        cascades = [
+            MockCascade(i, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+            for i in range(3)
+        ]
+
+        result = validator.validate(cascades)
+        assert result.status == "INSUFFICIENT_DATA"
+
+    def test_categorizes_early_vs_late_entry(self, validator):
+        """Categorizes cascades by entry timing."""
+        cascades = [
+            MockCascade(1, "BTC", 1000, 1060, "10.0", 3, 1, "REVERSAL"),  # Early (1 wave)
+            MockCascade(2, "BTC", 1000, 1060, "10.0", 3, 2, "CONTINUATION"),  # Early (2 waves)
+            MockCascade(3, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL"),  # Late (4 waves)
+            MockCascade(4, "BTC", 1000, 1060, "10.0", 3, 5, "REVERSAL"),  # Late (5 waves)
+            MockCascade(5, "BTC", 1000, 1060, "10.0", 3, 3, "REVERSAL"),  # Late (3 waves)
+        ]
+
+        result = validator.validate(cascades)
+
+        assert 'early_entry_count' in result.details
+        assert 'late_entry_count' in result.details
+        assert result.details['early_entry_count'] == 2  # 1-2 waves
+        assert result.details['late_entry_count'] == 3  # 3+ waves
+
+    def test_get_ideal_entry_timing(self, validator):
+        """Determines ideal entry timing."""
+        # Not ready (1 wave)
+        cascade_early = MockCascade(1, "BTC", 1000, 1060, "10.0", 3, 1, None)
+        timing = validator.get_ideal_entry_timing(cascade_early)
+        assert timing['ready'] is False
+
+        # Ready (3+ waves with reversal)
+        cascade_late = MockCascade(2, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL")
+        timing = validator.get_ideal_entry_timing(cascade_late)
+        assert timing['ready'] is True
+        assert timing['confidence'] == 'HIGH'
+
+    def test_sequence_statistics(self, validator):
+        """Calculates sequence statistics."""
+        cascades = [
+            MockCascade(1, "BTC", 1000, 1060, "10.0", 3, 4, "REVERSAL"),
+            MockCascade(2, "BTC", 1000, 1060, "10.0", 3, 3, "REVERSAL"),
+            MockCascade(3, "BTC", 1000, 1060, "10.0", 3, 2, "CONTINUATION"),
+        ]
+
+        stats = validator.calculate_sequence_statistics(cascades)
+
+        assert stats['total_cascades'] == 3
+        assert 'followed_ideal_rate' in stats

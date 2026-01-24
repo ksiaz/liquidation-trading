@@ -596,6 +596,32 @@ class ResearchDatabase:
             )
         """)
 
+        # Table: Binance funding rate snapshots (for cross-exchange comparison)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS binance_funding_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                funding_rate TEXT NOT NULL,
+                funding_time INTEGER,
+                mark_price TEXT,
+                index_price TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Spot price snapshots (for basis calculation)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spot_price_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                price TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Table: Wallet discovery provenance
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS hl_wallet_discovery (
@@ -704,6 +730,10 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_mark_raw_coin ON hl_mark_prices_raw(coin)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_ts ON hl_funding_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_coin ON hl_funding_snapshots(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_binance_funding_ts ON binance_funding_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_binance_funding_coin ON binance_funding_snapshots(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_spot_price_ts ON spot_price_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_spot_price_coin ON spot_price_snapshots(coin)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_addr ON hl_wallet_discovery(wallet_address)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_ts ON hl_wallet_discovery(discovery_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cycles_ts ON hl_poll_cycles(cycle_ts)")
@@ -1673,6 +1703,132 @@ class ResearchDatabase:
 
         self.conn.commit()
         return cursor.lastrowid
+
+    def log_binance_funding_snapshot(
+        self,
+        snapshot_ts: int,
+        coin: str,
+        funding_rate: str,
+        funding_time: int = None,
+        mark_price: str = None,
+        index_price: str = None
+    ) -> int:
+        """Log Binance funding rate snapshot.
+
+        For cross-exchange funding lead validation (HLP25 Part 1).
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            coin: Asset symbol (e.g., 'BTC', 'ETH')
+            funding_rate: Funding rate string
+            funding_time: Funding time from Binance
+            mark_price: Mark price at snapshot
+            index_price: Index price at snapshot
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO binance_funding_snapshots
+            (snapshot_ts, coin, funding_rate, funding_time, mark_price, index_price)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (snapshot_ts, coin, funding_rate, funding_time, mark_price, index_price))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_spot_price_snapshot(
+        self,
+        snapshot_ts: int,
+        coin: str,
+        price: str,
+        source: str
+    ) -> int:
+        """Log spot price snapshot.
+
+        For spot-perp basis calculation (HLP25 Part 8).
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            coin: Asset symbol (e.g., 'BTC', 'ETH')
+            price: Spot price string
+            source: Price source (e.g., 'binance', 'coinbase')
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO spot_price_snapshots (snapshot_ts, coin, price, source)
+            VALUES (?, ?, ?, ?)
+        """, (snapshot_ts, coin, price, source))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_binance_funding_history(
+        self,
+        coin: str,
+        start_ts: int,
+        end_ts: int
+    ) -> List[Dict]:
+        """Get Binance funding history for a coin.
+
+        Args:
+            coin: Asset symbol
+            start_ts: Start timestamp (nanoseconds)
+            end_ts: End timestamp (nanoseconds)
+
+        Returns:
+            List of funding snapshots
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM binance_funding_snapshots
+            WHERE coin = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+            ORDER BY snapshot_ts ASC
+        """, (coin, start_ts, end_ts))
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_spot_price_history(
+        self,
+        coin: str,
+        start_ts: int,
+        end_ts: int,
+        source: str = None
+    ) -> List[Dict]:
+        """Get spot price history for a coin.
+
+        Args:
+            coin: Asset symbol
+            start_ts: Start timestamp (nanoseconds)
+            end_ts: End timestamp (nanoseconds)
+            source: Optional filter by source
+
+        Returns:
+            List of spot price snapshots
+        """
+        cursor = self.conn.cursor()
+
+        if source:
+            cursor.execute("""
+                SELECT * FROM spot_price_snapshots
+                WHERE coin = ? AND snapshot_ts >= ? AND snapshot_ts <= ? AND source = ?
+                ORDER BY snapshot_ts ASC
+            """, (coin, start_ts, end_ts, source))
+        else:
+            cursor.execute("""
+                SELECT * FROM spot_price_snapshots
+                WHERE coin = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+                ORDER BY snapshot_ts ASC
+            """, (coin, start_ts, end_ts))
+
+        return [dict(row) for row in cursor.fetchall()]
 
     def log_hl_wallet_discovery(
         self,

@@ -13,6 +13,8 @@ from .cross_asset import CrossAssetValidator
 from .funding_settlement import FundingSettlementValidator
 from .manipulation import ManipulationValidator
 from .funding_lead import FundingLeadValidator
+from .basis import BasisValidator
+from .sequencing import SequencingValidator
 
 __all__ = [
     'HypothesisValidator',
@@ -23,5 +25,7 @@ __all__ = [
     'CrossAssetValidator',
     'FundingSettlementValidator',
     'ManipulationValidator',
-    'FundingLeadValidator'
+    'FundingLeadValidator',
+    'BasisValidator',
+    'SequencingValidator'
 ]

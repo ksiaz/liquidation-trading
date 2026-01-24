@@ -30,6 +30,8 @@ from analysis.validators import (
     FundingSettlementValidator,
     ManipulationValidator,
     FundingLeadValidator,
+    BasisValidator,
+    SequencingValidator,
     ValidationResult
 )
 
@@ -143,6 +145,8 @@ def run_validation(db_path: str, days: int = 30, verbose: bool = False) -> list:
         FundingSettlementValidator(),
         ManipulationValidator(),
         FundingLeadValidator(),
+        BasisValidator(),
+        SequencingValidator(),
     ]
 
     results = []

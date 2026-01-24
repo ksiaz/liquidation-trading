@@ -639,6 +639,55 @@ class ResearchDatabase:
             )
         """)
 
+        # HLP25 Validation Tables
+        # Table: Labeled cascade events (from raw data)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_labeled_cascades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin TEXT NOT NULL,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER NOT NULL,
+                oi_drop_pct TEXT NOT NULL,
+                liquidation_count INTEGER NOT NULL,
+                wave_count INTEGER,
+                price_start TEXT,
+                price_end TEXT,
+                price_5min_after TEXT,
+                outcome TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Wave structure within cascades
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_cascade_waves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cascade_id INTEGER NOT NULL,
+                wave_num INTEGER NOT NULL,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER NOT NULL,
+                liquidation_count INTEGER NOT NULL,
+                oi_drop_pct TEXT,
+                FOREIGN KEY (cascade_id) REFERENCES hl_labeled_cascades(id)
+            )
+        """)
+
+        # Table: Validation results for HLP25 hypotheses
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_validation_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hypothesis_name TEXT NOT NULL,
+                run_ts INTEGER NOT NULL,
+                total_events INTEGER NOT NULL,
+                supporting_events INTEGER NOT NULL,
+                success_rate REAL NOT NULL,
+                calibrated_threshold REAL,
+                status TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # HLP24 table indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
@@ -660,6 +709,13 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cycles_ts ON hl_poll_cycles(cycle_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_tier ON hl_wallet_polling_config(tier)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_next ON hl_wallet_polling_config(next_poll_ts)")
+
+        # HLP25 validation indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascades_coin ON hl_labeled_cascades(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascades_ts ON hl_labeled_cascades(start_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_waves_cascade ON hl_cascade_waves(cascade_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_name ON hl_validation_results(hypothesis_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_ts ON hl_validation_results(run_ts)")
 
         self.conn.commit()
     
@@ -1832,6 +1888,208 @@ class ResearchDatabase:
             ORDER BY snapshot_ts ASC
         """, (coin, start_ts, end_ts))
 
+        return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # HLP25 Validation Methods
+    # =========================================================================
+
+    def log_labeled_cascade(
+        self,
+        coin: str,
+        start_ts: int,
+        end_ts: int,
+        oi_drop_pct: str,
+        liquidation_count: int,
+        wave_count: int = None,
+        price_start: str = None,
+        price_end: str = None,
+        price_5min_after: str = None,
+        outcome: str = None
+    ) -> int:
+        """Log a labeled cascade event.
+
+        Args:
+            coin: Asset symbol
+            start_ts: Cascade start timestamp (nanoseconds)
+            end_ts: Cascade end timestamp (nanoseconds)
+            oi_drop_pct: OI drop percentage as string
+            liquidation_count: Number of liquidations in cascade
+            wave_count: Number of distinct waves
+            price_start: Price at cascade start
+            price_end: Price at cascade end
+            price_5min_after: Price 5 minutes after cascade
+            outcome: REVERSAL, CONTINUATION, or NEUTRAL
+
+        Returns:
+            Row ID of inserted cascade
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_labeled_cascades (
+                coin, start_ts, end_ts, oi_drop_pct, liquidation_count,
+                wave_count, price_start, price_end, price_5min_after, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            coin, start_ts, end_ts, oi_drop_pct, liquidation_count,
+            wave_count, price_start, price_end, price_5min_after, outcome
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_cascade_wave(
+        self,
+        cascade_id: int,
+        wave_num: int,
+        start_ts: int,
+        end_ts: int,
+        liquidation_count: int,
+        oi_drop_pct: str = None
+    ) -> int:
+        """Log a wave within a cascade.
+
+        Args:
+            cascade_id: Parent cascade ID
+            wave_num: Wave number (1-indexed)
+            start_ts: Wave start timestamp
+            end_ts: Wave end timestamp
+            liquidation_count: Liquidations in this wave
+            oi_drop_pct: OI drop in this wave
+
+        Returns:
+            Row ID of inserted wave
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_cascade_waves (
+                cascade_id, wave_num, start_ts, end_ts,
+                liquidation_count, oi_drop_pct
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (cascade_id, wave_num, start_ts, end_ts, liquidation_count, oi_drop_pct))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_validation_result(
+        self,
+        hypothesis_name: str,
+        run_ts: int,
+        total_events: int,
+        supporting_events: int,
+        success_rate: float,
+        status: str,
+        calibrated_threshold: float = None,
+        notes: str = None
+    ) -> int:
+        """Log a validation result for an HLP25 hypothesis.
+
+        Args:
+            hypothesis_name: Name of hypothesis (e.g., 'wave_structure')
+            run_ts: Timestamp of validation run
+            total_events: Total events tested
+            supporting_events: Events supporting hypothesis
+            success_rate: Success rate (0.0 - 1.0)
+            status: VALIDATED, FAILED, or INSUFFICIENT_DATA
+            calibrated_threshold: Discovered threshold value
+            notes: Additional notes
+
+        Returns:
+            Row ID of inserted result
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_validation_results (
+                hypothesis_name, run_ts, total_events, supporting_events,
+                success_rate, calibrated_threshold, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            hypothesis_name, run_ts, total_events, supporting_events,
+            success_rate, calibrated_threshold, status, notes
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_labeled_cascades(
+        self,
+        coin: str = None,
+        start_ts: int = None,
+        end_ts: int = None
+    ) -> List[Dict]:
+        """Get labeled cascade events.
+
+        Args:
+            coin: Optional filter by coin
+            start_ts: Optional start timestamp
+            end_ts: Optional end timestamp
+
+        Returns:
+            List of labeled cascades
+        """
+        cursor = self.conn.cursor()
+
+        query = "SELECT * FROM hl_labeled_cascades WHERE 1=1"
+        params = []
+
+        if coin:
+            query += " AND coin = ?"
+            params.append(coin)
+        if start_ts:
+            query += " AND start_ts >= ?"
+            params.append(start_ts)
+        if end_ts:
+            query += " AND end_ts <= ?"
+            params.append(end_ts)
+
+        query += " ORDER BY start_ts ASC"
+
+        cursor.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_cascade_waves(self, cascade_id: int) -> List[Dict]:
+        """Get waves for a specific cascade.
+
+        Args:
+            cascade_id: Cascade ID
+
+        Returns:
+            List of waves in order
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM hl_cascade_waves
+            WHERE cascade_id = ?
+            ORDER BY wave_num ASC
+        """, (cascade_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_validation_results(
+        self,
+        hypothesis_name: str = None,
+        status: str = None
+    ) -> List[Dict]:
+        """Get validation results.
+
+        Args:
+            hypothesis_name: Optional filter by hypothesis
+            status: Optional filter by status
+
+        Returns:
+            List of validation results
+        """
+        cursor = self.conn.cursor()
+
+        query = "SELECT * FROM hl_validation_results WHERE 1=1"
+        params = []
+
+        if hypothesis_name:
+            query += " AND hypothesis_name = ?"
+            params.append(hypothesis_name)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY run_ts DESC"
+
+        cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
     def close(self):

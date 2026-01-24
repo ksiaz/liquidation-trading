@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from .client import HyperliquidClient, ClientConfig
 from .position_tracker import PositionTracker, TrackerConfig
 from .types import LiquidationProximity, WalletState, SystemWallets
+from .hl_data_store import HLDataStore, PollCycleStats, now_ns
 from runtime.logging.execution_db import ResearchDatabase
 from memory.m4_cascade_momentum import CascadeMomentumTracker, MomentumPhase, phase_to_string
 
@@ -125,6 +126,9 @@ class HyperliquidCollector:
         # Cascade momentum tracker for exhaustion detection
         self._momentum_tracker = CascadeMomentumTracker()
 
+        # HLP24-compliant raw data store
+        self._data_store = HLDataStore(db)
+
         # Blockchain indexer (optional)
         self._indexer: Optional['IndexerCoordinator'] = None
 
@@ -224,10 +228,21 @@ class HyperliquidCollector:
         """Periodically poll all tracked wallets."""
         self._logger.info(f"Poll loop started, tracking {len(self._tracker._tracked_wallets)} wallets")
         while self._running:
+            # Start poll cycle for HLP24 tracking
+            cycle_id = self._data_store.start_poll_cycle("wallet_poll")
+            stats = PollCycleStats()
+            start_time = time.time()
+
             try:
                 await self._tracker.update_all_wallets()
+                stats.wallets_polled = len(self._tracker._tracked_wallets)
             except Exception as e:
                 self._logger.debug(f"Wallet poll error: {e}")
+                stats.api_errors += 1
+
+            # End poll cycle with stats
+            stats.duration_ms = int((time.time() - start_time) * 1000)
+            self._data_store.end_poll_cycle(cycle_id, stats)
 
             await asyncio.sleep(self._config.wallet_poll_interval)
 
@@ -341,11 +356,34 @@ class HyperliquidCollector:
 
         self._tracker.on_wallet_update(wallet_state)
 
+        snapshot_ts = now_ns()
+        cycle_id = self._data_store.current_cycle_id or 0
+
+        # Store raw wallet summary (HLP24 compliant)
+        if hasattr(wallet_state, 'raw_summary') and wallet_state.raw_summary:
+            self._data_store.store_wallet_snapshot(
+                snapshot_ts=snapshot_ts,
+                poll_cycle_id=cycle_id,
+                wallet=wallet_state.address,
+                raw_summary=wallet_state.raw_summary
+            )
+
         # Log individual positions
         for coin, position in wallet_state.positions.items():
             price = self._client.get_mid_price(coin)
             distance = position.distance_to_liquidation(price) if price else None
 
+            # Store raw position snapshot (HLP24 compliant)
+            if hasattr(position, 'raw_position') and position.raw_position:
+                self._data_store.store_position_snapshot(
+                    snapshot_ts=snapshot_ts,
+                    poll_cycle_id=cycle_id,
+                    wallet=wallet_state.address,
+                    coin=coin,
+                    raw_position=position.raw_position
+                )
+
+            # Also log to legacy table for backwards compatibility
             self._db.log_hl_position(
                 timestamp=position.timestamp,
                 wallet_address=position.wallet_address,
@@ -379,6 +417,35 @@ class HyperliquidCollector:
         oi_change_pct = event.get('oi_change_pct', 0)
         is_liq_signal = event.get('is_liquidation_signal', False)
         mark_price = event.get('mark_price')
+
+        # Store raw OI/funding snapshot (HLP24 compliant)
+        snapshot_ts = now_ns()
+        if 'openInterest' in event or 'oi' in event:
+            self._data_store.store_oi_snapshot(
+                snapshot_ts=snapshot_ts,
+                coin=coin,
+                raw_context=event
+            )
+
+        # Store raw mark price
+        if mark_price is not None:
+            self._data_store.store_mark_price(
+                snapshot_ts=snapshot_ts,
+                coin=coin,
+                mark_px=str(mark_price),
+                oracle_px=str(event.get('oracle_price')) if event.get('oracle_price') else None
+            )
+
+        # Store funding rate if present
+        if 'funding' in event or 'fundingRate' in event:
+            funding_rate = event.get('funding') or event.get('fundingRate')
+            if funding_rate is not None:
+                self._data_store.store_funding_snapshot(
+                    snapshot_ts=snapshot_ts,
+                    coin=coin,
+                    funding_rate=str(funding_rate),
+                    next_funding_ts=event.get('nextFundingTs')
+                )
 
         # Track state for phase transition logging
         if not hasattr(self, '_last_phase'):

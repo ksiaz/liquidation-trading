@@ -5,8 +5,8 @@ Pure data structures for position tracking and liquidation proximity.
 No interpretation, no semantic labeling - only factual observations.
 """
 
-from dataclasses import dataclass
-from typing import List, Optional, Dict
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
 from enum import Enum
 
 
@@ -41,6 +41,9 @@ class HyperliquidPosition:
     unrealized_pnl: float
     position_value: float
     timestamp: float
+
+    # HLP24: Raw API response for append-only storage
+    raw_position: Optional[Dict[str, Any]] = None
 
     @property
     def side(self) -> PositionSide:
@@ -160,6 +163,9 @@ class WalletState:
     total_margin_used: float
     withdrawable: float
     last_updated: float
+
+    # HLP24: Raw API response for append-only storage
+    raw_summary: Optional[Dict[str, Any]] = None
 
     def get_position(self, coin: str) -> Optional[HyperliquidPosition]:
         """Get position for a specific coin."""

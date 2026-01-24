@@ -1063,7 +1063,8 @@ class HyperliquidClient:
                     margin_used=safe_float(pos.get('marginUsed')),
                     unrealized_pnl=safe_float(pos.get('unrealizedPnl')),
                     position_value=safe_float(pos.get('positionValue')),
-                    timestamp=timestamp
+                    timestamp=timestamp,
+                    raw_position=pos  # HLP24: Store raw API response
                 )
 
                 # Only include non-zero positions
@@ -1079,7 +1080,8 @@ class HyperliquidClient:
                 account_value=safe_float(margin_summary.get('accountValue')),
                 total_margin_used=safe_float(margin_summary.get('totalMarginUsed')),
                 withdrawable=safe_float(data.get('withdrawable')),
-                last_updated=timestamp
+                last_updated=timestamp,
+                raw_summary=margin_summary  # HLP24: Store raw API response
             )
 
         except Exception as e:

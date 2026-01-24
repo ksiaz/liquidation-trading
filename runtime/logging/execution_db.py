@@ -501,6 +501,166 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_ts ON hl_cascade_events(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_coin ON hl_cascade_events(coin)")
 
+        # =====================================================================
+        # HLP24-Compliant Raw Data Tables (Append-Only, No Computed Fields)
+        # Store raw API responses exactly as received. Labels computed at query time.
+        # =====================================================================
+
+        # Table: Raw position snapshots (store API response strings)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_position_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                poll_cycle_id INTEGER NOT NULL,
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                szi TEXT NOT NULL,
+                entry_px TEXT NOT NULL,
+                liquidation_px TEXT,
+                leverage_type TEXT,
+                leverage_value REAL,
+                margin_used TEXT,
+                position_value TEXT,
+                unrealized_pnl TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Raw wallet account snapshots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_wallet_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                poll_cycle_id INTEGER NOT NULL,
+                wallet_address TEXT NOT NULL,
+                account_value TEXT,
+                total_margin_used TEXT,
+                withdrawable TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Liquidation events (detected from position disappearance)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_liquidation_events_raw (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_ts INTEGER NOT NULL,
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                last_known_szi TEXT NOT NULL,
+                last_known_entry_px TEXT NOT NULL,
+                last_known_liquidation_px TEXT,
+                last_known_position_value TEXT,
+                last_known_unrealized_pnl TEXT,
+                prev_snapshot_id INTEGER,
+                detection_method TEXT DEFAULT 'position_disappearance',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: OI/Funding snapshots (raw API response)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_oi_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                open_interest TEXT NOT NULL,
+                funding_rate TEXT,
+                premium TEXT,
+                day_ntl_vlm TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Mark price snapshots (raw)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_mark_prices_raw (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                mark_px TEXT NOT NULL,
+                oracle_px TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Funding rate snapshots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_funding_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_ts INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                funding_rate TEXT NOT NULL,
+                next_funding_ts INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Wallet discovery provenance
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_wallet_discovery (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                discovery_ts INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                source_coin TEXT,
+                source_value REAL,
+                source_metadata TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Poll cycle tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_poll_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_ts INTEGER NOT NULL,
+                cycle_type TEXT NOT NULL,
+                wallets_polled INTEGER DEFAULT 0,
+                positions_found INTEGER DEFAULT 0,
+                liquidations_detected INTEGER DEFAULT 0,
+                api_errors INTEGER DEFAULT 0,
+                duration_ms INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table: Wallet polling configuration (tiered intervals)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_wallet_polling_config (
+                wallet_address TEXT PRIMARY KEY,
+                tier INTEGER NOT NULL,
+                last_poll_ts INTEGER,
+                next_poll_ts INTEGER,
+                poll_count INTEGER DEFAULT 0,
+                consecutive_empty INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # HLP24 table indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_coin ON hl_position_snapshots(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_cycle ON hl_position_snapshots(poll_cycle_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_wallet_snap_ts ON hl_wallet_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_wallet_snap_addr ON hl_wallet_snapshots(wallet_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_ts ON hl_liquidation_events_raw(detected_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_wallet ON hl_liquidation_events_raw(wallet_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_coin ON hl_liquidation_events_raw(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_oi_snap_ts ON hl_oi_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_oi_snap_coin ON hl_oi_snapshots(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_mark_raw_ts ON hl_mark_prices_raw(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_mark_raw_coin ON hl_mark_prices_raw(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_ts ON hl_funding_snapshots(snapshot_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_coin ON hl_funding_snapshots(coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_addr ON hl_wallet_discovery(wallet_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_ts ON hl_wallet_discovery(discovery_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cycles_ts ON hl_poll_cycles(cycle_ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_tier ON hl_wallet_polling_config(tier)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_next ON hl_wallet_polling_config(next_poll_ts)")
+
         self.conn.commit()
     
     def log_cycle(
@@ -1168,6 +1328,511 @@ class ResearchDatabase:
 
         row = cursor.fetchone()
         return dict(row) if row else None
+
+    # =========================================================================
+    # HLP24-Compliant Raw Data Logging Methods
+    # Store raw API responses exactly as received. No computed fields.
+    # =========================================================================
+
+    def start_hl_poll_cycle(self, cycle_type: str) -> int:
+        """Start a new poll cycle for batch tracking.
+
+        Args:
+            cycle_type: Type of cycle ('tier1', 'tier2', 'tier3', 'discovery')
+
+        Returns:
+            poll_cycle_id for linking snapshots
+        """
+        cursor = self.conn.cursor()
+        cycle_ts = int(time.time() * 1_000_000_000)  # nanoseconds
+
+        cursor.execute("""
+            INSERT INTO hl_poll_cycles (cycle_ts, cycle_type)
+            VALUES (?, ?)
+        """, (cycle_ts, cycle_type))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def end_hl_poll_cycle(
+        self,
+        cycle_id: int,
+        wallets_polled: int = 0,
+        positions_found: int = 0,
+        liquidations_detected: int = 0,
+        api_errors: int = 0,
+        duration_ms: int = None
+    ):
+        """Complete a poll cycle with statistics.
+
+        Args:
+            cycle_id: The poll cycle ID from start_hl_poll_cycle
+            wallets_polled: Number of wallets polled
+            positions_found: Number of positions found
+            liquidations_detected: Number of liquidations detected
+            api_errors: Number of API errors encountered
+            duration_ms: Total duration in milliseconds
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            UPDATE hl_poll_cycles
+            SET wallets_polled = ?,
+                positions_found = ?,
+                liquidations_detected = ?,
+                api_errors = ?,
+                duration_ms = ?
+            WHERE id = ?
+        """, (wallets_polled, positions_found, liquidations_detected,
+              api_errors, duration_ms, cycle_id))
+
+        self.conn.commit()
+
+    def log_hl_position_snapshot_raw(
+        self,
+        snapshot_ts: int,
+        poll_cycle_id: int,
+        wallet_address: str,
+        coin: str,
+        szi: str,
+        entry_px: str,
+        liquidation_px: str = None,
+        leverage_type: str = None,
+        leverage_value: float = None,
+        margin_used: str = None,
+        position_value: str = None,
+        unrealized_pnl: str = None
+    ) -> int:
+        """Log raw position snapshot from API response.
+
+        Stores API response strings exactly as received.
+        No computed or derived fields.
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            poll_cycle_id: ID of the poll cycle this belongs to
+            wallet_address: Wallet address (stored lowercase)
+            coin: Asset symbol (e.g., "BTC")
+            szi: Signed size string from API
+            entry_px: Entry price string from API
+            liquidation_px: Liquidation price string (optional)
+            leverage_type: "isolated" or "cross" (optional)
+            leverage_value: Numeric leverage (optional)
+            margin_used: Margin used string (optional)
+            position_value: Position value string (optional)
+            unrealized_pnl: Unrealized PnL string (optional)
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_position_snapshots (
+                snapshot_ts, poll_cycle_id, wallet_address, coin,
+                szi, entry_px, liquidation_px, leverage_type, leverage_value,
+                margin_used, position_value, unrealized_pnl
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            snapshot_ts, poll_cycle_id, wallet_address.lower(), coin,
+            szi, entry_px, liquidation_px, leverage_type, leverage_value,
+            margin_used, position_value, unrealized_pnl
+        ))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_wallet_snapshot_raw(
+        self,
+        snapshot_ts: int,
+        poll_cycle_id: int,
+        wallet_address: str,
+        account_value: str = None,
+        total_margin_used: str = None,
+        withdrawable: str = None
+    ) -> int:
+        """Log raw wallet account snapshot from API response.
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            poll_cycle_id: ID of the poll cycle
+            wallet_address: Wallet address
+            account_value: Account value string from API
+            total_margin_used: Total margin used string
+            withdrawable: Withdrawable amount string
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_wallet_snapshots (
+                snapshot_ts, poll_cycle_id, wallet_address,
+                account_value, total_margin_used, withdrawable
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (snapshot_ts, poll_cycle_id, wallet_address.lower(),
+              account_value, total_margin_used, withdrawable))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_liquidation_event_raw(
+        self,
+        detected_ts: int,
+        wallet_address: str,
+        coin: str,
+        last_known_szi: str,
+        last_known_entry_px: str,
+        last_known_liquidation_px: str = None,
+        last_known_position_value: str = None,
+        last_known_unrealized_pnl: str = None,
+        prev_snapshot_id: int = None,
+        detection_method: str = 'position_disappearance'
+    ) -> int:
+        """Log liquidation event detected from position disappearance.
+
+        A position disappearing IS the liquidation event.
+        Stores last known state before disappearance.
+
+        Args:
+            detected_ts: Detection timestamp in nanoseconds
+            wallet_address: Wallet that was liquidated
+            coin: Asset that was liquidated
+            last_known_szi: Last known signed size
+            last_known_entry_px: Last known entry price
+            last_known_liquidation_px: Last known liquidation price
+            last_known_position_value: Last known position value
+            last_known_unrealized_pnl: Last known unrealized PnL
+            prev_snapshot_id: Reference to last position snapshot
+            detection_method: How liquidation was detected
+
+        Returns:
+            Row ID of inserted event
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_liquidation_events_raw (
+                detected_ts, wallet_address, coin,
+                last_known_szi, last_known_entry_px, last_known_liquidation_px,
+                last_known_position_value, last_known_unrealized_pnl,
+                prev_snapshot_id, detection_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            detected_ts, wallet_address.lower(), coin,
+            last_known_szi, last_known_entry_px, last_known_liquidation_px,
+            last_known_position_value, last_known_unrealized_pnl,
+            prev_snapshot_id, detection_method
+        ))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_oi_snapshot_raw(
+        self,
+        snapshot_ts: int,
+        coin: str,
+        open_interest: str,
+        funding_rate: str = None,
+        premium: str = None,
+        day_ntl_vlm: str = None
+    ) -> int:
+        """Log OI/funding snapshot from API.
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            coin: Asset symbol
+            open_interest: Open interest string from API
+            funding_rate: Funding rate string
+            premium: Oracle-mark premium string
+            day_ntl_vlm: 24h notional volume string
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_oi_snapshots (
+                snapshot_ts, coin, open_interest, funding_rate, premium, day_ntl_vlm
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (snapshot_ts, coin, open_interest, funding_rate, premium, day_ntl_vlm))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_mark_price_raw(
+        self,
+        snapshot_ts: int,
+        coin: str,
+        mark_px: str,
+        oracle_px: str = None
+    ) -> int:
+        """Log mark price snapshot.
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            coin: Asset symbol
+            mark_px: Mark price string from API
+            oracle_px: Oracle price string (optional)
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_mark_prices_raw (snapshot_ts, coin, mark_px, oracle_px)
+            VALUES (?, ?, ?, ?)
+        """, (snapshot_ts, coin, mark_px, oracle_px))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_funding_snapshot(
+        self,
+        snapshot_ts: int,
+        coin: str,
+        funding_rate: str,
+        next_funding_ts: int = None
+    ) -> int:
+        """Log funding rate snapshot.
+
+        Args:
+            snapshot_ts: Timestamp in nanoseconds
+            coin: Asset symbol
+            funding_rate: Funding rate string
+            next_funding_ts: Next funding timestamp
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_funding_snapshots (snapshot_ts, coin, funding_rate, next_funding_ts)
+            VALUES (?, ?, ?, ?)
+        """, (snapshot_ts, coin, funding_rate, next_funding_ts))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_hl_wallet_discovery(
+        self,
+        wallet_address: str,
+        discovery_ts: int,
+        source_type: str,
+        source_coin: str = None,
+        source_value: float = None,
+        source_metadata: str = None
+    ) -> int:
+        """Log wallet discovery provenance.
+
+        Tracks HOW wallets were discovered for audit trail.
+
+        Args:
+            wallet_address: Discovered wallet address
+            discovery_ts: Discovery timestamp in nanoseconds
+            source_type: Discovery source ('trade', 'liquidation', 'manual', 'hyperdash')
+            source_coin: Coin if discovered from trade
+            source_value: Trade/liquidation value that triggered discovery
+            source_metadata: JSON string with additional context
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO hl_wallet_discovery (
+                wallet_address, discovery_ts, source_type,
+                source_coin, source_value, source_metadata
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (wallet_address.lower(), discovery_ts, source_type,
+              source_coin, source_value, source_metadata))
+
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def set_hl_wallet_tier(
+        self,
+        wallet_address: str,
+        tier: int,
+        next_poll_ts: int = None
+    ):
+        """Set or update wallet polling tier.
+
+        Args:
+            wallet_address: Wallet address
+            tier: Polling tier (1=5s, 2=30s, 3=300s)
+            next_poll_ts: Next scheduled poll timestamp
+        """
+        cursor = self.conn.cursor()
+        now = int(time.time() * 1_000_000_000)
+
+        cursor.execute("""
+            INSERT INTO hl_wallet_polling_config (
+                wallet_address, tier, next_poll_ts, created_at, updated_at
+            ) VALUES (?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(wallet_address) DO UPDATE SET
+                tier = excluded.tier,
+                next_poll_ts = excluded.next_poll_ts,
+                updated_at = datetime('now')
+        """, (wallet_address.lower(), tier, next_poll_ts))
+
+        self.conn.commit()
+
+    def get_hl_wallets_due_for_poll(self, tier: int, current_ts: int) -> List[str]:
+        """Get wallets that are due for polling in a specific tier.
+
+        Args:
+            tier: Polling tier to check
+            current_ts: Current timestamp in nanoseconds
+
+        Returns:
+            List of wallet addresses due for polling
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT wallet_address FROM hl_wallet_polling_config
+            WHERE tier = ? AND (next_poll_ts IS NULL OR next_poll_ts <= ?)
+        """, (tier, current_ts))
+
+        return [row[0] for row in cursor.fetchall()]
+
+    def update_hl_wallet_poll_stats(
+        self,
+        wallet_address: str,
+        last_poll_ts: int,
+        next_poll_ts: int,
+        had_positions: bool
+    ):
+        """Update wallet polling statistics after a poll.
+
+        Args:
+            wallet_address: Wallet that was polled
+            last_poll_ts: Timestamp of this poll
+            next_poll_ts: Scheduled next poll timestamp
+            had_positions: Whether wallet had any positions
+        """
+        cursor = self.conn.cursor()
+
+        if had_positions:
+            cursor.execute("""
+                UPDATE hl_wallet_polling_config
+                SET last_poll_ts = ?,
+                    next_poll_ts = ?,
+                    poll_count = poll_count + 1,
+                    consecutive_empty = 0,
+                    updated_at = datetime('now')
+                WHERE wallet_address = ?
+            """, (last_poll_ts, next_poll_ts, wallet_address.lower()))
+        else:
+            cursor.execute("""
+                UPDATE hl_wallet_polling_config
+                SET last_poll_ts = ?,
+                    next_poll_ts = ?,
+                    poll_count = poll_count + 1,
+                    consecutive_empty = consecutive_empty + 1,
+                    updated_at = datetime('now')
+                WHERE wallet_address = ?
+            """, (last_poll_ts, next_poll_ts, wallet_address.lower()))
+
+        self.conn.commit()
+
+    # =========================================================================
+    # HLP24 Query Methods (for replay/analysis)
+    # =========================================================================
+
+    def get_hl_position_history(
+        self,
+        wallet_address: str,
+        coin: str,
+        start_ts: int,
+        end_ts: int
+    ) -> List[Dict]:
+        """Get position snapshot history for a wallet/coin.
+
+        Args:
+            wallet_address: Wallet address
+            coin: Asset symbol
+            start_ts: Start timestamp (nanoseconds)
+            end_ts: End timestamp (nanoseconds)
+
+        Returns:
+            List of position snapshots in chronological order
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM hl_position_snapshots
+            WHERE wallet_address = ? AND coin = ?
+              AND snapshot_ts >= ? AND snapshot_ts <= ?
+            ORDER BY snapshot_ts ASC
+        """, (wallet_address.lower(), coin, start_ts, end_ts))
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_hl_liquidations_in_window(
+        self,
+        start_ts: int,
+        end_ts: int,
+        coin: str = None
+    ) -> List[Dict]:
+        """Get liquidation events in a time window.
+
+        Args:
+            start_ts: Start timestamp (nanoseconds)
+            end_ts: End timestamp (nanoseconds)
+            coin: Optional filter by coin
+
+        Returns:
+            List of liquidation events
+        """
+        cursor = self.conn.cursor()
+
+        if coin:
+            cursor.execute("""
+                SELECT * FROM hl_liquidation_events_raw
+                WHERE detected_ts >= ? AND detected_ts <= ? AND coin = ?
+                ORDER BY detected_ts ASC
+            """, (start_ts, end_ts, coin))
+        else:
+            cursor.execute("""
+                SELECT * FROM hl_liquidation_events_raw
+                WHERE detected_ts >= ? AND detected_ts <= ?
+                ORDER BY detected_ts ASC
+            """, (start_ts, end_ts))
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_hl_oi_history(
+        self,
+        coin: str,
+        start_ts: int,
+        end_ts: int
+    ) -> List[Dict]:
+        """Get OI snapshot history for a coin.
+
+        Args:
+            coin: Asset symbol
+            start_ts: Start timestamp (nanoseconds)
+            end_ts: End timestamp (nanoseconds)
+
+        Returns:
+            List of OI snapshots in chronological order
+        """
+        cursor = self.conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM hl_oi_snapshots
+            WHERE coin = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+            ORDER BY snapshot_ts ASC
+        """, (coin, start_ts, end_ts))
+
+        return [dict(row) for row in cursor.fetchall()]
 
     def close(self):
         """Close database connection."""

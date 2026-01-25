@@ -50,6 +50,7 @@ from .types import (
     ExecutionLog,
     FillType,
 )
+from .asset_metadata import get_asset_metadata_service, AssetMetadataService
 
 
 class StopOrderState(Enum):
@@ -317,12 +318,12 @@ class OrderExecutor:
         # Determine order type structure
         order_type_struct = self._build_order_type_struct(request)
 
-        # Build order entry
+        # Build order entry (P1: use symbol for proper formatting)
         order = {
             "a": self._get_asset_index(request.symbol),
             "b": request.side == OrderSide.BUY,
-            "p": self._format_price(request.price or request.expected_price or 0),
-            "s": self._format_size(request.size),
+            "p": self._format_price(request.price or request.expected_price or 0, request.symbol),
+            "s": self._format_size(request.size, request.symbol),
             "r": request.reduce_only,
             "t": order_type_struct,
         }
@@ -368,7 +369,7 @@ class OrderExecutor:
             return {
                 "trigger": {
                     "isMarket": True,
-                    "triggerPx": self._format_price(request.stop_price),
+                    "triggerPx": self._format_price(request.stop_price, request.symbol),
                     "tpsl": "tp" if is_tp else "sl"
                 }
             }
@@ -381,8 +382,8 @@ class OrderExecutor:
             return {
                 "trigger": {
                     "isMarket": False,
-                    "triggerPx": self._format_price(request.stop_price),
-                    "limitPx": self._format_price(request.price),
+                    "triggerPx": self._format_price(request.stop_price, request.symbol),
+                    "limitPx": self._format_price(request.price, request.symbol),
                     "tpsl": "tp" if is_tp else "sl"
                 }
             }
@@ -391,33 +392,56 @@ class OrderExecutor:
         return {"limit": {"tif": "Gtc"}}
 
     def _get_asset_index(self, symbol: str) -> int:
-        """Get Hyperliquid asset index for symbol."""
-        # Common mappings - should be loaded from exchange meta
-        asset_map = {
-            "BTC": 0, "ETH": 1, "SOL": 2, "DOGE": 3, "XRP": 4,
-            "AVAX": 5, "LINK": 6, "ARB": 7, "OP": 8, "SUI": 9,
-            "ATOM": 10, "APT": 11, "INJ": 12, "SEI": 13, "TIA": 14,
-        }
-        return asset_map.get(symbol, 0)
+        """Get Hyperliquid asset index for symbol.
 
-    def _format_price(self, price: float) -> str:
-        """Format price for Hyperliquid API."""
+        P1: Uses dynamic asset metadata from exchange.
+        Falls back to cached/static mapping if service unavailable.
+        """
+        service = get_asset_metadata_service(
+            use_testnet=self._config.use_testnet
+        )
+        return service.get_asset_index(symbol)
+
+    def _format_price(self, price: float, symbol: str = "") -> str:
+        """Format price for Hyperliquid API.
+
+        P1: Uses 5 significant figures as per Hyperliquid spec.
+        """
         if price == 0:
             return "0"
-        # Use appropriate precision based on price magnitude
-        if price >= 1000:
+
+        # Hyperliquid uses 5 significant figures
+        if price >= 10000:
+            return f"{price:.0f}"
+        elif price >= 1000:
             return f"{price:.1f}"
-        elif price >= 1:
+        elif price >= 100:
             return f"{price:.2f}"
+        elif price >= 10:
+            return f"{price:.3f}"
+        elif price >= 1:
+            return f"{price:.4f}"
+        elif price >= 0.1:
+            return f"{price:.5f}"
         else:
             return f"{price:.6f}"
 
-    def _format_size(self, size: float) -> str:
-        """Format size for Hyperliquid API."""
-        if size >= 1:
-            return f"{size:.4f}"
-        else:
-            return f"{size:.6f}"
+    def _format_size(self, size: float, symbol: str = "") -> str:
+        """Format size for Hyperliquid API.
+
+        P1: Uses szDecimals from exchange metadata.
+        """
+        if not symbol:
+            # Fallback for backward compatibility
+            if size >= 1:
+                return f"{size:.4f}"
+            else:
+                return f"{size:.6f}"
+
+        service = get_asset_metadata_service(
+            use_testnet=self._config.use_testnet
+        )
+        return service.format_size(symbol, size)
 
     async def _submit_to_exchange(
         self,

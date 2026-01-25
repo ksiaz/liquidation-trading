@@ -28,14 +28,34 @@ from .types import (
 )
 
 
+class LiquidityState:
+    """P1: Liquidity state classification."""
+    HIGH = "HIGH"       # Deep orderbook, tight spreads
+    NORMAL = "NORMAL"   # Normal market conditions
+    LOW = "LOW"         # Thin orderbook, wide spreads
+    STRESSED = "STRESSED"  # Cascade/crisis conditions
+
+
 @dataclass
 class SlippageConfig:
     """Configuration for slippage tracking."""
-    # Slippage thresholds (percentage)
+    # Base slippage thresholds (percentage) - P1: Now state-adjusted
     default_max_slippage_pct: float = 0.5   # 50 bps normal
     aggressive_max_slippage_pct: float = 1.0 # 100 bps aggressive
     cascade_max_slippage_pct: float = 1.0   # 100 bps for cascade
     exit_max_slippage_pct: float = 2.0      # No limit on stops
+
+    # P1: Regime multipliers
+    high_liquidity_multiplier: float = 0.7   # Tighten by 30%
+    normal_liquidity_multiplier: float = 1.0
+    low_liquidity_multiplier: float = 1.5    # Widen by 50%
+    stressed_liquidity_multiplier: float = 2.0  # Widen by 100%
+
+    # P1: Liquidity state thresholds
+    high_liquidity_depth_usd: float = 500_000  # Book depth > $500k = HIGH
+    low_liquidity_depth_usd: float = 50_000    # Book depth < $50k = LOW
+    stressed_oi_drop_pct: float = 5.0          # OI drop > 5% = STRESSED
+    stressed_spread_pct: float = 0.5           # Spread > 0.5% = STRESSED
 
     # Historical tracking
     history_window: int = 100  # Keep last 100 fills per symbol
@@ -90,6 +110,115 @@ class SlippageTracker:
 
     def _now_ns(self) -> int:
         return int(time.time() * 1_000_000_000)
+
+    # =========================================================================
+    # P1: Adaptive Slippage - Liquidity Regime
+    # =========================================================================
+
+    def detect_liquidity_state(self, symbol: str) -> str:
+        """
+        P1: Detect current liquidity state for a symbol.
+
+        Uses orderbook depth, spread, and recent OI changes.
+
+        Returns:
+            LiquidityState.HIGH, NORMAL, LOW, or STRESSED
+        """
+        with self._lock:
+            orderbook = self._orderbooks.get(symbol)
+
+        if not orderbook:
+            return LiquidityState.NORMAL
+
+        # Check spread
+        bids = orderbook.get('bids', [])
+        asks = orderbook.get('asks', [])
+        mid_price = orderbook.get('mid_price', 0)
+
+        if mid_price <= 0:
+            return LiquidityState.NORMAL
+
+        if bids and asks:
+            best_bid = bids[0].get('price', 0) if bids else 0
+            best_ask = asks[0].get('price', 0) if asks else 0
+            spread_pct = (best_ask - best_bid) / mid_price * 100 if mid_price > 0 else 0
+
+            if spread_pct >= self._config.stressed_spread_pct:
+                return LiquidityState.STRESSED
+
+        # Check book depth
+        bid_depth = sum(b.get('price', 0) * b.get('size', 0) for b in bids[:10])
+        ask_depth = sum(a.get('price', 0) * a.get('size', 0) for a in asks[:10])
+        total_depth = bid_depth + ask_depth
+
+        if total_depth >= self._config.high_liquidity_depth_usd:
+            return LiquidityState.HIGH
+        elif total_depth < self._config.low_liquidity_depth_usd:
+            return LiquidityState.LOW
+
+        return LiquidityState.NORMAL
+
+    def get_state_multiplier(self, state: str) -> float:
+        """P1: Get slippage multiplier for liquidity state."""
+        if state == LiquidityState.HIGH:
+            return self._config.high_liquidity_multiplier
+        elif state == LiquidityState.LOW:
+            return self._config.low_liquidity_multiplier
+        elif state == LiquidityState.STRESSED:
+            return self._config.stressed_liquidity_multiplier
+        return self._config.normal_liquidity_multiplier
+
+    def get_adaptive_slippage_limit(
+        self,
+        symbol: str,
+        base_limit_pct: float = None,
+        is_cascade: bool = False,
+        is_exit: bool = False
+    ) -> float:
+        """
+        P1: Get adaptive slippage limit based on current state.
+
+        Args:
+            symbol: Trading pair
+            base_limit_pct: Base slippage limit (uses config defaults if None)
+            is_cascade: True for cascade entry
+            is_exit: True for exit/stop
+
+        Returns:
+            Adjusted slippage limit in percentage
+        """
+        # Determine base limit
+        if base_limit_pct is None:
+            if is_exit:
+                base_limit_pct = self._config.exit_max_slippage_pct
+            elif is_cascade:
+                base_limit_pct = self._config.cascade_max_slippage_pct
+            else:
+                base_limit_pct = self._config.default_max_slippage_pct
+
+        # Detect state and apply multiplier
+        state = self.detect_liquidity_state(symbol)
+        multiplier = self.get_state_multiplier(state)
+
+        adjusted_limit = base_limit_pct * multiplier
+
+        self._logger.debug(
+            f"P1: Adaptive slippage for {symbol}: "
+            f"state={state}, base={base_limit_pct:.2f}%, "
+            f"adjusted={adjusted_limit:.2f}%"
+        )
+
+        return adjusted_limit
+
+    def set_stressed_state(self, symbol: str, is_stressed: bool = True):
+        """
+        P1: Manually set stressed state for a symbol.
+
+        Used during cascade detection to widen slippage.
+        """
+        if symbol not in self._orderbooks:
+            self._orderbooks[symbol] = {}
+        self._orderbooks[symbol]['_stressed'] = is_stressed
 
     def update_orderbook(self, symbol: str, orderbook: Dict):
         """
@@ -349,10 +478,13 @@ class SlippageTracker:
         side: OrderSide,
         size: float,
         is_cascade: bool = False,
-        is_exit: bool = False
+        is_exit: bool = False,
+        use_adaptive: bool = True
     ) -> Tuple[bool, SlippageEstimate]:
         """
         Check if order would have acceptable slippage.
+
+        P1: Now uses adaptive slippage based on liquidity state.
 
         Args:
             symbol: Trading pair
@@ -360,16 +492,26 @@ class SlippageTracker:
             size: Order size
             is_cascade: True for cascade entry (higher tolerance)
             is_exit: True for exit/stop (highest tolerance)
+            use_adaptive: Use state-adaptive slippage limits
 
         Returns:
             (is_acceptable, SlippageEstimate)
         """
-        if is_exit:
-            max_slippage = self._config.exit_max_slippage_pct
-        elif is_cascade:
-            max_slippage = self._config.cascade_max_slippage_pct
+        if use_adaptive:
+            # P1: Use adaptive limit based on state
+            max_slippage = self.get_adaptive_slippage_limit(
+                symbol=symbol,
+                is_cascade=is_cascade,
+                is_exit=is_exit
+            )
         else:
-            max_slippage = self._config.default_max_slippage_pct
+            # Legacy: static limits
+            if is_exit:
+                max_slippage = self._config.exit_max_slippage_pct
+            elif is_cascade:
+                max_slippage = self._config.cascade_max_slippage_pct
+            else:
+                max_slippage = self._config.default_max_slippage_pct
 
         estimate = self.estimate_slippage(symbol, side, size, max_slippage)
         return estimate.is_acceptable, estimate

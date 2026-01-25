@@ -146,7 +146,8 @@ class TestOrderPayloadConstruction:
         order = payload["action"]["orders"][0]
         assert order["a"] == 0  # BTC index
         assert order["b"] is True  # Buy
-        assert order["s"] == "1.5000"
+        # P1: BTC has szDecimals=5, so 5 decimal places
+        assert order["s"] == "1.50000"
         assert order["r"] is False  # Not reduce only
 
     def test_build_limit_order_payload(self):
@@ -200,7 +201,8 @@ class TestOrderPayloadConstruction:
         assert order["r"] is True  # Reduce only
         assert "trigger" in order["t"]
         assert order["t"]["trigger"]["isMarket"] is True
-        assert order["t"]["trigger"]["triggerPx"] == "45000.0"
+        # P1: 5 significant figures, 45000 has 5 digits, no decimals needed
+        assert order["t"]["trigger"]["triggerPx"] == "45000"
 
 
 class TestOrderLifecycle:
@@ -406,22 +408,34 @@ class TestAssetIndexMapping:
 
 
 class TestPriceFormatting:
-    """Tests for price formatting."""
+    """Tests for price formatting.
+
+    P1: Updated for 5 significant figure formatting.
+    """
 
     def test_format_large_price(self):
-        """Test large price uses 1 decimal."""
+        """Test large price (>= 10000) uses 0 decimals."""
         executor = OrderExecutor()
-        assert executor._format_price(50123.456) == "50123.5"
+        # >= 10000: 0 decimals (5 significant figures in whole part)
+        assert executor._format_price(50123.456) == "50123"
 
     def test_format_medium_price(self):
-        """Test medium price uses 2 decimals."""
+        """Test medium price (100-1000) uses 2 decimals."""
         executor = OrderExecutor()
+        # >= 100: 2 decimals
         assert executor._format_price(123.456) == "123.46"
 
     def test_format_small_price(self):
-        """Test small price uses 6 decimals."""
+        """Test small price uses 5 decimals."""
         executor = OrderExecutor()
-        assert executor._format_price(0.123456789) == "0.123457"
+        # >= 0.1: 5 decimals (5 significant figures)
+        assert executor._format_price(0.123456789) == "0.12346"
+
+    def test_format_very_small_price(self):
+        """Test very small price (< 0.1) uses 6 decimals."""
+        executor = OrderExecutor()
+        # < 0.1: 6 decimals
+        assert executor._format_price(0.0123456789) == "0.012346"
 
     def test_format_zero_price(self):
         """Test zero price returns '0'."""

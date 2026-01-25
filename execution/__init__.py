@@ -34,6 +34,13 @@ from execution.ep4_exchange_adapter import (
     ExchangeResponse,
     ExchangeResponseCode
 )
+from execution.hyperliquid_adapter import (
+    HyperliquidExchangeAdapter,
+    SyncHyperliquidAdapter,
+    AssetMetadata,
+    ExchangeConstraintViolation,
+    validate_exchange_constraints,
+)
 
 __all__ = [
     # Main orchestrator
@@ -62,4 +69,10 @@ __all__ = [
     "MockedExchangeAdapter",
     "ExchangeResponse",
     "ExchangeResponseCode",
+    # Hyperliquid Real Adapter
+    "HyperliquidExchangeAdapter",
+    "SyncHyperliquidAdapter",
+    "AssetMetadata",
+    "ExchangeConstraintViolation",
+    "validate_exchange_constraints",
 ]

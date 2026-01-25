@@ -201,8 +201,8 @@ class CollectorService:
         self._stop_hunt_detector = StopHuntDetector()
         self._logger.info("Validation and manipulation detection initialized")
 
-        # Diagnostic logging configuration
-        self._diag_enabled = True  # Enable comprehensive diagnostic output
+        # Diagnostic logging configuration (P1: now opt-in via env)
+        self._diag_enabled = os.environ.get('ENABLE_DIAG', '').lower() == 'true'
         self._diag_coins = TOP_10_SYMBOLS  # All symbols for diagnostics
         self._diag_interval = 5  # Log diagnostics every N cycles
         self._diag_cycle_count = 0
@@ -366,16 +366,16 @@ class CollectorService:
             all_mandates = []
             mandate_primitives_map = {}  # Track primitives for each mandate
 
-            # DEBUG EXIT: Show all position states once per cycle
+            # DEBUG EXIT: Show all position states once per cycle (P1: gated by env)
             import os
-            if os.environ.get('DEBUG_EXIT') or True:
+            if os.environ.get('DEBUG_EXIT'):
                 open_positions = []
                 for sym in snapshot.symbols_active:
                     pos = self.executor.state_machine.get_position(sym)
                     if pos and pos.state.name != 'FLAT':
                         open_positions.append(f"{sym}:{pos.state.name}")
                 if open_positions:
-                    print(f"[EXIT_DEBUG] Open positions this cycle: {', '.join(open_positions)}")
+                    self._logger.debug(f"Open positions: {', '.join(open_positions)}")
 
             for symbol in snapshot.symbols_active:
                 try:
@@ -1123,8 +1123,7 @@ class CollectorService:
                                 symbol = stream.split('@')[0].upper()
                                 event_type = "UNKNOWN"
 
-                                # DEBUG: Log what stream we received
-                                print(f"DEBUG STREAM: Received stream='{stream}', symbol={symbol}")
+                                # P1: Removed DEBUG_STREAM print from hot path
 
                                 if 'aggtrade' in stream.lower():
                                     event_type = "TRADE"
@@ -1176,16 +1175,13 @@ class CollectorService:
                                         pass
                                 elif 'forceorder' in stream.lower():
                                     event_type = "LIQUIDATION"
-                                    print(f"DEBUG STREAM: Received forceOrder for {symbol}")
+                                    # P1: Removed DEBUG_STREAM print from hot path
                                     # Log raw liquidation event
                                     if 'o' in payload:
                                         order = payload['o']
                                         try:
-                                            print(f"DEBUG: About to log liquidation event")
-                                            print(f"DEBUG: order dict = {order}")
+                                            # P1: Removed DEBUG prints from hot path
                                             side_value = order.get('S', 'UNKNOWN')
-                                            print(f"DEBUG: side_value = {side_value}")
-
                                             self._execution_db.log_liquidation_event(
                                                 timestamp=ts if 'ts' in locals() else time.time(),
                                                 symbol=order.get('s', symbol),
@@ -1193,11 +1189,8 @@ class CollectorService:
                                                 price=float(order.get('p', 0)),
                                                 volume=float(order.get('q', 0))
                                             )
-                                            print(f"DEBUG: Liquidation event logged successfully")
-                                        except Exception as e:
-                                            print(f"ERROR logging liquidation: {e}")
-                                            import traceback
-                                            traceback.print_exc()
+                                        except Exception:
+                                            pass  # Fail silently per constitutional rules
 
                                     # Phase 5: Update liquidation Z-score calculator
                                     try:
@@ -1323,10 +1316,7 @@ class CollectorService:
                                 if self._last_stream_time is None or ts > self._last_stream_time:
                                     self._last_stream_time = ts
 
-                                # INGEST                                
-                                if event_type == "LIQUIDATION":
-                                    print(f"DEBUG INGEST: {symbol} LIQUIDATION detected. TS={ts}")
-                                    
+                                # INGEST (P1: removed debug print from hot path)
                                 self._obs.ingest_observation(ts, symbol, event_type, payload)
                                 
                             except Exception as e:
@@ -1359,8 +1349,8 @@ class CollectorService:
         if self._hyperliquid_collector:
             try:
                 await self._hyperliquid_collector.stop()
-            except Exception as e:
-                self._logger.debug(f"Hyperliquid stop error: {e}")
+            except Exception:
+                pass  # Fail silently per constitutional rules
 
     def get_liquidation_proximity(self, coin: str):
         """

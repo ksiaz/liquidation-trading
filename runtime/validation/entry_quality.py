@@ -111,6 +111,8 @@ class EntryScore:
 class EntryQualityScorer:
     """Score entry quality based on liquidation context WITH TREND KILL-SWITCH.
 
+    H8-A: Filter hit rate logging for observability.
+
     KEY INSIGHT - EXHAUSTION REVERSAL:
     Large liquidations mark exhaustion points. The best entry is:
     - LONG after large LONG liquidation (SELL) - exhausted dump, reversal UP
@@ -163,6 +165,16 @@ class EntryQualityScorer:
         # Recent liquidation events per symbol
         self._liquidations: dict[str, deque[LiquidationContext]] = {}
         self._max_history = max_history
+
+        # H8-A: Filter hit rate tracking for observability
+        self._filter_stats = {
+            'total_scored': 0,
+            'trend_blocked': 0,
+            'quality_high': 0,
+            'quality_neutral': 0,
+            'quality_avoid': 0,
+            'quality_skip': 0
+        }
 
     def record_liquidation(
         self,
@@ -222,6 +234,9 @@ class EntryQualityScorer:
         """
         current_time = timestamp or time.time()
 
+        # H8-A: Track filter calls
+        self._filter_stats['total_scored'] += 1
+
         # Get liquidations in window
         liqs = self._liquidations.get(symbol, [])
 
@@ -271,6 +286,9 @@ class EntryQualityScorer:
             # KILL-SWITCH: Block entries that fade strong trends
             if self._is_entry_blocked_by_trend(entry_side, trend_context):
                 trend_blocked = True
+                # H8-A: Track trend blocks
+                self._filter_stats['trend_blocked'] += 1
+                self._filter_stats['quality_skip'] += 1
 
                 return EntryScore(
                     symbol=symbol,
@@ -331,10 +349,14 @@ class EntryQualityScorer:
                 reason = f"Exhaustion reversal: ${buy_liqs:,.0f} shorts liquidated, expect pullback"
             if trend_bonus > 0:
                 reason += f" (trend-aligned bonus: +{trend_bonus:.2f})"
+            # H8-A: Track quality
+            self._filter_stats['quality_high'] += 1
         elif score < self.AVOID_THRESHOLD:
             quality = EntryQuality.AVOID
             should_enter = False
             reason = f"Against exhaustion pattern: entering into ongoing pressure"
+            # H8-A: Track quality
+            self._filter_stats['quality_avoid'] += 1
         else:
             quality = EntryQuality.NEUTRAL
             should_enter = total_activity > 0  # Enter if there's activity
@@ -342,6 +364,8 @@ class EntryQualityScorer:
                 reason = f"Mixed signal: ${total_activity:,.0f} total liquidations"
             else:
                 reason = "No significant liquidation context"
+            # H8-A: Track quality
+            self._filter_stats['quality_neutral'] += 1
 
         return EntryScore(
             symbol=symbol,
@@ -524,6 +548,35 @@ class EntryQualityScorer:
             "total_liquidations_tracked": total_liqs,
             "symbols_tracked": len(symbols),
             "symbols": symbols
+        }
+
+    def get_filter_stats(self) -> dict:
+        """H8-A: Get filter hit rate statistics for observability."""
+        stats = dict(self._filter_stats)
+        total = stats['total_scored']
+        if total > 0:
+            stats['trend_block_rate'] = stats['trend_blocked'] / total
+            stats['high_rate'] = stats['quality_high'] / total
+            stats['neutral_rate'] = stats['quality_neutral'] / total
+            stats['avoid_rate'] = stats['quality_avoid'] / total
+            stats['skip_rate'] = stats['quality_skip'] / total
+        else:
+            stats['trend_block_rate'] = 0.0
+            stats['high_rate'] = 0.0
+            stats['neutral_rate'] = 0.0
+            stats['avoid_rate'] = 0.0
+            stats['skip_rate'] = 0.0
+        return stats
+
+    def reset_filter_stats(self):
+        """H8-A: Reset filter statistics."""
+        self._filter_stats = {
+            'total_scored': 0,
+            'trend_blocked': 0,
+            'quality_high': 0,
+            'quality_neutral': 0,
+            'quality_avoid': 0,
+            'quality_skip': 0
         }
 
     def clear_old_data(self, max_age_sec: float = 300.0):

@@ -71,6 +71,10 @@ class CascadeSniperConfig:
     # Liquidation lookback window (seconds)
     liquidation_window_sec: float = 10.0
 
+    # H6-A: Maximum delay for momentum entries (seconds since trigger)
+    # Prevents late entries into cascades with poor risk/reward
+    max_momentum_entry_delay: float = 10.0
+
     # Absorption analysis thresholds
     # absorption_ratio = book_depth / liquidation_value
     # >1.0 means book can absorb, <1.0 means cascade continues
@@ -758,6 +762,13 @@ def generate_cascade_sniper_proposal(
             primed = sm.get_primed_data(symbol)
 
             if dominant_side and primed:
+                # H6-A: Check cascade age - reject late entries
+                trigger_time = sm._triggered_at.get(symbol, 0)
+                elapsed_since_trigger = context.timestamp - trigger_time
+                if elapsed_since_trigger > _config.max_momentum_entry_delay:
+                    print(f"[H6-A LATE ENTRY] {symbol}: Momentum entry blocked - {elapsed_since_trigger:.1f}s since trigger (max {_config.max_momentum_entry_delay}s)")
+                    return None
+
                 # Rule 3a: Check absorption filter
                 # For momentum, need thin book (ratio < threshold)
                 if not sm.check_absorption_filter(symbol, entry_mode):

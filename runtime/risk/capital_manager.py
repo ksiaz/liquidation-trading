@@ -6,8 +6,13 @@ Integrates all capital management and risk control components:
 - Risk limits
 - Drawdown tracking
 - Trade decision validation
+
+Hardenings:
+- H1-A: Entry cooldown (prevents over-trading)
+- H9-B: Stacked multiplier floor (prevents under-sizing)
 """
 
+import time
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
@@ -25,6 +30,7 @@ class TradeDecision(Enum):
     REJECTED_DRAWDOWN = auto()
     REJECTED_SIZE_ZERO = auto()
     REJECTED_INVALID_PARAMS = auto()
+    REJECTED_COOLDOWN = auto()  # H1-A: Entry cooldown active
 
 
 @dataclass
@@ -33,6 +39,13 @@ class CapitalManagerConfig:
     sizing: SizingConfig = field(default_factory=SizingConfig)
     limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
     drawdown: DrawdownConfig = field(default_factory=DrawdownConfig)
+
+    # H1-A: Entry cooldown (prevents over-trading)
+    min_entry_cooldown_sec: float = 60.0  # Minimum seconds between entries
+    enable_entry_cooldown: bool = True    # Toggle for cooldown check
+
+    # H9-B: Stacked multiplier floor (prevents under-sizing)
+    min_stacked_multiplier: float = 0.25  # Floor for combined multipliers (25%)
 
 
 @dataclass
@@ -101,6 +114,9 @@ class CapitalManager:
         # Current regime
         self._regime = Regime.SIDEWAYS
 
+        # H1-A: Entry cooldown tracking
+        self._last_entry_timestamp: float = 0.0
+
     @property
     def capital(self) -> float:
         """Get current capital."""
@@ -141,6 +157,26 @@ class CapitalManager:
                 rejection_reasons=['Trading halted due to drawdown'],
                 details={'drawdown_state': self._drawdown.state.name}
             )
+
+        # H1-A: Check entry cooldown (prevents over-trading)
+        if self._config.enable_entry_cooldown:
+            current_time = time.time()
+            time_since_last = current_time - self._last_entry_timestamp
+            if time_since_last < self._config.min_entry_cooldown_sec:
+                remaining = self._config.min_entry_cooldown_sec - time_since_last
+                return TradeApproval(
+                    decision=TradeDecision.REJECTED_COOLDOWN,
+                    approved_size=0,
+                    position_value=0,
+                    risk_amount=0,
+                    risk_pct=0,
+                    rejection_reasons=[f'Entry cooldown active ({remaining:.1f}s remaining)'],
+                    details={
+                        'cooldown_sec': self._config.min_entry_cooldown_sec,
+                        'time_since_last': time_since_last,
+                        'remaining': remaining
+                    }
+                )
 
         # Check regime
         if self._regime == Regime.DISABLED:
@@ -229,6 +265,9 @@ class CapitalManager:
         risk_amount = adjusted_size * stop_distance
         risk_pct = risk_amount / self._capital if self._capital > 0 else 0
 
+        # H1-A: Update entry timestamp on approval
+        self._last_entry_timestamp = time.time()
+
         return TradeApproval(
             decision=TradeDecision.APPROVED,
             approved_size=adjusted_size,
@@ -310,9 +349,15 @@ class CapitalManager:
         return self._limits.get_available_exposure(self._capital)
 
     def get_size_multiplier(self) -> float:
-        """Get current size multiplier from all factors."""
+        """Get current size multiplier from all factors.
+
+        H9-B: Applies floor to prevent extreme shrink from stacked multipliers.
+        """
         dd_mult = self._drawdown.get_size_multiplier()
         regime_mult = self._config.sizing.regime_scalars.get(
             self._regime.name, 1.0
         )
-        return dd_mult * regime_mult
+        combined = dd_mult * regime_mult
+
+        # H9-B: Floor to prevent under-sizing
+        return max(combined, self._config.min_stacked_multiplier)

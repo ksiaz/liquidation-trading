@@ -109,12 +109,22 @@ class TestRapidLossBreaker:
         assert breaker.is_open
 
     def test_consecutive_losses_trips(self, breaker):
-        """Consecutive losses trip breaker."""
+        """Consecutive losses trip breaker.
+
+        H7-A: Now requires min_trades_for_streak trades before streak check.
+        """
         breaker.set_capital(10000)
+
+        # First, record enough trades to meet H7-A minimum (10 trades)
+        # Mix of wins and small losses that don't trip other breakers
+        for _ in range(7):
+            breaker.record_trade(50)  # Small wins
+
+        # Now test consecutive losses (breaker has consecutive_losses=3)
         breaker.record_trade(-50)  # Small loss
         breaker.record_trade(-50)
         assert breaker.is_closed
-        breaker.record_trade(-50)  # 3rd consecutive
+        breaker.record_trade(-50)  # 3rd consecutive, now have 10 total trades
         assert breaker.is_open
 
     def test_win_resets_consecutive_counter(self, breaker):

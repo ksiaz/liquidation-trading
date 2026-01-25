@@ -6,6 +6,9 @@ Calculates position sizes based on:
 2. Volatility adjustment
 3. Event multipliers
 4. Dynamic streak adjustments
+
+Hardenings:
+- H2-A: Size floor (prevents under-sizing from stacked adjustments)
 """
 
 import time
@@ -36,6 +39,9 @@ class SizingConfig:
     risk_per_trade_default: float = 0.01  # 1%
     risk_per_trade_max: float = 0.02  # 2%
     risk_per_trade_min: float = 0.005  # 0.5%
+
+    # H2-A: Size floor (prevents under-sizing)
+    min_risk_pct_floor: float = 0.003  # 0.3% absolute minimum after all adjustments
 
     # Volatility adjustment
     max_volatility_scalar: float = 2.0
@@ -188,6 +194,17 @@ class PositionSizer:
         # Calculate actual risk
         actual_risk = position_size * stop_distance
         actual_risk_pct = actual_risk / capital if capital > 0 else 0
+
+        # H2-A: Apply size floor to prevent under-sizing
+        if actual_risk_pct < self._config.min_risk_pct_floor and actual_risk_pct > 0:
+            # Scale up to meet minimum floor
+            floor_multiplier = self._config.min_risk_pct_floor / actual_risk_pct
+            position_size *= floor_multiplier
+            position_value = position_size * entry_price
+            actual_risk = position_size * stop_distance
+            actual_risk_pct = self._config.min_risk_pct_floor
+            adjustments['floor_applied'] = True
+            adjustments['floor_multiplier'] = floor_multiplier
 
         return SizingResult(
             position_size=position_size,

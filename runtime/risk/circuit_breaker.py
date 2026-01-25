@@ -8,6 +8,10 @@ Circuit breakers:
 2. Abnormal Price Movement - Flash crash detection
 3. Strategy Malfunction - Strategy performing poorly
 4. Resource Exhaustion - System overloaded
+
+Hardenings:
+- H7-A: Sample size guard for consecutive loss breaker
+- H7-B: Larger window for strategy malfunction detection
 """
 
 import time
@@ -32,6 +36,7 @@ class CircuitBreakerConfig:
     single_trade_loss_pct: float = 0.05  # 5% loss triggers
     session_loss_pct: float = 0.10  # 10% session loss triggers
     consecutive_losses: int = 5
+    min_trades_for_streak: int = 10  # H7-A: Minimum trades before streak check
 
     # Abnormal price
     price_move_threshold_pct: float = 0.20  # 20% in 1 minute
@@ -42,6 +47,7 @@ class CircuitBreakerConfig:
     win_rate_drop_pct: float = 0.30  # 30% below baseline
     avg_loss_multiplier: float = 2.0  # Loss 2x avg win
     sharpe_threshold: float = 0.0
+    malfunction_window_size: int = 30  # H7-B: Trades for malfunction detection (was 20)
 
     # Resource exhaustion
     cpu_threshold_pct: float = 95.0
@@ -173,6 +179,7 @@ class RapidLossBreaker(CircuitBreaker):
         self._session_pnl: float = 0.0
         self._consecutive_losses: int = 0
         self._capital: float = 0.0
+        self._total_trades: int = 0  # H7-A: Track total trades for sample guard
 
     def set_capital(self, capital: float):
         """Set current capital for threshold calculations."""
@@ -184,6 +191,7 @@ class RapidLossBreaker(CircuitBreaker):
             return
 
         self._session_pnl += pnl
+        self._total_trades += 1  # H7-A: Track total trades
 
         # Check single trade loss
         loss_pct = abs(pnl) / self._capital if pnl < 0 else 0
@@ -206,10 +214,12 @@ class RapidLossBreaker(CircuitBreaker):
         # Track consecutive losses
         if pnl < 0:
             self._consecutive_losses += 1
-            if self._consecutive_losses >= self._config.consecutive_losses:
+            # H7-A: Only check streak after minimum trades (prevents false trips)
+            if (self._consecutive_losses >= self._config.consecutive_losses and
+                    self._total_trades >= self._config.min_trades_for_streak):
                 self.trip(
                     f"{self._consecutive_losses} consecutive losses",
-                    {'consecutive_losses': self._consecutive_losses}
+                    {'consecutive_losses': self._consecutive_losses, 'total_trades': self._total_trades}
                 )
         else:
             self._consecutive_losses = 0
@@ -218,6 +228,7 @@ class RapidLossBreaker(CircuitBreaker):
         """Reset session tracking (call at start of new session)."""
         self._session_pnl = 0.0
         self._consecutive_losses = 0
+        self._total_trades = 0  # H7-A: Reset trade count
 
 
 class AbnormalPriceBreaker(CircuitBreaker):
@@ -306,7 +317,8 @@ class StrategyMalfunctionBreaker(CircuitBreaker):
         super().__init__("strategy_malfunction", config, logger)
         self._baseline_win_rate: Dict[str, float] = {}
         self._recent_trades: Dict[str, List[float]] = {}  # strategy -> [pnl...]
-        self._window_size = 20
+        # H7-B: Use config window size (default 30, was hardcoded 20)
+        self._window_size = self._config.malfunction_window_size
 
     def set_baseline(self, strategy_name: str, win_rate: float):
         """Set baseline win rate for a strategy."""

@@ -174,6 +174,9 @@ class WhaleFlowMetrics:
     # Is exhaustion driven by whales or retail?
     whale_driven: bool                # True if whale volume > 50% of exhaustion
 
+    # H5-A: Whale reload detection
+    whale_reload_detected: bool = False  # True if whale sell volume increased after absorption
+
 
 @dataclass(frozen=True)
 class PersistenceMetrics:
@@ -395,8 +398,8 @@ class AbsorptionConfirmationTracker:
     WHALE_EXHAUSTION_THRESHOLD = 0.5  # 50% of whale sells absorbed
 
     # Persistence thresholds
-    BID_SURVIVAL_THRESHOLD = 0.6      # 60% of bids must survive > 3 seconds
-    MIN_BID_LIFETIME_SEC = 3.0        # Minimum lifetime to not be "flash"
+    BID_SURVIVAL_THRESHOLD = 0.6      # 60% of bids must survive > N seconds
+    MIN_BID_LIFETIME_SEC = 5.0        # H4-A: Extended from 3.0 to 5.0 seconds
     FLASH_BID_MAX_RATIO = 0.3         # Max 30% flash bids allowed
     CONTROL_PERSISTENCE_WINDOWS = 3   # Need 3 consecutive windows
     CONTROL_CONSISTENCY_THRESHOLD = 0.6  # 60% of windows must show control
@@ -445,6 +448,10 @@ class AbsorptionConfirmationTracker:
 
         # Per-coin trade size history for whale threshold calculation
         self._trade_sizes: Dict[str, deque] = {}
+
+        # H5-A: Per-coin whale sell volume history for reload detection
+        # Tracks (timestamp, whale_sell_volume) to detect increases
+        self._whale_sell_history: Dict[str, deque] = {}
 
     def record_trade(
         self,
@@ -1270,7 +1277,8 @@ class AbsorptionConfirmationTracker:
                 whale_buy_volume=0.0,
                 whale_sell_volume=0.0,
                 whale_exhaustion_ratio=0.0,
-                whale_driven=False
+                whale_driven=False,
+                whale_reload_detected=False
             )
 
         # Calculate whale threshold (90th percentile of recent trade sizes)
@@ -1319,6 +1327,25 @@ class AbsorptionConfirmationTracker:
         # Is exhaustion driven by whales?
         whale_driven = whale_ratio >= self.MIN_WHALE_RATIO
 
+        # H5-A: Whale reload detection
+        # Compare current whale sell volume to previous observation
+        # If whale sells increased after initial absorption, it's a reload trap
+        whale_reload_detected = False
+        if coin not in self._whale_sell_history:
+            self._whale_sell_history[coin] = deque(maxlen=10)
+
+        # Check if whale sell volume increased vs recent observations
+        recent_whale_sells = list(self._whale_sell_history[coin])
+        if len(recent_whale_sells) >= 2 and whale_sell > 0:
+            # Get the minimum recent whale sell (representing post-absorption low)
+            min_recent_sell = min(ws for _, ws in recent_whale_sells[-5:])
+            # Reload = current whale sell > 1.5x the minimum (significant increase)
+            if min_recent_sell > 0 and whale_sell > min_recent_sell * 1.5:
+                whale_reload_detected = True
+
+        # Record current whale sell for future comparison
+        self._whale_sell_history[coin].append((current_time, whale_sell))
+
         return WhaleFlowMetrics(
             whale_threshold=whale_threshold,
             whale_volume=whale_volume,
@@ -1328,7 +1355,8 @@ class AbsorptionConfirmationTracker:
             whale_buy_volume=whale_buy,
             whale_sell_volume=whale_sell,
             whale_exhaustion_ratio=whale_exhaustion_ratio,
-            whale_driven=whale_driven
+            whale_driven=whale_driven,
+            whale_reload_detected=whale_reload_detected
         )
 
     def _is_whale_validated(self, whale: WhaleFlowMetrics) -> bool:
@@ -1338,9 +1366,11 @@ class AbsorptionConfirmationTracker:
         VALIDATES if:
         - Sufficient whale participation (>30% of volume)
         - Whale sells are being absorbed (>50% absorption ratio)
+        - No whale reload detected (H5-A)
 
         REJECTS if:
         - Exhaustion is retail-driven (whales may still be selling)
+        - H5-A: Whale reload detected (whale sell volume increased)
         """
         # Need meaningful whale participation
         if not whale.whale_driven:
@@ -1348,6 +1378,10 @@ class AbsorptionConfirmationTracker:
 
         # Whale sells should be absorbed
         if whale.whale_exhaustion_ratio < self.WHALE_EXHAUSTION_THRESHOLD:
+            return False
+
+        # H5-A: Reject if whale reload detected
+        if whale.whale_reload_detected:
             return False
 
         return True

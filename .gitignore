@@ -87,3 +87,42 @@ constitutional-clean/
 # Test output files
 trace_latest.json
 *.log
+
+# Oracle Cloud SSH keys
+oracle.key
+oracle.pub
+oracle_derived.pub
+*.key
+*.pem
+
+# Screenshots and images (test/debug artifacts)
+*.png
+*.jpg
+*.jpeg
+screenshot*.png
+dashboard*.png
+chart*.png
+*_test.png
+*_check.png
+*_fixed.png
+
+# Temporary files
+nul
+*.tmp
+temp_*.json
+
+# Debug/research output files
+hyperdash_*.txt
+hyperdash_*.html
+hyperdash_*.json
+*_datavisor_*.json
+oracle_command.md
+oracle_pubkey.md
+
+# PowerShell scripts (system-specific)
+*.ps1
+
+# Research scripts (not part of core system)
+analyze_*.py
+check_*.py
+cleanup_*.py

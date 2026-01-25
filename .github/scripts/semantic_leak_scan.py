@@ -70,30 +70,30 @@ R6_M6_INTERPRETATION = re.compile(
 EXCEPTIONS: Dict[str, Dict[int, str]] = {
     'observation/governance.py': {
         # Structural thresholds (factual boundaries, not interpretation)
-        86: "Structural config: time window for price correlation in seconds",
+        95: "Structural config: time window for price correlation in seconds",
         # Trade handling - Binance API semantic field names
-        309: "Binance API semantic: is_taker_sell indicates trade aggressor side",
-        321: "Parameter passing Binance API field to M2 store",
-        328: "Local variable derived from Binance trade side field",
+        361: "Binance API semantic: is_taker_sell indicates trade aggressor side",
+        373: "Parameter passing Binance API field to M2 store",
+        380: "Local variable derived from Binance trade side field",
         # Orderbook primitive parameters
-        428: "Structural parameter: minimum consumption size threshold",
-        439: "Structural parameter: minimum consumption size threshold",
-        445: "Data access: recent_prices is collection name, not semantic claim",
-        464: "Structural parameter: maximum price movement percentage",
-        475: "Structural parameter: minimum refill size threshold",
-        486: "Structural parameter: minimum refill size threshold",
-        # Debug logging with structural parameter
-        505: "Debug logging with structural constant name",
+        480: "Structural parameter: minimum consumption size threshold",
+        491: "Structural parameter: minimum consumption size threshold",
+        497: "Data access: recent_prices is collection name, not semantic claim",
+        516: "Structural parameter: maximum price movement percentage",
+        527: "Structural parameter: minimum refill size threshold",
+        538: "Structural parameter: minimum refill size threshold",
         # Clustering parameter
-        599: "Structural parameter: maximum gap percentage for clustering",
+        651: "Structural parameter: maximum gap percentage for clustering",
+        # HLP proximity threshold
+        848: "Structural parameter: threshold percentage for HLP proximity",
     },
     'runtime/collector/service.py': {
-        165: "Factual error logging: reports initialization exception",
-        182: "Factual status logging: reports collector task created",
-        184: "Factual error logging: reports start exception",
-        290: "Factual error logging: reports exception occurred, no interpretation",
-        319: "Factual error logging: reports classification exception",
-        1203: "Factual error logging: reports stop exception",
+        196: "Factual error logging: reports initialization exception",
+        202: "Factual status logging: reports validation init",
+        225: "Factual status logging: reports collector started",
+        232: "Factual error logging: reports start exception",
+        362: "Factual error logging: reports classification exception",
+        1363: "Factual error logging: reports stop exception",
     },
 }
 

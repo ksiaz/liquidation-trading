@@ -7,6 +7,7 @@ Authority Hierarchy (Theorem 2.2):
 """
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import Optional, Callable, TYPE_CHECKING
 
@@ -43,6 +44,9 @@ class Mandate:
     - symbol must be non-empty
     - authority >= 0
     - timestamp >= 0
+
+    F5: Mandates MUST carry real sizing for ENTRY/REDUCE actions.
+    Placeholder values are rejected at execution time.
     """
     symbol: str
     type: MandateType
@@ -51,6 +55,10 @@ class Mandate:
     expiry: Optional[Callable] = None  # Optional expiry condition
     direction: Optional[str] = None  # "LONG" or "SHORT" for ENTRY mandates
     strategy_id: Optional[str] = None  # Which strategy emitted this
+    # F5: Real quantity - required for ENTRY/REDUCE, validated at execution
+    quantity: Optional[Decimal] = None
+    # F5: Entry price hint (for risk validation)
+    entry_price: Optional[Decimal] = None
 
     def __post_init__(self):
         """Validate mandate."""
@@ -69,18 +77,27 @@ class Action:
     """Arbitrated action to execute.
 
     Exactly one action per symbol per cycle (Theorem 4.1).
+
+    F5: Actions MUST carry real parameters (quantity, direction, entry_price)
+    for ENTRY/REDUCE actions. Execution rejects actions with missing params.
     """
     type: ActionType
     symbol: str
     strategy_id: Optional[str] = None  # Which strategy triggered this (for tracing)
     direction: Optional[str] = None  # "LONG" or "SHORT" for ENTRY actions
+    # F5: Real quantity - required for ENTRY/REDUCE
+    quantity: Optional[Decimal] = None
+    # F5: Entry price hint (for risk validation)
+    entry_price: Optional[Decimal] = None
 
     @staticmethod
     def from_mandate_type(
         mandate_type: MandateType,
         symbol: str,
         strategy_id: Optional[str] = None,
-        direction: Optional[str] = None
+        direction: Optional[str] = None,
+        quantity: Optional[Decimal] = None,
+        entry_price: Optional[Decimal] = None
     ) -> "Action":
         """Convert mandate type to action type."""
         mapping = {
@@ -94,15 +111,19 @@ class Action:
             type=mapping[mandate_type],
             symbol=symbol,
             strategy_id=strategy_id,
-            direction=direction
+            direction=direction,
+            quantity=quantity,
+            entry_price=entry_price
         )
 
     @staticmethod
     def from_mandate(mandate: "Mandate") -> "Action":
-        """Create action from mandate, preserving direction."""
+        """Create action from mandate, preserving direction and quantity."""
         return Action.from_mandate_type(
             mandate_type=mandate.type,
             symbol=mandate.symbol,
             strategy_id=mandate.strategy_id,
-            direction=mandate.direction
+            direction=mandate.direction,
+            quantity=mandate.quantity,
+            entry_price=mandate.entry_price
         )

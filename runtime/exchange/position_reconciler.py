@@ -40,6 +40,10 @@ class ReconcilerConfig:
     size_tolerance_pct: float = 0.01    # 1% size difference = mismatch
     emergency_close: bool = True        # Auto-close unknown positions
 
+    # F4: Consecutive mismatch requirement before emergency close
+    # Prevents nuking valid positions on API glitches
+    consecutive_mismatches_required: int = 2
+
     # API settings
     api_url: str = "https://api.hyperliquid.xyz"
     testnet_api_url: str = "https://api.hyperliquid-testnet.xyz"
@@ -92,6 +96,11 @@ class PositionReconciler:
 
         # Local position state
         self._positions: Dict[str, LocalPosition] = {}
+
+        # F4: Consecutive mismatch tracking per symbol
+        # Prevents emergency close on API glitches
+        self._consecutive_unknown: Dict[str, int] = {}
+        self._consecutive_missing: Dict[str, int] = {}
 
         # Reconciliation history
         self._results: List[ReconciliationResult] = []
@@ -204,12 +213,24 @@ class PositionReconciler:
                     result = self._handle_size_mismatch(symbol, local_pos, exchange_pos)
                     results.append(result)
 
+                else:
+                    # F4: Positions match - clear consecutive mismatch counters
+                    if symbol in self._consecutive_unknown:
+                        self._consecutive_unknown[symbol] = 0
+                    if symbol in self._consecutive_missing:
+                        self._consecutive_missing[symbol] = 0
+
             # Check local positions not on exchange
             for symbol, local_pos in list(self._positions.items()):
                 if symbol not in exchange_positions:
                     # Case 2: Position missing on exchange
                     result = self._handle_missing_position(symbol, local_pos)
                     results.append(result)
+
+                else:
+                    # F4: Position exists on exchange - clear missing counter
+                    if symbol in self._consecutive_missing:
+                        self._consecutive_missing[symbol] = 0
 
         # Store results
         with self._lock:
@@ -280,11 +301,45 @@ class PositionReconciler:
         return True
 
     def _handle_unknown_position(self, symbol: str, exchange_pos: Dict) -> ReconciliationResult:
-        """Handle position on exchange that we don't track locally."""
+        """
+        Handle position on exchange that we don't track locally.
+
+        F4: Requires consecutive_mismatches_required consecutive detections
+        before triggering emergency close - prevents nuking valid positions
+        on API glitches or temporary data lag.
+        """
         size = exchange_pos['size']
 
+        # F4: Increment consecutive unknown counter
+        self._consecutive_unknown[symbol] = self._consecutive_unknown.get(symbol, 0) + 1
+        consecutive_count = self._consecutive_unknown[symbol]
+        required = self._config.consecutive_mismatches_required
+
+        if consecutive_count < required:
+            # F4: Not enough consecutive mismatches - flag only, don't close
+            self._logger.warning(
+                f"UNKNOWN POSITION: {symbol} size={size} - detection {consecutive_count}/{required} "
+                f"(API glitch protection active)"
+            )
+
+            result = ReconciliationResult(
+                symbol=symbol,
+                expected_size=0,
+                actual_size=size,
+                action=ReconciliationAction.NONE,  # No action yet
+                discrepancy=abs(size),
+                message=f"Unknown position detected ({consecutive_count}/{required}) - waiting for confirmation"
+            )
+
+            if self._on_discrepancy:
+                self._on_discrepancy(result)
+
+            return result
+
+        # F4: Consecutive threshold met - proceed with emergency close
         self._logger.error(
-            f"UNKNOWN POSITION: {symbol} size={size} - not in local state"
+            f"UNKNOWN POSITION CONFIRMED: {symbol} size={size} - "
+            f"{consecutive_count} consecutive detections, closing"
         )
 
         result = ReconciliationResult(
@@ -293,8 +348,11 @@ class PositionReconciler:
             actual_size=size,
             action=ReconciliationAction.EMERGENCY_CLOSE,
             discrepancy=abs(size),
-            message=f"Unknown position detected - closing immediately"
+            message=f"Unknown position confirmed after {consecutive_count} checks - closing"
         )
+
+        # Reset counter after action
+        self._consecutive_unknown[symbol] = 0
 
         # Notify callback for emergency close
         if self._on_emergency_close and self._config.emergency_close:
@@ -306,9 +364,42 @@ class PositionReconciler:
         return result
 
     def _handle_missing_position(self, symbol: str, local_pos: LocalPosition) -> ReconciliationResult:
-        """Handle position in local state but not on exchange."""
+        """
+        Handle position in local state but not on exchange.
+
+        F4: Requires consecutive_mismatches_required consecutive detections
+        before resetting local state - prevents state corruption on API glitches.
+        """
+        # F4: Increment consecutive missing counter
+        self._consecutive_missing[symbol] = self._consecutive_missing.get(symbol, 0) + 1
+        consecutive_count = self._consecutive_missing[symbol]
+        required = self._config.consecutive_mismatches_required
+
+        if consecutive_count < required:
+            # F4: Not enough consecutive mismatches - flag only, don't reset
+            self._logger.warning(
+                f"POSITION MISSING: {symbol} expected={local_pos.size} - "
+                f"detection {consecutive_count}/{required} (API glitch protection active)"
+            )
+
+            result = ReconciliationResult(
+                symbol=symbol,
+                expected_size=local_pos.size,
+                actual_size=0,
+                action=ReconciliationAction.NONE,  # No action yet
+                discrepancy=local_pos.size,
+                message=f"Position missing ({consecutive_count}/{required}) - waiting for confirmation"
+            )
+
+            if self._on_discrepancy:
+                self._on_discrepancy(result)
+
+            return result
+
+        # F4: Consecutive threshold met - proceed with state reset
         self._logger.error(
-            f"POSITION MISSING: {symbol} expected={local_pos.size} - not on exchange"
+            f"POSITION MISSING CONFIRMED: {symbol} expected={local_pos.size} - "
+            f"{consecutive_count} consecutive detections, resetting state"
         )
 
         result = ReconciliationResult(
@@ -317,10 +408,11 @@ class PositionReconciler:
             actual_size=0,
             action=ReconciliationAction.RESET_STATE,
             discrepancy=local_pos.size,
-            message=f"Position closed externally - resetting local state"
+            message=f"Position missing confirmed after {consecutive_count} checks - resetting local state"
         )
 
-        # Clear local position
+        # Reset counter and clear local position
+        self._consecutive_missing[symbol] = 0
         self._positions.pop(symbol, None)
 
         if self._on_discrepancy:

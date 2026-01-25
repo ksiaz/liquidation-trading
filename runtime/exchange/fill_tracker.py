@@ -14,6 +14,7 @@ import logging
 import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Set
+from enum import auto
 from threading import RLock
 from enum import Enum
 
@@ -258,12 +259,29 @@ class FillTracker:
                 return
 
             entry = self._tracked_orders[order_id]
-            fill_time_ns = int(fill_data.get('time', time.time() * 1000)) * 1_000_000
+
+            # F1: Deduplication by fill ID (tid)
+            fill_id = str(fill_data.get('tid', ''))
+            if fill_id and fill_id in entry.seen_fill_ids:
+                self._logger.debug(f"Duplicate fill ignored: {fill_id} for order {order_id}")
+                return
+            if fill_id:
+                entry.seen_fill_ids.add(fill_id)
+
+            # F2: Fill time source precedence (exchange time > local time)
+            # Exchange 'time' is in milliseconds, local fallback only if missing
+            exchange_time_ms = fill_data.get('time')
+            if exchange_time_ms is not None:
+                fill_time_ns = int(exchange_time_ms) * 1_000_000
+            else:
+                # Local time fallback - mark as potentially unreliable
+                fill_time_ns = self._now_ns()
+                self._logger.warning(f"Fill {fill_id}: No exchange time, using local time")
 
             # Create fill object
             fill = OrderFill(
                 order_id=order_id,
-                fill_id=str(fill_data.get('tid', fill_time_ns)),
+                fill_id=fill_id or str(fill_time_ns),
                 symbol=fill_data.get('coin', entry.symbol),
                 side=entry.side,
                 price=float(fill_data.get('px', 0)),
@@ -280,6 +298,11 @@ class FillTracker:
             entry.remaining_size = fill.remaining_size
             entry.last_fill_ns = fill_time_ns
             entry.last_update_ns = self._now_ns()
+
+            # F3: Clear timeout flag on fill (order is alive)
+            if entry.timeout_flagged:
+                self._logger.info(f"Order {order_id}: Late fill arrived, clearing timeout flag")
+                entry.timeout_flagged = False
 
             # Calculate slippage
             if entry.expected_price and entry.expected_price > 0:
@@ -411,11 +434,19 @@ class FillTracker:
             self._logger.debug(f"Check order fills error: {e}")
 
     def _check_timeouts(self):
-        """Check for timed out orders."""
+        """
+        Check for timed out orders.
+
+        F3: Timeout flags order but does not finalize unless:
+        - Cancel has been confirmed
+        - Order has partial fills (safe to close tracking)
+        - Double-timeout (flagged twice with no fills between)
+        """
         now_ns = self._now_ns()
 
         with self._lock:
-            timed_out = []
+            to_notify = []
+            to_finalize = []
 
             for order_id, entry in list(self._tracked_orders.items()):
                 elapsed_ms = (now_ns - entry.submit_time_ns) / 1_000_000
@@ -427,14 +458,38 @@ class FillTracker:
                 )
 
                 if elapsed_ms > timeout_ms:
-                    timed_out.append(order_id)
-                    entry.status = OrderStatus.EXPIRED
+                    if entry.timeout_flagged:
+                        # F3: Double-timeout with no fills = finalize
+                        to_finalize.append(order_id)
+                        entry.status = OrderStatus.EXPIRED
+                        self._logger.warning(
+                            f"Order {order_id}: Double timeout, finalizing "
+                            f"(filled: {entry.filled_size}/{entry.original_size})"
+                        )
+                    elif entry.cancel_confirmed:
+                        # F3: Cancel confirmed = safe to finalize
+                        to_finalize.append(order_id)
+                        entry.status = OrderStatus.CANCELED
+                        self._logger.info(f"Order {order_id}: Cancel confirmed, finalizing")
+                    else:
+                        # F3: First timeout = flag only, don't finalize
+                        entry.timeout_flagged = True
+                        to_notify.append(order_id)
+                        self._logger.warning(
+                            f"Order {order_id}: Timeout flagged (not finalized) "
+                            f"- late fills may still arrive"
+                        )
 
-            for order_id in timed_out:
+            # Notify timeouts (but keep tracking)
+            for order_id in to_notify:
+                if self._on_timeout:
+                    self._on_timeout(order_id)
+
+            # Finalize only confirmed cases
+            for order_id in to_finalize:
                 entry = self._tracked_orders.pop(order_id, None)
                 if entry and self._on_timeout:
                     self._on_timeout(order_id)
-                self._logger.warning(f"Order timeout: {order_id}")
 
     def get_order_status(self, order_id: str) -> Optional[OrderStatus]:
         """Get current status of a tracked order."""
@@ -477,6 +532,17 @@ class FillTracker:
         """Set callback for order timeouts."""
         self._on_timeout = callback
 
+    def confirm_cancel(self, order_id: str):
+        """
+        Confirm that an order cancel was acknowledged by exchange.
+
+        F3: This allows safe finalization after timeout.
+        """
+        with self._lock:
+            if order_id in self._tracked_orders:
+                self._tracked_orders[order_id].cancel_confirmed = True
+                self._logger.debug(f"Cancel confirmed for order {order_id}")
+
 
 @dataclass
 class TrackingEntry:
@@ -497,3 +563,10 @@ class TrackingEntry:
     filled_size: float = 0.0
     avg_fill_price: float = 0.0
     slippage_bps: float = 0.0
+
+    # F1: Fill deduplication - prevent duplicate fill processing
+    seen_fill_ids: Set[str] = field(default_factory=set)
+
+    # F3: Timeout flag vs finalization
+    timeout_flagged: bool = False
+    cancel_confirmed: bool = False

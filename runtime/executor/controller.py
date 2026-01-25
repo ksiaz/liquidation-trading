@@ -112,30 +112,46 @@ class ExecutionController:
             
             # Step 3a: Validate ENTRY actions against risk constraints
             if action.type == ActionType.ENTRY:
-                # Need entry details (size, price, direction)
-                # In full implementation, these come from the mandate/action
-                # For now, we assume fixed size or extract from mandate if available
-                
-                # Simplified entry validation for V1:
-                # We need entry parameters which Action struct doesn't strictly have yet
-                # Assuming Action carries metadata or we look up the mandate
-                # TODO: Enhance Action type to carry entry params
-                
-                # For now, we'll validate a default small entry to check headers
-                # or rely on the fact that if we have an ENTRY action, we imply specific params
-                # This is a stub for integration - real impl needs Action.quantity
-                
-                # Assuming mandate has authority, we still check risk
+                # F5: Require real parameters - reject placeholder/missing values
+                if action.quantity is None or action.quantity <= 0:
+                    self._execution_log.append(ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=self.state_machine.get_position(symbol).state,
+                        state_after=self.state_machine.get_position(symbol).state,
+                        timestamp=time.time(),
+                        error="F5: ENTRY rejected - missing/invalid quantity (no placeholders allowed)"
+                    ))
+                    actions_rejected += 1
+                    continue
+
+                if action.direction is None:
+                    self._execution_log.append(ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=self.state_machine.get_position(symbol).state,
+                        state_after=self.state_machine.get_position(symbol).state,
+                        timestamp=time.time(),
+                        error="F5: ENTRY rejected - missing direction (no placeholders allowed)"
+                    ))
+                    actions_rejected += 1
+                    continue
+
+                # F5: Use real values from action
+                entry_price = action.entry_price or mark_prices.get(symbol, Decimal("0"))
+
                 valid, error = self.risk_monitor.validate_entry(
                     symbol=symbol,
-                    size=Decimal("0.1"), # Placeholder - needs actual size
-                    direction="LONG",    # Placeholder
-                    entry_price=mark_prices.get(symbol, Decimal("0")),
+                    size=action.quantity,  # F5: Real quantity from action
+                    direction=action.direction,  # F5: Real direction from action
+                    entry_price=entry_price,
                     account=account,
                     positions=positions,
                     mark_prices=mark_prices
                 )
-                
+
                 if not valid:
                     # Log rejection
                     self._execution_log.append(ExecutionResult(
@@ -198,13 +214,19 @@ class ExecutionController:
             # For now, just trigger the state transition
             # In real implementation, would submit exchange orders here
             if state_action == StateAction.ENTRY:
-                # Get direction from action (defaults to LONG if not specified)
-                direction = Direction.LONG
-                if action.direction == "SHORT":
-                    direction = Direction.SHORT
-                elif action.direction == "LONG":
-                    direction = Direction.LONG
-                # direction remains LONG if action.direction is None
+                # F5: Reject entries without direction
+                if action.direction is None:
+                    return ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=state_before,
+                        state_after=state_before,
+                        timestamp=timestamp,
+                        error="F5: ENTRY rejected - direction required (no ghost mode)",
+                    )
+
+                direction = Direction.SHORT if action.direction == "SHORT" else Direction.LONG
 
                 new_position = self.state_machine.transition(
                     symbol, state_action, direction=direction
@@ -213,11 +235,24 @@ class ExecutionController:
                 # For ghost trading: immediately confirm entry (ENTERING → OPEN)
                 # In live trading, this would happen after exchange confirms fill
                 if new_position.state == PositionState.ENTERING:
-                    # Use actual mark price instead of zero
-                    entry_price = self._mark_prices.get(symbol, Decimal("1"))  # Fallback to 1 if missing
+                    # F5: Use real quantity from action, fallback to mark price if no entry_price
+                    entry_price = action.entry_price or self._mark_prices.get(symbol, Decimal("1"))
+
+                    # F5: Reject if quantity is missing (no placeholders)
+                    if action.quantity is None or action.quantity <= 0:
+                        return ExecutionResult(
+                            symbol=symbol,
+                            action=action.type,
+                            success=False,
+                            state_before=state_before,
+                            state_after=new_position.state,
+                            timestamp=timestamp,
+                            error="F5: ENTRY confirmation rejected - quantity required (no ghost mode)",
+                        )
+
                     new_position = self.state_machine.transition(
                         symbol, "SUCCESS",
-                        quantity=Decimal("0.01"),  # Placeholder
+                        quantity=action.quantity,  # F5: Real quantity
                         entry_price=entry_price
                     )
             elif state_action == StateAction.EXIT:
@@ -234,11 +269,32 @@ class ExecutionController:
                 # For ghost trading: immediately confirm reduction
                 # In live trading, this would happen after exchange confirms partial fill
                 if new_position.state == PositionState.REDUCING:
-                    # Could transition to OPEN (partial) or CLOSING (complete)
-                    # For now, assume partial → back to OPEN
-                    new_position = self.state_machine.transition(symbol, "PARTIAL",
-                        quantity=Decimal("0.005")  # Placeholder for remaining
-                    )
+                    # F5: Use real quantity from action for remaining size
+                    # If action.quantity is the amount to REDUCE BY, remaining = original - quantity
+                    # If action.quantity is None, reject (no ghost mode)
+                    current_qty = position_before.quantity or Decimal("0")
+
+                    if action.quantity is None or action.quantity <= 0:
+                        return ExecutionResult(
+                            symbol=symbol,
+                            action=action.type,
+                            success=False,
+                            state_before=state_before,
+                            state_after=new_position.state,
+                            timestamp=timestamp,
+                            error="F5: REDUCE confirmation rejected - quantity required (no ghost mode)",
+                        )
+
+                    remaining_qty = max(Decimal("0"), current_qty - action.quantity)
+
+                    if remaining_qty > 0:
+                        # Partial reduction → back to OPEN with remaining
+                        new_position = self.state_machine.transition(symbol, "PARTIAL",
+                            quantity=remaining_qty  # F5: Real remaining quantity
+                        )
+                    else:
+                        # Full reduction → FLAT
+                        new_position = self.state_machine.transition(symbol, "SUCCESS")
             elif state_action == StateAction.HOLD:
                 new_position = position_before  # No change
             else:

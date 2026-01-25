@@ -226,7 +226,11 @@ class TestTimeoutHandling:
     """Tests for order timeout detection."""
 
     def test_market_order_timeout(self):
-        """Test market order timeout detection."""
+        """Test market order timeout detection.
+
+        F3: Timeout now requires double-timeout to finalize (first flags, second finalizes).
+        This prevents nuking orders that receive late fills.
+        """
         config = FillTrackerConfig(market_fill_timeout_ms=100)  # 100ms timeout
         tracker = FillTracker(config=config)
 
@@ -247,9 +251,15 @@ class TestTimeoutHandling:
         timeout_callback = MagicMock()
         tracker.set_timeout_callback(timeout_callback)
 
+        # F3: First timeout = flag only (order stays)
         tracker._check_timeouts()
+        assert tracker.get_pending_count() == 1
+        assert tracker._tracked_orders["order_timeout"].timeout_flagged is True
+        timeout_callback.assert_called_once_with("order_timeout")
 
-        # Order should be removed and callback invoked
+        # F3: Second timeout = finalize (double-timeout with no fills)
+        timeout_callback.reset_mock()
+        tracker._check_timeouts()
         assert tracker.get_pending_count() == 0
         timeout_callback.assert_called_once_with("order_timeout")
 

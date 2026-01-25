@@ -132,6 +132,30 @@ class StopHuntStats:
     successful_reversals: int = 0
     average_reversal_pct: float = 0.0
     average_hunt_duration_sec: float = 0.0
+    # F6: Regime-blocked entries
+    entries_blocked_by_regime: int = 0
+
+
+@dataclass
+class RegimeContext:
+    """F6: Regime context for stop-hunt filtering.
+
+    Stop-hunts may NOT reverse in strong trends - we must block entries.
+    """
+    # Trend strength (0.0 = no trend, 1.0 = very strong trend)
+    trend_strength: float = 0.0
+
+    # Trend direction: "BULLISH", "BEARISH", or None
+    trend_direction: Optional[str] = None
+
+    # Funding rate bias: positive = longs paying, negative = shorts paying
+    funding_rate: float = 0.0
+
+    # Whale activity: True if whales are adding in trend direction
+    whale_continuation: bool = False
+
+    # Timestamp of this context
+    timestamp: float = 0.0
 
 
 class StopHuntDetector:
@@ -158,6 +182,10 @@ class StopHuntDetector:
     MAX_HUNT_DURATION_SEC = 60.0       # Hunt should complete within 60s
     ENTRY_WINDOW_SEC = 30.0            # Entry window after reversal starts
 
+    # F6: Regime thresholds for blocking stop-hunt entries
+    STRONG_TREND_THRESHOLD = 0.7    # Block if trend_strength > 0.7
+    FUNDING_ALIGNMENT_THRESHOLD = 0.0005  # 0.05% funding = significant
+
     def __init__(self):
         # Active hunts per symbol
         self._active_hunts: Dict[str, StopHuntEvent] = {}
@@ -173,6 +201,9 @@ class StopHuntDetector:
 
         # Statistics
         self._stats = StopHuntStats()
+
+        # F6: Regime context per symbol
+        self._regime_context: Dict[str, RegimeContext] = {}
 
     def update_cluster(
         self,
@@ -494,13 +525,95 @@ class StopHuntDetector:
         """Get current liquidity cluster for a symbol."""
         return self._clusters.get(symbol)
 
+    def update_regime_context(
+        self,
+        symbol: str,
+        trend_strength: float,
+        trend_direction: Optional[str],
+        funding_rate: float,
+        whale_continuation: bool,
+        timestamp: float
+    ):
+        """F6: Update regime context for a symbol.
+
+        Called by observation layer to provide trend/funding data.
+
+        Args:
+            symbol: Trading symbol
+            trend_strength: 0.0-1.0 trend strength
+            trend_direction: "BULLISH", "BEARISH", or None
+            funding_rate: Current funding rate
+            whale_continuation: Whether whales are adding in trend direction
+            timestamp: Current timestamp
+        """
+        self._regime_context[symbol] = RegimeContext(
+            trend_strength=trend_strength,
+            trend_direction=trend_direction,
+            funding_rate=funding_rate,
+            whale_continuation=whale_continuation,
+            timestamp=timestamp
+        )
+
+    def _check_regime_block(self, symbol: str, entry_direction: str) -> Optional[str]:
+        """F6: Check if regime should block this stop-hunt entry.
+
+        Returns:
+            Block reason string if entry should be blocked, None if OK
+        """
+        regime = self._regime_context.get(symbol)
+        if regime is None:
+            return None  # No regime data = allow entry
+
+        # F6 Block #1: Strong trend against entry direction
+        if regime.trend_strength > self.STRONG_TREND_THRESHOLD:
+            # In strong uptrend, block SHORT entries (hunt reversals expecting drop)
+            # In strong downtrend, block LONG entries (hunt reversals expecting bounce)
+            if regime.trend_direction == "BULLISH" and entry_direction == "SHORT":
+                return f"F6: Blocked SHORT in strong BULLISH trend (strength={regime.trend_strength:.2f})"
+            if regime.trend_direction == "BEARISH" and entry_direction == "LONG":
+                return f"F6: Blocked LONG in strong BEARISH trend (strength={regime.trend_strength:.2f})"
+
+        # F6 Block #2: Funding alignment suggests trend continuation
+        if abs(regime.funding_rate) > self.FUNDING_ALIGNMENT_THRESHOLD:
+            # High positive funding = longs paying = market is long-heavy
+            # Shorting against this is risky (stop-hunt shorts may fail)
+            if regime.funding_rate > self.FUNDING_ALIGNMENT_THRESHOLD and entry_direction == "SHORT":
+                # However, if trend is BEARISH despite high funding, short may work
+                if regime.trend_direction != "BEARISH":
+                    return f"F6: Blocked SHORT with high positive funding ({regime.funding_rate:.4f})"
+
+            # High negative funding = shorts paying = market is short-heavy
+            # Longing against this is risky
+            if regime.funding_rate < -self.FUNDING_ALIGNMENT_THRESHOLD and entry_direction == "LONG":
+                if regime.trend_direction != "BULLISH":
+                    return f"F6: Blocked LONG with high negative funding ({regime.funding_rate:.4f})"
+
+        # F6 Block #3: Whale continuation mode
+        if regime.whale_continuation:
+            # If whales are adding in trend direction, don't fade
+            if regime.trend_direction == "BULLISH" and entry_direction == "SHORT":
+                return "F6: Blocked SHORT - whale continuation in BULLISH trend"
+            if regime.trend_direction == "BEARISH" and entry_direction == "LONG":
+                return "F6: Blocked LONG - whale continuation in BEARISH trend"
+
+        return None  # No block
+
     def get_entry_opportunity(self, symbol: str) -> Optional[Dict]:
         """Get entry opportunity if hunt is in reversal phase.
+
+        F6: Returns None if regime blocks the entry.
 
         Returns dict with entry details or None.
         """
         hunt = self._active_hunts.get(symbol)
         if hunt is None or hunt.phase != StopHuntPhase.REVERSAL:
+            return None
+
+        # F6: Check regime filter
+        block_reason = self._check_regime_block(symbol, hunt.suggested_entry)
+        if block_reason:
+            print(f"[STOP HUNT] {symbol}: Entry BLOCKED - {block_reason}")
+            self._stats.entries_blocked_by_regime += 1
             return None
 
         return {
@@ -512,7 +625,8 @@ class StopHuntDetector:
             "quality": hunt.entry_quality,
             "reversal_pct": hunt.reversal_pct,
             "hunt_value": hunt.value_triggered,
-            "risk_reward": abs(hunt.target_price - hunt.price_current) / abs(hunt.price_current - hunt.stop_loss_price) if hunt.price_current != hunt.stop_loss_price else 0
+            "risk_reward": abs(hunt.target_price - hunt.price_current) / abs(hunt.price_current - hunt.stop_loss_price) if hunt.price_current != hunt.stop_loss_price else 0,
+            "regime_clear": True  # F6: Indicates regime check passed
         }
 
     def get_stats(self) -> Dict:
@@ -522,7 +636,8 @@ class StopHuntDetector:
             "hunts_by_direction": self._stats.hunts_by_direction,
             "successful_reversals": self._stats.successful_reversals,
             "active_hunts": list(self._active_hunts.keys()),
-            "clusters_detected": list(self._clusters.keys())
+            "clusters_detected": list(self._clusters.keys()),
+            "entries_blocked_by_regime": self._stats.entries_blocked_by_regime  # F6
         }
 
     def get_recent_hunts(self, limit: int = 10) -> List[StopHuntEvent]:

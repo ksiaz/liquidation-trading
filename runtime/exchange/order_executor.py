@@ -9,18 +9,34 @@ Order submission flow:
 3. Submit to exchange
 4. Track until fill/cancel/reject
 5. Log execution details
+
+Hardenings:
+- E1: Exponential backoff for retries (prevents retry storms)
+- E2: Proper wallet signing for Hyperliquid
+- E3: Partial fill handling with cancel-resubmit
+- E4: Post-fill stop placement
 """
 
 import time
+import asyncio
 import logging
 import hashlib
 import hmac
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Tuple
 from threading import RLock
 from enum import Enum
 import aiohttp
+
+# E2: Optional eth_account for signing (graceful fallback if not installed)
+try:
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+    HAS_ETH_ACCOUNT = True
+except ImportError:
+    HAS_ETH_ACCOUNT = False
+    Account = None
 
 from .types import (
     OrderType,
@@ -48,13 +64,18 @@ class ExecutorConfig:
     default_max_slippage_pct: float = 0.5  # 50 bps
     cascade_max_slippage_pct: float = 1.0  # 100 bps for cascade entries
 
-    # Partial fill thresholds
+    # E3: Partial fill thresholds and handling
     min_fill_pct: float = 0.8   # Accept fills >= 80%
     cascade_min_fill_pct: float = 0.5  # Accept fills >= 50% during cascade
+    partial_fill_timeout_ms: int = 10_000  # Cancel partial after 10s
+    partial_resubmit_enabled: bool = True  # Resubmit remaining size
+    max_partial_resubmits: int = 2  # Max resubmit attempts
 
-    # Retry settings
+    # E1: Retry settings with exponential backoff
     max_retries: int = 3
-    retry_delay_ms: int = 100
+    retry_base_delay_ms: int = 100      # Initial delay
+    retry_max_delay_ms: int = 2000      # Cap delay at 2 seconds
+    retry_backoff_factor: float = 2.0   # Exponential factor
 
     # API settings
     api_url: str = "https://api.hyperliquid.xyz"
@@ -113,10 +134,32 @@ class OrderExecutor:
         # HTTP session (initialized on first use)
         self._session: Optional[aiohttp.ClientSession] = None
 
+        # E3: Partial fill tracking
+        self._partial_resubmit_counts: Dict[str, int] = {}
+
+        # E4: Stop placement tracking
+        self._pending_stop_placements: Dict[str, Dict] = {}  # order_id -> stop config
+        self._placed_stops: Dict[str, str] = {}  # entry_order_id -> stop_order_id
+
         self._lock = RLock()
 
     def _now_ns(self) -> int:
         return int(time.time() * 1_000_000_000)
+
+    def _calculate_retry_delay(self, attempt: int) -> float:
+        """E1: Calculate exponential backoff delay for retry attempt.
+
+        Args:
+            attempt: Retry attempt number (0-indexed)
+
+        Returns:
+            Delay in seconds
+        """
+        delay_ms = self._config.retry_base_delay_ms * (
+            self._config.retry_backoff_factor ** attempt
+        )
+        delay_ms = min(delay_ms, self._config.retry_max_delay_ms)
+        return delay_ms / 1000.0  # Convert to seconds
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
@@ -336,80 +379,181 @@ class OrderExecutor:
         payload: Dict,
         request: OrderRequest
     ) -> OrderResponse:
-        """Submit order payload to Hyperliquid API."""
+        """Submit order payload to Hyperliquid API with E1 exponential backoff."""
         # Sign payload if private key available
         if self._private_key:
             payload = self._sign_payload(payload)
 
-        try:
-            session = await self._get_session()
+        last_error = None
 
-            async with session.post(
-                f"{self._api_url}/exchange",
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as response:
-                data = await response.json()
+        # E1: Retry loop with exponential backoff
+        for attempt in range(self._config.max_retries):
+            try:
+                session = await self._get_session()
 
-                if response.status == 200 and data.get("status") == "ok":
-                    # Extract order ID from response
-                    response_data = data.get("response", {})
-                    order_id = None
+                async with session.post(
+                    f"{self._api_url}/exchange",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    data = await response.json()
 
-                    if "data" in response_data:
-                        statuses = response_data["data"].get("statuses", [])
-                        if statuses and len(statuses) > 0:
-                            status = statuses[0]
-                            if "resting" in status:
-                                order_id = str(status["resting"]["oid"])
-                            elif "filled" in status:
-                                order_id = str(status["filled"]["oid"])
+                    if response.status == 200 and data.get("status") == "ok":
+                        # Extract order ID from response
+                        response_data = data.get("response", {})
+                        order_id = None
 
-                    return OrderResponse(
-                        success=True,
-                        order_id=order_id or request.client_order_id,
-                        client_order_id=request.client_order_id,
-                        status=OrderStatus.SUBMITTED,
-                        raw_response=data
-                    )
-                else:
-                    error_msg = data.get("response", str(data))
-                    return OrderResponse(
-                        success=False,
-                        client_order_id=request.client_order_id,
-                        status=OrderStatus.REJECTED,
-                        error_code=str(response.status),
-                        error_message=str(error_msg),
-                        raw_response=data
-                    )
+                        if "data" in response_data:
+                            statuses = response_data["data"].get("statuses", [])
+                            if statuses and len(statuses) > 0:
+                                status = statuses[0]
+                                if "resting" in status:
+                                    order_id = str(status["resting"]["oid"])
+                                elif "filled" in status:
+                                    order_id = str(status["filled"]["oid"])
 
-        except aiohttp.ClientError as e:
-            self._logger.error(f"HTTP error submitting order: {e}")
-            return OrderResponse(
-                success=False,
-                client_order_id=request.client_order_id,
-                status=OrderStatus.FAILED,
-                error_message=f"Network error: {e}"
-            )
-        except Exception as e:
-            self._logger.error(f"Error submitting order: {e}")
-            return OrderResponse(
-                success=False,
-                client_order_id=request.client_order_id,
-                status=OrderStatus.FAILED,
-                error_message=str(e)
-            )
+                        return OrderResponse(
+                            success=True,
+                            order_id=order_id or request.client_order_id,
+                            client_order_id=request.client_order_id,
+                            status=OrderStatus.SUBMITTED,
+                            raw_response=data
+                        )
+                    else:
+                        # Non-retryable rejection (e.g., insufficient margin)
+                        error_msg = data.get("response", str(data))
+                        return OrderResponse(
+                            success=False,
+                            client_order_id=request.client_order_id,
+                            status=OrderStatus.REJECTED,
+                            error_code=str(response.status),
+                            error_message=str(error_msg),
+                            raw_response=data
+                        )
+
+            except aiohttp.ClientError as e:
+                last_error = f"Network error: {e}"
+                self._logger.warning(
+                    f"E1: Retry {attempt + 1}/{self._config.max_retries} "
+                    f"for {request.symbol}: {last_error}"
+                )
+            except asyncio.TimeoutError:
+                last_error = "Request timeout"
+                self._logger.warning(
+                    f"E1: Retry {attempt + 1}/{self._config.max_retries} "
+                    f"for {request.symbol}: {last_error}"
+                )
+            except Exception as e:
+                last_error = str(e)
+                self._logger.warning(
+                    f"E1: Retry {attempt + 1}/{self._config.max_retries} "
+                    f"for {request.symbol}: {last_error}"
+                )
+
+            # E1: Exponential backoff before next retry
+            if attempt < self._config.max_retries - 1:
+                delay = self._calculate_retry_delay(attempt)
+                self._logger.info(f"E1: Waiting {delay:.3f}s before retry")
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        self._logger.error(
+            f"E1: All {self._config.max_retries} retries failed for {request.symbol}"
+        )
+        return OrderResponse(
+            success=False,
+            client_order_id=request.client_order_id,
+            status=OrderStatus.FAILED,
+            error_message=f"All retries failed: {last_error}"
+        )
 
     def _sign_payload(self, payload: Dict) -> Dict:
         """
-        Sign order payload with private key.
+        E2: Sign order payload with private key using EIP-712.
 
-        Note: Actual signing requires eth_account library.
-        This is a placeholder for the signing structure.
+        Hyperliquid uses EIP-712 typed data signing.
+        Requires eth_account library for production use.
+
+        Args:
+            payload: Order payload to sign
+
+        Returns:
+            Signed payload with signature field
         """
-        # Signing implementation would go here
-        # For now, return payload as-is (will need wallet connection)
-        return payload
+        if not HAS_ETH_ACCOUNT:
+            self._logger.warning(
+                "E2: eth_account not installed - signing disabled. "
+                "Install with: pip install eth-account"
+            )
+            return payload
+
+        if not self._private_key:
+            self._logger.warning("E2: No private key configured - signing disabled")
+            return payload
+
+        try:
+            # Hyperliquid EIP-712 domain
+            domain = {
+                "name": "Exchange",
+                "version": "1",
+                "chainId": 42161,  # Arbitrum
+                "verifyingContract": "0x0000000000000000000000000000000000000000"
+            }
+
+            # Build typed data for signing
+            # Hyperliquid uses a specific message format
+            action = payload.get("action", {})
+            nonce = payload.get("nonce", int(time.time() * 1000))
+
+            # Create message hash for Hyperliquid
+            message = {
+                "action": json.dumps(action, separators=(',', ':')),
+                "nonce": nonce
+            }
+
+            types = {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"}
+                ],
+                "Agent": [
+                    {"name": "action", "type": "string"},
+                    {"name": "nonce", "type": "uint64"}
+                ]
+            }
+
+            typed_data = {
+                "types": types,
+                "primaryType": "Agent",
+                "domain": domain,
+                "message": message
+            }
+
+            # Sign with eth_account
+            account = Account.from_key(self._private_key)
+            signed = account.sign_typed_data(
+                domain_data=domain,
+                message_types={"Agent": types["Agent"]},
+                message_data=message
+            )
+
+            # Add signature to payload
+            payload["signature"] = {
+                "r": hex(signed.r),
+                "s": hex(signed.s),
+                "v": signed.v
+            }
+            payload["vaultAddress"] = self._wallet_address
+
+            self._logger.debug(f"E2: Signed payload for {self._wallet_address[:10]}...")
+            return payload
+
+        except Exception as e:
+            self._logger.error(f"E2: Signing failed: {e}")
+            # Return unsigned payload - exchange will reject
+            return payload
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """
@@ -459,19 +603,26 @@ class OrderExecutor:
             self._logger.error(f"Error canceling order {order_id}: {e}")
             return False
 
-    def handle_fill(self, fill: OrderFill):
+    def handle_fill(self, fill: OrderFill) -> bool:
         """
         Handle a fill notification from WebSocket or polling.
 
+        E4: Returns True if stop placement is pending (caller should await place_stop_for_fill).
+
         Args:
             fill: Fill event details
+
+        Returns:
+            True if stop placement is pending for this fill
         """
+        stop_pending = False
+
         with self._lock:
             order_id = fill.order_id
 
             if order_id not in self._order_updates:
                 self._logger.warning(f"Fill for unknown order: {order_id}")
-                return
+                return False
 
             update = self._order_updates[order_id]
             update.fills.append(fill)
@@ -487,6 +638,10 @@ class OrderExecutor:
             if update.remaining_size <= 0:
                 update.status = OrderStatus.FILLED
                 self._pending_orders.pop(order_id, None)
+
+                # E4: Check if stop placement is pending
+                if order_id in self._pending_stop_placements:
+                    stop_pending = True
             else:
                 update.status = OrderStatus.PARTIAL
 
@@ -512,6 +667,14 @@ class OrderExecutor:
             # Notify callback
             if self._on_fill:
                 self._on_fill(fill)
+
+        # E4: Log if stop placement pending
+        if stop_pending:
+            self._logger.info(
+                f"E4: Entry {order_id} filled, stop placement pending"
+            )
+
+        return stop_pending
 
     def handle_order_update(self, update: OrderUpdate):
         """Handle order status update from WebSocket."""
@@ -565,6 +728,129 @@ class OrderExecutor:
 
         return timed_out
 
+    async def check_partial_fills(self) -> List[Tuple[str, float]]:
+        """
+        E3: Check for stale partial fills and handle them.
+
+        Returns:
+            List of (order_id, remaining_size) that need attention
+        """
+        now_ns = self._now_ns()
+        partials = []
+
+        with self._lock:
+            for order_id, update in list(self._order_updates.items()):
+                if update.status != OrderStatus.PARTIAL:
+                    continue
+
+                submit_time = self._order_submission_times.get(order_id, now_ns)
+                elapsed_ms = (now_ns - submit_time) / 1_000_000
+
+                if elapsed_ms > self._config.partial_fill_timeout_ms:
+                    request = self._pending_orders.get(order_id)
+                    if request:
+                        fill_pct = update.filled_size / request.size
+                        min_pct = (
+                            self._config.cascade_min_fill_pct
+                            if request.is_cascade else self._config.min_fill_pct
+                        )
+
+                        if fill_pct >= min_pct:
+                            # Acceptable partial - cancel remaining
+                            self._logger.info(
+                                f"E3: Partial fill {fill_pct*100:.1f}% >= min "
+                                f"{min_pct*100:.1f}% for {order_id}, accepting"
+                            )
+                            partials.append((order_id, 0))  # 0 = don't resubmit
+                        else:
+                            # Need more fill - cancel and resubmit
+                            remaining = update.remaining_size
+                            resubmit_count = self._partial_resubmit_counts.get(order_id, 0)
+
+                            if (self._config.partial_resubmit_enabled and
+                                    resubmit_count < self._config.max_partial_resubmits):
+                                self._logger.info(
+                                    f"E3: Partial fill {fill_pct*100:.1f}% < min "
+                                    f"{min_pct*100:.1f}% for {order_id}, will resubmit {remaining}"
+                                )
+                                partials.append((order_id, remaining))
+                            else:
+                                self._logger.warning(
+                                    f"E3: Partial fill {fill_pct*100:.1f}% for {order_id}, "
+                                    f"max resubmits reached, abandoning"
+                                )
+                                partials.append((order_id, 0))
+
+        return partials
+
+    async def handle_partial_fill(
+        self,
+        order_id: str,
+        remaining_size: float
+    ) -> Optional[OrderResponse]:
+        """
+        E3: Handle a partial fill by canceling and optionally resubmitting.
+
+        Args:
+            order_id: Order ID with partial fill
+            remaining_size: Size to resubmit (0 = just cancel)
+
+        Returns:
+            OrderResponse for resubmitted order, or None
+        """
+        with self._lock:
+            request = self._pending_orders.get(order_id)
+            update = self._order_updates.get(order_id)
+
+        if not request or not update:
+            return None
+
+        # Cancel remaining order
+        cancelled = await self.cancel_order(order_id, request.symbol)
+        if not cancelled:
+            self._logger.error(f"E3: Failed to cancel partial {order_id}")
+            return None
+
+        self._log_execution(
+            'partial_fill_cancelled',
+            request,
+            order_id=order_id,
+            fill_price=update.average_price
+        )
+
+        # Resubmit if needed
+        if remaining_size > 0:
+            # Create new request for remaining size
+            from copy import copy
+            new_request = OrderRequest(
+                symbol=request.symbol,
+                side=request.side,
+                size=remaining_size,
+                order_type=request.order_type,
+                price=request.price,
+                stop_price=request.stop_price,
+                expected_price=request.expected_price,
+                reduce_only=request.reduce_only,
+                post_only=request.post_only,
+                client_order_id=f"{request.client_order_id}_R",
+                strategy_id=request.strategy_id,
+                event_id=request.event_id,
+                is_cascade=request.is_cascade
+            )
+
+            # Track resubmit count
+            with self._lock:
+                self._partial_resubmit_counts[order_id] = (
+                    self._partial_resubmit_counts.get(order_id, 0) + 1
+                )
+
+            self._logger.info(
+                f"E3: Resubmitting {remaining_size} for {request.symbol}"
+            )
+            return await self.submit_order(new_request)
+
+        return None
+
     def get_pending_orders(self) -> Dict[str, OrderUpdate]:
         """Get all pending orders."""
         with self._lock:
@@ -591,6 +877,86 @@ class OrderExecutor:
     def set_update_callback(self, callback: Callable[[OrderUpdate], None]):
         """Set callback for order updates."""
         self._on_update = callback
+
+    def register_stop_for_entry(
+        self,
+        entry_order_id: str,
+        stop_config: Dict
+    ):
+        """
+        E4: Register a stop loss to be placed after entry fills.
+
+        Args:
+            entry_order_id: Order ID of the entry order
+            stop_config: Stop configuration with keys:
+                - stop_price: Stop trigger price
+                - symbol: Trading symbol
+                - side: Stop order side (opposite of entry)
+                - size: Stop size (usually same as entry)
+        """
+        with self._lock:
+            self._pending_stop_placements[entry_order_id] = stop_config
+            self._logger.info(
+                f"E4: Registered stop for entry {entry_order_id}: "
+                f"stop @ {stop_config.get('stop_price')}"
+            )
+
+    async def place_stop_for_fill(self, entry_order_id: str, fill: OrderFill) -> Optional[OrderResponse]:
+        """
+        E4: Place stop loss after entry fill.
+
+        Args:
+            entry_order_id: Order ID of the filled entry
+            fill: Fill details
+
+        Returns:
+            OrderResponse for stop order, or None if not configured
+        """
+        with self._lock:
+            stop_config = self._pending_stop_placements.pop(entry_order_id, None)
+
+        if not stop_config:
+            return None
+
+        # Create stop order request
+        stop_side = OrderSide.SELL if stop_config.get('side') == 'SELL' else OrderSide.BUY
+        stop_request = OrderRequest(
+            symbol=stop_config['symbol'],
+            side=stop_side,
+            size=stop_config.get('size', fill.size),
+            order_type=OrderType.STOP_MARKET,
+            stop_price=stop_config['stop_price'],
+            expected_price=fill.price,
+            reduce_only=True,
+            client_order_id=f"{entry_order_id}_SL",
+            strategy_id=stop_config.get('strategy_id'),
+            event_id=stop_config.get('event_id')
+        )
+
+        self._logger.info(
+            f"E4: Placing stop for filled entry {entry_order_id}: "
+            f"{stop_request.symbol} {stop_request.side.value} @ {stop_request.stop_price}"
+        )
+
+        response = await self.submit_order(stop_request)
+
+        if response.success:
+            with self._lock:
+                self._placed_stops[entry_order_id] = response.order_id
+            self._logger.info(
+                f"E4: Stop placed successfully: {response.order_id}"
+            )
+        else:
+            self._logger.error(
+                f"E4: Failed to place stop for {entry_order_id}: {response.error_message}"
+            )
+
+        return response
+
+    def get_stop_order_id(self, entry_order_id: str) -> Optional[str]:
+        """E4: Get stop order ID for an entry order."""
+        with self._lock:
+            return self._placed_stops.get(entry_order_id)
 
     def _log_execution(
         self,

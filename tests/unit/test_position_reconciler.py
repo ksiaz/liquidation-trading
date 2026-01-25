@@ -147,7 +147,11 @@ class TestDiscrepancyHandling:
     """Tests for discrepancy handling."""
 
     def test_handle_unknown_position(self):
-        """Test handling unknown position on exchange."""
+        """Test handling unknown position on exchange.
+
+        F4: Now requires 2 consecutive mismatches before emergency close
+        to protect against API glitches.
+        """
         reconciler = PositionReconciler()
 
         callback = MagicMock()
@@ -160,16 +164,27 @@ class TestDiscrepancyHandling:
             'entry_price': 50000.0
         }
 
-        result = reconciler._handle_unknown_position("BTC", exchange_pos)
+        # F4: First call = flag only, no action
+        result1 = reconciler._handle_unknown_position("BTC", exchange_pos)
+        assert result1.symbol == "BTC"
+        assert result1.action == ReconciliationAction.NONE  # F4: No action yet
+        callback.assert_called_once()
 
-        assert result.symbol == "BTC"
-        assert result.action == ReconciliationAction.EMERGENCY_CLOSE
-        assert result.expected_size == 0
-        assert result.actual_size == 1.0
+        # F4: Second consecutive call = emergency close
+        callback.reset_mock()
+        result2 = reconciler._handle_unknown_position("BTC", exchange_pos)
+        assert result2.symbol == "BTC"
+        assert result2.action == ReconciliationAction.EMERGENCY_CLOSE
+        assert result2.expected_size == 0
+        assert result2.actual_size == 1.0
         callback.assert_called_once()
 
     def test_handle_missing_position(self):
-        """Test handling position missing from exchange."""
+        """Test handling position missing from exchange.
+
+        F4: Now requires 2 consecutive mismatches before state reset
+        to protect against API glitches.
+        """
         reconciler = PositionReconciler()
         reconciler.set_local_position("BTC", OrderSide.BUY, 1.0, 50000.0)
 
@@ -177,14 +192,25 @@ class TestDiscrepancyHandling:
         reconciler.set_discrepancy_callback(callback)
 
         local_pos = reconciler.get_local_position("BTC")
-        result = reconciler._handle_missing_position("BTC", local_pos)
 
-        assert result.symbol == "BTC"
-        assert result.action == ReconciliationAction.RESET_STATE
-        assert result.expected_size == 1.0
-        assert result.actual_size == 0
+        # F4: First call = flag only, no action
+        result1 = reconciler._handle_missing_position("BTC", local_pos)
+        assert result1.symbol == "BTC"
+        assert result1.action == ReconciliationAction.NONE  # F4: No action yet
+        assert reconciler.get_local_position("BTC") is not None  # Not cleared yet
+        callback.assert_called_once()
 
-        # Local position should be cleared
+        # F4: Second consecutive call = reset state
+        callback.reset_mock()
+        local_pos = reconciler.get_local_position("BTC")  # Re-fetch
+        result2 = reconciler._handle_missing_position("BTC", local_pos)
+
+        assert result2.symbol == "BTC"
+        assert result2.action == ReconciliationAction.RESET_STATE
+        assert result2.expected_size == 1.0
+        assert result2.actual_size == 0
+
+        # Local position should be cleared after second mismatch
         assert reconciler.get_local_position("BTC") is None
         callback.assert_called_once()
 
@@ -242,7 +268,10 @@ class TestEmergencyClose:
     """Tests for emergency close functionality."""
 
     def test_emergency_close_callback(self):
-        """Test emergency close callback is invoked."""
+        """Test emergency close callback is invoked.
+
+        F4: Now requires 2 consecutive mismatches before emergency close.
+        """
         reconciler = PositionReconciler()
 
         emergency_callback = MagicMock()
@@ -255,8 +284,12 @@ class TestEmergencyClose:
             'entry_price': 50000.0
         }
 
+        # F4: First call = flag only, no callback
         reconciler._handle_unknown_position("BTC", exchange_pos)
+        emergency_callback.assert_not_called()
 
+        # F4: Second consecutive call = emergency close
+        reconciler._handle_unknown_position("BTC", exchange_pos)
         emergency_callback.assert_called_once_with("BTC", 1.5)
 
     def test_emergency_close_disabled(self):
@@ -302,7 +335,11 @@ class TestReconciliationResults:
         assert results[0].symbol == "BTC"
 
     def test_mismatch_count(self):
-        """Test mismatch count is tracked."""
+        """Test mismatch count is tracked.
+
+        F4: Now requires 2 consecutive mismatches - first call returns NONE,
+        second call returns actual action.
+        """
         reconciler = PositionReconciler()
 
         # Add some results
@@ -312,11 +349,18 @@ class TestReconciliationResults:
             'side': OrderSide.BUY,
             'entry_price': 50000.0
         }
-        result1 = reconciler._handle_unknown_position("BTC", exchange_pos)
-        result2 = reconciler._handle_unknown_position("ETH", exchange_pos)
-        # Manually add to results (simulate reconcile method)
-        reconciler._results.append(result1)
-        reconciler._results.append(result2)
+
+        # F4: First calls = NONE (no action), second calls = actual action
+        # BTC: 2 calls needed for action
+        result1_btc = reconciler._handle_unknown_position("BTC", exchange_pos)
+        result2_btc = reconciler._handle_unknown_position("BTC", exchange_pos)  # This has action
+        # ETH: 2 calls needed for action
+        result1_eth = reconciler._handle_unknown_position("ETH", exchange_pos)
+        result2_eth = reconciler._handle_unknown_position("ETH", exchange_pos)  # This has action
+
+        # Only add results with actual actions
+        reconciler._results.append(result2_btc)
+        reconciler._results.append(result2_eth)
 
         assert reconciler.get_mismatch_count() == 2
 

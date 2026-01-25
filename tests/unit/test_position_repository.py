@@ -408,6 +408,7 @@ class TestExecutionControllerWithPersistence:
                 authority=10,
                 timestamp=time.time(),
                 direction="LONG",
+                quantity=Decimal("0.1"),  # F5: Required quantity
             ),
         ]
 

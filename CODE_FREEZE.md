@@ -37,6 +37,10 @@ The following components are **frozen** and may not be modified without explicit
 - `execution/ep4_execution.py` - Execution orchestrator
 - `execution/ep4_ghost_adapter.py` - Ghost execution
 
+### Execution Layer (Frozen 2026-01-25)
+- `runtime/m6_executor.py` - EP4 pipeline orchestrator
+- `runtime/executor/controller.py` - Canonical theorem-verified executor
+
 ---
 
 ## Allowed Modifications (Instrumentation Only)

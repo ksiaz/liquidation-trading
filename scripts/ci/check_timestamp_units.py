@@ -21,13 +21,15 @@ def check_timestamp_conversion(file_path):
         # Bad:  timestamp = int(raw_payload['T'])
 
         good_patterns = [
-            r"timestamp\s*=.*\['[TE]'\]\s*/\s*1000",
-            r"timestamp\s*=.*\[\"[TE]\"\]\s*/\s*1000"
+            r"timestamp\s*=.*\['[TE]'\].*?/\s*1000",
+            r"timestamp\s*=.*\[\"[TE]\"\].*?/\s*1000",
+            r"timestamp\s*=.*\.get\(['\"][TE]['\"].*?\).*?/\s*1000"
         ]
 
         bad_patterns = [
-            r"timestamp\s*=.*\['[TE]'\]\s*(?!/\s*1000)",
-            r"timestamp\s*=.*\[\"[TE]\"\]\s*(?!/\s*1000)"
+            # Pattern for raw access without division (bad: timestamp = raw_payload['T'])
+            r"timestamp\s*=\s*raw_payload\['[TE]'\]\s*$",
+            r"timestamp\s*=\s*raw_payload\[\"[TE]\"\]\s*$"
         ]
 
         has_good = any(re.search(p, content) for p in good_patterns)

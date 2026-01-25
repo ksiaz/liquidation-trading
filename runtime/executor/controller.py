@@ -1,4 +1,8 @@
-"""Execution Controller.
+"""Execution Controller - Canonical Execution Path.
+
+CANONICAL: 2026-01-25
+STATUS: Theorem-verified execution implementation
+FROZEN: Per CODE_FREEZE.md - requires logged evidence to modify
 
 Orchestrates mandate arbitration → state machine → execution flow.
 
@@ -7,6 +11,26 @@ Enforces:
 - All 13 arbitration theorems
 - Risk constraints (leverage, liquidation avoidance)
 - Constitutional logging requirements
+
+Architecture:
+1. Receive mandates from strategies
+2. Check risk invariants → emit protective mandates
+3. Arbitrate all mandates → single action per symbol
+4. Validate ENTRY actions against risk constraints
+5. Validate action against state machine
+6. Execute action → update position state
+7. Log results
+
+Properties:
+- Symbol-local execution (independent processing)
+- State machine invariants preserved
+- Arbitration properties enforced
+- Risk constraints enforced (fail closed)
+- Constitutional logging
+- Optional position persistence across restarts
+
+See Also:
+- runtime/m6_executor.py - EP4 pipeline executor (frozen)
 """
 
 import time
@@ -24,24 +48,10 @@ from .types import ExecutionResult, CycleStats
 
 
 class ExecutionController:
-    """Main execution controller orchestrating the flow.
+    """
+    Canonical execution controller - theorem-verified mandate processing.
 
-    Architecture:
-    1. Receive mandates from strategies
-    2. Check risk invariants → emit protective mandates
-    3. Arbitrate all mandates → single action per symbol
-    4. Validate ENTRY actions against risk constraints
-    5. Validate action against state machine
-    6. Execute action → update position state
-    7. Log results
-
-    Properties:
-    - Symbol-local execution (independent processing)
-    - State machine invariants preserved
-    - Arbitration properties enforced
-    - Risk constraints enforced (fail closed)
-    - Constitutional logging
-    - Optional position persistence across restarts
+    See module docstring for architecture and properties.
     """
 
     def __init__(

@@ -1,6 +1,10 @@
 """
 M6 Executor - Execution Layer Orchestrator
 
+FROZEN: 2026-01-25
+REASON: Production-verified EP4 pipeline implementation
+REQUIRES: Logged evidence from Phase V1-LIVE runs to modify
+
 Wires observation → policy → arbitration → execution pipeline.
 
 Flow:
@@ -20,6 +24,9 @@ Constitutional Constraints:
 Hardenings:
 - E6: Full pipeline implementation
 - Uses E1-E5 from OrderExecutor
+
+See Also:
+- runtime/executor/controller.py - Canonical theorem-verified execution path
 """
 
 import time

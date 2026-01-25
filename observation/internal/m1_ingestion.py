@@ -45,12 +45,18 @@ class M1IngestionEngine:
             'depth': 0,
             'hl_positions': 0,
             'hl_liquidations': 0,
-            'errors': 0
+            'errors': 0,
+            # P2: Side derivation validation counters
+            'side_validated': 0,
+            'side_mismatch': 0,
+            'side_unvalidated': 0
         }
 
     def normalize_trade(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
         """
-        Normalize raw binance trade paylod.
+        Normalize raw binance trade payload.
+
+        P2: Validates trade side derivation against order book delta.
         """
         try:
             # Binance AggTrade format
@@ -58,11 +64,19 @@ class M1IngestionEngine:
             quantity = float(raw_payload['q'])
             timestamp = int(raw_payload['T']) / 1000.0
             is_buyer_maker = raw_payload['m']
-            side = "SELL" if is_buyer_maker else "BUY" # Maker is buyer -> Taker sold -> SELL (?) 
-            # Wait, standard Binance: m=True means maker was buyer. 
-            # If maker was buyer, the taker was SELLER. So it's a SELL. Correct.
-            
-            # 1. Update Raw Buffer
+
+            # Standard derivation: m=True means maker was buyer, taker sold -> SELL
+            derived_side = "SELL" if is_buyer_maker else "BUY"
+
+            # P2: Validate side against order book
+            validated_side, validation_status = self._validate_trade_side(
+                symbol, price, derived_side
+            )
+
+            # Use validated side if available, otherwise use derived
+            side = validated_side if validated_side else derived_side
+
+            # Update Raw Buffer
             event = {
                 'timestamp': timestamp,
                 'symbol': symbol,
@@ -70,20 +84,73 @@ class M1IngestionEngine:
                 'quantity': quantity,
                 'side': side,
                 'base_qty': quantity,
-                'quote_qty': quantity * price
+                'quote_qty': quantity * price,
+                'side_validation': validation_status  # P2: Track validation result
             }
             self.raw_trades[symbol].append(event)
-            self.recent_prices[symbol].append((timestamp, price))  # Track for absorption detection
+            self.recent_prices[symbol].append((timestamp, price))
             self.counters['trades'] += 1
 
-            # DEBUG: Log trade buffer size
-            print(f"DEBUG M1: Added TRADE for {symbol}, buffer size now={len(self.raw_trades[symbol])}")
-
             return event
-            
-        except Exception as e:
+
+        except Exception:
             self.counters['errors'] += 1
             return None
+
+    def _validate_trade_side(
+        self,
+        symbol: str,
+        trade_price: float,
+        derived_side: str
+    ) -> tuple:
+        """
+        P2: Validate trade side derivation against order book.
+
+        Cross-references trade price with book delta:
+        - Trade at/above best ask = BUY (taker buying from asks)
+        - Trade at/below best bid = SELL (taker selling into bids)
+
+        Args:
+            symbol: Trading symbol
+            trade_price: Trade execution price
+            derived_side: Side derived from is_buyer_maker flag
+
+        Returns:
+            (validated_side, validation_status):
+                - validated_side: Confirmed side or None if unvalidated
+                - validation_status: "VALIDATED", "MISMATCH", "UNVALIDATED"
+        """
+        depth = self.latest_depth.get(symbol)
+
+        if not depth:
+            self.counters['side_unvalidated'] += 1
+            return (None, "UNVALIDATED")
+
+        best_bid = depth.get('best_bid_price')
+        best_ask = depth.get('best_ask_price')
+
+        if best_bid is None or best_ask is None:
+            self.counters['side_unvalidated'] += 1
+            return (None, "UNVALIDATED")
+
+        # Determine side from book position
+        if trade_price >= best_ask:
+            book_side = "BUY"  # Trade at/above ask = taker buying
+        elif trade_price <= best_bid:
+            book_side = "SELL"  # Trade at/below bid = taker selling
+        else:
+            # Trade between spread - use derived side
+            self.counters['side_validated'] += 1
+            return (derived_side, "VALIDATED")
+
+        # Compare with derived side
+        if book_side == derived_side:
+            self.counters['side_validated'] += 1
+            return (derived_side, "VALIDATED")
+        else:
+            # Mismatch - trust the book delta over is_buyer_maker
+            self.counters['side_mismatch'] += 1
+            return (book_side, "MISMATCH")
 
     def normalize_liquidation(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
         """
@@ -217,6 +284,30 @@ class M1IngestionEngine:
         return {
             'trades': {s: list(d) for s, d in self.raw_trades.items()},
             'liquidations': {s: list(d) for s, d in self.raw_liquidations.items()}
+        }
+
+    def get_side_validation_stats(self) -> Dict:
+        """
+        P2: Get trade side validation statistics.
+
+        Returns:
+            Dict with validation metrics:
+            - validated: Trades where side was confirmed by book delta
+            - mismatch: Trades where book delta contradicted is_buyer_maker
+            - unvalidated: Trades without book data for validation
+            - mismatch_rate: Percentage of validated trades with mismatch
+        """
+        validated = self.counters['side_validated']
+        mismatch = self.counters['side_mismatch']
+        unvalidated = self.counters['side_unvalidated']
+        total_checked = validated + mismatch
+
+        return {
+            'validated': validated,
+            'mismatch': mismatch,
+            'unvalidated': unvalidated,
+            'total_checked': total_checked,
+            'mismatch_rate': (mismatch / total_checked * 100) if total_checked > 0 else 0.0
         }
 
     # =========================================================================

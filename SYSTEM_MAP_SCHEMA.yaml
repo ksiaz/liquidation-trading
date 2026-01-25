@@ -252,11 +252,17 @@ subsystems:
       - "runtime/exchange/order_executor.py"
       - "runtime/exchange/trailing_stop_manager.py"
       - "runtime/exchange/fill_tracker.py"
+      - "runtime/exchange/asset_metadata.py"
+      - "runtime/exchange/mark_price_service.py"
+      - "runtime/exchange/slippage_tracker.py"
+      - "execution/hyperliquid_adapter.py"
     frozen: false
     allowed_inputs:
       - order_intent
       - price_updates
       - fill_events
+      - exchange_metadata
+      - mark_prices
     forbidden_knowledge:
       - observation_interpretation
       - strategy_logic
@@ -264,6 +270,8 @@ subsystems:
       - order_submission
       - stop_management
       - fill_tracking
+      - asset_metadata_lookup
+      - mark_price_freshness
 
 # ============================================================================
 # DEPENDENCIES — Allowed Information Flow

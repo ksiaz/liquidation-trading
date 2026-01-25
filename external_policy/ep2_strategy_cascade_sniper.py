@@ -33,6 +33,10 @@ from runtime.validation.entry_quality import (
     EntryQuality,
     EntryMode as EQEntryMode  # Alias to avoid conflict with local EntryMode
 )
+from memory.m4_absorption_confirmation import (
+    TrendRegimeContext,
+    TrendDirection,
+)
 
 if TYPE_CHECKING:
     from observation.types import M4PrimitiveBundle
@@ -552,6 +556,57 @@ def record_liquidation_event(
     scorer.record_liquidation(symbol, side, value, timestamp)
 
 
+# Trend strength threshold for blocking reversal entries
+TREND_STRENGTH_BLOCK_THRESHOLD = 0.7
+
+
+def _is_reversal_blocked_by_trend(
+    entry_direction: str,
+    trend: TrendRegimeContext
+) -> bool:
+    """
+    Check if reversal entry should be BLOCKED by trend context.
+
+    BLOCKS reversal when:
+    1. LONG reversal during STRONG_DOWN with aligned delta (distribution phase)
+    2. SHORT reversal during STRONG_UP with aligned delta (accumulation phase)
+    3. High trend strength (>70%) with entry fading the trend
+
+    Reversal entries during strong directional moves are dangerous because:
+    - Absorption during strong trend = reload/pause, not exhaustion
+    - Delta alignment = dominant side is actively distributing/accumulating
+    - High trend strength = clear directional move, likely to continue
+
+    Args:
+        entry_direction: "LONG" or "SHORT"
+        trend: Trend regime context
+
+    Returns:
+        True if entry should be blocked, False if allowed
+    """
+    # LONG reversal blocked during strong downtrend
+    if entry_direction == "LONG":
+        if trend.direction == TrendDirection.STRONG_DOWN:
+            # Delta aligned = sellers are in control (distribution)
+            if trend.delta_direction_aligned:
+                return True
+            # High trend strength = clear downtrend, dangerous to fade
+            if trend.trend_strength >= TREND_STRENGTH_BLOCK_THRESHOLD:
+                return True
+
+    # SHORT reversal blocked during strong uptrend
+    if entry_direction == "SHORT":
+        if trend.direction == TrendDirection.STRONG_UP:
+            # Delta aligned = buyers are in control (accumulation)
+            if trend.delta_direction_aligned:
+                return True
+            # High trend strength = clear uptrend, dangerous to fade
+            if trend.trend_strength >= TREND_STRENGTH_BLOCK_THRESHOLD:
+                return True
+
+    return False
+
+
 def generate_cascade_sniper_proposal(
     *,
     permission: PermissionOutput,
@@ -560,26 +615,35 @@ def generate_cascade_sniper_proposal(
     context: StrategyContext,
     position_state: Optional[PositionState] = None,
     entry_mode: EntryMode = EntryMode.ABSORPTION_REVERSAL,
-    absorption: Optional[AbsorptionAnalysis] = None
+    absorption: Optional[AbsorptionAnalysis] = None,
+    trend_context: Optional[TrendRegimeContext] = None
 ) -> Optional[StrategyProposal]:
     """
-    Generate cascade sniper entry proposal.
+    Generate cascade sniper entry proposal WITH TREND KILL-SWITCH.
 
     Strategy:
     1. Monitor Hyperliquid proximity for position clusters
-    2. When cluster detected (PRIMED), wait for liquidation trigger
-    3. On ABSORPTION, enter reversal opposite to cascade direction
-    4. Apply absorption filter based on orderbook depth vs liquidation volume
+    2. CHECK TREND KILL-SWITCH (blocks dangerous entries)
+    3. When cluster detected (PRIMED), wait for liquidation trigger
+    4. On ABSORPTION, enter reversal opposite to cascade direction
+    5. Apply absorption filter based on orderbook depth vs liquidation volume
+    6. Apply entry quality filter with trend context
+
+    TREND KILL-SWITCH:
+    - ABSORPTION_REVERSAL entries are BLOCKED when fading strong trends
+    - CASCADE_MOMENTUM entries are allowed during strong trends (aligned)
 
     For ABSORPTION_REVERSAL mode:
     - If longs were liquidated (cascade DOWN), enter LONG (reversal UP)
     - If shorts were liquidated (cascade UP), enter SHORT (reversal DOWN)
     - REQUIRES: absorption_ratio > threshold (book absorbed cascade)
+    - BLOCKED: if trend is STRONG_DOWN with aligned delta (distribution)
 
     For CASCADE_MOMENTUM mode:
     - If longs being liquidated, enter SHORT (ride cascade)
     - If shorts being liquidated, enter LONG (ride cascade)
     - REQUIRES: absorption_ratio < threshold (thin book, cascade continues)
+    - ALLOWED: during strong trends (momentum aligned)
 
     Args:
         permission: M6 permission result
@@ -589,6 +653,7 @@ def generate_cascade_sniper_proposal(
         position_state: Current position state
         entry_mode: Entry timing mode
         absorption: Order book absorption analysis
+        trend_context: Optional trend regime context for kill-switch
 
     Returns:
         StrategyProposal if conditions warrant entry, None otherwise
@@ -641,23 +706,32 @@ def generate_cascade_sniper_proposal(
                 # If SHORTS were liquidated (cascade UP) -> enter SHORT
                 entry_direction = dominant_side  # Same as liquidated side = reversal
 
+                # Rule 3a-TREND: TREND KILL-SWITCH for reversal entries
+                # Reversal entries are DANGEROUS during strong trends
+                if trend_context is not None:
+                    if _is_reversal_blocked_by_trend(entry_direction, trend_context):
+                        print(f"[TREND KILL-SWITCH] {symbol}: {entry_direction} reversal blocked - {trend_context.direction.name}")
+                        return None
+
                 # Rule 3b: Check entry quality based on liquidation exhaustion
                 # This uses the data-driven scoring from analysis of 759 trades
+                # Pass trend context for additional filtering
                 if _config and _config.use_entry_quality_filter:
                     should_enter, eq_score = eq_scorer.get_entry_recommendation(
                         symbol=symbol,
                         intended_side=entry_direction,
                         min_quality=_config.min_entry_quality,
-                        require_large_liq=_config.require_large_liquidations
+                        require_large_liq=_config.require_large_liquidations,
+                        trend_context=trend_context
                     )
 
                     if not should_enter:
-                        # Entry quality too low - skip
+                        # Entry quality too low or trend blocked - skip
                         print(f"[EQ FILTER] {symbol}: {entry_direction} blocked - {eq_score.reason}")
                         return None
                 else:
-                    # No filter, get score for logging only
-                    eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp)
+                    # No filter, get score for logging only (with trend context)
+                    eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
 
                 # Include absorption ratio and entry quality in justification
                 absorption_data = sm.get_absorption_data(symbol)
@@ -695,13 +769,20 @@ def generate_cascade_sniper_proposal(
                 # If SHORTS being liquidated -> cascade UP -> enter LONG
                 entry_direction = "SHORT" if dominant_side == "LONG" else "LONG"
 
+                # Note: NO trend kill-switch for momentum mode
+                # Momentum entries are ALIGNED with strong trends, so trend context
+                # actually helps (provides bonus via entry quality scorer)
+                # The entry quality scorer will apply trend bonus for aligned entries
+
                 # Rule 3b: Check entry quality based on liquidation exhaustion
+                # Pass trend context for bonus calculation (momentum = trend-aligned)
                 if _config and _config.use_entry_quality_filter:
                     should_enter, eq_score = eq_scorer.get_entry_recommendation(
                         symbol=symbol,
                         intended_side=entry_direction,
                         min_quality=_config.min_entry_quality,
-                        require_large_liq=_config.require_large_liquidations
+                        require_large_liq=_config.require_large_liquidations,
+                        trend_context=trend_context
                     )
 
                     if not should_enter:
@@ -709,8 +790,8 @@ def generate_cascade_sniper_proposal(
                         print(f"[EQ FILTER] {symbol}: {entry_direction} blocked - {eq_score.reason}")
                         return None
                 else:
-                    # No filter, get score for logging only
-                    eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp)
+                    # No filter, get score for logging only (with trend context)
+                    eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
 
                 # Include absorption ratio and entry quality in justification
                 absorption_data = sm.get_absorption_data(symbol)
@@ -804,13 +885,18 @@ def generate_cascade_sniper_proposal_from_primitives(
     primitives: 'M4PrimitiveBundle',
     context: StrategyContext,
     position_state: Optional[PositionState] = None,
-    entry_mode: EntryMode = EntryMode.ABSORPTION_REVERSAL
+    entry_mode: EntryMode = EntryMode.ABSORPTION_REVERSAL,
+    trend_context: Optional[TrendRegimeContext] = None
 ) -> Optional[StrategyProposal]:
     """
-    Generate cascade sniper proposal from M4PrimitiveBundle.
+    Generate cascade sniper proposal from M4PrimitiveBundle WITH TREND KILL-SWITCH.
 
     This is the constitutional flow - data comes from M4 primitives via M5,
     not directly injected from HyperliquidCollector.
+
+    TREND KILL-SWITCH:
+    - Reversal entries are blocked during strong directional moves
+    - Momentum entries benefit from trend alignment (bonus applied)
 
     Args:
         permission: M6 permission result
@@ -818,6 +904,7 @@ def generate_cascade_sniper_proposal_from_primitives(
         context: Strategy execution context
         position_state: Current position state
         entry_mode: Entry timing mode
+        trend_context: Optional trend regime context for kill-switch
 
     Returns:
         StrategyProposal if conditions warrant entry, None otherwise
@@ -861,12 +948,13 @@ def generate_cascade_sniper_proposal_from_primitives(
             window_end=cascade_state.timestamp
         )
 
-    # Delegate to existing function
+    # Delegate to existing function with trend context
     return generate_cascade_sniper_proposal(
         permission=permission,
         proximity=proximity,
         liquidations=liquidations,
         context=context,
         position_state=position_state,
-        entry_mode=entry_mode
+        entry_mode=entry_mode,
+        trend_context=trend_context
     )

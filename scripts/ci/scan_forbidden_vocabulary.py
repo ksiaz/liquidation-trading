@@ -106,6 +106,7 @@ WORD_EXEMPTIONS = {
         'hyperliquid/',  # Hyperliquid tracking
         'ep2_strategy_cascade_sniper',  # Strategy uses cascade momentum
         'regime/',  # Regime classifier documents momentum behavior
+        'm4_absorption_confirmation',  # Documentation of cascade sniper mode
     ],
     'regime': [
         'm4_absorption_confirmation',  # Technical term for market context (volatility/liquidity state)
@@ -124,6 +125,16 @@ WORD_EXEMPTIONS = {
         'logging/execution_db',  # Database schema
         'meta/',  # System regime detector
         'risk/',  # Capital management uses regime
+        'entry_quality',  # TrendRegimeContext parameter type
+        'ep2_strategy_cascade_sniper',  # TrendRegimeContext parameter type
+    ],
+    'trend': [
+        # TrendDirection/TrendRegimeContext - observable price structure, not prediction
+        'm4_absorption_confirmation',  # Trend primitive computation (price structure)
+        'observation/types',  # Re-exports TrendRegimeContext
+        'entry_quality',  # Kill-switch uses trend context
+        'ep2_strategy_cascade_sniper',  # Strategy uses trend for reversal blocking
+        'policy_adapter',  # Wires trend context to strategies
     ],
 }
 

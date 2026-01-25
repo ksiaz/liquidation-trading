@@ -57,6 +57,9 @@ from external_policy.ep2_strategy_cascade_sniper import (
 )
 from runtime.liquidations import LiquidationBurst
 
+# Directional context for kill-switch (via observation layer)
+from observation.types import TrendRegimeContext
+
 
 @dataclass(frozen=True)
 class AdapterConfig:
@@ -110,11 +113,16 @@ class PolicyAdapter:
         current_price: Optional[float] = None,  # Current price from collector
         hl_proximity: Optional[ProximityData] = None,  # Hyperliquid proximity data
         liquidation_burst: Optional[LiquidationBurst] = None,  # Recent Binance liquidations
-        absorption: Optional[AbsorptionAnalysis] = None  # Order book absorption analysis
+        absorption: Optional[AbsorptionAnalysis] = None,  # Order book absorption analysis
+        trend_context: Optional[TrendRegimeContext] = None  # Trend regime for kill-switch
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
         Pure wiring - no decisions made here.
+
+        TREND KILL-SWITCH:
+        When trend_context is provided, the cascade sniper strategy will use it
+        to block dangerous reversal entries during strong directional moves.
 
         Args:
             observation_snapshot: Current observation state
@@ -127,6 +135,7 @@ class PolicyAdapter:
             hl_proximity: Hyperliquid liquidation proximity data (Phase 6)
             liquidation_burst: Recent Binance liquidation burst (Phase 6)
             absorption: Order book absorption analysis (Phase 6)
+            trend_context: Trend regime context for kill-switch (blocks fading strong trends)
 
         Returns:
             List of Mandates (possibly empty)
@@ -282,7 +291,7 @@ class PolicyAdapter:
                 if proposal:
                     proposals.append(proposal)
 
-        # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
+        # Phase 6: Cascade Sniper strategy (Hyperliquid proximity) with TREND KILL-SWITCH
         if self.config.enable_cascade_sniper and (hl_proximity is not None or liquidation_burst is not None):
             # Determine entry mode from config
             entry_mode = CascadeSniperEntryMode.ABSORPTION_REVERSAL
@@ -296,7 +305,8 @@ class PolicyAdapter:
                 context=context,
                 position_state=position_state,
                 entry_mode=entry_mode,
-                absorption=absorption  # Pass orderbook absorption analysis
+                absorption=absorption,  # Pass orderbook absorption analysis
+                trend_context=trend_context  # Pass trend context for kill-switch
             )
             if proposal:
                 proposals.append(proposal)

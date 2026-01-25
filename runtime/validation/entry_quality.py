@@ -35,12 +35,25 @@ from typing import List, Optional, Tuple
 from collections import deque
 import time
 
+# Import directional context for kill-switch (via observation layer)
+from observation.types import (
+    TrendRegimeContext,
+    TrendDirection,
+)
+
 
 class EntryQuality(Enum):
-    """Entry quality classification."""
-    HIGH = "HIGH"           # Score > 0.5, ~58%+ win rate
-    NEUTRAL = "NEUTRAL"     # Score = 0, ~41% win rate
+    """Entry quality classification.
+
+    SKIP: Trend kill-switch activated - entry blocked by trend context
+    AVOID: Against exhaustion pattern - entry allowed but discouraged
+    NEUTRAL: Mixed signal - entry allowed
+    HIGH: Strong exhaustion reversal setup - entry recommended
+    """
+    SKIP = "SKIP"           # BLOCKED: Trend kill-switch (do not enter)
     AVOID = "AVOID"         # Score < 0, ~10% win rate
+    NEUTRAL = "NEUTRAL"     # Score = 0, ~41% win rate
+    HIGH = "HIGH"           # Score > 0.5, ~58%+ win rate
 
 
 class LiquidationSide(Enum):
@@ -84,19 +97,34 @@ class EntryScore:
     largest_liq_value: float # Largest single liquidation in window
     total_liq_activity: float
 
+    # Trend context (for kill-switch)
+    trend_direction: Optional[TrendDirection] = None
+    trend_blocked: bool = False  # True if trend kill-switch activated
+    trend_bonus: float = 0.0     # Bonus for trend-aligned entries
+
     # Recommendations
-    should_enter: bool
-    suggested_side: str      # "LONG" or "SHORT" based on analysis
-    reason: str
+    should_enter: bool = False
+    suggested_side: str = ""     # "LONG" or "SHORT" based on analysis
+    reason: str = ""
 
 
 class EntryQualityScorer:
-    """Score entry quality based on liquidation context.
+    """Score entry quality based on liquidation context WITH TREND KILL-SWITCH.
 
     KEY INSIGHT - EXHAUSTION REVERSAL:
     Large liquidations mark exhaustion points. The best entry is:
     - LONG after large LONG liquidation (SELL) - exhausted dump, reversal UP
     - SHORT after large SHORT liquidation (BUY) - exhausted squeeze, reversal DOWN
+
+    TREND KILL-SWITCH (hardening):
+    Entries are BLOCKED when trend context is dangerous:
+    - Fading strong directional moves (STRONG_DOWN with aligned delta)
+    - Reversal entries against high-strength trends
+
+    TREND BONUS (enhancement):
+    Entries aligned with trend get a score bonus:
+    - LONG in weak uptrend = aligned, bonus applied
+    - SHORT in weak downtrend = aligned, bonus applied
 
     Size thresholds (data-driven):
     - Small (<$10k): Noise, ignore
@@ -106,8 +134,10 @@ class EntryQualityScorer:
     Architecture:
     1. Track recent liquidation events per symbol
     2. Focus on large liquidations only
-    3. Score exhaustion reversal setup
-    4. Suggest entry direction based on recent liquidation side
+    3. Check trend kill-switch FIRST (blocks entry before scoring)
+    4. Score exhaustion reversal setup
+    5. Apply trend bonus for aligned entries
+    6. Suggest entry direction based on analysis
     """
 
     # Window parameters
@@ -124,6 +154,10 @@ class EntryQualityScorer:
     # Score thresholds
     HIGH_QUALITY_THRESHOLD = 0.5
     AVOID_THRESHOLD = -0.3
+
+    # Trend kill-switch thresholds
+    TREND_STRENGTH_BLOCK_THRESHOLD = 0.7   # Block entry if trend strength > 70%
+    TREND_ALIGNED_BONUS = 0.3              # Bonus for trend-aligned entries
 
     def __init__(self, max_history: int = 1000):
         # Recent liquidation events per symbol
@@ -160,18 +194,28 @@ class EntryQualityScorer:
         self,
         symbol: str,
         intended_side: Optional[str] = None,  # "LONG" or "SHORT", None for auto-suggest
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        trend_context: Optional[TrendRegimeContext] = None
     ) -> EntryScore:
-        """Score an entry opportunity based on liquidation context.
+        """Score an entry opportunity based on liquidation context WITH TREND KILL-SWITCH.
 
         EXHAUSTION REVERSAL PATTERN:
         - After large LONG liq (SELL): Price was falling, now exhausted → LONG
         - After large SHORT liq (BUY): Price was rising, now exhausted → SHORT
 
+        TREND KILL-SWITCH:
+        Entry is BLOCKED (returns SKIP) when:
+        - Strong downtrend with aligned delta (distribution, not exhaustion)
+        - Fading strong directional moves
+
+        TREND BONUS:
+        Entries aligned with trend get a score bonus.
+
         Args:
             symbol: Trading symbol
             intended_side: Direction of intended entry (optional, will suggest if None)
             timestamp: Entry time (defaults to now)
+            trend_context: Optional trend regime context for kill-switch
 
         Returns:
             EntryScore with quality classification and suggested direction
@@ -214,6 +258,43 @@ class EntryQualityScorer:
         # Use provided side or suggested
         entry_side = intended_side or suggested_side
 
+        # =====================================================================
+        # TREND KILL-SWITCH CHECK (before any scoring)
+        # =====================================================================
+        trend_direction = None
+        trend_blocked = False
+        trend_bonus = 0.0
+
+        if trend_context is not None:
+            trend_direction = trend_context.direction
+
+            # KILL-SWITCH: Block entries that fade strong trends
+            if self._is_entry_blocked_by_trend(entry_side, trend_context):
+                trend_blocked = True
+
+                return EntryScore(
+                    symbol=symbol,
+                    score=0.0,
+                    quality=EntryQuality.SKIP,
+                    mode=mode,
+                    exhaustion_score=0.0,
+                    momentum_score=0.0,
+                    size_multiplier=0.0,
+                    buy_liqs_before=buy_liqs,
+                    sell_liqs_before=sell_liqs,
+                    largest_liq_value=largest_liq_value,
+                    total_liq_activity=total_activity,
+                    trend_direction=trend_direction,
+                    trend_blocked=True,
+                    trend_bonus=0.0,
+                    should_enter=False,
+                    suggested_side=suggested_side,
+                    reason=self._get_trend_block_reason(entry_side, trend_context)
+                )
+
+            # TREND BONUS: Apply bonus for trend-aligned entries
+            trend_bonus = self._compute_trend_bonus(entry_side, trend_context)
+
         # Calculate exhaustion score (how well setup matches reversal pattern)
         if entry_side == "LONG":
             # LONG benefits from SELL liquidations (exhausted dump)
@@ -233,9 +314,9 @@ class EntryQualityScorer:
         elif significant_liqs:
             size_multiplier = 1.2  # Moderate boost for significant
 
-        # Calculate final score
+        # Calculate final score (including trend bonus)
         base_score = exhaustion_score + momentum_score
-        score = base_score * size_multiplier
+        score = (base_score * size_multiplier) + trend_bonus
 
         # Cap score
         score = max(-3.0, min(3.0, score))
@@ -248,6 +329,8 @@ class EntryQualityScorer:
                 reason = f"Exhaustion reversal: ${sell_liqs:,.0f} longs liquidated, expect bounce"
             else:
                 reason = f"Exhaustion reversal: ${buy_liqs:,.0f} shorts liquidated, expect pullback"
+            if trend_bonus > 0:
+                reason += f" (trend-aligned bonus: +{trend_bonus:.2f})"
         elif score < self.AVOID_THRESHOLD:
             quality = EntryQuality.AVOID
             should_enter = False
@@ -272,36 +355,132 @@ class EntryQualityScorer:
             sell_liqs_before=sell_liqs,
             largest_liq_value=largest_liq_value,
             total_liq_activity=total_activity,
+            trend_direction=trend_direction,
+            trend_blocked=trend_blocked,
+            trend_bonus=trend_bonus,
             should_enter=should_enter,
             suggested_side=suggested_side,
             reason=reason
         )
+
+    def _is_entry_blocked_by_trend(
+        self,
+        entry_side: str,
+        trend: TrendRegimeContext
+    ) -> bool:
+        """
+        Check if entry should be BLOCKED by trend context.
+
+        BLOCKS entry when:
+        1. LONG entry during STRONG_DOWN with aligned delta (distribution)
+        2. SHORT entry during STRONG_UP with aligned delta (accumulation)
+        3. High trend strength (>70%) with fading direction
+
+        Absorption during strong trend = reload/pause, not reversal.
+        """
+        # Strong downtrend blocks LONG entries (fading the trend)
+        if trend.direction == TrendDirection.STRONG_DOWN:
+            if entry_side == "LONG":
+                # Delta aligned = distribution continues, not exhaustion
+                if trend.delta_direction_aligned:
+                    return True
+                # High trend strength = strong move, dangerous to fade
+                if trend.trend_strength >= self.TREND_STRENGTH_BLOCK_THRESHOLD:
+                    return True
+
+        # Strong uptrend blocks SHORT entries (fading the trend)
+        if trend.direction == TrendDirection.STRONG_UP:
+            if entry_side == "SHORT":
+                # Delta aligned = accumulation continues
+                if trend.delta_direction_aligned:
+                    return True
+                # High trend strength = dangerous to fade
+                if trend.trend_strength >= self.TREND_STRENGTH_BLOCK_THRESHOLD:
+                    return True
+
+        return False
+
+    def _get_trend_block_reason(
+        self,
+        entry_side: str,
+        trend: TrendRegimeContext
+    ) -> str:
+        """Get reason string for trend-blocked entry."""
+        direction_str = trend.direction.name.replace("_", " ").lower()
+
+        if entry_side == "LONG":
+            if trend.delta_direction_aligned:
+                return f"BLOCKED: LONG entry during {direction_str} with aligned selling (distribution phase)"
+            else:
+                return f"BLOCKED: LONG entry fading {direction_str} (trend strength {trend.trend_strength:.0%})"
+        else:
+            if trend.delta_direction_aligned:
+                return f"BLOCKED: SHORT entry during {direction_str} with aligned buying (accumulation phase)"
+            else:
+                return f"BLOCKED: SHORT entry fading {direction_str} (trend strength {trend.trend_strength:.0%})"
+
+    def _compute_trend_bonus(
+        self,
+        entry_side: str,
+        trend: TrendRegimeContext
+    ) -> float:
+        """
+        Compute trend bonus for trend-aligned entries.
+
+        BONUS applied when:
+        - LONG in weak/neutral uptrend
+        - SHORT in weak/neutral downtrend
+        - Entry aligns with overall direction
+        """
+        # No bonus in neutral trend
+        if trend.direction == TrendDirection.NEUTRAL:
+            return 0.0
+
+        # LONG aligned with uptrend
+        if entry_side == "LONG":
+            if trend.direction in (TrendDirection.WEAK_UP, TrendDirection.STRONG_UP):
+                return self.TREND_ALIGNED_BONUS * trend.trend_strength
+
+        # SHORT aligned with downtrend
+        if entry_side == "SHORT":
+            if trend.direction in (TrendDirection.WEAK_DOWN, TrendDirection.STRONG_DOWN):
+                return self.TREND_ALIGNED_BONUS * trend.trend_strength
+
+        # Slight penalty for counter-trend entries (but not blocked)
+        return -self.TREND_ALIGNED_BONUS * 0.3
 
     def get_entry_recommendation(
         self,
         symbol: str,
         intended_side: Optional[str] = None,
         min_quality: EntryQuality = EntryQuality.NEUTRAL,
-        require_large_liq: bool = False
+        require_large_liq: bool = False,
+        trend_context: Optional[TrendRegimeContext] = None
     ) -> Tuple[bool, EntryScore]:
-        """Get entry recommendation with quality filter.
+        """Get entry recommendation with quality filter and trend kill-switch.
 
         Args:
             symbol: Trading symbol
             intended_side: "LONG" or "SHORT" (optional, will auto-suggest)
             min_quality: Minimum acceptable quality (default: NEUTRAL)
             require_large_liq: If True, only recommend entry if there's large liq activity
+            trend_context: Optional trend regime context for kill-switch
 
         Returns:
             (should_enter, score) tuple
         """
-        score = self.score_entry(symbol, intended_side)
+        score = self.score_entry(symbol, intended_side, trend_context=trend_context)
+
+        # SKIP quality = trend blocked, always reject
+        if score.quality == EntryQuality.SKIP:
+            return (False, score)
 
         # Apply quality filter
         quality_order = {
-            EntryQuality.HIGH: 2,
-            EntryQuality.NEUTRAL: 1,
-            EntryQuality.AVOID: 0
+            EntryQuality.HIGH: 3,
+            EntryQuality.NEUTRAL: 2,
+            EntryQuality.AVOID: 1,
+            EntryQuality.SKIP: 0
         }
 
         meets_quality = quality_order[score.quality] >= quality_order[min_quality]

@@ -22,6 +22,12 @@ from memory.m4_cascade_state import CascadeStateObservation
 from memory.m4_leverage_concentration import LeverageConcentrationRatio
 from memory.m4_open_interest_bias import OpenInterestDirectionalBias
 
+# Tier B-6.1: Absorption confirmation primitives (directional context)
+from memory.m4_absorption_confirmation import (
+    TrendRegimeContext,
+    TrendDirection,
+)
+
 class SystemHaltedException(Exception):
     """Critical Failure: System Invariant Broken."""
     pass

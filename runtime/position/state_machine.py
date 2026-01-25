@@ -11,9 +11,12 @@ Enforces:
 """
 
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 
 from .types import Position, PositionState, Direction, InvariantViolation
+
+if TYPE_CHECKING:
+    from .repository import PositionRepository
 
 
 class Action(str):
@@ -26,13 +29,15 @@ class Action(str):
 
 class PositionStateMachine:
     """Manages position lifecycle for all symbols.
-    
+
     Invariants:
     - One position per symbol (dict uniqueness - Theorem 3.1)
     - Deterministic transitions (Theorem 2.1)
     - All paths lead to FLAT (Theorem 6.1)
+
+    Supports optional persistence via PositionRepository.
     """
-    
+
     # Allowed transitions (Theorem 2.1, Section 1.2)
     ALLOWED_TRANSITIONS = {
         (PositionState.FLAT, Action.ENTRY): PositionState.ENTERING,
@@ -44,10 +49,20 @@ class PositionStateMachine:
         (PositionState.REDUCING, "PARTIAL"): PositionState.OPEN,
         (PositionState.CLOSING, "SUCCESS"): PositionState.FLAT,
     }
-    
-    def __init__(self):
-        """Initialize state machine with no positions."""
+
+    def __init__(self, repository: Optional["PositionRepository"] = None):
+        """Initialize state machine.
+
+        Args:
+            repository: Optional persistence layer. If provided, positions
+                       are loaded on init and saved on every transition.
+        """
         self._positions: Dict[str, Position] = {}
+        self._repository = repository
+
+        # Load existing positions if repository provided
+        if self._repository:
+            self._positions = self._repository.load_non_flat_positions()
     
     def get_position(self, symbol: str) -> Position:
         """Get position for symbol (creates FLAT if not exists)."""
@@ -129,6 +144,11 @@ class PositionStateMachine:
             raise InvariantViolation(f"Unhandled transition: {transition_key}")
         
         self._positions[symbol] = new_position
+
+        # Persist if repository configured
+        if self._repository:
+            self._repository.save(new_position)
+
         return new_position
     
     def _handle_entry(self, symbol: str, next_state: PositionState, **kwargs) -> Position:

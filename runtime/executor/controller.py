@@ -16,15 +16,16 @@ from decimal import Decimal
 from runtime.arbitration.arbitrator import MandateArbitrator
 from runtime.arbitration.types import Mandate, Action, ActionType
 from runtime.position.state_machine import PositionStateMachine, Action as StateAction
+from runtime.position.repository import PositionRepository
 from runtime.position.types import PositionState, Direction, InvariantViolation
-from runtime.risk.monitor import RiskMonitor  # NEW
-from runtime.risk.types import RiskConfig, AccountState  # NEW
+from runtime.risk.monitor import RiskMonitor
+from runtime.risk.types import RiskConfig, AccountState
 from .types import ExecutionResult, CycleStats
 
 
 class ExecutionController:
     """Main execution controller orchestrating the flow.
-    
+
     Architecture:
     1. Receive mandates from strategies
     2. Check risk invariants → emit protective mandates
@@ -33,18 +34,35 @@ class ExecutionController:
     5. Validate action against state machine
     6. Execute action → update position state
     7. Log results
-    
+
     Properties:
     - Symbol-local execution (independent processing)
     - State machine invariants preserved
     - Arbitration properties enforced
     - Risk constraints enforced (fail closed)
     - Constitutional logging
+    - Optional position persistence across restarts
     """
-    
-    def __init__(self, risk_config: Optional[RiskConfig] = None):
-        """Initialize controller with state machine, arbitrator, and risk monitor."""
-        self.state_machine = PositionStateMachine()
+
+    def __init__(
+        self,
+        risk_config: Optional[RiskConfig] = None,
+        db_path: Optional[str] = None
+    ):
+        """Initialize controller with state machine, arbitrator, and risk monitor.
+
+        Args:
+            risk_config: Risk configuration (uses defaults if None)
+            db_path: Path to positions database for persistence.
+                    If None, positions are in-memory only (lost on restart).
+        """
+        # Initialize persistence if db_path provided
+        self._repository: Optional[PositionRepository] = None
+        if db_path:
+            self._repository = PositionRepository(db_path)
+
+        # Initialize state machine with optional persistence
+        self.state_machine = PositionStateMachine(repository=self._repository)
         self.arbitrator = MandateArbitrator()
         # Initialize risk monitor with default or provided config
         self.risk_monitor = RiskMonitor(risk_config or RiskConfig())

@@ -52,6 +52,34 @@ from .types import (
 )
 
 
+class StopOrderState(Enum):
+    """X1: Stop order lifecycle states."""
+    PENDING_PLACEMENT = "PENDING_PLACEMENT"  # Registered, waiting for entry fill
+    PLACED = "PLACED"                        # Successfully placed on exchange
+    TRIGGERED = "TRIGGERED"                  # Stop triggered, awaiting fill
+    FILLED = "FILLED"                        # Stop order filled
+    CANCELLED = "CANCELLED"                  # Stop cancelled (by user or system)
+    FAILED = "FAILED"                        # Failed to place after retries
+
+
+@dataclass
+class StopOrderStatus:
+    """X1: Complete stop order status for tracking."""
+    entry_order_id: str
+    stop_order_id: Optional[str]
+    state: StopOrderState
+    stop_price: float
+    symbol: str
+    side: str
+    size: float
+    placement_attempts: int = 0
+    last_error: Optional[str] = None
+    placed_at_ns: Optional[int] = None
+    triggered_at_ns: Optional[int] = None
+    filled_at_ns: Optional[int] = None
+    fill_price: Optional[float] = None
+
+
 @dataclass
 class ExecutorConfig:
     """Configuration for order executor."""
@@ -76,6 +104,11 @@ class ExecutorConfig:
     retry_base_delay_ms: int = 100      # Initial delay
     retry_max_delay_ms: int = 2000      # Cap delay at 2 seconds
     retry_backoff_factor: float = 2.0   # Exponential factor
+
+    # X2-A: Stop placement retry settings
+    stop_max_retries: int = 3           # Max stop placement attempts
+    stop_retry_base_delay_ms: int = 200 # Initial delay for stop retry
+    stop_retry_max_delay_ms: int = 2000 # Cap delay at 2 seconds
 
     # API settings
     api_url: str = "https://api.hyperliquid.xyz"
@@ -140,6 +173,18 @@ class OrderExecutor:
         # E4: Stop placement tracking
         self._pending_stop_placements: Dict[str, Dict] = {}  # order_id -> stop config
         self._placed_stops: Dict[str, str] = {}  # entry_order_id -> stop_order_id
+
+        # X1: Stop order lifecycle tracking
+        self._stop_order_status: Dict[str, StopOrderStatus] = {}  # entry_order_id -> status
+        self._stop_order_by_stop_id: Dict[str, str] = {}  # stop_order_id -> entry_order_id
+
+        # X2-B: Callback for stop placement failure (caller can emit BLOCK)
+        self._on_stop_failure: Optional[Callable[[str, str, str], None]] = None  # (entry_id, symbol, error)
+
+        # X1: Callback for stop lifecycle events
+        self._on_stop_triggered: Optional[Callable[[StopOrderStatus], None]] = None
+        self._on_stop_filled: Optional[Callable[[StopOrderStatus], None]] = None
+        self._on_stop_cancelled: Optional[Callable[[StopOrderStatus], None]] = None
 
         self._lock = RLock()
 
@@ -878,6 +923,26 @@ class OrderExecutor:
         """Set callback for order updates."""
         self._on_update = callback
 
+    def set_stop_failure_callback(self, callback: Callable[[str, str, str], None]):
+        """X2-B: Set callback for stop placement failure after all retries.
+
+        Callback receives: (entry_order_id, symbol, error_message)
+        Caller should use this to emit BLOCK mandate for unprotected position.
+        """
+        self._on_stop_failure = callback
+
+    def set_stop_triggered_callback(self, callback: Callable[[StopOrderStatus], None]):
+        """X1: Set callback for stop order triggered."""
+        self._on_stop_triggered = callback
+
+    def set_stop_filled_callback(self, callback: Callable[[StopOrderStatus], None]):
+        """X1: Set callback for stop order filled."""
+        self._on_stop_filled = callback
+
+    def set_stop_cancelled_callback(self, callback: Callable[[StopOrderStatus], None]):
+        """X1: Set callback for stop order cancelled."""
+        self._on_stop_cancelled = callback
+
     def register_stop_for_entry(
         self,
         entry_order_id: str,
@@ -903,7 +968,11 @@ class OrderExecutor:
 
     async def place_stop_for_fill(self, entry_order_id: str, fill: OrderFill) -> Optional[OrderResponse]:
         """
-        E4: Place stop loss after entry fill.
+        E4 + X2-A: Place stop loss after entry fill with retry logic.
+
+        X2-A: Retries with exponential backoff if placement fails.
+        X2-B: Calls stop_failure callback if all retries exhausted.
+        X1: Tracks stop order lifecycle status.
 
         Args:
             entry_order_id: Order ID of the filled entry
@@ -933,30 +1002,203 @@ class OrderExecutor:
             event_id=stop_config.get('event_id')
         )
 
+        # X1: Initialize stop order status
+        stop_status = StopOrderStatus(
+            entry_order_id=entry_order_id,
+            stop_order_id=None,
+            state=StopOrderState.PENDING_PLACEMENT,
+            stop_price=stop_config['stop_price'],
+            symbol=stop_config['symbol'],
+            side=stop_config.get('side', 'SELL'),
+            size=stop_config.get('size', fill.size),
+            placement_attempts=0
+        )
+
+        with self._lock:
+            self._stop_order_status[entry_order_id] = stop_status
+
         self._logger.info(
             f"E4: Placing stop for filled entry {entry_order_id}: "
             f"{stop_request.symbol} {stop_request.side.value} @ {stop_request.stop_price}"
         )
 
-        response = await self.submit_order(stop_request)
+        # X2-A: Retry loop with exponential backoff
+        last_error = None
+        for attempt in range(self._config.stop_max_retries):
+            stop_status.placement_attempts = attempt + 1
 
-        if response.success:
-            with self._lock:
-                self._placed_stops[entry_order_id] = response.order_id
-            self._logger.info(
-                f"E4: Stop placed successfully: {response.order_id}"
-            )
-        else:
-            self._logger.error(
-                f"E4: Failed to place stop for {entry_order_id}: {response.error_message}"
+            response = await self.submit_order(stop_request)
+
+            if response.success:
+                # X1: Update status to PLACED
+                with self._lock:
+                    stop_status.stop_order_id = response.order_id
+                    stop_status.state = StopOrderState.PLACED
+                    stop_status.placed_at_ns = self._now_ns()
+                    self._placed_stops[entry_order_id] = response.order_id
+                    self._stop_order_by_stop_id[response.order_id] = entry_order_id
+                    self._stop_order_status[entry_order_id] = stop_status
+
+                self._logger.info(
+                    f"E4: Stop placed successfully: {response.order_id} (attempt {attempt + 1})"
+                )
+                return response
+
+            # X2-A: Placement failed, prepare for retry
+            last_error = response.error_message
+            self._logger.warning(
+                f"X2-A: Stop placement failed (attempt {attempt + 1}/{self._config.stop_max_retries}): "
+                f"{last_error}"
             )
 
-        return response
+            # X2-A: Exponential backoff before retry (except on last attempt)
+            if attempt < self._config.stop_max_retries - 1:
+                delay_ms = self._config.stop_retry_base_delay_ms * (
+                    self._config.retry_backoff_factor ** attempt
+                )
+                delay_ms = min(delay_ms, self._config.stop_retry_max_delay_ms)
+                await asyncio.sleep(delay_ms / 1000.0)
+
+        # X2-B: All retries exhausted - mark as FAILED and notify
+        with self._lock:
+            stop_status.state = StopOrderState.FAILED
+            stop_status.last_error = last_error
+            self._stop_order_status[entry_order_id] = stop_status
+
+        self._logger.error(
+            f"X2-B: CRITICAL - Stop placement FAILED after {self._config.stop_max_retries} attempts "
+            f"for entry {entry_order_id}: {last_error}"
+        )
+
+        # X2-B: Notify caller of failure (they should emit BLOCK)
+        if self._on_stop_failure:
+            self._on_stop_failure(entry_order_id, stop_config['symbol'], last_error or "Unknown error")
+
+        return OrderResponse(
+            success=False,
+            client_order_id=stop_request.client_order_id,
+            status=OrderStatus.FAILED,
+            error_message=f"Stop placement failed after {self._config.stop_max_retries} retries: {last_error}"
+        )
 
     def get_stop_order_id(self, entry_order_id: str) -> Optional[str]:
         """E4: Get stop order ID for an entry order."""
         with self._lock:
             return self._placed_stops.get(entry_order_id)
+
+    def get_stop_order_status(self, entry_order_id: str) -> Optional[StopOrderStatus]:
+        """X1: Get complete stop order status for an entry."""
+        with self._lock:
+            return self._stop_order_status.get(entry_order_id)
+
+    def handle_stop_triggered(self, stop_order_id: str):
+        """X1: Handle stop order triggered event from exchange.
+
+        Called when stop price is hit and order becomes active.
+
+        Args:
+            stop_order_id: The stop order ID that was triggered
+        """
+        with self._lock:
+            entry_order_id = self._stop_order_by_stop_id.get(stop_order_id)
+            if not entry_order_id:
+                self._logger.warning(f"X1: Triggered stop {stop_order_id} not tracked")
+                return
+
+            status = self._stop_order_status.get(entry_order_id)
+            if not status:
+                return
+
+            status.state = StopOrderState.TRIGGERED
+            status.triggered_at_ns = self._now_ns()
+            self._stop_order_status[entry_order_id] = status
+
+        self._logger.info(f"X1: Stop triggered for entry {entry_order_id}: {stop_order_id}")
+
+        if self._on_stop_triggered:
+            self._on_stop_triggered(status)
+
+    def handle_stop_filled(self, stop_order_id: str, fill_price: float):
+        """X1: Handle stop order filled event from exchange.
+
+        Args:
+            stop_order_id: The stop order ID that was filled
+            fill_price: The fill price
+        """
+        with self._lock:
+            entry_order_id = self._stop_order_by_stop_id.get(stop_order_id)
+            if not entry_order_id:
+                self._logger.warning(f"X1: Filled stop {stop_order_id} not tracked")
+                return
+
+            status = self._stop_order_status.get(entry_order_id)
+            if not status:
+                return
+
+            status.state = StopOrderState.FILLED
+            status.filled_at_ns = self._now_ns()
+            status.fill_price = fill_price
+            self._stop_order_status[entry_order_id] = status
+
+            # Clean up tracking
+            self._placed_stops.pop(entry_order_id, None)
+
+        self._logger.info(
+            f"X1: Stop filled for entry {entry_order_id}: {stop_order_id} @ {fill_price}"
+        )
+
+        if self._on_stop_filled:
+            self._on_stop_filled(status)
+
+    def handle_stop_cancelled(self, stop_order_id: str, reason: str = ""):
+        """X1: Handle stop order cancelled event from exchange.
+
+        CRITICAL: Position is now unprotected!
+
+        Args:
+            stop_order_id: The stop order ID that was cancelled
+            reason: Cancellation reason
+        """
+        with self._lock:
+            entry_order_id = self._stop_order_by_stop_id.get(stop_order_id)
+            if not entry_order_id:
+                self._logger.warning(f"X1: Cancelled stop {stop_order_id} not tracked")
+                return
+
+            status = self._stop_order_status.get(entry_order_id)
+            if not status:
+                return
+
+            status.state = StopOrderState.CANCELLED
+            status.last_error = reason or "Cancelled"
+            self._stop_order_status[entry_order_id] = status
+
+            # Clean up tracking
+            self._placed_stops.pop(entry_order_id, None)
+
+        self._logger.error(
+            f"X1: CRITICAL - Stop CANCELLED for entry {entry_order_id}: {stop_order_id} "
+            f"(reason: {reason}) - POSITION UNPROTECTED"
+        )
+
+        if self._on_stop_cancelled:
+            self._on_stop_cancelled(status)
+
+        # X2-B: Also notify failure callback since position is unprotected
+        if self._on_stop_failure:
+            self._on_stop_failure(entry_order_id, status.symbol, f"Stop cancelled: {reason}")
+
+    def get_unprotected_entries(self) -> List[str]:
+        """X1: Get list of entry orders without active stop protection.
+
+        Returns entries where stop is FAILED or CANCELLED.
+        """
+        unprotected = []
+        with self._lock:
+            for entry_id, status in self._stop_order_status.items():
+                if status.state in (StopOrderState.FAILED, StopOrderState.CANCELLED):
+                    unprotected.append(entry_id)
+        return unprotected
 
     def _log_execution(
         self,

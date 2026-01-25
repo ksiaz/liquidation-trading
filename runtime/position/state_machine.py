@@ -4,19 +4,38 @@ Implements deterministic position lifecycle per POSITION_STATE_MACHINE_PROOFS.md
 
 Enforces:
 - 13 proven theorems
-- 8 allowed transitions
+- 8 allowed transitions (+ X3-A emergency exit)
 - 17 forbidden transitions (rejected)
 - Single-position invariant
 - Direction preservation
+- X6-A: CLOSING state timeout
+
+Hardenings:
+- X3-A: Emergency exit from ENTERING/REDUCING states
+- X6-A: CLOSING state timeout tracking
 """
 
+import time
 from decimal import Decimal
 from typing import Dict, Optional, TYPE_CHECKING
+from dataclasses import dataclass
 
 from .types import Position, PositionState, Direction, InvariantViolation
 
 if TYPE_CHECKING:
     from .repository import PositionRepository
+
+
+# X6-A: Default CLOSING state timeout (30 seconds)
+DEFAULT_CLOSING_TIMEOUT_SEC = 30.0
+
+
+@dataclass
+class ClosingStateTracker:
+    """X6-A: Tracks CLOSING state entry time for timeout detection."""
+    symbol: str
+    entered_closing_at: float  # timestamp when entered CLOSING
+    timeout_sec: float = DEFAULT_CLOSING_TIMEOUT_SEC
 
 
 class Action(str):
@@ -25,6 +44,7 @@ class Action(str):
     EXIT = "EXIT"
     REDUCE = "REDUCE"
     HOLD = "HOLD"
+    EMERGENCY_EXIT = "EMERGENCY_EXIT"  # X3-A: Emergency exit from any state
 
 
 class PositionStateMachine:
@@ -39,6 +59,7 @@ class PositionStateMachine:
     """
 
     # Allowed transitions (Theorem 2.1, Section 1.2)
+    # X3-A: Added EMERGENCY_EXIT from ENTERING and REDUCING states
     ALLOWED_TRANSITIONS = {
         (PositionState.FLAT, Action.ENTRY): PositionState.ENTERING,
         (PositionState.ENTERING, "SUCCESS"): PositionState.OPEN,
@@ -48,17 +69,29 @@ class PositionStateMachine:
         (PositionState.REDUCING, "COMPLETE"): PositionState.CLOSING,
         (PositionState.REDUCING, "PARTIAL"): PositionState.OPEN,
         (PositionState.CLOSING, "SUCCESS"): PositionState.FLAT,
+        # X3-A: Emergency exit paths (cancel pending + market close)
+        (PositionState.ENTERING, Action.EMERGENCY_EXIT): PositionState.CLOSING,
+        (PositionState.REDUCING, Action.EMERGENCY_EXIT): PositionState.CLOSING,
     }
 
-    def __init__(self, repository: Optional["PositionRepository"] = None):
+    def __init__(
+        self,
+        repository: Optional["PositionRepository"] = None,
+        closing_timeout_sec: float = DEFAULT_CLOSING_TIMEOUT_SEC
+    ):
         """Initialize state machine.
 
         Args:
             repository: Optional persistence layer. If provided, positions
                        are loaded on init and saved on every transition.
+            closing_timeout_sec: X6-A timeout for CLOSING state (default 30s)
         """
         self._positions: Dict[str, Position] = {}
         self._repository = repository
+
+        # X6-A: CLOSING state timeout tracking
+        self._closing_timeout_sec = closing_timeout_sec
+        self._closing_trackers: Dict[str, ClosingStateTracker] = {}
 
         # Load existing positions if repository provided
         if self._repository:
@@ -138,12 +171,27 @@ class PositionStateMachine:
             new_position = self._handle_reduce_complete(current, next_state)
         elif action == Action.EXIT:
             new_position = self._handle_exit(current, next_state)
+        elif action == Action.EMERGENCY_EXIT:
+            # X3-A: Emergency exit from ENTERING or REDUCING
+            new_position = self._handle_emergency_exit(current, next_state)
         elif action == "SUCCESS" and current.state == PositionState.CLOSING:
             new_position = Position.create_flat(symbol)
         else:
             raise InvariantViolation(f"Unhandled transition: {transition_key}")
         
         self._positions[symbol] = new_position
+
+        # X6-A: Track CLOSING state entry time
+        if new_position.state == PositionState.CLOSING:
+            if symbol not in self._closing_trackers:
+                self._closing_trackers[symbol] = ClosingStateTracker(
+                    symbol=symbol,
+                    entered_closing_at=time.time(),
+                    timeout_sec=self._closing_timeout_sec
+                )
+        elif new_position.state == PositionState.FLAT:
+            # Clear CLOSING tracker when position closes
+            self._closing_trackers.pop(symbol, None)
 
         # Persist if repository configured
         if self._repository:
@@ -241,3 +289,93 @@ class PositionStateMachine:
             quantity=current.quantity,
             entry_price=current.entry_price
         )
+
+    def _handle_emergency_exit(self, current: Position, next_state: PositionState) -> Position:
+        """X3-A: Handle emergency exit from ENTERING or REDUCING states.
+
+        This is a safety valve for scenarios where:
+        - Market crashes during entry order pending
+        - Need to abort a reduce operation
+        - Risk limits breached while in transitional state
+
+        The caller is responsible for:
+        1. Cancelling any pending orders on exchange
+        2. Submitting market close order for any filled quantity
+
+        Returns position in CLOSING state (awaiting close confirmation).
+        """
+        return Position(
+            symbol=current.symbol,
+            state=next_state,  # CLOSING
+            direction=current.direction,
+            quantity=current.quantity,  # May be 0 if nothing filled yet
+            entry_price=current.entry_price
+        )
+
+    def check_closing_timeouts(self) -> Dict[str, float]:
+        """X6-A: Check for CLOSING state timeouts.
+
+        Returns:
+            Dict of symbol -> seconds in CLOSING state for timed-out positions
+        """
+        now = time.time()
+        timed_out = {}
+
+        for symbol, tracker in self._closing_trackers.items():
+            elapsed = now - tracker.entered_closing_at
+            if elapsed > tracker.timeout_sec:
+                timed_out[symbol] = elapsed
+
+        return timed_out
+
+    def force_close_timeout(self, symbol: str) -> Position:
+        """X6-A: Force position to FLAT after CLOSING timeout.
+
+        This is a last resort when exit order never fills.
+        WARNING: May result in state desync with exchange!
+
+        The caller MUST:
+        1. Cancel any pending exit orders
+        2. Verify actual exchange position state
+        3. Reconcile if necessary
+
+        Args:
+            symbol: Symbol to force close
+
+        Returns:
+            New FLAT position
+
+        Raises:
+            InvariantViolation: If position not in CLOSING state
+        """
+        current = self.get_position(symbol)
+
+        if current.state != PositionState.CLOSING:
+            raise InvariantViolation(
+                f"X6-A: Cannot force close {symbol} - not in CLOSING state "
+                f"(current: {current.state})"
+            )
+
+        # Force transition to FLAT
+        new_position = Position.create_flat(symbol)
+        self._positions[symbol] = new_position
+
+        # Clear timeout tracker
+        self._closing_trackers.pop(symbol, None)
+
+        # Persist if repository configured
+        if self._repository:
+            self._repository.save(new_position)
+
+        return new_position
+
+    def get_closing_duration(self, symbol: str) -> Optional[float]:
+        """X6-A: Get how long position has been in CLOSING state.
+
+        Returns:
+            Seconds in CLOSING state, or None if not in CLOSING
+        """
+        tracker = self._closing_trackers.get(symbol)
+        if tracker:
+            return time.time() - tracker.entered_closing_at
+        return None

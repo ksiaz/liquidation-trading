@@ -8,7 +8,10 @@ Authority Hierarchy (Theorem 2.2):
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from runtime.position.types import Direction
 
 
 class MandateType(Enum):
@@ -35,7 +38,7 @@ class ActionType(Enum):
 @dataclass(frozen=True)
 class Mandate:
     """Mandate emitted by strategy or risk layer.
-    
+
     Invariants:
     - symbol must be non-empty
     - authority >= 0
@@ -46,7 +49,9 @@ class Mandate:
     authority: float
     timestamp: float
     expiry: Optional[Callable] = None  # Optional expiry condition
-    
+    direction: Optional[str] = None  # "LONG" or "SHORT" for ENTRY mandates
+    strategy_id: Optional[str] = None  # Which strategy emitted this
+
     def __post_init__(self):
         """Validate mandate."""
         if not self.symbol:
@@ -55,6 +60,8 @@ class Mandate:
             raise ValueError(f"authority must be non-negative, got {self.authority}")
         if self.timestamp < 0:
             raise ValueError(f"timestamp must be non-negative, got {self.timestamp}")
+        if self.direction is not None and self.direction not in ("LONG", "SHORT"):
+            raise ValueError(f"direction must be LONG or SHORT, got {self.direction}")
 
 
 @dataclass(frozen=True)
@@ -66,9 +73,15 @@ class Action:
     type: ActionType
     symbol: str
     strategy_id: Optional[str] = None  # Which strategy triggered this (for tracing)
+    direction: Optional[str] = None  # "LONG" or "SHORT" for ENTRY actions
 
     @staticmethod
-    def from_mandate_type(mandate_type: MandateType, symbol: str, strategy_id: Optional[str] = None) -> "Action":
+    def from_mandate_type(
+        mandate_type: MandateType,
+        symbol: str,
+        strategy_id: Optional[str] = None,
+        direction: Optional[str] = None
+    ) -> "Action":
         """Convert mandate type to action type."""
         mapping = {
             MandateType.ENTRY: ActionType.ENTRY,
@@ -77,4 +90,19 @@ class Action:
             MandateType.HOLD: ActionType.HOLD,
             MandateType.BLOCK: ActionType.NO_ACTION,  # BLOCK is not actionable
         }
-        return Action(type=mapping[mandate_type], symbol=symbol, strategy_id=strategy_id)
+        return Action(
+            type=mapping[mandate_type],
+            symbol=symbol,
+            strategy_id=strategy_id,
+            direction=direction
+        )
+
+    @staticmethod
+    def from_mandate(mandate: "Mandate") -> "Action":
+        """Create action from mandate, preserving direction."""
+        return Action.from_mandate_type(
+            mandate_type=mandate.type,
+            symbol=mandate.symbol,
+            strategy_id=mandate.strategy_id,
+            direction=mandate.direction
+        )

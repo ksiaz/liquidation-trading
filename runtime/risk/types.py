@@ -51,6 +51,48 @@ class RiskConfig:
         assert 0 < self.risk_fraction_per_trade < 1.0, "risk_fraction must be in (0, 1)"
         assert 0 < self.min_free_margin_pct < 1.0, "min_free_margin_pct must be in (0, 1)"
 
+    @classmethod
+    def for_testing(
+        cls,
+        L_max: float = 100.0,
+        L_target: float = 50.0,
+        L_symbol_max: float = 50.0,
+        **kwargs
+    ) -> "RiskConfig":
+        """Create a permissive config for testing.
+
+        Relaxes leverage and exposure limits while maintaining
+        internally consistent constraints.
+
+        Args:
+            L_max: Maximum leverage (default 100x for testing)
+            L_target: Target leverage (default 50x)
+            L_symbol_max: Per-symbol max (default 50x)
+            **kwargs: Override any other config values
+
+        Returns:
+            RiskConfig with relaxed limits for testing
+        """
+        defaults = {
+            "L_max": L_max,
+            "L_target": L_target,
+            "L_symbol_max": L_symbol_max,
+            "L_max_net": L_max,
+            "D_min_safe": 0.08,
+            "D_critical": 0.03,
+            "R_liq_min": 0.08,
+            "MMR_default": 0.005,
+            "reduction_pct_default": 0.5,
+            "safety_factor": 0.7,
+            "risk_fraction_per_trade": 0.5,  # Allow larger test positions
+            "min_free_margin_pct": 0.05,  # Lower margin requirement
+            "stop_loss_pct": 0.10,  # Wider stops for testing
+            "take_profit_pct": 0.10,
+            "time_stop_seconds": 0.0,  # Disable time stop
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+
 
 @dataclass(frozen=True)
 class AccountState:

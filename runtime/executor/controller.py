@@ -180,10 +180,16 @@ class ExecutionController:
             # For now, just trigger the state transition
             # In real implementation, would submit exchange orders here
             if state_action == StateAction.ENTRY:
-                # Entry requires direction (simplified - would come from mandate)
-                # TODO: Get actual direction/size from Action/Mandate
+                # Get direction from action (defaults to LONG if not specified)
+                direction = Direction.LONG
+                if action.direction == "SHORT":
+                    direction = Direction.SHORT
+                elif action.direction == "LONG":
+                    direction = Direction.LONG
+                # direction remains LONG if action.direction is None
+
                 new_position = self.state_machine.transition(
-                    symbol, state_action, direction=Direction.LONG
+                    symbol, state_action, direction=direction
                 )
 
                 # For ghost trading: immediately confirm entry (ENTERING → OPEN)

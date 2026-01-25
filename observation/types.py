@@ -99,6 +99,40 @@ class M4PrimitiveBundle:
     leverage_concentration_ratio: Optional[LeverageConcentrationRatio]
     open_interest_directional_bias: Optional[OpenInterestDirectionalBias]
 
+    @classmethod
+    def empty(cls, symbol: str) -> "M4PrimitiveBundle":
+        """Create an empty bundle with all primitives set to None.
+
+        Use for testing or when no primitives are available.
+        None means "absence of structural fact", not failure.
+        """
+        return cls(
+            symbol=symbol,
+            zone_penetration=None,
+            displacement_origin_anchor=None,
+            price_traversal_velocity=None,
+            traversal_compactness=None,
+            central_tendency_deviation=None,
+            structural_absence_duration=None,
+            traversal_void_span=None,
+            event_non_occurrence_counter=None,
+            structural_persistence_duration=None,
+            resting_size=None,
+            order_consumption=None,
+            absorption_event=None,
+            refill_event=None,
+            price_acceptance_ratio=None,
+            liquidation_density=None,
+            directional_continuity=None,
+            trade_burst=None,
+            order_block=None,
+            supply_demand_zone=None,
+            liquidation_cascade_proximity=None,
+            cascade_state=None,
+            leverage_concentration_ratio=None,
+            open_interest_directional_bias=None,
+        )
+
 
 @dataclass(frozen=True)
 class ObservationSnapshot:

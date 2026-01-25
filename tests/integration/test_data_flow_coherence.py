@@ -45,33 +45,12 @@ from runtime.position.types import Position, PositionState, Direction
 
 
 def create_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
-    """Create an empty M4PrimitiveBundle with all None primitives."""
-    return M4PrimitiveBundle(
-        symbol=symbol,
-        zone_penetration=None,
-        displacement_origin_anchor=None,
-        price_traversal_velocity=None,
-        traversal_compactness=None,
-        central_tendency_deviation=None,
-        structural_absence_duration=None,
-        traversal_void_span=None,
-        event_non_occurrence_counter=None,
-        structural_persistence_duration=None,
-        resting_size=None,
-        order_consumption=None,
-        absorption_event=None,
-        refill_event=None,
-        price_acceptance_ratio=None,
-        liquidation_density=None,
-        directional_continuity=None,
-        trade_burst=None,
-        order_block=None,
-        supply_demand_zone=None,
-        liquidation_cascade_proximity=None,
-        cascade_state=None,
-        leverage_concentration_ratio=None,
-        open_interest_directional_bias=None,
-    )
+    """Create an empty M4PrimitiveBundle with all None primitives.
+
+    Note: This helper is kept for backwards compatibility.
+    Prefer using M4PrimitiveBundle.empty(symbol) directly.
+    """
+    return M4PrimitiveBundle.empty(symbol)
 
 
 class TestObservationToSnapshot:
@@ -257,6 +236,42 @@ class TestMandateToAction:
 
         # EXIT wins regardless of authority
         assert actions["BTCUSDT"].type == ActionType.EXIT
+
+    def test_direction_passthrough(self):
+        """Direction is preserved from Mandate to Action."""
+        arbitrator = MandateArbitrator()
+
+        # Test LONG direction
+        long_mandate = Mandate(
+            type=MandateType.ENTRY,
+            symbol="BTCUSDT",
+            authority=10,
+            timestamp=time.time(),
+            direction="LONG",
+        )
+        actions = arbitrator.arbitrate_all([long_mandate])
+        assert actions["BTCUSDT"].direction == "LONG"
+
+        # Test SHORT direction
+        short_mandate = Mandate(
+            type=MandateType.ENTRY,
+            symbol="ETHUSDT",
+            authority=10,
+            timestamp=time.time(),
+            direction="SHORT",
+        )
+        actions = arbitrator.arbitrate_all([short_mandate])
+        assert actions["ETHUSDT"].direction == "SHORT"
+
+        # Test None direction (default)
+        no_dir_mandate = Mandate(
+            type=MandateType.ENTRY,
+            symbol="SOLUSDT",
+            authority=10,
+            timestamp=time.time(),
+        )
+        actions = arbitrator.arbitrate_all([no_dir_mandate])
+        assert actions["SOLUSDT"].direction is None
 
 
 class TestActionToExecution:

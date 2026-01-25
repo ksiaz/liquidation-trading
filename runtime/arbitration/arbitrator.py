@@ -76,8 +76,8 @@ class MandateArbitrator:
         ]:
             if mandate_type in by_type:
                 mandate = by_type[mandate_type]
-                strategy_id = mandate.strategy_id if hasattr(mandate, 'strategy_id') else None
-                return Action.from_mandate_type(mandate_type, symbol, strategy_id)
+                # Use from_mandate to preserve direction for ENTRY actions
+                return Action.from_mandate(mandate)
         
         # If only BLOCK remains, it's not actionable
         if MandateType.BLOCK in by_type:

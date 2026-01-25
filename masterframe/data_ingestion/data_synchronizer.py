@@ -19,7 +19,7 @@ from data_pipeline.normalized_events import (
     CandleEvent
 )
 from .types import SynchronizedData
-from .rolling_buffer import (
+from .stream_buffers import (
     OrderbookBuffer,
     TradeBuffer,
     LiquidationBuffer,
@@ -104,7 +104,7 @@ class DataSynchronizer:
         """
         return self.kline_buffer_1m.get_all()
     
-    def get_all_klines_5m(self) -> Optional[Tuple[Kline, ...]]:
+    def get_all_klines_5m(self) -> Optional[Tuple[CandleEvent, ...]]:
         """
         Get all 5m klines if warm.
         

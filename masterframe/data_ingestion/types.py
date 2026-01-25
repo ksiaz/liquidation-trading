@@ -1,17 +1,17 @@
 """
 Data Type Definitions for Market Regime Masterframe
 
-DEPRECATED: Individual event types moved to data_pipeline.normalized_events
-
-This module now only contains SynchronizedData for time-aligned snapshots.
-All event types must be imported from data_pipeline.normalized_events.
+Contains:
+- Legacy types for backward compatibility (OrderbookSnapshot, AggressiveTrade, Kline)
+- SynchronizedData for time-aligned snapshots
+- Re-exports of canonical types from data_pipeline.normalized_events
 
 RULE: No mutable state in data structures.
 RULE: All timestamps are Unix epoch in seconds (float).
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 # Import canonical event types
 import sys
@@ -19,8 +19,70 @@ sys.path.append('d:/liquidation-trading')
 from data_pipeline.normalized_events import (
     OrderbookEvent,
     TradeEvent,
-    LiquidationEvent
+    LiquidationEvent as CanonicalLiquidationEvent,
+    CandleEvent,
 )
+
+
+# =============================================================================
+# LEGACY TYPES - For backward compatibility with existing tests and modules
+# =============================================================================
+
+@dataclass(frozen=True)
+class OrderbookSnapshot:
+    """
+    Legacy orderbook snapshot type for backward compatibility.
+
+    Used by: orderbook_zoning, tests
+    """
+    timestamp: float
+    bids: Tuple[Tuple[float, float], ...]  # ((price, qty), ...)
+    asks: Tuple[Tuple[float, float], ...]
+    mid_price: float
+
+
+@dataclass(frozen=True)
+class AggressiveTrade:
+    """
+    Legacy aggressive trade type for backward compatibility.
+
+    Used by: metrics, orderbook_zoning, tests
+    """
+    timestamp: float
+    price: float
+    quantity: float
+    is_buyer_aggressor: bool
+
+
+@dataclass(frozen=True)
+class LiquidationEvent:
+    """
+    Legacy liquidation event type for backward compatibility.
+
+    Used by: tests
+    """
+    timestamp: float
+    symbol: str
+    side: str
+    quantity: float
+    price: float
+    value_usd: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class Kline:
+    """
+    Legacy kline (candlestick) type for backward compatibility.
+
+    Used by: tests, metrics
+    """
+    timestamp: float
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    interval: str  # '1m', '5m', etc.
 
 
 @dataclass(frozen=True)
@@ -44,10 +106,17 @@ class SynchronizedData:
     kline_5m: 'CandleEvent'
 
 
-# Re-export canonical types for backward compatibility
+# Re-export types
 __all__ = [
-    'SynchronizedData',
-    'OrderbookEvent',
-    'TradeEvent', 
+    # Legacy types (backward compatibility)
+    'OrderbookSnapshot',
+    'AggressiveTrade',
     'LiquidationEvent',
+    'Kline',
+    # Synchronized data
+    'SynchronizedData',
+    # Canonical types
+    'OrderbookEvent',
+    'TradeEvent',
+    'CandleEvent',
 ]

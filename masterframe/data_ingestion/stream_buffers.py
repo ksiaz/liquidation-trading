@@ -35,7 +35,7 @@ class OrderbookBuffer:
     
     def push(self, snapshot: OrderbookEvent) -> None:
         """Add new orderbook snapshot."""
-        self._buffer.push(snapshot.timestamp, snapshot)
+        self._buffer.push(snapshot, snapshot.timestamp)
     
     def is_warm(self) -> bool:
         """Check if buffer has data."""
@@ -70,7 +70,7 @@ class TradeBuffer:
     
     def push(self, trade: TradeEvent) -> None:
         """Add new trade."""
-        self._buffer.push(trade.timestamp, trade)
+        self._buffer.push(trade, trade.timestamp)
     
     def is_warm(self) -> bool:
         """Check if buffer is warm."""
@@ -87,10 +87,7 @@ class TradeBuffer:
         Returns:
             Tuple of trades or None if insufficient data
         """
-        result = self._buffer.get_all_in_window(window_seconds, reference_time)
-        if result is None:
-            return None
-        return tuple(result)
+        return self._buffer.get_items_in_window(window_seconds, reference_time)
     
     def clear(self) -> None:
         """Clear all trades."""
@@ -146,7 +143,7 @@ class LiquidationBuffer:
 class KlineBuffer:
     """
     Buffer for OHLCV klines (candlesticks).
-    
+
     RULE: Stores klines for specific interval (1m or 5m).
     RULE: Used for ATR and VWAP calculations.
     """
@@ -174,13 +171,13 @@ class KlineBuffer:
         # Set min_size based on interval
         min_size = self.MIN_KLINES_1M if interval == '1m' else self.MIN_KLINES_5M
         
-        self._buffer = RollingBuffer[Kline](
+        self._buffer = RollingBuffer[CandleEvent](
             max_size=self.MAX_KLINES,
             min_size=min_size,
             max_age_seconds=self.MAX_AGE_SECONDS
         )
     
-    def push(self, kline: Kline) -> None:
+    def push(self, kline: CandleEvent) -> None:
         """
         Add kline to buffer.
         
@@ -188,7 +185,7 @@ class KlineBuffer:
         """
         if kline.interval != self.interval:
             raise ValueError(
-                f"Kline interval mismatch: expected {self.interval}, got {kline.interval}"
+                f"CandleEvent interval mismatch: expected {self.interval}, got {kline.interval}"
             )
         
         self._buffer.push(kline, kline.timestamp)
@@ -197,11 +194,11 @@ class KlineBuffer:
         """Check if buffer has sufficient klines."""
         return self._buffer.is_warm()
     
-    def get_latest(self) -> Optional[Kline]:
+    def get_latest(self) -> Optional[CandleEvent]:
         """Get most recent kline if warm."""
         return self._buffer.get_latest()
     
-    def get_all(self) -> Optional[Tuple[Kline, ...]]:
+    def get_all(self) -> Optional[Tuple[CandleEvent, ...]]:
         """Get all klines if warm."""
         return self._buffer.get_items()
     

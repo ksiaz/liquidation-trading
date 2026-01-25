@@ -28,18 +28,32 @@ from data_pipeline.normalized_events import (
 )
 
 # Import local modules
-from .types import SynchronizedData
+from .types import (
+    SynchronizedData,
+    # Legacy types for backward compatibility
+    OrderbookSnapshot,
+    AggressiveTrade,
+    LiquidationEvent as LegacyLiquidationEvent,
+    Kline,
+)
 from .rolling_buffer import RollingBuffer
 from .data_synchronizer import DataSynchronizer
+
+# Use legacy LiquidationEvent for backward compatibility
+LiquidationEvent = LegacyLiquidationEvent
 
 __all__ = [
     # Canonical event types (from data_pipeline)
     "OrderbookEvent",
     "TradeEvent",
-    "LiquidationEvent",
     "CandleEvent",
     "BookTickerEvent",
     "generate_event_id",
+    # Legacy types (backward compatibility)
+    "OrderbookSnapshot",
+    "AggressiveTrade",
+    "LiquidationEvent",
+    "Kline",
     # Local types
     "SynchronizedData",
     "RollingBuffer",

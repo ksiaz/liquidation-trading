@@ -16,9 +16,8 @@ INVARIANTS:
 
 from .types import BlockType, LiquidityBlock
 from .state_machine import SLBRSStateMachine, SLBRSState, TradeSetup, Position
-
-# BlockDetector and BlockTracker removed for C9 isolation
-# (They require orderbook_zoning which triggers broken masterframe chain)
+from .block_detector import BlockDetector
+from .block_tracker import BlockTracker
 
 __all__ = [
     "BlockType",
@@ -27,4 +26,6 @@ __all__ = [
     "SLBRSState",
     "TradeSetup",
     "Position",
+    "BlockDetector",
+    "BlockTracker",
 ]

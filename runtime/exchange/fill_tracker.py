@@ -7,18 +7,23 @@ Monitors order fills via multiple methods:
 3. Position monitoring (validation)
 
 Detects partial fills and handles fill timeouts.
+
+P3: Fill ID deduplication persisted across restarts.
 """
 
 import time
 import logging
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Set
+from typing import Dict, List, Optional, Callable, Set, TYPE_CHECKING
 from enum import auto
 from threading import RLock
 from enum import Enum
 
 import aiohttp
+
+if TYPE_CHECKING:
+    from runtime.persistence import ExecutionStateRepository
 
 from .types import (
     OrderStatus,
@@ -56,17 +61,23 @@ class FillTracker:
     Validation: Position change detection
 
     Ensures no fills are missed due to network issues.
+
+    P3: Fill ID deduplication persisted via ExecutionStateRepository.
     """
 
     def __init__(
         self,
         config: FillTrackerConfig = None,
         wallet_address: Optional[str] = None,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        repository: Optional["ExecutionStateRepository"] = None
     ):
         self._config = config or FillTrackerConfig()
         self._wallet_address = wallet_address
         self._logger = logger or logging.getLogger(__name__)
+
+        # P3: Persistence layer
+        self._repository = repository
 
         # API endpoint
         self._api_url = (
@@ -78,6 +89,9 @@ class FillTracker:
         # Tracked orders
         self._tracked_orders: Dict[str, TrackingEntry] = {}
         self._order_fills: Dict[str, List[OrderFill]] = {}
+
+        # P3: Global fill ID dedup set (loaded from persistence)
+        self._global_seen_fill_ids: Set[str] = set()
 
         # Callbacks
         self._on_fill: Optional[Callable[[OrderFill], None]] = None
@@ -93,8 +107,36 @@ class FillTracker:
 
         self._lock = RLock()
 
+        # P3: Load persisted fill IDs on init
+        if self._repository:
+            self._load_persisted_fill_ids()
+
     def _now_ns(self) -> int:
         return int(time.time() * 1_000_000_000)
+
+    def _load_persisted_fill_ids(self):
+        """P3: Load persisted fill IDs on startup."""
+        if not self._repository:
+            return
+
+        try:
+            # Load fill IDs from last 24 hours
+            self._global_seen_fill_ids = self._repository.load_recent_fill_ids(hours=24)
+            self._logger.info(
+                f"P3: Loaded {len(self._global_seen_fill_ids)} fill IDs from persistence"
+            )
+        except Exception as e:
+            self._logger.error(f"P3: Failed to load persisted fill IDs: {e}")
+
+    def _persist_fill_id(self, fill_id: str, symbol: str, order_id: str):
+        """P3: Persist a fill ID to prevent reprocessing on restart."""
+        if not self._repository:
+            return
+
+        try:
+            self._repository.save_fill_id(fill_id, symbol, order_id)
+        except Exception as e:
+            self._logger.error(f"P3: Failed to persist fill ID {fill_id}: {e}")
 
     async def start(self):
         """Start fill tracking (begins polling loop)."""
@@ -262,11 +304,22 @@ class FillTracker:
 
             # F1: Deduplication by fill ID (tid)
             fill_id = str(fill_data.get('tid', ''))
+
+            # P3: Check global persisted set first (survives restarts)
+            if fill_id and fill_id in self._global_seen_fill_ids:
+                self._logger.debug(f"Duplicate fill ignored (persisted): {fill_id} for order {order_id}")
+                return
+
+            # F1: Check per-order set (runtime dedup)
             if fill_id and fill_id in entry.seen_fill_ids:
                 self._logger.debug(f"Duplicate fill ignored: {fill_id} for order {order_id}")
                 return
+
             if fill_id:
                 entry.seen_fill_ids.add(fill_id)
+                self._global_seen_fill_ids.add(fill_id)
+                # P3: Persist fill ID for restart recovery
+                self._persist_fill_id(fill_id, entry.symbol, order_id)
 
             # F2: Fill time source precedence (exchange time > local time)
             # Exchange 'time' is in milliseconds, local fallback only if missing

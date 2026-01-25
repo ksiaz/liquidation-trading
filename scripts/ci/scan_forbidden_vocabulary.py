@@ -127,6 +127,7 @@ WORD_EXEMPTIONS = {
         'risk/',  # Capital management uses regime
         'entry_quality',  # TrendRegimeContext parameter type
         'ep2_strategy_cascade_sniper',  # TrendRegimeContext parameter type
+        'stop_hunt_detector',  # F6: Regime context for stop-hunt filtering
     ],
     'trend': [
         # TrendDirection/TrendRegimeContext - observable price structure, not prediction
@@ -135,6 +136,7 @@ WORD_EXEMPTIONS = {
         'entry_quality',  # Kill-switch uses trend context
         'ep2_strategy_cascade_sniper',  # Strategy uses trend for reversal blocking
         'policy_adapter',  # Wires trend context to strategies
+        'stop_hunt_detector',  # F6: Trend filtering for stop-hunt entries
     ],
 }
 

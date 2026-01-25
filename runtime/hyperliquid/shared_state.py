@@ -6,14 +6,19 @@ Architecture:
 - UI reads from SharedPositionState at throttled intervals (250ms)
 - Thread-safe access via RLock
 
+P7: State persistence across restarts via ExecutionStateRepository.
+
 This eliminates UI from the hot path entirely.
 """
 
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, TYPE_CHECKING
 from collections import defaultdict
+
+if TYPE_CHECKING:
+    from runtime.persistence import ExecutionStateRepository
 
 
 @dataclass
@@ -63,10 +68,15 @@ class SharedPositionState:
     - get_danger_positions() - positions in danger zone
     - get_alerts() - recent alerts
     - get_market_positions() - positions by market
+
+    P7: State persistence via ExecutionStateRepository.
     """
 
-    def __init__(self):
+    def __init__(self, repository: Optional["ExecutionStateRepository"] = None):
         self._lock = threading.RLock()
+
+        # P7: Persistence layer
+        self._repository = repository
 
         # Position storage (wallet -> coin -> PositionSnapshot)
         self._positions: Dict[str, Dict[str, PositionSnapshot]] = defaultdict(dict)
@@ -97,6 +107,90 @@ class SharedPositionState:
         # Mid prices (for UI display)
         self._mid_prices: Dict[str, float] = {}
 
+        # P7: Load persisted state on init
+        if self._repository:
+            self._load_persisted_state()
+
+    # ===================
+    # P7: PERSISTENCE METHODS
+    # ===================
+
+    def _load_persisted_state(self):
+        """P7: Load persisted positions on startup."""
+        if not self._repository:
+            return
+
+        try:
+            persisted = self._repository.load_tracked_positions()
+            for row in persisted:
+                pos = PositionSnapshot(
+                    wallet=row['wallet'],
+                    coin=row['coin'],
+                    side=row['side'],
+                    size=row['size'],
+                    notional=row['notional'],
+                    entry_price=row['entry_price'],
+                    liq_price=row['liq_price'],
+                    current_price=row['current_price'],
+                    distance_pct=row['distance_pct'],
+                    leverage=row['leverage'],
+                    danger_level=row.get('danger_level', 0),
+                    updated_at=row.get('updated_at', 0),
+                    opened_at=row.get('opened_at', 0),
+                    discovered_at=row.get('discovered_at', 0)
+                )
+                # Directly populate without triggering persistence again
+                self._positions[pos.wallet][pos.coin] = pos
+                self._market_positions[pos.coin][pos.wallet] = pos
+
+                key = f"{pos.wallet}:{pos.coin}"
+                if pos.danger_level > 0 and pos.distance_pct > 0:
+                    self._danger_positions[key] = pos
+
+            import logging
+            logging.getLogger(__name__).info(
+                f"P7: Loaded {len(persisted)} tracked positions from persistence"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                f"P7: Failed to load persisted positions: {e}"
+            )
+
+    def _persist_position(self, pos: PositionSnapshot):
+        """P7: Persist a position snapshot."""
+        if not self._repository:
+            return
+
+        try:
+            self._repository.save_tracked_position(
+                wallet=pos.wallet,
+                coin=pos.coin,
+                side=pos.side,
+                size=pos.size,
+                notional=pos.notional,
+                entry_price=pos.entry_price,
+                liq_price=pos.liq_price,
+                current_price=pos.current_price,
+                distance_pct=pos.distance_pct,
+                leverage=pos.leverage,
+                danger_level=pos.danger_level,
+                opened_at=pos.opened_at,
+                discovered_at=pos.discovered_at
+            )
+        except Exception:
+            pass  # Don't fail updates due to persistence errors
+
+    def _delete_persisted_position(self, wallet: str, coin: str):
+        """P7: Delete a position from persistence."""
+        if not self._repository:
+            return
+
+        try:
+            self._repository.delete_tracked_position(wallet, coin)
+        except Exception:
+            pass  # Don't fail removals due to persistence errors
+
     # ===================
     # WRITE METHODS (Detection)
     # ===================
@@ -122,6 +216,9 @@ class SharedPositionState:
 
             # Invalidate cache - force rebuild on next read
             self._cache_time = 0
+
+        # P7: Persist position (outside lock to minimize contention)
+        self._persist_position(pos)
 
     def update_positions_batch(self, positions: List[PositionSnapshot]):
         """Bulk update positions (more efficient)."""
@@ -156,6 +253,9 @@ class SharedPositionState:
 
             # Invalidate cache - force rebuild on next read
             self._cache_time = 0
+
+        # P7: Delete from persistence (outside lock)
+        self._delete_persisted_position(wallet, coin)
 
     def add_alert(self, alert: DangerAlert):
         """Add danger zone alert."""
@@ -259,11 +359,27 @@ _shared_state: Optional[SharedPositionState] = None
 _state_lock = threading.Lock()
 
 
-def get_shared_state() -> SharedPositionState:
-    """Get or create the global shared state instance."""
+def get_shared_state(
+    repository: Optional["ExecutionStateRepository"] = None
+) -> SharedPositionState:
+    """Get or create the global shared state instance.
+
+    Args:
+        repository: P7 - Optional persistence layer. Only used on first call.
+
+    Returns:
+        SharedPositionState singleton instance
+    """
     global _shared_state
     if _shared_state is None:
         with _state_lock:
             if _shared_state is None:
-                _shared_state = SharedPositionState()
+                _shared_state = SharedPositionState(repository=repository)
     return _shared_state
+
+
+def reset_shared_state():
+    """Reset the global shared state (for testing)."""
+    global _shared_state
+    with _state_lock:
+        _shared_state = None

@@ -13,6 +13,7 @@ Enforces:
 Hardenings:
 - X3-A: Emergency exit from ENTERING/REDUCING states
 - X6-A: CLOSING state timeout tracking
+- P4: CLOSING timeout persistence across restarts
 """
 
 import time
@@ -24,6 +25,7 @@ from .types import Position, PositionState, Direction, InvariantViolation
 
 if TYPE_CHECKING:
     from .repository import PositionRepository
+    from runtime.persistence import ExecutionStateRepository
 
 
 # X6-A: Default CLOSING state timeout (30 seconds)
@@ -77,7 +79,8 @@ class PositionStateMachine:
     def __init__(
         self,
         repository: Optional["PositionRepository"] = None,
-        closing_timeout_sec: float = DEFAULT_CLOSING_TIMEOUT_SEC
+        closing_timeout_sec: float = DEFAULT_CLOSING_TIMEOUT_SEC,
+        execution_state_repository: Optional["ExecutionStateRepository"] = None
     ):
         """Initialize state machine.
 
@@ -85,6 +88,7 @@ class PositionStateMachine:
             repository: Optional persistence layer. If provided, positions
                        are loaded on init and saved on every transition.
             closing_timeout_sec: X6-A timeout for CLOSING state (default 30s)
+            execution_state_repository: P4 - Optional persistence for CLOSING timeouts
         """
         self._positions: Dict[str, Position] = {}
         self._repository = repository
@@ -93,10 +97,61 @@ class PositionStateMachine:
         self._closing_timeout_sec = closing_timeout_sec
         self._closing_trackers: Dict[str, ClosingStateTracker] = {}
 
+        # P4: Persistence for CLOSING timeouts
+        self._exec_state_repo = execution_state_repository
+
         # Load existing positions if repository provided
         if self._repository:
             self._positions = self._repository.load_non_flat_positions()
+
+        # P4: Load persisted CLOSING timeouts
+        if self._exec_state_repo:
+            self._load_persisted_closing_timeouts()
     
+    def _load_persisted_closing_timeouts(self):
+        """P4: Load persisted CLOSING timeouts on startup."""
+        if not self._exec_state_repo:
+            return
+
+        try:
+            persisted = self._exec_state_repo.load_all_closing_timeouts()
+            for symbol, p in persisted.items():
+                self._closing_trackers[symbol] = ClosingStateTracker(
+                    symbol=p.symbol,
+                    entered_closing_at=p.entered_closing_at,
+                    timeout_sec=p.timeout_sec
+                )
+            # Note: imported here to avoid circular imports
+            import logging
+            logging.getLogger(__name__).info(
+                f"P4: Loaded {len(persisted)} CLOSING timeouts from persistence"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                f"P4: Failed to load persisted CLOSING timeouts: {e}"
+            )
+
+    def _persist_closing_timeout(self, symbol: str, entered_at: float, timeout_sec: float):
+        """P4: Persist CLOSING timeout."""
+        if not self._exec_state_repo:
+            return
+
+        try:
+            self._exec_state_repo.save_closing_timeout(symbol, entered_at, timeout_sec)
+        except Exception:
+            pass  # Don't fail transitions due to persistence errors
+
+    def _delete_closing_timeout(self, symbol: str):
+        """P4: Delete CLOSING timeout from persistence."""
+        if not self._exec_state_repo:
+            return
+
+        try:
+            self._exec_state_repo.delete_closing_timeout(symbol)
+        except Exception:
+            pass  # Don't fail transitions due to persistence errors
+
     def get_position(self, symbol: str) -> Position:
         """Get position for symbol (creates FLAT if not exists)."""
         if symbol not in self._positions:
@@ -184,14 +239,19 @@ class PositionStateMachine:
         # X6-A: Track CLOSING state entry time
         if new_position.state == PositionState.CLOSING:
             if symbol not in self._closing_trackers:
+                entered_at = time.time()
                 self._closing_trackers[symbol] = ClosingStateTracker(
                     symbol=symbol,
-                    entered_closing_at=time.time(),
+                    entered_closing_at=entered_at,
                     timeout_sec=self._closing_timeout_sec
                 )
+                # P4: Persist CLOSING timeout
+                self._persist_closing_timeout(symbol, entered_at, self._closing_timeout_sec)
         elif new_position.state == PositionState.FLAT:
             # Clear CLOSING tracker when position closes
             self._closing_trackers.pop(symbol, None)
+            # P4: Delete from persistence
+            self._delete_closing_timeout(symbol)
 
         # Persist if repository configured
         if self._repository:
@@ -362,6 +422,9 @@ class PositionStateMachine:
 
         # Clear timeout tracker
         self._closing_trackers.pop(symbol, None)
+
+        # P4: Delete from persistence
+        self._delete_closing_timeout(symbol)
 
         # Persist if repository configured
         if self._repository:

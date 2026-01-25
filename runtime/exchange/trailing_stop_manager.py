@@ -8,16 +8,21 @@ Features:
 - Break-even stop after X profit
 - ATR-based trailing distance
 - Multiple trailing modes
+- P2: State persistence across restarts
 
 This is EXTERNAL to the core state machine - operates on placed stop orders.
 """
 
 import time
+import json
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Callable, List
+from dataclasses import dataclass, field, asdict
+from typing import Dict, Optional, Callable, List, TYPE_CHECKING
 from enum import Enum
 from threading import RLock
+
+if TYPE_CHECKING:
+    from runtime.persistence import ExecutionStateRepository, PersistedTrailingStop
 
 
 class TrailingMode(Enum):
@@ -83,19 +88,113 @@ class TrailingStopManager:
     2. update_price() on each price tick
     3. Handle on_stop_update callback to modify stop order
 
+    P2: State persistence across restarts via ExecutionStateRepository.
+
     Thread-safe.
     """
 
-    def __init__(self, logger: logging.Logger = None):
+    def __init__(
+        self,
+        logger: logging.Logger = None,
+        repository: Optional["ExecutionStateRepository"] = None
+    ):
         self._logger = logger or logging.getLogger(__name__)
         self._stops: Dict[str, TrailingStopState] = {}  # entry_order_id -> state
         self._lock = RLock()
 
+        # P2: Persistence layer
+        self._repository = repository
+
         # Callback for stop updates (caller should modify stop order)
         self._on_stop_update: Optional[Callable[[str, float, float], None]] = None
 
+        # P2: Load persisted state on init
+        if self._repository:
+            self._load_persisted_state()
+
     def _now_ns(self) -> int:
         return int(time.time() * 1_000_000_000)
+
+    def _load_persisted_state(self):
+        """P2: Load persisted trailing stop state on startup."""
+        if not self._repository:
+            return
+
+        try:
+            persisted = self._repository.load_all_trailing_stops()
+            for entry_id, p in persisted.items():
+                # Reconstruct config from JSON
+                config_dict = json.loads(p.config_json)
+                config = TrailingStopConfig(
+                    mode=TrailingMode(config_dict.get('mode', 'FIXED_DISTANCE')),
+                    trail_distance_pct=config_dict.get('trail_distance_pct', 0.02),
+                    atr_multiplier=config_dict.get('atr_multiplier', 2.0),
+                    break_even_trigger_pct=config_dict.get('break_even_trigger_pct', 0.01),
+                    break_even_offset_pct=config_dict.get('break_even_offset_pct', 0.001),
+                    step_size_pct=config_dict.get('step_size_pct', 0.01),
+                    step_trail_pct=config_dict.get('step_trail_pct', 0.005),
+                    min_move_to_update_pct=config_dict.get('min_move_to_update_pct', 0.002),
+                )
+
+                state = TrailingStopState(
+                    entry_order_id=p.entry_order_id,
+                    symbol=p.symbol,
+                    direction=p.direction,
+                    entry_price=p.entry_price,
+                    current_stop_price=p.current_stop_price,
+                    initial_stop_price=p.initial_stop_price,
+                    highest_price=p.highest_price,
+                    lowest_price=p.lowest_price,
+                    break_even_triggered=p.break_even_triggered,
+                    updates_count=p.updates_count,
+                    current_atr=p.current_atr,
+                    config=config
+                )
+                self._stops[entry_id] = state
+
+            self._logger.info(f"P2: Loaded {len(persisted)} trailing stops from persistence")
+        except Exception as e:
+            self._logger.error(f"P2: Failed to load persisted trailing stops: {e}")
+
+    def _persist_state(self, state: TrailingStopState):
+        """P2: Persist trailing stop state."""
+        if not self._repository:
+            return
+
+        try:
+            from runtime.persistence import PersistedTrailingStop
+
+            # Serialize config to JSON
+            config_dict = {
+                'mode': state.config.mode.value,
+                'trail_distance_pct': state.config.trail_distance_pct,
+                'atr_multiplier': state.config.atr_multiplier,
+                'break_even_trigger_pct': state.config.break_even_trigger_pct,
+                'break_even_offset_pct': state.config.break_even_offset_pct,
+                'step_size_pct': state.config.step_size_pct,
+                'step_trail_pct': state.config.step_trail_pct,
+                'min_move_to_update_pct': state.config.min_move_to_update_pct,
+            }
+
+            persisted = PersistedTrailingStop(
+                entry_order_id=state.entry_order_id,
+                symbol=state.symbol,
+                direction=state.direction,
+                entry_price=state.entry_price,
+                current_stop_price=state.current_stop_price,
+                initial_stop_price=state.initial_stop_price,
+                highest_price=state.highest_price,
+                lowest_price=state.lowest_price,
+                break_even_triggered=state.break_even_triggered,
+                updates_count=state.updates_count,
+                current_atr=state.current_atr,
+                config_json=json.dumps(config_dict),
+                created_at=time.time(),
+                updated_at=time.time()
+            )
+            self._repository.save_trailing_stop(persisted)
+        except Exception as e:
+            self._logger.error(f"P2: Failed to persist trailing stop: {e}")
 
     def set_stop_update_callback(self, callback: Callable[[str, float, float], None]):
         """Set callback for stop price updates.
@@ -141,6 +240,9 @@ class TrailingStopManager:
 
         with self._lock:
             self._stops[entry_order_id] = state
+
+        # P2: Persist new trailing stop
+        self._persist_state(state)
 
         self._logger.info(
             f"X4-A: Registered trailing stop for {entry_order_id}: "
@@ -193,6 +295,9 @@ class TrailingStopManager:
                             f"{old_stop:.2f} -> {new_stop:.2f} "
                             f"(price={price:.2f}, high/low={state.highest_price:.2f}/{state.lowest_price:.2f})"
                         )
+
+                        # P2: Persist updated state
+                        self._persist_state(state)
 
                         # Notify callback
                         if self._on_stop_update:
@@ -276,6 +381,13 @@ class TrailingStopManager:
             if entry_order_id in self._stops:
                 del self._stops[entry_order_id]
                 self._logger.info(f"X4-A: Unregistered trailing stop for {entry_order_id}")
+
+        # P2: Remove from persistence
+        if self._repository:
+            try:
+                self._repository.delete_trailing_stop(entry_order_id)
+            except Exception as e:
+                self._logger.error(f"P2: Failed to delete persisted trailing stop: {e}")
 
     def get_stop_state(self, entry_order_id: str) -> Optional[TrailingStopState]:
         """Get current trailing stop state."""

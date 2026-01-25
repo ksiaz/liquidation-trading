@@ -226,6 +226,45 @@ subsystems:
       - mandate_lifecycle
       - observation_consumer
 
+  persistence_layer:
+    modules:
+      - "runtime/persistence/__init__.py"
+      - "runtime/persistence/execution_state_repository.py"
+      - "runtime/persistence/startup_reconciler.py"
+    frozen: false
+    allowed_inputs:
+      - position_state
+      - stop_order_state
+      - trailing_stop_state
+      - fill_ids
+      - exchange_positions
+    forbidden_knowledge:
+      - observation_interpretation
+      - mandate_evaluation
+    responsibilities:
+      - state_persistence
+      - crash_recovery
+      - startup_reconciliation
+      - atomic_transactions
+
+  exchange_infrastructure:
+    modules:
+      - "runtime/exchange/order_executor.py"
+      - "runtime/exchange/trailing_stop_manager.py"
+      - "runtime/exchange/fill_tracker.py"
+    frozen: false
+    allowed_inputs:
+      - order_intent
+      - price_updates
+      - fill_events
+    forbidden_knowledge:
+      - observation_interpretation
+      - strategy_logic
+    responsibilities:
+      - order_submission
+      - stop_management
+      - fill_tracking
+
 # ============================================================================
 # DEPENDENCIES — Allowed Information Flow
 # ============================================================================
@@ -327,6 +366,18 @@ dependencies:
     dependency_type: "soft"
     justification: "Policies receive primitives from adapter (via M6)"
 
+  - from: "exchange_infrastructure"
+    to: "persistence_layer"
+    artifact: "state_data"
+    dependency_type: "soft"
+    justification: "Exchange components persist state via repository"
+
+  - from: "position_tracking"
+    to: "persistence_layer"
+    artifact: "timeout_state"
+    dependency_type: "soft"
+    justification: "State machine persists CLOSING timeouts"
+
 # ============================================================================
 # FORBIDDEN EDGES — Constitutional Violations
 # ============================================================================
@@ -381,14 +432,15 @@ state_machines:
       - CLOSING
     transitions:
       allowed:
+        # Core transitions (matches code exactly)
         - from: "FLAT"
           action: "ENTRY"
           to: "ENTERING"
         - from: "ENTERING"
-          action: "fill_confirmed"
+          action: "SUCCESS"
           to: "OPEN"
         - from: "ENTERING"
-          action: "BLOCK"
+          action: "FAILURE"
           to: "FLAT"
         - from: "OPEN"
           action: "EXIT"
@@ -397,14 +449,21 @@ state_machines:
           action: "REDUCE"
           to: "REDUCING"
         - from: "REDUCING"
-          action: "partial_fill"
-          to: "OPEN"
-        - from: "REDUCING"
-          action: "EXIT"
+          action: "COMPLETE"
           to: "CLOSING"
+        - from: "REDUCING"
+          action: "PARTIAL"
+          to: "OPEN"
         - from: "CLOSING"
-          action: "full_exit_confirmed"
+          action: "SUCCESS"
           to: "FLAT"
+        # X3-A: Emergency exit paths (cancel pending + market close)
+        - from: "ENTERING"
+          action: "EMERGENCY_EXIT"
+          to: "CLOSING"
+        - from: "REDUCING"
+          action: "EMERGENCY_EXIT"
+          to: "CLOSING"
     enforcement_point: "runtime/position/state_machine.py:validate_transition"
 
   arbitration_priority:

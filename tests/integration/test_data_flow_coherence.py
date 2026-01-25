@@ -351,6 +351,9 @@ class TestExecutionToPosition:
                 symbol="BTCUSDT",
                 authority=10,
                 timestamp=time.time(),
+                direction="LONG",  # F5: Required for ENTRY
+                quantity=Decimal("0.1"),  # F5: Required for ENTRY
+                entry_price=Decimal("50000"),
             ),
         ]
 
@@ -386,6 +389,9 @@ class TestExecutionToPosition:
                 symbol="BTCUSDT",
                 authority=10,
                 timestamp=time.time(),
+                direction="LONG",  # F5: Required for ENTRY
+                quantity=Decimal("0.1"),  # F5: Required for ENTRY
+                entry_price=Decimal("50000"),
             ),
         ]
         controller.process_cycle(entry_mandates, account, mark_prices)
@@ -524,6 +530,9 @@ class TestEndToEndFlow:
                 symbol="BTCUSDT",
                 authority=10,
                 timestamp=time.time(),
+                direction="LONG",  # F5: Required for ENTRY
+                quantity=Decimal("0.1"),  # F5: Required for ENTRY
+                entry_price=Decimal("50000"),
             ),
             Mandate(
                 type=MandateType.HOLD,
@@ -593,6 +602,9 @@ class TestRiskIntegration:
                 symbol="BTCUSDT",
                 authority=10,
                 timestamp=time.time(),
+                direction="LONG",  # F5: Required for ENTRY
+                quantity=Decimal("0.1"),  # F5: Required for ENTRY
+                entry_price=Decimal("50000"),
             ),
         ]
 

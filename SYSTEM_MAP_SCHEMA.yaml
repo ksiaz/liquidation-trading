@@ -128,6 +128,9 @@ subsystems:
     modules:
       - "external_policy/ep1_oracle_volatility.py"
       - "external_policy/ep2_strategy_geometry.py"
+      - "external_policy/ep2_strategy_kinematics.py"
+      - "external_policy/ep2_effcs_strategy.py"
+      - "external_policy/ep2_slbrs_strategy.py"
       - "external_policy/ep3_strategy_deviation_bounds.py"
     frozen: true
     allowed_inputs:
@@ -508,6 +511,9 @@ frozen_components:
 
   tier_c_external_policy:
     - "external_policy/ep2_strategy_geometry.py"
+    - "external_policy/ep2_strategy_kinematics.py"
+    - "external_policy/ep2_effcs_strategy.py"
+    - "external_policy/ep2_slbrs_strategy.py"
     - "external_policy/ep3_strategy_deviation_bounds.py"
 
   tier_d_execution:

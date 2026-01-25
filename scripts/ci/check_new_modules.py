@@ -74,7 +74,12 @@ def main():
     for file_path in new_files:
         if file_path not in registered:
             # Ignore test files and scripts
-            if '/tests/' not in file_path and '/scripts/' not in file_path and not file_path.startswith('test_'):
+            # Check both /tests/ (in middle) and tests/ (at start)
+            is_test = '/tests/' in file_path or file_path.startswith('tests/')
+            is_script = '/scripts/' in file_path or file_path.startswith('scripts/')
+            is_test_file = file_path.startswith('test_') or '/test_' in file_path
+
+            if not is_test and not is_script and not is_test_file:
                 unregistered.append(file_path)
 
     if unregistered:

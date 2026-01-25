@@ -11,10 +11,31 @@ import os
 import yaml
 import argparse
 
+def is_documentary_enforcement(enforcement_point):
+    """Check if enforcement point is documentary (placeholder) rather than specific."""
+    documentary_markers = [
+        '(all functions)',
+        '(all methods)',
+        '(entire file)',
+        '(entire module)',
+        '(all)',
+    ]
+    return any(marker in enforcement_point.lower() for marker in documentary_markers)
+
+
 def file_and_function_exist(codebase, enforcement_point):
     """Check if enforcement point exists in codebase"""
     # Format: "file.py:function" or "file.py:class.method"
+    # Also handles documentary format: "file.py (all functions)"
     try:
+        # Documentary enforcement points describe scope, not specific functions
+        # Accept them if the file exists
+        if is_documentary_enforcement(enforcement_point):
+            # Extract just the file path (before parentheses or colon)
+            file_path = enforcement_point.split('(')[0].split(':')[0].strip()
+            full_path = os.path.join(codebase, file_path)
+            return os.path.exists(full_path)
+
         parts = enforcement_point.split(':')
         if len(parts) != 2:
             return False

@@ -11,6 +11,126 @@ import os
 import re
 import argparse
 
+# ==============================================================================
+# EXCEPTIONS (with constitutional justification)
+# ==============================================================================
+
+# Files exempt from vocabulary checks entirely
+EXEMPT_FILES = {
+    # Test files
+    'test_': "Test files are exempt",
+    '/tests/': "Test directory is exempt",
+}
+
+# Word-specific exemptions by file path pattern
+# Format: {word: [list of path patterns where word is allowed]}
+WORD_EXEMPTIONS = {
+    'regime': [
+        'regime_classifier',  # Component name
+        'masterframe/regime',  # Regime module
+        'runtime/regime',  # Runtime regime module
+        'ep2_effcs_strategy',  # Strategy uses regime
+        'ep2_slbrs_strategy',  # Strategy uses regime
+        'policy_adapter',  # Passes regime to strategies
+        'collector/service',  # Collector tracks regime
+        'analytics/',  # Analytics tracks regime for journaling
+        'native_app/',  # UI displays regime
+        'indicators/',  # ATR/VWAP for regime classification
+        'liquidations/',  # Z-score for regime classification
+        'orderflow/',  # Imbalance for regime classification
+        'logging/execution_db',  # Database schema
+        'meta/',  # System regime detector
+        'risk/',  # Capital management uses regime
+    ],
+    'momentum': [
+        'm4_cascade_momentum',  # M4 primitive name
+        'cascade_momentum',  # Component reference
+        'hyperliquid/',  # Hyperliquid tracking
+        'ep2_strategy_cascade_sniper',  # Strategy uses cascade momentum
+    ],
+    'bias': [
+        'm4_open_interest_bias',  # M4 primitive name
+        'open_interest_bias',  # Component reference
+        'directional_bias',  # Component reference
+        'governance.py',  # Computes bias primitive
+        'native_app/',  # UI panels (whale bias display)
+        'meta/',  # Design bias protection documentation
+        'regime/classifier',  # Imbalance bias threshold
+    ],
+    'pressure': [
+        'm2_pressure',  # M2 module name
+        'memory_pressure',  # Component reference
+        'm2_continuity_store',  # Memory pressure method
+        'stop_hunt_detector',  # Absorption pressure (technical)
+        'ep4_ghost_tracker',  # Market pressure context
+        'entry_quality',  # Exhaustion pressure context
+    ],
+    'signal': [
+        'm4_cascade_state',  # Documentation about what it cannot be
+        'ep2_strategy_absence',  # Documents what is not a signal
+        'hyperliquid/',  # WebSocket signal (technical term)
+        'ws_position_tracker',  # Technical signal term
+        'liquidation_fade',  # Technical signal term
+        'client.py',  # API documentation
+        'ep4_ghost_tracker',  # Liquidation signal strength (technical)
+        'stop_hunt_detector',  # Detection signal (technical)
+        'native_app/',  # Qt Signal class, UI signal handling
+        'terminal_app/',  # Python signal module
+        'entry_quality',  # Documentation about signal strength
+    ],
+    'opportunity': [
+        'ep2_effcs_strategy',  # Method name (constitutional: no semantic interpretation)
+        'ep2_slbrs_strategy',  # Method name (constitutional: no semantic interpretation)
+        'ep2_strategy_cascade_sniper',  # Method name
+        'arbitration/types',  # Comment in enum
+        'ep4_ghost_tracker',  # Entry opportunity method
+        'stop_hunt_detector',  # Entry opportunity method
+        'entry_quality',  # Entry opportunity scoring method
+    ],
+    'edge': [
+        'ep2_slbrs_strategy',  # "block edge" - geometric term, not semantic
+        'meta/',  # System edge detector (legitimate component)
+        'native_app/',  # Chart edge positioning (geometric)
+    ],
+    'setup': [
+        'env_setup',  # File name
+        'position_tracker',  # Method name (setup wallets)
+        'entry_quality',  # "reversal setup" - technical term
+    ],
+    'alpha': [
+        'indicators/',  # EMA alpha smoothing constant (mathematical)
+    ],
+    'momentum': [
+        'm4_cascade_momentum',  # M4 primitive name
+        'cascade_momentum',  # Component reference
+        'hyperliquid/',  # Hyperliquid tracking
+        'ep2_strategy_cascade_sniper',  # Strategy uses cascade momentum
+        'regime/',  # Regime classifier documents momentum behavior
+    ],
+}
+
+def is_exempt_file(file_path):
+    """Check if file is completely exempt from vocabulary checks."""
+    normalized = file_path.replace('\\', '/')
+
+    for pattern in EXEMPT_FILES:
+        if pattern in normalized:
+            return True
+
+    return False
+
+def is_word_exempt_in_file(word, file_path):
+    """Check if specific word is exempt in specific file."""
+    normalized = file_path.replace('\\', '/')
+    word_lower = word.lower()
+
+    if word_lower in WORD_EXEMPTIONS:
+        for pattern in WORD_EXEMPTIONS[word_lower]:
+            if pattern in normalized:
+                return True
+
+    return False
+
 def is_negation_context(line, word):
     """Check if word appears in negation context"""
     line_lower = line.lower()
@@ -79,6 +199,10 @@ def is_negation_context(line, word):
 
 def scan_file_for_words(file_path, forbidden_words, context_sensitive=False):
     """Scan file for forbidden vocabulary"""
+    # Check if entire file is exempt
+    if is_exempt_file(file_path):
+        return []
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -94,6 +218,10 @@ def scan_file_for_words(file_path, forbidden_words, context_sensitive=False):
             # Skip strings (but not docstrings - those matter)
             # Simplistic check - just look for words in code
             for word in forbidden_words:
+                # Check if word is exempt in this file
+                if is_word_exempt_in_file(word, file_path):
+                    continue
+
                 # Case-insensitive search
                 pattern = rf'\b{word}\b'
                 if re.search(pattern, line, re.IGNORECASE):

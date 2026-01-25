@@ -1,6 +1,6 @@
 # SYSTEM ARCHITECTURE MAP
 **Status:** Cartography Report
-**Date:** 2026-01-12
+**Date:** 2026-01-25
 **Purpose:** Navigation Manual for Agent & Human Understanding
 **Authority:** Code Inspection + Constitutional Documents
 
@@ -476,7 +476,7 @@ Contains pre-computed primitives for ONE symbol:
 - REDUCING (partial exit in progress)
 - CLOSING (full exit in progress)
 
-**Allowed Transitions (8):**
+**Allowed Transitions (10):**
 ```
 FLAT --[ENTRY]--> ENTERING
 ENTERING --[SUCCESS]--> OPEN
@@ -486,9 +486,12 @@ OPEN --[EXIT]--> CLOSING
 REDUCING --[PARTIAL]--> OPEN
 REDUCING --[COMPLETE]--> CLOSING
 CLOSING --[SUCCESS]--> FLAT
+# X3-A Emergency Exit (cancel pending + market close)
+ENTERING --[EMERGENCY_EXIT]--> CLOSING
+REDUCING --[EMERGENCY_EXIT]--> CLOSING
 ```
 
-**Forbidden Transitions (17):**
+**Forbidden Transitions (15):**
 - All other combinations (rejected with InvariantViolation)
 
 **Invariants Enforced:**
@@ -537,6 +540,166 @@ CLOSING --[SUCCESS]--> FLAT
 **NOT EXPOSED EXTERNALLY** (research only)
 
 **Constitution Compliance:** ✓ (Internal logging, no external exposure)
+
+---
+
+### 1.15 Persistence Layer (P1-P7 Hardenings)
+
+**Location:** `runtime/persistence/`
+
+**Files:**
+- `execution_state_repository.py` - SQLite persistence for execution state
+- `startup_reconciler.py` - Startup reconciliation with exchange
+
+**Responsibility:**
+- P1: Stop order lifecycle persistence (PENDING → PLACED → TRIGGERED → FILLED)
+- P2: Trailing stop state persistence (with config JSON)
+- P3: Fill ID deduplication (prevents duplicate fill processing)
+- P4: CLOSING timeout tracking (recovers stuck positions)
+- P5: Startup reconciliation (sync local state with exchange)
+- P6: Atomic transaction support (multi-write consistency)
+- P7: Tracked position persistence (for detection/UI layer)
+
+**Tables:**
+```sql
+stop_orders          -- Stop order lifecycle state
+trailing_stops       -- Trailing stop configurations
+seen_fill_ids        -- Fill deduplication (global)
+closing_timeouts     -- CLOSING state timeout tracking
+tracked_positions    -- SharedPositionState persistence
+```
+
+**Key Classes:**
+- `ExecutionStateRepository` - Unified persistence interface
+- `StartupReconciler` - Detects and resolves state discrepancies
+- `AtomicTransaction` - Context manager for atomic writes
+
+**Discrepancy Types (Reconciliation):**
+- GHOST_POSITION: Local has position, exchange doesn't
+- ORPHAN_POSITION: Exchange has position, local doesn't
+- SIZE_MISMATCH: Both have position, sizes differ
+- DIRECTION_MISMATCH: Both have position, directions differ
+- STATE_MISMATCH: Local in transitional state
+
+**Constitution Compliance:** ✓ (State persistence, no interpretation)
+
+---
+
+### 1.16 Exchange Infrastructure
+
+**Location:** `runtime/exchange/`
+
+**Files:**
+- `order_executor.py` - Order submission and tracking
+- `trailing_stop_manager.py` - Trailing stop management
+- `fill_tracker.py` - Fill event processing and deduplication
+
+**Responsibility:**
+- Submit orders to exchange
+- Track order lifecycle
+- Manage trailing stops with price updates
+- Process fill events
+- Deduplicate fills (prevent double-processing)
+
+**Trailing Stop Manager:**
+- Registers trailing stops with initial config
+- Updates stop price on favorable price movement
+- Persists state via ExecutionStateRepository
+- Tracks: activation_price, current_stop, trailing_pct, trigger_pct
+
+**Fill Tracker:**
+- Processes fill events from exchange
+- Maintains global seen_fill_ids set
+- Persists fill IDs to database
+- Prevents duplicate fill processing across restarts
+
+**Constitution Compliance:** ✓ (Execution infrastructure, no interpretation)
+
+---
+
+### 1.17 Hyperliquid Integration
+
+**Location:** `runtime/hyperliquid/`
+
+**Files:**
+- `shared_state.py` - Thread-safe shared state for detection/UI
+- `live_tracker.py` - Live position tracking
+- `indexer/` - Hyperliquid indexer integration
+
+**SharedPositionState:**
+- Thread-safe state between detection loop and UI
+- Detection writes: update_position(), add_alert()
+- UI reads: get_all_positions(), get_danger_positions()
+- Persistence via ExecutionStateRepository (P7)
+
+**Position Tracking:**
+- PositionSnapshot: wallet, coin, side, size, notional, liq_price, distance_pct
+- DangerAlert: danger zone notifications
+- Danger levels: 0=safe, 1=watch, 2=warning, 3=critical
+
+**Constitution Compliance:** ✓ (Data tracking, no interpretation)
+
+---
+
+### 1.18 Analysis & Validation Pipeline (HLP25)
+
+**Location:** `analysis/`
+
+**Files:**
+- `cascade_labeler.py` - Mechanical cascade event detection
+- `wave_detector.py` - Wave structure detection within cascades
+- `validators/` - Hypothesis validators
+
+**Validators:**
+- `wave_structure.py` - HLP25 Part 2: Cascades occur in 3-5 waves
+- `absorption.py` - HLP25 Part 3: Absorption predicts exhaustion
+- `oi_concentration.py` - HLP25 Part 4: Top 10 wallets >40% = high risk
+- `cross_asset.py` - HLP25 Part 6: BTC→ETH→Alts lead time
+
+**Cascade Labeling (Mechanical Definition):**
+- OI dropped >10% in <60 seconds
+- At least 2 liquidation events detected
+- No interpretation, pure observable facts
+
+**ValidationResult:**
+- hypothesis_name: str
+- total_events: int
+- supporting_events: int
+- success_rate: float
+- status: VALIDATED | FAILED | INSUFFICIENT_DATA
+
+**Constitution Compliance:** ✓ (Mechanical labeling, no prediction)
+
+---
+
+### 1.19 EFFCS & SLBRS Strategies
+
+**Location:** `external_policy/`
+
+**Files:**
+- `ep2_effcs_strategy.py` - Expansion-Focused Flow Continuation Strategy
+- `ep2_slbrs_strategy.py` - Sideways Liquidity Band Reversion Strategy
+
+**EFFCS (Expansion Regime):**
+- Regime gate: Only active in EXPANSION regime
+- Impulse detection: >2% move in <10 candles
+- Pullback filtering: 20-50% retracement
+- Entry: Continuation in impulse direction
+- Exit: Liquidations stopped OR volatility contraction
+
+**SLBRS (Sideways Regime):**
+- Regime gate: Only active in SIDEWAYS regime
+- First test detection: Initial band touch
+- Retest entry: Price returns to band with absorption
+- Invalidation: Volatility expansion OR price acceptance beyond band
+- Exit: Opposite band approach OR invalidation
+
+**Mutual Exclusion:**
+- Only ONE strategy active at a time
+- Regime change forces exit of active strategy
+- No overlap period allowed
+
+**Constitution Compliance:** ✓ (Stateless evaluation, no prediction)
 
 ---
 
@@ -625,6 +788,26 @@ ContinuityMemoryStore → ResearchDatabase [SOFT]
   Purpose: Log M2 events (node creation, state transitions)
   Artifact: _event_logger attribute
   Conditional: If _event_logger is not None
+
+ExecutionController → ExecutionStateRepository [SOFT]
+  Purpose: Persist state machine timeouts
+  Artifact: save_closing_timeout(), delete_closing_timeout()
+  Conditional: If repository provided
+
+TrailingStopManager → ExecutionStateRepository [SOFT]
+  Purpose: Persist trailing stop state
+  Artifact: save_trailing_stop(), load_trailing_stops()
+  Conditional: If repository provided
+
+FillTracker → ExecutionStateRepository [SOFT]
+  Purpose: Persist seen fill IDs
+  Artifact: save_fill_id(), has_fill_id()
+  Conditional: If repository provided
+
+SharedPositionState → ExecutionStateRepository [SOFT]
+  Purpose: Persist tracked positions
+  Artifact: save_tracked_position(), load_tracked_positions()
+  Conditional: If repository provided
 ```
 
 ### 2.3 Circular Dependencies (Red Flags)
@@ -1210,7 +1393,7 @@ REDUCING   — Partial exit in progress
 CLOSING    — Full exit in progress
 ```
 
-**Allowed Transitions (8):**
+**Allowed Transitions (10):**
 ```
 FLAT --[ENTRY]--> ENTERING
 ENTERING --[SUCCESS]--> OPEN
@@ -1220,6 +1403,9 @@ OPEN --[EXIT]--> CLOSING
 REDUCING --[PARTIAL]--> OPEN
 REDUCING --[COMPLETE]--> CLOSING
 CLOSING --[SUCCESS]--> FLAT
+# X3-A Emergency Exit (cancel pending + market close)
+ENTERING --[EMERGENCY_EXIT]--> CLOSING
+REDUCING --[EMERGENCY_EXIT]--> CLOSING
 ```
 
 **Invariants Enforced:**
@@ -1690,17 +1876,24 @@ class MemoryStateThresholds:
 
 ## 10. SUMMARY METRICS
 
-**Total Subsystems:** 14
+**Total Subsystems:** 19 (updated 2026-01-25)
 **Frozen Components:** 23
 **Constitutional Documents:** 5
 **State Machines:** 3 (Position, Arbitration, Observation)
 **Primitives (M4):** 17
-**External Policies:** 3
+**External Policies:** 5 (3 original + EFFCS + SLBRS)
 **Mandate Types:** 5
 **Position States:** 5
-**Allowed Transitions:** 8
-**Forbidden Transitions:** 17
+**Allowed Transitions:** 10 (8 original + 2 X3-A emergency exit)
+**Forbidden Transitions:** 15
 **Proven Theorems:** 26 (13 position + 13 arbitration)
+
+**New Subsystems (2026-01-25):**
+- Persistence Layer (P1-P7)
+- Exchange Infrastructure
+- Hyperliquid Integration
+- Analysis/Validation Pipeline (HLP25)
+- EFFCS/SLBRS Strategies
 
 **Constitution Compliance:** ✓ FULL (observation layer)
 **Code Freeze Compliance:** ✓ ALL FROZEN COMPONENTS IDENTIFIED

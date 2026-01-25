@@ -107,6 +107,24 @@ WORD_EXEMPTIONS = {
         'ep2_strategy_cascade_sniper',  # Strategy uses cascade momentum
         'regime/',  # Regime classifier documents momentum behavior
     ],
+    'regime': [
+        'm4_absorption_confirmation',  # Technical term for market context (volatility/liquidity state)
+        'regime_classifier',  # Component name
+        'masterframe/regime',  # Regime module
+        'runtime/regime',  # Runtime regime module
+        'ep2_effcs_strategy',  # Strategy uses regime
+        'ep2_slbrs_strategy',  # Strategy uses regime
+        'policy_adapter',  # Passes regime to strategies
+        'collector/service',  # Collector tracks regime
+        'analytics/',  # Analytics tracks regime for journaling
+        'native_app/',  # UI displays regime
+        'indicators/',  # ATR/VWAP for regime classification
+        'liquidations/',  # Z-score for regime classification
+        'orderflow/',  # Imbalance for regime classification
+        'logging/execution_db',  # Database schema
+        'meta/',  # System regime detector
+        'risk/',  # Capital management uses regime
+    ],
 }
 
 def is_exempt_file(file_path):

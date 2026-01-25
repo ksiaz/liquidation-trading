@@ -65,6 +65,24 @@ subsystems:
       - composite_scores
     epistemic_class: "structural_only"
 
+  m4_primitives:
+    modules:
+      - "memory/m4_cascade_momentum.py"
+      - "memory/m4_absorption_confirmation.py"
+      - "memory/m4_liquidation_clustering.py"
+      - "memory/m4_trade_flow.py"
+    frozen: false
+    allowed_inputs:
+      - trade_stream
+      - orderbook_snapshots
+      - absorption_events
+      - refill_events
+    forbidden_knowledge:
+      - prediction
+      - reversal_timing
+      - entry_recommendation
+    epistemic_class: "structural_only"
+
   m5_governance:
     modules:
       - "memory/m5_access.py"

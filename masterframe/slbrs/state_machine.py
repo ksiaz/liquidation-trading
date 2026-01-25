@@ -158,8 +158,9 @@ class SLBRSStateMachine:
         RULE: Check regime first - abort if not SIDEWAYS.
         RULE: Follow state sequence exactly.
         """
-        # HARD REGIME GATE
-        if regime != RegimeType.SIDEWAYS:
+        # HARD REGIME GATE (compare by value to allow different enum classes)
+        regime_value = regime.value if hasattr(regime, 'value') else str(regime)
+        if regime_value != "SIDEWAYS":
             if self.state != SLBRSState.DISABLED:
                 return self._force_exit("Regime changed", current_price, current_time)
             return None

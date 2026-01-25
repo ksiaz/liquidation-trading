@@ -19,7 +19,8 @@ from masterframe.replay.feed_adapters import (
 from masterframe.replay.synchronizer import ReplayDataSync
 from masterframe.replay.system_wrapper import ReplaySystemWrapper
 from masterframe.data_ingestion import (
-    OrderbookSnapshot, AggressiveTrade, LiquidationEvent, Kline
+    OrderbookSnapshot, AggressiveTrade, LiquidationEvent, Kline,
+    BookTickerEvent, generate_event_id
 )
 
 
@@ -335,18 +336,19 @@ class TestV5Determinism:
                 [AggressiveTrade(i, 100.0, 1.0, True) for i in range(30)],
                 [LiquidationEvent(i, "BTCUSDT", "SELL", 0.1, 100.0, 10.0) for i in range(30)],
                 [Kline(i, 100.0, 101.0, 99.0, 100.5, 1000.0, '1m') for i in range(30)],
-                [Kline(i*5, 100.0, 101.0, 99.0, 100.5, 5000.0, '5m') for i in range(6)],
+                [Kline(i*5, 100.0, 101.0, 99.0, 100.5, 5000.0, '5m') for i in range(10)],  # Need 10 for buffer
+                [BookTickerEvent(generate_event_id(), float(i), float(i) + 0.001, "BTCUSDT", 100.0, 1.0, 101.0, 1.0) for i in range(30)],
             )
-        
+
         # Run replay twice
         controller1 = ReplayController()
-        obs1, trades1, liqs1, k1m1, k5m1 = create_data()
-        summary1 = controller1.run_replay(obs1, trades1, liqs1, k1m1, k5m1)
-        
+        obs1, trades1, liqs1, k1m1, k5m1, bt1 = create_data()
+        summary1 = controller1.run_replay(obs1, trades1, liqs1, k1m1, k5m1, bt1)
+
         controller2 = ReplayController()
-        obs2, trades2, liqs2, k1m2, k5m2 = create_data()
-        summary2 = controller2.run_replay(obs2, trades2, liqs2, k1m2, k5m2)
-        
+        obs2, trades2, liqs2, k1m2, k5m2, bt2 = create_data()
+        summary2 = controller2.run_replay(obs2, trades2, liqs2, k1m2, k5m2, bt2)
+
         # EXPECT: Identical results
         assert summary1['events_processed'] == summary2['events_processed']
         assert summary1['executions'] == summary2['executions']

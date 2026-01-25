@@ -119,22 +119,24 @@ class TestIntegrationWithReplay:
         )
         from masterframe.replay.synchronizer import ReplayDataSync
         
-        # Create historical data
+        # Create historical data (enough for all warmup thresholds)
         base_time = 1000.0
+        count = 50  # Need 30 1m klines, 10 5m klines, 10 trades, 5 liquidations
+
         orderbooks = [OrderbookSnapshot(
             timestamp=base_time + i,
             bids=((100.0, 1.0),),
             asks=((101.0, 1.0),),
             mid_price=100.5
-        ) for i in range(30)]
-        
+        ) for i in range(count)]
+
         trades = [AggressiveTrade(
             timestamp=base_time + i,
             price=100.0,
             quantity=0.5,
             is_buyer_aggressor=True
-        ) for i in range(30)]
-        
+        ) for i in range(count)]
+
         liqs = [LiquidationEvent(
             timestamp=base_time + i,
             symbol="BTCUSDT",
@@ -142,8 +144,8 @@ class TestIntegrationWithReplay:
             quantity=0.1,
             price=100.0,
             value_usd=10.0
-        ) for i in range(30)]
-        
+        ) for i in range(count)]
+
         klines_1m = [Kline(
             timestamp=base_time + i,
             open=100.0,
@@ -152,8 +154,8 @@ class TestIntegrationWithReplay:
             close=100.5,
             volume=1000.0,
             interval='1m'
-        ) for i in range(30)]
-        
+        ) for i in range(count)]
+
         klines_5m = [Kline(
             timestamp=base_time + i * 5,
             open=100.0,
@@ -162,7 +164,7 @@ class TestIntegrationWithReplay:
             close=100.5,
             volume=5000.0,
             interval='5m'
-        ) for i in range(6)]
+        ) for i in range(count // 5)]  # 10 5m klines for warmup
         
         # Create adapters
         adapters = [

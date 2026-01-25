@@ -42,7 +42,7 @@ class TestOrderBookIngestion:
         )
 
         # Check M1 counter
-        assert obs_system._m1.counters['depth_updates'] == 1
+        assert obs_system._m1.counters['depth'] == 1
 
     def test_m1_handles_empty_orderbook(self):
         """M1 handles empty bids/asks gracefully."""
@@ -63,7 +63,7 @@ class TestOrderBookIngestion:
             payload=depth_payload
         )
 
-        assert obs_system._m1.counters['depth_updates'] == 1
+        assert obs_system._m1.counters['depth'] == 1
 
 
 class TestOrderBookStateUpdate:
@@ -112,17 +112,15 @@ class TestOrderBookStateUpdate:
 
         # Verify node updated with order book state
         node = active_nodes[0]
-        assert node.resting_size_bid == 5.0
+        assert node.last_observed_bid_size == 5.0
+        assert node.last_observed_ask_size == 3.0
         assert node.last_orderbook_update_ts == 1001.0
-        # Note: orderbook_update_count is 2 because both bid and ask levels
-        # fall within the node's price band (50000 ± 50), so both updates matched
-        assert node.orderbook_update_count >= 1
 
     def test_m2_updates_multiple_price_levels(self):
-        """M2 updates multiple nodes with different price levels."""
+        """M2 updates nodes that overlap with best bid/ask price."""
         obs_system = ObservationSystem(allowed_symbols=["BTCUSDT"])
 
-        # Create multiple nodes
+        # Create multiple nodes at different prices
         for price in [50000.0, 49900.0, 50100.0]:
             liq_payload = {
                 "E": 1000000,
@@ -143,7 +141,8 @@ class TestOrderBookStateUpdate:
         active_nodes = obs_system._m2_store.get_active_nodes(symbol="BTCUSDT")
         assert len(active_nodes) == 3
 
-        # Update order book with multiple levels
+        # Update order book - only best_bid_price (50000) is used for overlap check
+        # The depth update aggregates sizes but only the best price level is checked
         depth_payload = {
             "e": "depthUpdate",
             "E": 1001000,
@@ -163,9 +162,15 @@ class TestOrderBookStateUpdate:
             payload=depth_payload
         )
 
-        # Verify all nodes updated
+        # Only the node overlapping with best_bid_price (50000) should be updated
         nodes_with_ob = [n for n in active_nodes if n.last_orderbook_update_ts is not None]
-        assert len(nodes_with_ob) == 3
+        assert len(nodes_with_ob) == 1
+
+        # Verify the correct node was updated
+        updated_node = nodes_with_ob[0]
+        assert updated_node.price_center == 50000.0
+        # bid_size is sum of top 5 levels = 5.0 + 3.0 + 7.0 = 15.0
+        assert updated_node.last_observed_bid_size == 15.0
 
 
 class TestOrderBookPrimitives:
@@ -209,11 +214,11 @@ class TestOrderBookPrimitives:
         # Verify resting size primitive exists
         primitives = snapshot.primitives["BTCUSDT"]
         assert primitives.resting_size is not None
-        assert primitives.resting_size.price == 50000.0
-        assert primitives.resting_size.size_bid == 5.0
-        # Note: size_ask is 3.0 because the ask price 50001 falls within
+        assert primitives.resting_size.best_bid_price == 50000.0
+        assert primitives.resting_size.bid_size == 5.0
+        # Note: ask_size is 3.0 because the ask price 50001 falls within
         # the node's price band (50000 ± 50), so both bid and ask matched the node
-        assert primitives.resting_size.size_ask == 3.0
+        assert primitives.resting_size.ask_size == 3.0
 
     def test_empty_orderbook_returns_none(self):
         """Empty order book data returns None primitive gracefully."""
@@ -234,20 +239,21 @@ class TestOrderBookConstitutionalCompliance:
 
     def test_no_semantic_interpretation(self):
         """Order book primitives are factual, not interpretive."""
-        from memory.m4_orderbook import RestingSizeAtPrice
+        from memory.m4_orderbook_primitives import RestingSizeAtPrice
 
         # Create primitive
         resting_size = RestingSizeAtPrice(
-            price=50000.0,
-            size_bid=5.0,
-            size_ask=3.0,
+            bid_size=5.0,
+            ask_size=3.0,
+            best_bid_price=50000.0,
+            best_ask_price=50001.0,
             timestamp=1000.0
         )
 
         # Verify fields are purely factual
-        assert hasattr(resting_size, 'price')
-        assert hasattr(resting_size, 'size_bid')
-        assert hasattr(resting_size, 'size_ask')
+        assert hasattr(resting_size, 'best_bid_price')
+        assert hasattr(resting_size, 'bid_size')
+        assert hasattr(resting_size, 'ask_size')
         assert hasattr(resting_size, 'timestamp')
 
         # Verify NO semantic fields
@@ -258,15 +264,16 @@ class TestOrderBookConstitutionalCompliance:
 
     def test_primitives_are_frozen(self):
         """Order book primitives are immutable."""
-        from memory.m4_orderbook import RestingSizeAtPrice
+        from memory.m4_orderbook_primitives import RestingSizeAtPrice
 
         resting_size = RestingSizeAtPrice(
-            price=50000.0,
-            size_bid=5.0,
-            size_ask=3.0,
+            bid_size=5.0,
+            ask_size=3.0,
+            best_bid_price=50000.0,
+            best_ask_price=50001.0,
             timestamp=1000.0
         )
 
         # Attempt to modify (should raise)
         with pytest.raises(Exception):
-            resting_size.price = 51000.0
+            resting_size.bid_size = 10.0

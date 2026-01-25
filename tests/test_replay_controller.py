@@ -15,8 +15,9 @@ import sys
 sys.path.append('d:/liquidation-trading')
 
 from masterframe.data_ingestion import (
-    OrderbookSnapshot, AggressiveTrade, 
-    LiquidationEvent, Kline
+    OrderbookSnapshot, AggressiveTrade,
+    LiquidationEvent, Kline, BookTickerEvent,
+    generate_event_id
 )
 from masterframe.replay import ReplayController
 
@@ -27,21 +28,21 @@ class TestReplayController:
     def create_sample_data(self, count: int = 50):
         """Helper to create sample historical data."""
         base_time = 1000.0
-        
+
         orderbooks = [OrderbookSnapshot(
             timestamp=base_time + i,
             bids=((100.0 - i * 0.1, 1.0),),
             asks=((101.0 + i * 0.1, 1.0),),
             mid_price=100.5 + i * 0.05
         ) for i in range(count)]
-        
+
         trades = [AggressiveTrade(
             timestamp=base_time + i,
             price=100.0 + i * 0.1,
             quantity=0.5,
             is_buyer_aggressor=i % 2 == 0
         ) for i in range(count)]
-        
+
         liqs = [LiquidationEvent(
             timestamp=base_time + i,
             symbol="BTCUSDT",
@@ -50,7 +51,7 @@ class TestReplayController:
             price=100.0 + i * 0.1,
             value_usd=10.0
         ) for i in range(count)]
-        
+
         klines_1m = [Kline(
             timestamp=base_time + i,
             open=100.0,
@@ -60,7 +61,7 @@ class TestReplayController:
             volume=1000.0 + i * 10,
             interval='1m'
         ) for i in range(count)]
-        
+
         klines_5m = [Kline(
             timestamp=base_time + i * 5,
             open=100.0,
@@ -70,25 +71,37 @@ class TestReplayController:
             volume=5000.0,
             interval='5m'
         ) for i in range(count // 5)]
-        
-        return orderbooks, trades, liqs, klines_1m, klines_5m
+
+        booktickers = [BookTickerEvent(
+            event_id=generate_event_id(),
+            timestamp=base_time + i,
+            receive_time=base_time + i + 0.001,
+            symbol="BTCUSDT",
+            best_bid_price=100.0 - i * 0.1,
+            best_bid_qty=1.0,
+            best_ask_price=101.0 + i * 0.1,
+            best_ask_qty=1.0
+        ) for i in range(count)]
+
+        return orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
     
     def test_complete_replay(self):
         """Run complete replay with sample data."""
         controller = ReplayController(symbol="BTCUSDT")
-        
+
         # Create data
-        orderbooks, trades, liqs, klines_1m, klines_5m = self.create_sample_data(50)
-        
+        orderbooks, trades, liqs, klines_1m, klines_5m, booktickers = self.create_sample_data(50)
+
         # Run replay
         summary = controller.run_replay(
             orderbooks=orderbooks,
             trades=trades,
             liquidations=liqs,
             klines_1m=klines_1m,
-            klines_5m=klines_5m
+            klines_5m=klines_5m,
+            booktickers=booktickers
         )
-        
+
         # EXPECT: Summary with results
         assert summary['symbol'] == "BTCUSDT"
         assert summary['events_processed'] > 0
@@ -100,19 +113,19 @@ class TestReplayController:
     def test_deterministic_results(self):
         """Same data produces same results."""
         # Create data once
-        orderbooks, trades, liqs, klines_1m, klines_5m = self.create_sample_data(30)
-        
+        orderbooks, trades, liqs, klines_1m, klines_5m, booktickers = self.create_sample_data(30)
+
         # Run replay twice
         controller1 = ReplayController(symbol="BTCUSDT")
         summary1 = controller1.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
-        
+
         controller2 = ReplayController(symbol="BTCUSDT")
         summary2 = controller2.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
-        
+
         # EXPECT: Identical results
         assert summary1['events_processed'] == summary2['events_processed']
         assert summary1['executions'] == summary2['executions']
@@ -121,26 +134,26 @@ class TestReplayController:
     def test_event_counting(self):
         """Events are correctly counted."""
         controller = ReplayController()
-        
-        orderbooks, trades, liqs, klines_1m, klines_5m = self.create_sample_data(20)
-        
+
+        orderbooks, trades, liqs, klines_1m, klines_5m, booktickers = self.create_sample_data(20)
+
         summary = controller.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
-        
-        # Total events = orderbooks + trades + liqs + klines_1m + klines_5m
-        expected_events = 20 + 20 + 20 + 20 + 4  # 84 total
+
+        # Total events = orderbooks + trades + liqs + klines_1m + klines_5m + booktickers
+        expected_events = 20 + 20 + 20 + 20 + 4 + 20  # 104 total
         assert summary['events_scheduled'] == expected_events
         assert summary['events_processed'] == expected_events
     
     def test_result_collection(self):
         """Results are collected correctly."""
         controller = ReplayController()
-        
-        orderbooks, trades, liqs, klines_1m, klines_5m = self.create_sample_data(25)
-        
+
+        orderbooks, trades, liqs, klines_1m, klines_5m, booktickers = self.create_sample_data(25)
+
         summary = controller.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
         
         # Get results
@@ -160,41 +173,41 @@ class TestReplayController:
     def test_get_execution_count(self):
         """Execution count accessor works."""
         controller = ReplayController()
-        
+
         assert controller.get_execution_count() == 0
-        
-        orderbooks, trades, liqs, klines_1m, klines_5m = self.create_sample_data(15)
-        
+
+        orderbooks, trades, liqs, klines_1m, klines_5m, booktickers = self.create_sample_data(15)
+
         controller.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
-        
+
         assert controller.get_execution_count() == len(controller.get_results())
 
 
 class TestReplayControllerIntegration:
     """Test full integration."""
-    
+
     def test_end_to_end_replay(self):
         """Complete end-to-end replay."""
         # Create realistic data
         base_time = 1704196800.0  # Jan 2, 2024
         count = 100
-        
+
         orderbooks = [OrderbookSnapshot(
             timestamp=base_time + i,
             bids=((50000.0, 1.0), (49999.0, 2.0)),
             asks=((50001.0, 1.0), (50002.0, 2.0)),
             mid_price=50000.5
         ) for i in range(count)]
-        
+
         trades = [AggressiveTrade(
             timestamp=base_time + i,
             price=50000.0,
             quantity=0.1,
             is_buyer_aggressor=True
         ) for i in range(count)]
-        
+
         liqs = [LiquidationEvent(
             timestamp=base_time + i,
             symbol="BTCUSDT",
@@ -203,7 +216,7 @@ class TestReplayControllerIntegration:
             price=50000.0,
             value_usd=25000.0
         ) for i in range(count)]
-        
+
         klines_1m = [Kline(
             timestamp=base_time + i,
             open=50000.0,
@@ -213,7 +226,7 @@ class TestReplayControllerIntegration:
             volume=10.0,
             interval='1m'
         ) for i in range(count)]
-        
+
         klines_5m = [Kline(
             timestamp=base_time + i * 5,
             open=50000.0,
@@ -223,13 +236,24 @@ class TestReplayControllerIntegration:
             volume=50.0,
             interval='5m'
         ) for i in range(count // 5)]
-        
+
+        booktickers = [BookTickerEvent(
+            event_id=generate_event_id(),
+            timestamp=base_time + i,
+            receive_time=base_time + i + 0.001,
+            symbol="BTCUSDT",
+            best_bid_price=50000.0,
+            best_bid_qty=1.0,
+            best_ask_price=50001.0,
+            best_ask_qty=1.0
+        ) for i in range(count)]
+
         # Run replay
         controller = ReplayController(symbol="BTCUSDT")
         summary = controller.run_replay(
-            orderbooks, trades, liqs, klines_1m, klines_5m
+            orderbooks, trades, liqs, klines_1m, klines_5m, booktickers
         )
-        
+
         # Validate
         assert summary['symbol'] == "BTCUSDT"
         assert summary['events_processed'] > 0

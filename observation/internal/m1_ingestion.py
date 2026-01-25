@@ -118,28 +118,67 @@ class M1IngestionEngine:
 
     def normalize_depth(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
         """
-        Normalize raw binance bookTicker payload.
+        Normalize raw depth payload.
 
-        bookTicker format:
+        Supports two formats:
+
+        1. bookTicker format:
         {
             "e": "bookTicker",
-            "E": 1234567890123,  // Event time
-            "s": "BTCUSDT",
-            "b": "96573.28",     // Best bid price
-            "B": "0.44492",      // Best bid quantity
-            "a": "96573.29",     // Best ask price
-            "A": "5.85264"       // Best ask quantity
+            "E": 1234567890123,
+            "b": "96573.28",     // Best bid price (string)
+            "B": "0.44492",      // Best bid quantity (string)
+            "a": "96573.29",     // Best ask price (string)
+            "A": "5.85264"       // Best ask quantity (string)
+        }
+
+        2. Depth update format:
+        {
+            "E": 1234567890123,
+            "b": [["96573.28", "0.44492"], ...],  // Bids array
+            "a": [["96573.29", "5.85264"], ...]   // Asks array
         }
         """
         try:
             # Extract timestamp
             timestamp = int(raw_payload.get('E', 0)) / 1000.0
 
-            # Extract best bid/ask from bookTicker format
-            best_bid_price = float(raw_payload['b']) if 'b' in raw_payload else None
-            bid_size = float(raw_payload['B']) if 'B' in raw_payload else 0.0
-            best_ask_price = float(raw_payload['a']) if 'a' in raw_payload else None
-            ask_size = float(raw_payload['A']) if 'A' in raw_payload else 0.0
+            # Detect format and extract accordingly
+            bids = raw_payload.get('b')
+            asks = raw_payload.get('a')
+
+            if isinstance(bids, list):
+                # Depth update format: arrays of [price, qty] pairs
+                # Only use top 5 levels for aggregation
+                MAX_LEVELS = 5
+
+                if bids and len(bids) > 0:
+                    best_bid_price = float(bids[0][0])
+                    top_bids = bids[:MAX_LEVELS]
+                    bid_size = sum(float(level[1]) for level in top_bids)
+                    bid_levels = len(top_bids)
+                else:
+                    best_bid_price = None
+                    bid_size = 0.0
+                    bid_levels = 0
+
+                if asks and len(asks) > 0:
+                    best_ask_price = float(asks[0][0])
+                    top_asks = asks[:MAX_LEVELS]
+                    ask_size = sum(float(level[1]) for level in top_asks)
+                    ask_levels = len(top_asks)
+                else:
+                    best_ask_price = None
+                    ask_size = 0.0
+                    ask_levels = 0
+            else:
+                # bookTicker format: single string values
+                best_bid_price = float(bids) if bids else None
+                bid_size = float(raw_payload.get('B', 0))
+                best_ask_price = float(asks) if asks else None
+                ask_size = float(raw_payload.get('A', 0))
+                bid_levels = 1 if best_bid_price else 0
+                ask_levels = 1 if best_ask_price else 0
 
             # Create normalized event
             event = {
@@ -149,8 +188,8 @@ class M1IngestionEngine:
                 'ask_size': ask_size,
                 'best_bid_price': best_bid_price,
                 'best_ask_price': best_ask_price,
-                'bid_levels': 1,  # bookTicker only provides best level
-                'ask_levels': 1
+                'bid_levels': bid_levels,
+                'ask_levels': ask_levels
             }
             self.raw_depth[symbol].append(event)
 

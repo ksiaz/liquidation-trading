@@ -323,42 +323,6 @@ class ContinuityMemoryStore:
         # No match found - Trade is ignored (constitutionally correct)
         return None
     
-    def update_orderbook_state(
-        self,
-        symbol: str,
-        price: float,
-        size: float,
-        side: str,
-        timestamp: float
-    ):
-        """
-        Update order book state for nodes at this price.
-
-        Constitutional: This is factual state update, not interpretation.
-
-        Args:
-            symbol: Symbol partitioning key
-            price: Order book price level
-            size: Resting size at price (0.0 = level removed)
-            side: "bid" or "ask"
-            timestamp: Update timestamp
-        """
-        # Find nodes within band of this price (symbol-partitioned)
-        nearby_nodes = self.get_active_nodes(symbol=symbol)
-
-        for node in nearby_nodes:
-            if node.overlaps(price):
-                # Store previous values for consumption detection
-                if side == "bid":
-                    node.previous_resting_size_bid = node.resting_size_bid
-                    node.resting_size_bid = size
-                else:
-                    node.previous_resting_size_ask = node.resting_size_ask
-                    node.resting_size_ask = size
-
-                node.last_orderbook_update_ts = timestamp
-                node.orderbook_update_count += 1
-
     def update_mark_price_state(
         self,
         symbol: str,
@@ -526,15 +490,25 @@ class ContinuityMemoryStore:
             if node.symbol != symbol:
                 continue
 
-            # Check if node overlaps with best bid
-            if best_bid_price is not None and node.overlaps(best_bid_price):
-                if node.side in ('bid', 'both'):
-                    node.update_orderbook_state(timestamp, bid_size, 0.0)
+            # Determine which prices overlap with this node
+            overlaps_bid = best_bid_price is not None and node.overlaps(best_bid_price)
+            overlaps_ask = best_ask_price is not None and node.overlaps(best_ask_price)
 
-            # Check if node overlaps with best ask
-            if best_ask_price is not None and node.overlaps(best_ask_price):
-                if node.side in ('ask', 'both'):
-                    node.update_orderbook_state(timestamp, 0.0, ask_size)
+            if not overlaps_bid and not overlaps_ask:
+                continue
+
+            # Determine effective sizes based on overlap and node side
+            effective_bid = 0.0
+            effective_ask = 0.0
+
+            if overlaps_bid and node.side in ('bid', 'both'):
+                effective_bid = bid_size
+            if overlaps_ask and node.side in ('ask', 'both'):
+                effective_ask = ask_size
+
+            # Update node with both values in single call
+            if effective_bid > 0 or effective_ask > 0:
+                node.update_orderbook_state(timestamp, effective_bid, effective_ask)
 
     def get_active_nodes_for_symbol(self, symbol: str) -> List[EnrichedLiquidityMemoryNode]:
         """Get all active nodes for a specific symbol.

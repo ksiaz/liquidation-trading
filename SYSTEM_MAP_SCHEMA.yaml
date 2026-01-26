@@ -511,6 +511,15 @@ state_machines:
     priority_order: "EXIT > BLOCK > REDUCE > ENTRY > HOLD"
     enforcement_point: "runtime/arbitration/arbitrator.py:arbitrate"
 
+  mandate_arbitration:
+    priority_levels:
+      EXIT: 5
+      BLOCK: 4
+      REDUCE: 3
+      ENTRY: 2
+      HOLD: 1
+    enforcement_point: "runtime/arbitration/arbitrator.py:arbitrate"
+
   observation_status:
     states:
       - UNINITIALIZED

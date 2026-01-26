@@ -73,6 +73,12 @@ class TrailingStopState:
     # ATR (if using ATR mode)
     current_atr: Optional[float] = None
 
+    # AUDIT-P0-9: Track confirmed exchange state separately from intended state
+    # This allows detecting divergence when exchange ACK fails
+    last_confirmed_stop_price: Optional[float] = None
+    pending_stop_price: Optional[float] = None  # Price awaiting exchange ACK
+    pending_update_ns: Optional[int] = None  # When pending update was requested
+
     # Config
     config: TrailingStopConfig = field(default_factory=TrailingStopConfig)
 
@@ -286,20 +292,17 @@ class TrailingStopManager:
                         improvement = (old_stop - new_stop) / state.entry_price
 
                     if improvement >= state.config.min_move_to_update_pct:
-                        state.current_stop_price = new_stop
-                        state.last_update_ns = self._now_ns()
-                        state.updates_count += 1
+                        # AUDIT-P0-9: Track pending state before exchange ACK
+                        state.pending_stop_price = new_stop
+                        state.pending_update_ns = self._now_ns()
 
                         self._logger.info(
-                            f"X4-A: Trailing stop updated for {entry_id}: "
+                            f"X4-A: Trailing stop update requested for {entry_id}: "
                             f"{old_stop:.2f} -> {new_stop:.2f} "
                             f"(price={price:.2f}, high/low={state.highest_price:.2f}/{state.lowest_price:.2f})"
                         )
 
-                        # P2: Persist updated state
-                        self._persist_state(state)
-
-                        # Notify callback
+                        # Notify callback - caller should confirm_stop_update on exchange ACK
                         if self._on_stop_update:
                             self._on_stop_update(entry_id, old_stop, new_stop)
 
@@ -411,3 +414,169 @@ class TrailingStopManager:
                 "break_even_triggered": be_triggered,
                 "symbols": list(set(s.symbol for s in self._stops.values()))
             }
+
+    def confirm_stop_update(self, entry_order_id: str, confirmed_price: float) -> bool:
+        """AUDIT-P0-9: Confirm that exchange has updated the stop price.
+
+        Call this AFTER receiving exchange ACK for stop modification.
+        Only persists state after exchange confirms the update.
+
+        Args:
+            entry_order_id: Entry order ID
+            confirmed_price: The stop price confirmed by exchange
+
+        Returns:
+            True if update confirmed, False if no pending update or mismatch
+        """
+        with self._lock:
+            state = self._stops.get(entry_order_id)
+            if not state:
+                self._logger.warning(f"P0-9: confirm_stop_update for unknown order {entry_order_id}")
+                return False
+
+            if state.pending_stop_price is None:
+                self._logger.warning(
+                    f"P0-9: confirm_stop_update called but no pending update for {entry_order_id}"
+                )
+                return False
+
+            # Verify the confirmed price matches what we requested
+            if abs(confirmed_price - state.pending_stop_price) > 0.0001:
+                self._logger.warning(
+                    f"P0-9: Exchange confirmed different price for {entry_order_id}: "
+                    f"requested={state.pending_stop_price:.2f}, confirmed={confirmed_price:.2f}"
+                )
+
+            # Update confirmed state
+            old_confirmed = state.last_confirmed_stop_price or state.initial_stop_price
+            state.current_stop_price = confirmed_price
+            state.last_confirmed_stop_price = confirmed_price
+            state.last_update_ns = self._now_ns()
+            state.updates_count += 1
+            state.pending_stop_price = None
+            state.pending_update_ns = None
+
+            self._logger.info(
+                f"P0-9: Trailing stop confirmed for {entry_order_id}: "
+                f"{old_confirmed:.2f} -> {confirmed_price:.2f}"
+            )
+
+            # P2: Only persist after exchange ACK
+            self._persist_state(state)
+            return True
+
+    def fail_stop_update(self, entry_order_id: str, error: str):
+        """AUDIT-P0-9: Handle failed stop update (exchange rejected/timeout).
+
+        Clears pending state so divergence can be detected and retried.
+        """
+        with self._lock:
+            state = self._stops.get(entry_order_id)
+            if not state:
+                return
+
+            self._logger.warning(
+                f"P0-9: Stop update failed for {entry_order_id}: {error}. "
+                f"Pending: {state.pending_stop_price}, Confirmed: {state.last_confirmed_stop_price}"
+            )
+
+            # Clear pending but don't update confirmed
+            state.pending_stop_price = None
+            state.pending_update_ns = None
+
+    def get_divergent_stops(self) -> List[Dict]:
+        """AUDIT-P0-9: Find stops with unconfirmed updates (potential divergence).
+
+        Returns list of stops where intended != confirmed state.
+        """
+        with self._lock:
+            divergent = []
+            now = self._now_ns()
+
+            for entry_id, state in self._stops.items():
+                # Check for old pending updates (>30 seconds)
+                if state.pending_stop_price is not None and state.pending_update_ns is not None:
+                    elapsed_sec = (now - state.pending_update_ns) / 1_000_000_000
+                    if elapsed_sec > 30.0:
+                        divergent.append({
+                            "entry_order_id": entry_id,
+                            "symbol": state.symbol,
+                            "pending_price": state.pending_stop_price,
+                            "confirmed_price": state.last_confirmed_stop_price,
+                            "elapsed_sec": elapsed_sec,
+                            "issue": "pending_timeout"
+                        })
+
+            return divergent
+
+    def reconcile_with_exchange(
+        self,
+        exchange_stops: Dict[str, float],
+        logger=None
+    ) -> List[Dict]:
+        """AUDIT-P0-9: Reconcile local state with exchange reality.
+
+        Args:
+            exchange_stops: Dict mapping entry_order_id -> actual stop price on exchange
+            logger: Optional logger
+
+        Returns:
+            List of discrepancies found
+        """
+        import logging
+        log = logger or logging.getLogger(__name__)
+
+        discrepancies = []
+        with self._lock:
+            for entry_id, state in self._stops.items():
+                if entry_id not in exchange_stops:
+                    # Stop exists locally but not on exchange
+                    discrepancies.append({
+                        "entry_order_id": entry_id,
+                        "symbol": state.symbol,
+                        "local_price": state.current_stop_price,
+                        "exchange_price": None,
+                        "issue": "missing_on_exchange"
+                    })
+                    log.warning(
+                        f"P0-9: Trailing stop {entry_id} not found on exchange "
+                        f"(local={state.current_stop_price:.2f})"
+                    )
+                else:
+                    exchange_price = exchange_stops[entry_id]
+                    # Check for price mismatch (>0.1% difference)
+                    diff_pct = abs(exchange_price - state.current_stop_price) / state.current_stop_price
+                    if diff_pct > 0.001:
+                        discrepancies.append({
+                            "entry_order_id": entry_id,
+                            "symbol": state.symbol,
+                            "local_price": state.current_stop_price,
+                            "exchange_price": exchange_price,
+                            "diff_pct": diff_pct * 100,
+                            "issue": "price_mismatch"
+                        })
+                        log.warning(
+                            f"P0-9: Trailing stop {entry_id} price mismatch: "
+                            f"local={state.current_stop_price:.2f}, "
+                            f"exchange={exchange_price:.2f} ({diff_pct*100:.2f}%)"
+                        )
+
+                        # Update local to match exchange (exchange is truth)
+                        state.current_stop_price = exchange_price
+                        state.last_confirmed_stop_price = exchange_price
+                        self._persist_state(state)
+
+            # Check for stops on exchange that we don't track
+            for entry_id, exchange_price in exchange_stops.items():
+                if entry_id not in self._stops:
+                    discrepancies.append({
+                        "entry_order_id": entry_id,
+                        "local_price": None,
+                        "exchange_price": exchange_price,
+                        "issue": "unknown_stop_on_exchange"
+                    })
+                    log.warning(
+                        f"P0-9: Unknown stop order on exchange: {entry_id} @ {exchange_price:.2f}"
+                    )
+
+        return discrepancies

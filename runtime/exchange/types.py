@@ -70,6 +70,8 @@ class OrderRequest:
     event_id: Optional[str] = None
     expected_price: Optional[float] = None  # For slippage tracking
     max_slippage_pct: float = 0.5  # Default 50 bps
+    # AUDIT-P0-12: Flag for cascade-triggered orders (different fill thresholds)
+    is_cascade: bool = False
 
     def __post_init__(self):
         if self.client_order_id is None:

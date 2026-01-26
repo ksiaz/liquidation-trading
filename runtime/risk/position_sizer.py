@@ -206,6 +206,18 @@ class PositionSizer:
             adjustments['floor_applied'] = True
             adjustments['floor_multiplier'] = floor_multiplier
 
+        # AUDIT-P0-5: Re-validate against max risk limit after floor application
+        # This prevents floor from bypassing maximum risk constraints
+        if actual_risk_pct > self._config.risk_per_trade_max:
+            # Cap at maximum risk
+            cap_scalar = self._config.risk_per_trade_max / actual_risk_pct
+            position_size *= cap_scalar
+            position_value = position_size * entry_price
+            actual_risk = position_size * stop_distance
+            actual_risk_pct = self._config.risk_per_trade_max
+            adjustments['max_cap_applied'] = True
+            adjustments['max_cap_scalar'] = cap_scalar
+
         return SizingResult(
             position_size=position_size,
             position_value=position_value,

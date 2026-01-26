@@ -18,6 +18,7 @@ Hardenings:
 
 import time
 from decimal import Decimal
+from threading import RLock
 from typing import Dict, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
@@ -90,6 +91,9 @@ class PositionStateMachine:
             closing_timeout_sec: X6-A timeout for CLOSING state (default 30s)
             execution_state_repository: P4 - Optional persistence for CLOSING timeouts
         """
+        # AUDIT-P0-1: Thread safety lock for all state access
+        self._lock = RLock()
+
         self._positions: Dict[str, Position] = {}
         self._repository = repository
 
@@ -115,12 +119,13 @@ class PositionStateMachine:
 
         try:
             persisted = self._exec_state_repo.load_all_closing_timeouts()
-            for symbol, p in persisted.items():
-                self._closing_trackers[symbol] = ClosingStateTracker(
-                    symbol=p.symbol,
-                    entered_closing_at=p.entered_closing_at,
-                    timeout_sec=p.timeout_sec
-                )
+            with self._lock:
+                for symbol, p in persisted.items():
+                    self._closing_trackers[symbol] = ClosingStateTracker(
+                        symbol=p.symbol,
+                        entered_closing_at=p.entered_closing_at,
+                        timeout_sec=p.timeout_sec
+                    )
             # Note: imported here to avoid circular imports
             import logging
             logging.getLogger(__name__).info(
@@ -131,6 +136,8 @@ class PositionStateMachine:
             logging.getLogger(__name__).error(
                 f"P4: Failed to load persisted CLOSING timeouts: {e}"
             )
+            # AUDIT-P0-1: Re-raise to prevent state machine operating with incomplete state
+            raise
 
     def _persist_closing_timeout(self, symbol: str, entered_at: float, timeout_sec: float):
         """P4: Persist CLOSING timeout."""
@@ -154,20 +161,22 @@ class PositionStateMachine:
 
     def get_position(self, symbol: str) -> Position:
         """Get position for symbol (creates FLAT if not exists)."""
-        if symbol not in self._positions:
-            self._positions[symbol] = Position.create_flat(symbol)
-        return self._positions[symbol]
+        with self._lock:
+            if symbol not in self._positions:
+                self._positions[symbol] = Position.create_flat(symbol)
+            return self._positions[symbol]
     
     def validate_entry(self, symbol: str) -> bool:
         """Validate ENTRY action (Theorem 3.1 - single position invariant).
-        
+
         Returns:
             True if ENTRY allowed, False otherwise
         """
-        position = self.get_position(symbol)
-        if position.state != PositionState.FLAT:
-            return False  # Reject: position already exists
-        return True
+        with self._lock:
+            position = self.get_position(symbol)
+            if position.state != PositionState.FLAT:
+                return False  # Reject: position already exists
+            return True
     
     def validate_direction_preserved(
         self, 
@@ -182,82 +191,83 @@ class PositionStateMachine:
         return current_direction == new_direction
     
     def transition(
-        self, 
-        symbol: str, 
-        action: str, 
+        self,
+        symbol: str,
+        action: str,
         **kwargs
     ) -> Position:
         """Execute state transition (deterministic - Theorem 2.1).
-        
+
         Args:
             symbol: Symbol to transition
             action: Action triggering transition
             kwargs: Additional data (direction, quantity, price)
-        
+
         Returns:
             New position state
-            
+
         Raises:
             InvariantViolation: If transition invalid or invariant violated
         """
-        current = self.get_position(symbol)
-        transition_key = (current.state, action)
-        
-        # Validate transition allowed
-        if transition_key not in self.ALLOWED_TRANSITIONS:
-            raise InvariantViolation(
-                f"Invalid transition: {current.state} --[{action}]-> ?"
-            )
-        
-        next_state = self.ALLOWED_TRANSITIONS[transition_key]
-        
-        # Execute transition with state-specific logic
-        if action == Action.ENTRY:
-            new_position = self._handle_entry(symbol, next_state, **kwargs)
-        elif action == "SUCCESS" and current.state == PositionState.ENTERING:
-            new_position = self._handle_entry_success(current, next_state, **kwargs)
-        elif action == "FAILURE" and current.state == PositionState.ENTERING:
-            new_position = Position.create_flat(symbol)
-        elif action == Action.REDUCE:
-            new_position = self._handle_reduce(current, next_state, **kwargs)
-        elif action == "PARTIAL" and current.state == PositionState.REDUCING:
-            new_position = self._handle_reduce_partial(current, next_state, **kwargs)
-        elif action == "COMPLETE" and current.state == PositionState.REDUCING:
-            new_position = self._handle_reduce_complete(current, next_state)
-        elif action == Action.EXIT:
-            new_position = self._handle_exit(current, next_state)
-        elif action == Action.EMERGENCY_EXIT:
-            # X3-A: Emergency exit from ENTERING or REDUCING
-            new_position = self._handle_emergency_exit(current, next_state)
-        elif action == "SUCCESS" and current.state == PositionState.CLOSING:
-            new_position = Position.create_flat(symbol)
-        else:
-            raise InvariantViolation(f"Unhandled transition: {transition_key}")
-        
-        self._positions[symbol] = new_position
+        with self._lock:
+            current = self.get_position(symbol)
+            transition_key = (current.state, action)
 
-        # X6-A: Track CLOSING state entry time
-        if new_position.state == PositionState.CLOSING:
-            if symbol not in self._closing_trackers:
-                entered_at = time.time()
-                self._closing_trackers[symbol] = ClosingStateTracker(
-                    symbol=symbol,
-                    entered_closing_at=entered_at,
-                    timeout_sec=self._closing_timeout_sec
+            # Validate transition allowed
+            if transition_key not in self.ALLOWED_TRANSITIONS:
+                raise InvariantViolation(
+                    f"Invalid transition: {current.state} --[{action}]-> ?"
                 )
-                # P4: Persist CLOSING timeout
-                self._persist_closing_timeout(symbol, entered_at, self._closing_timeout_sec)
-        elif new_position.state == PositionState.FLAT:
-            # Clear CLOSING tracker when position closes
-            self._closing_trackers.pop(symbol, None)
-            # P4: Delete from persistence
-            self._delete_closing_timeout(symbol)
 
-        # Persist if repository configured
-        if self._repository:
-            self._repository.save(new_position)
+            next_state = self.ALLOWED_TRANSITIONS[transition_key]
 
-        return new_position
+            # Execute transition with state-specific logic
+            if action == Action.ENTRY:
+                new_position = self._handle_entry(symbol, next_state, **kwargs)
+            elif action == "SUCCESS" and current.state == PositionState.ENTERING:
+                new_position = self._handle_entry_success(current, next_state, **kwargs)
+            elif action == "FAILURE" and current.state == PositionState.ENTERING:
+                new_position = Position.create_flat(symbol)
+            elif action == Action.REDUCE:
+                new_position = self._handle_reduce(current, next_state, **kwargs)
+            elif action == "PARTIAL" and current.state == PositionState.REDUCING:
+                new_position = self._handle_reduce_partial(current, next_state, **kwargs)
+            elif action == "COMPLETE" and current.state == PositionState.REDUCING:
+                new_position = self._handle_reduce_complete(current, next_state)
+            elif action == Action.EXIT:
+                new_position = self._handle_exit(current, next_state)
+            elif action == Action.EMERGENCY_EXIT:
+                # X3-A: Emergency exit from ENTERING or REDUCING
+                new_position = self._handle_emergency_exit(current, next_state)
+            elif action == "SUCCESS" and current.state == PositionState.CLOSING:
+                new_position = Position.create_flat(symbol)
+            else:
+                raise InvariantViolation(f"Unhandled transition: {transition_key}")
+
+            self._positions[symbol] = new_position
+
+            # X6-A: Track CLOSING state entry time
+            if new_position.state == PositionState.CLOSING:
+                if symbol not in self._closing_trackers:
+                    entered_at = time.time()
+                    self._closing_trackers[symbol] = ClosingStateTracker(
+                        symbol=symbol,
+                        entered_closing_at=entered_at,
+                        timeout_sec=self._closing_timeout_sec
+                    )
+                    # P4: Persist CLOSING timeout
+                    self._persist_closing_timeout(symbol, entered_at, self._closing_timeout_sec)
+            elif new_position.state == PositionState.FLAT:
+                # Clear CLOSING tracker when position closes
+                self._closing_trackers.pop(symbol, None)
+                # P4: Delete from persistence
+                self._delete_closing_timeout(symbol)
+
+            # Persist if repository configured
+            if self._repository:
+                self._repository.save(new_position)
+
+            return new_position
     
     def _handle_entry(self, symbol: str, next_state: PositionState, **kwargs) -> Position:
         """Handle FLAT -> ENTERING transition."""
@@ -378,10 +388,14 @@ class PositionStateMachine:
         Returns:
             Dict of symbol -> seconds in CLOSING state for timed-out positions
         """
-        now = time.time()
-        timed_out = {}
+        with self._lock:
+            now = time.time()
+            timed_out = {}
 
-        for symbol, tracker in self._closing_trackers.items():
+            # AUDIT-P0-1: Copy items to avoid modification during iteration
+            trackers_copy = list(self._closing_trackers.items())
+
+        for symbol, tracker in trackers_copy:
             elapsed = now - tracker.entered_closing_at
             if elapsed > tracker.timeout_sec:
                 timed_out[symbol] = elapsed
@@ -408,29 +422,30 @@ class PositionStateMachine:
         Raises:
             InvariantViolation: If position not in CLOSING state
         """
-        current = self.get_position(symbol)
+        with self._lock:
+            current = self.get_position(symbol)
 
-        if current.state != PositionState.CLOSING:
-            raise InvariantViolation(
-                f"X6-A: Cannot force close {symbol} - not in CLOSING state "
-                f"(current: {current.state})"
-            )
+            if current.state != PositionState.CLOSING:
+                raise InvariantViolation(
+                    f"X6-A: Cannot force close {symbol} - not in CLOSING state "
+                    f"(current: {current.state})"
+                )
 
-        # Force transition to FLAT
-        new_position = Position.create_flat(symbol)
-        self._positions[symbol] = new_position
+            # Force transition to FLAT
+            new_position = Position.create_flat(symbol)
+            self._positions[symbol] = new_position
 
-        # Clear timeout tracker
-        self._closing_trackers.pop(symbol, None)
+            # Clear timeout tracker
+            self._closing_trackers.pop(symbol, None)
 
-        # P4: Delete from persistence
-        self._delete_closing_timeout(symbol)
+            # P4: Delete from persistence
+            self._delete_closing_timeout(symbol)
 
-        # Persist if repository configured
-        if self._repository:
-            self._repository.save(new_position)
+            # Persist if repository configured
+            if self._repository:
+                self._repository.save(new_position)
 
-        return new_position
+            return new_position
 
     def get_closing_duration(self, symbol: str) -> Optional[float]:
         """X6-A: Get how long position has been in CLOSING state.
@@ -438,7 +453,8 @@ class PositionStateMachine:
         Returns:
             Seconds in CLOSING state, or None if not in CLOSING
         """
-        tracker = self._closing_trackers.get(symbol)
-        if tracker:
-            return time.time() - tracker.entered_closing_at
-        return None
+        with self._lock:
+            tracker = self._closing_trackers.get(symbol)
+            if tracker:
+                return time.time() - tracker.entered_closing_at
+            return None

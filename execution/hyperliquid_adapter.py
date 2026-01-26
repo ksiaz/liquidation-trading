@@ -16,8 +16,9 @@ import time
 import asyncio
 import logging
 import math
+import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Literal, Tuple
+from typing import Dict, List, Optional, Literal, Tuple, Set
 from enum import Enum
 from threading import Lock
 import aiohttp
@@ -81,11 +82,17 @@ class ExchangeResponse:
     """
     Opaque exchange response.
     No interpretation allowed.
+
+    AUDIT-P0-2: Added fill quantity tracking fields.
     """
     response_code: ExchangeResponseCode
     order_id: Optional[str]
     message: str
     timestamp: float
+    # AUDIT-P0-2: Fill quantity tracking
+    filled_size: Optional[float] = None  # Amount actually filled
+    requested_size: Optional[float] = None  # Original request size
+    remaining_size: Optional[float] = None  # Amount still resting
 
 
 # ==============================================================================
@@ -167,6 +174,15 @@ class HyperliquidExchangeAdapter:
         # HTTP session (created on first use)
         self._session: Optional[aiohttp.ClientSession] = None
 
+        # AUDIT-P0-4: Track submitted orders for idempotency
+        # action_id -> ExchangeResponse (if successful)
+        self._submitted_orders: Dict[str, ExchangeResponse] = {}
+        self._submitted_orders_lock = Lock()
+
+        # AUDIT-P0-11: Track canceled action_ids to block pending retries
+        self._canceled_action_ids: Set[str] = set()
+        self._canceled_lock = Lock()
+
     async def initialize(self) -> bool:
         """
         Initialize adapter by fetching exchange metadata.
@@ -200,6 +216,39 @@ class HyperliquidExchangeAdapter:
         """Close HTTP session."""
         if self._session and not self._session.closed:
             await self._session.close()
+
+    def clear_idempotency_cache(self):
+        """AUDIT-P0-4: Clear the submitted orders cache.
+
+        Useful for testing or when intentionally resubmitting orders.
+        """
+        with self._submitted_orders_lock:
+            self._submitted_orders.clear()
+            self._logger.info("P0-4: Idempotency cache cleared")
+
+    def is_order_submitted(self, action_id: str) -> bool:
+        """AUDIT-P0-4: Check if an order was already submitted.
+
+        Args:
+            action_id: The action ID to check
+
+        Returns:
+            True if order was already submitted and acknowledged
+        """
+        with self._submitted_orders_lock:
+            return action_id in self._submitted_orders
+
+    def get_cached_response(self, action_id: str) -> Optional[ExchangeResponse]:
+        """AUDIT-P0-4: Get cached response for an action_id.
+
+        Args:
+            action_id: The action ID to lookup
+
+        Returns:
+            Cached ExchangeResponse or None
+        """
+        with self._submitted_orders_lock:
+            return self._submitted_orders.get(action_id)
 
     async def _fetch_metadata(self):
         """Fetch asset metadata from exchange."""
@@ -450,7 +499,8 @@ class HyperliquidExchangeAdapter:
 
         # Build order payload
         try:
-            payload = self._build_order_payload(order_params)
+            # AUDIT-P0-4: Pass action_id for client order ID
+            payload = self._build_order_payload(order_params, action_id=action_id)
         except Exception as e:
             return ExchangeResponse(
                 response_code=ExchangeResponseCode.REJECTED,
@@ -466,8 +516,13 @@ class HyperliquidExchangeAdapter:
         # Submit with retry
         return await self._submit_with_retry(payload, action_id, timestamp)
 
-    def _build_order_payload(self, order_params: dict) -> dict:
-        """Build Hyperliquid order payload."""
+    def _build_order_payload(self, order_params: dict, action_id: str = None) -> dict:
+        """Build Hyperliquid order payload.
+
+        Args:
+            order_params: Order parameters dict
+            action_id: AUDIT-P0-4 - Optional action ID for client order ID
+        """
         symbol = order_params["symbol"]
         side = order_params.get("side", "BUY")
         size = order_params.get("size", 0)
@@ -475,6 +530,8 @@ class HyperliquidExchangeAdapter:
         price = order_params.get("price")
         stop_price = order_params.get("stop_price")
         reduce_only = order_params.get("reduce_only", False)
+        # AUDIT-P0-4: Client order ID for idempotency (hexadecimal format)
+        cloid = order_params.get("cloid") or action_id
 
         # Get asset index
         asset_idx = self.get_asset_index(symbol)
@@ -537,6 +594,20 @@ class HyperliquidExchangeAdapter:
             "r": reduce_only,
             "t": order_type_struct,
         }
+
+        # AUDIT-P0-4: Add client order ID for idempotency
+        # Format: hex string (Hyperliquid requires this format)
+        if cloid:
+            # Convert action_id to hex format if not already
+            try:
+                if cloid.startswith("0x"):
+                    order["c"] = cloid
+                else:
+                    # Create deterministic hex from action_id
+                    cloid_hash = hashlib.sha256(cloid.encode()).hexdigest()[:32]
+                    order["c"] = f"0x{cloid_hash}"
+            except Exception:
+                pass  # Don't fail order if cloid generation fails
 
         # Build action
         action = {
@@ -637,10 +708,50 @@ class HyperliquidExchangeAdapter:
         action_id: str,
         timestamp: float
     ) -> ExchangeResponse:
-        """Submit order with exponential backoff retry."""
+        """Submit order with exponential backoff retry.
+
+        AUDIT-P0-4: Implements idempotency via action_id tracking to prevent
+        duplicate orders on retry after ambiguous network failures.
+        """
+        # AUDIT-P0-4: Check if we already have a successful response for this action_id
+        with self._submitted_orders_lock:
+            if action_id in self._submitted_orders:
+                cached = self._submitted_orders[action_id]
+                self._logger.info(
+                    f"P0-4: Returning cached response for action_id={action_id}, "
+                    f"order_id={cached.order_id}"
+                )
+                return cached
+
+        # AUDIT-P0-11: Check if order was canceled before we retry
+        with self._canceled_lock:
+            if action_id in self._canceled_action_ids:
+                self._logger.info(
+                    f"P0-11: Blocking submission for canceled action_id={action_id}"
+                )
+                return ExchangeResponse(
+                    response_code=ExchangeResponseCode.REJECTED,
+                    order_id=None,
+                    message="Order canceled before submission",
+                    timestamp=timestamp
+                )
+
         last_error = None
 
         for attempt in range(self._max_retries):
+            # AUDIT-P0-11: Check for cancellation before each retry attempt
+            with self._canceled_lock:
+                if action_id in self._canceled_action_ids:
+                    self._logger.info(
+                        f"P0-11: Retry {attempt + 1} blocked - action_id={action_id} was canceled"
+                    )
+                    return ExchangeResponse(
+                        response_code=ExchangeResponseCode.REJECTED,
+                        order_id=None,
+                        message="Order canceled during retry",
+                        timestamp=timestamp
+                    )
+
             try:
                 session = await self._get_session()
 
@@ -652,25 +763,65 @@ class HyperliquidExchangeAdapter:
                     data = await response.json()
 
                     if response.status == 200 and data.get("status") == "ok":
-                        # Extract order ID
+                        # Extract order ID and fill quantities
                         response_data = data.get("response", {})
                         order_id = None
+                        filled_size = None
+                        remaining_size = None
 
+                        # AUDIT-P0-2: Parse fill quantities from response
                         if "data" in response_data:
                             statuses = response_data["data"].get("statuses", [])
                             if statuses:
                                 status = statuses[0]
                                 if "resting" in status:
-                                    order_id = str(status["resting"]["oid"])
+                                    resting_info = status["resting"]
+                                    order_id = str(resting_info.get("oid", ""))
+                                    # Resting means partial/no fill
+                                    try:
+                                        remaining_size = float(resting_info.get("sz", 0))
+                                    except (ValueError, TypeError):
+                                        remaining_size = None
                                 elif "filled" in status:
-                                    order_id = str(status["filled"]["oid"])
+                                    filled_info = status["filled"]
+                                    order_id = str(filled_info.get("oid", ""))
+                                    # Filled means complete fill
+                                    try:
+                                        filled_size = float(filled_info.get("totalSz", 0))
+                                    except (ValueError, TypeError):
+                                        filled_size = None
+                                    remaining_size = 0.0  # Fully filled
 
-                        return ExchangeResponse(
+                        # AUDIT-P0-2: Extract requested size from payload for tracking
+                        requested_size = None
+                        try:
+                            orders = payload.get("action", {}).get("orders", [])
+                            if orders:
+                                requested_size = float(orders[0].get("s", 0))
+                        except (ValueError, TypeError, IndexError):
+                            pass
+
+                        result = ExchangeResponse(
                             response_code=ExchangeResponseCode.ACKNOWLEDGED,
                             order_id=order_id or f"HL_{action_id}_{self._call_count}",
                             message="Order acknowledged",
-                            timestamp=timestamp
+                            timestamp=timestamp,
+                            filled_size=filled_size,
+                            requested_size=requested_size,
+                            remaining_size=remaining_size
                         )
+
+                        # AUDIT-P0-4: Cache successful response for idempotency
+                        with self._submitted_orders_lock:
+                            self._submitted_orders[action_id] = result
+                            # Limit cache size to prevent memory leak
+                            if len(self._submitted_orders) > 1000:
+                                # Remove oldest entries (FIFO)
+                                oldest_keys = list(self._submitted_orders.keys())[:100]
+                                for k in oldest_keys:
+                                    self._submitted_orders.pop(k, None)
+
+                        return result
                     else:
                         # Non-retryable rejection
                         error_msg = data.get("response", str(data))
@@ -684,17 +835,17 @@ class HyperliquidExchangeAdapter:
             except aiohttp.ClientError as e:
                 last_error = f"Network error: {e}"
                 self._logger.warning(
-                    f"Retry {attempt + 1}/{self._max_retries}: {last_error}"
+                    f"Retry {attempt + 1}/{self._max_retries} for action_id={action_id}: {last_error}"
                 )
             except asyncio.TimeoutError:
                 last_error = "Request timeout"
                 self._logger.warning(
-                    f"Retry {attempt + 1}/{self._max_retries}: {last_error}"
+                    f"Retry {attempt + 1}/{self._max_retries} for action_id={action_id}: {last_error}"
                 )
             except Exception as e:
                 last_error = str(e)
                 self._logger.warning(
-                    f"Retry {attempt + 1}/{self._max_retries}: {last_error}"
+                    f"Retry {attempt + 1}/{self._max_retries} for action_id={action_id}: {last_error}"
                 )
 
             # Exponential backoff before retry
@@ -702,11 +853,12 @@ class HyperliquidExchangeAdapter:
                 delay = self._calculate_retry_delay(attempt)
                 await asyncio.sleep(delay)
 
-        # All retries exhausted
+        # All retries exhausted - return AMBIGUOUS instead of TIMEOUT
+        # AUDIT-P0-4: Ambiguous means we don't know if the order was placed
         return ExchangeResponse(
-            response_code=ExchangeResponseCode.TIMEOUT,
+            response_code=ExchangeResponseCode.AMBIGUOUS,
             order_id=None,
-            message=f"All retries failed: {last_error}",
+            message=f"All retries failed (order may have been placed): {last_error}",
             timestamp=timestamp
         )
 
@@ -716,21 +868,32 @@ class HyperliquidExchangeAdapter:
         action_id: str,
         symbol: Optional[str] = None,
         order_ids: Optional[List[int]] = None,
-        timestamp: float
+        timestamp: float,
+        related_action_ids: Optional[List[str]] = None
     ) -> ExchangeResponse:
         """
         Cancel orders on Hyperliquid.
 
+        AUDIT-P0-11: Now blocks related pending retries and has retry logic.
+
         Args:
-            action_id: Action identifier
+            action_id: Action identifier for this cancel operation
             symbol: Symbol to cancel (for all orders on symbol)
             order_ids: Specific order IDs to cancel
             timestamp: Execution timestamp
+            related_action_ids: P0-11 - Original action_ids to block retries for
 
         Returns:
             ExchangeResponse
         """
         self._call_count += 1
+
+        # AUDIT-P0-11: Mark related action_ids as canceled to block retries
+        if related_action_ids:
+            with self._canceled_lock:
+                for aid in related_action_ids:
+                    self._canceled_action_ids.add(aid)
+                    self._logger.info(f"P0-11: Marked action_id={aid} as canceled")
 
         if not self._metadata_loaded:
             await self.initialize()
@@ -765,38 +928,82 @@ class HyperliquidExchangeAdapter:
         if self._private_key:
             payload = self._sign_payload(payload)
 
-        try:
-            session = await self._get_session()
+        # AUDIT-P0-11: Add retry logic for cancel operations
+        last_error = None
+        for attempt in range(self._max_retries):
+            try:
+                session = await self._get_session()
 
-            async with session.post(
-                f"{self._api_url}/exchange",
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as response:
-                data = await response.json()
+                async with session.post(
+                    f"{self._api_url}/exchange",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    data = await response.json()
 
-                if response.status == 200 and data.get("status") == "ok":
-                    return ExchangeResponse(
-                        response_code=ExchangeResponseCode.ACKNOWLEDGED,
-                        order_id=None,
-                        message="Orders cancelled",
-                        timestamp=timestamp
-                    )
-                else:
-                    return ExchangeResponse(
-                        response_code=ExchangeResponseCode.REJECTED,
-                        order_id=None,
-                        message=f"Cancel failed: {data}",
-                        timestamp=timestamp
-                    )
+                    if response.status == 200 and data.get("status") == "ok":
+                        return ExchangeResponse(
+                            response_code=ExchangeResponseCode.ACKNOWLEDGED,
+                            order_id=None,
+                            message="Orders cancelled",
+                            timestamp=timestamp
+                        )
+                    else:
+                        # Non-retryable rejection
+                        return ExchangeResponse(
+                            response_code=ExchangeResponseCode.REJECTED,
+                            order_id=None,
+                            message=f"Cancel failed: {data}",
+                            timestamp=timestamp
+                        )
 
-        except Exception as e:
-            return ExchangeResponse(
-                response_code=ExchangeResponseCode.TIMEOUT,
-                order_id=None,
-                message=f"Cancel error: {e}",
-                timestamp=timestamp
-            )
+            except aiohttp.ClientError as e:
+                last_error = f"Network error: {e}"
+                self._logger.warning(
+                    f"Cancel retry {attempt + 1}/{self._max_retries}: {last_error}"
+                )
+            except asyncio.TimeoutError:
+                last_error = "Request timeout"
+                self._logger.warning(
+                    f"Cancel retry {attempt + 1}/{self._max_retries}: {last_error}"
+                )
+            except Exception as e:
+                last_error = str(e)
+                self._logger.warning(
+                    f"Cancel retry {attempt + 1}/{self._max_retries}: {last_error}"
+                )
+
+            # Exponential backoff before retry
+            if attempt < self._max_retries - 1:
+                delay = self._calculate_retry_delay(attempt)
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        return ExchangeResponse(
+            response_code=ExchangeResponseCode.AMBIGUOUS,
+            order_id=None,
+            message=f"Cancel may have failed: {last_error}",
+            timestamp=timestamp
+        )
+
+    def mark_action_canceled(self, action_id: str):
+        """AUDIT-P0-11: Mark an action_id as canceled to block pending retries."""
+        with self._canceled_lock:
+            self._canceled_action_ids.add(action_id)
+            self._logger.info(f"P0-11: Marked action_id={action_id} as canceled")
+
+    def clear_canceled_actions(self, max_age_sec: float = 3600.0):
+        """AUDIT-P0-11: Clear old canceled action_ids to prevent memory leak.
+
+        Call periodically (e.g., hourly) to clean up old entries.
+        """
+        with self._canceled_lock:
+            # For simplicity, just clear all if called
+            # In production, would track timestamps per action_id
+            old_count = len(self._canceled_action_ids)
+            if old_count > 1000:
+                self._canceled_action_ids.clear()
+                self._logger.info(f"P0-11: Cleared {old_count} canceled action_ids")
 
     def get_call_count(self) -> int:
         """Get number of exchange calls made."""

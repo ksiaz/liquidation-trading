@@ -93,6 +93,12 @@ class FillTracker:
         # P3: Global fill ID dedup set (loaded from persistence)
         self._global_seen_fill_ids: Set[str] = set()
 
+        # AUDIT-P0-6: Buffer for fills that arrive before tracking registration
+        # Maps order_id -> list of fill_data dicts pending replay
+        self._early_fill_buffer: Dict[str, List[Dict]] = {}
+        # Maximum fills to buffer per order (prevent memory leak)
+        self._max_buffered_fills_per_order = 100
+
         # Callbacks
         self._on_fill: Optional[Callable[[OrderFill], None]] = None
         self._on_status_change: Optional[Callable[[OrderUpdate], None]] = None
@@ -137,6 +143,59 @@ class FillTracker:
             self._repository.save_fill_id(fill_id, symbol, order_id)
         except Exception as e:
             self._logger.error(f"P3: Failed to persist fill ID {fill_id}: {e}")
+
+    def _generate_synthetic_fill_id(self, order_id: str, fill_data: Dict) -> str:
+        """AUDIT-P0-7: Generate deterministic fill ID when exchange doesn't provide one.
+
+        Creates a unique ID from order_id + price + size + time to prevent
+        duplicate fills from being processed when tid is missing.
+        """
+        import hashlib
+        # Use available fill data to create deterministic hash
+        price = fill_data.get('px', '0')
+        size = fill_data.get('sz', '0')
+        fill_time = fill_data.get('time', self._now_ns())
+        # Include coin for extra uniqueness
+        coin = fill_data.get('coin', '')
+
+        # Create deterministic string and hash it
+        data_str = f"{order_id}|{coin}|{price}|{size}|{fill_time}"
+        hash_hex = hashlib.sha256(data_str.encode()).hexdigest()[:16]
+        return f"syn_{hash_hex}"
+
+    def _buffer_early_fill(self, order_id: str, fill_data: Dict):
+        """AUDIT-P0-6: Buffer a fill that arrived before order was tracked.
+
+        These fills will be replayed when track_order() is called.
+        """
+        # Lock already held by caller
+        if order_id not in self._early_fill_buffer:
+            self._early_fill_buffer[order_id] = []
+
+        # Prevent unbounded growth
+        if len(self._early_fill_buffer[order_id]) >= self._max_buffered_fills_per_order:
+            self._logger.warning(
+                f"P0-6: Early fill buffer full for order {order_id}, dropping oldest fill"
+            )
+            self._early_fill_buffer[order_id].pop(0)
+
+        self._early_fill_buffer[order_id].append(fill_data)
+        self._logger.info(
+            f"P0-6: Buffered early fill for untracked order {order_id} "
+            f"(buffer size: {len(self._early_fill_buffer[order_id])})"
+        )
+
+    def _replay_buffered_fills(self, order_id: str):
+        """AUDIT-P0-6: Replay any buffered fills for a newly tracked order."""
+        # Lock already held by caller
+        buffered_fills = self._early_fill_buffer.pop(order_id, [])
+        if buffered_fills:
+            self._logger.info(
+                f"P0-6: Replaying {len(buffered_fills)} buffered fills for order {order_id}"
+            )
+            for fill_data in buffered_fills:
+                # Process with from_buffer=True to prevent re-buffering
+                self._process_fill(fill_data, from_buffer=True)
 
     async def start(self):
         """Start fill tracking (begins polling loop)."""
@@ -195,6 +254,9 @@ class FillTracker:
             self._tracked_orders[order_id] = entry
             self._order_fills[order_id] = []
             self._logger.debug(f"Tracking order {order_id}: {symbol} {side.value} {size}")
+
+            # AUDIT-P0-6: Replay any fills that arrived before tracking
+            self._replay_buffered_fills(order_id)
 
     def untrack_order(self, order_id: str):
         """Stop tracking an order."""
@@ -291,35 +353,49 @@ class FillTracker:
             if status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED):
                 self._tracked_orders.pop(order_id, None)
 
-    def _process_fill(self, fill_data: Dict):
-        """Process a single fill event."""
+    def _process_fill(self, fill_data: Dict, from_buffer: bool = False):
+        """Process a single fill event.
+
+        Args:
+            fill_data: Fill data dict from exchange
+            from_buffer: AUDIT-P0-6 - True if replaying from early fill buffer
+        """
         order_id = str(fill_data.get('oid', ''))
 
         with self._lock:
             if order_id not in self._tracked_orders:
-                self._logger.debug(f"Fill for untracked order: {order_id}")
+                # AUDIT-P0-6: Buffer fill for later replay instead of discarding
+                if not from_buffer:  # Don't re-buffer already-buffered fills
+                    self._buffer_early_fill(order_id, fill_data)
                 return
 
             entry = self._tracked_orders[order_id]
 
             # F1: Deduplication by fill ID (tid)
-            fill_id = str(fill_data.get('tid', ''))
+            raw_fill_id = fill_data.get('tid')
+            if raw_fill_id is not None:
+                fill_id = str(raw_fill_id)
+            else:
+                # AUDIT-P0-7: Generate deterministic synthetic ID when tid is missing
+                # Use order_id + price + size + time to create unique identifier
+                fill_id = self._generate_synthetic_fill_id(order_id, fill_data)
+                self._logger.debug(f"P0-7: Generated synthetic fill ID: {fill_id}")
 
             # P3: Check global persisted set first (survives restarts)
-            if fill_id and fill_id in self._global_seen_fill_ids:
+            if fill_id in self._global_seen_fill_ids:
                 self._logger.debug(f"Duplicate fill ignored (persisted): {fill_id} for order {order_id}")
                 return
 
             # F1: Check per-order set (runtime dedup)
-            if fill_id and fill_id in entry.seen_fill_ids:
+            if fill_id in entry.seen_fill_ids:
                 self._logger.debug(f"Duplicate fill ignored: {fill_id} for order {order_id}")
                 return
 
-            if fill_id:
-                entry.seen_fill_ids.add(fill_id)
-                self._global_seen_fill_ids.add(fill_id)
-                # P3: Persist fill ID for restart recovery
-                self._persist_fill_id(fill_id, entry.symbol, order_id)
+            # Always track fill ID (now guaranteed to be non-empty)
+            entry.seen_fill_ids.add(fill_id)
+            self._global_seen_fill_ids.add(fill_id)
+            # P3: Persist fill ID for restart recovery
+            self._persist_fill_id(fill_id, entry.symbol, order_id)
 
             # F2: Fill time source precedence (exchange time > local time)
             # Exchange 'time' is in milliseconds, local fallback only if missing

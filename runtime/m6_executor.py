@@ -342,28 +342,36 @@ class M6Executor:
 
     def _arbitrate(self, mandates: List[Mandate]) -> Optional[Mandate]:
         """
-        Arbitrate mandates - highest authority wins.
+        Arbitrate mandates with EXIT supremacy (Theorem 2.2).
 
         Authority hierarchy: EXIT > BLOCK > REDUCE > ENTRY > HOLD
+
+        AUDIT-P0-3: EXIT supremacy is unconditional - EXIT always wins
+        regardless of authority score. This is a safety invariant.
         """
         if not mandates:
             return None
 
-        # Sort by type value (higher = more authority) then by authority score
+        # AUDIT-P0-3: EXIT supremacy - check first, unconditionally
+        type_exit = [m for m in mandates if m.type == MandateType.EXIT]
+        if type_exit:
+            # Return highest authority EXIT if multiple
+            return max(type_exit, key=lambda m: m.authority)
+
+        # BLOCK means no action (reject all lower mandates)
+        type_block = [m for m in mandates if m.type == MandateType.BLOCK]
+        if type_block:
+            self._logger.info("M6: BLOCK mandate wins - no action")
+            return None
+
+        # For remaining types (REDUCE, ENTRY, HOLD), sort by type then authority
         sorted_mandates = sorted(
             mandates,
             key=lambda m: (m.type.value, m.authority),
             reverse=True
         )
 
-        winner = sorted_mandates[0]
-
-        # BLOCK means no action (reject all lower mandates)
-        if winner.type == MandateType.BLOCK:
-            self._logger.info(f"M6: BLOCK mandate wins - no action")
-            return None
-
-        return winner
+        return sorted_mandates[0] if sorted_mandates else None
 
     def _is_action_valid(self, action: Action, position: Position) -> bool:
         """Check if action is valid for current position state."""

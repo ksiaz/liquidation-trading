@@ -262,12 +262,31 @@ class ExecutionStateRepository:
         """P1: Load all non-terminal stop orders (for restart recovery).
 
         Returns stop orders in states: PENDING_PLACEMENT, PLACED, TRIGGERED
+        AUDIT-P0-8: Excludes STALE orders (need reconciliation first)
         """
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("""
                 SELECT * FROM stop_orders
                 WHERE state IN ('PENDING_PLACEMENT', 'PLACED', 'TRIGGERED')
+            """)
+            result = {}
+            for row in cursor.fetchall():
+                stop = self._row_to_stop_order(row)
+                result[stop.entry_order_id] = stop
+            return result
+
+    def load_unreconciled_stop_orders(self) -> Dict[str, PersistedStopOrder]:
+        """AUDIT-P0-8: Load stop orders that need reconciliation before use.
+
+        Returns PLACED orders that should be validated against exchange.
+        Call reconcile_stop_orders() after querying exchange state.
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM stop_orders
+                WHERE state = 'PLACED'
             """)
             result = {}
             for row in cursor.fetchall():
@@ -282,6 +301,102 @@ class ExecutionStateRepository:
             cursor.execute(
                 "DELETE FROM stop_orders WHERE entry_order_id = ?",
                 (entry_order_id,)
+            )
+            self.conn.commit()
+
+    def reconcile_stop_orders(
+        self,
+        exchange_order_ids: Set[str],
+        logger=None
+    ) -> Dict[str, str]:
+        """AUDIT-P0-8: Reconcile persisted stop orders against exchange reality.
+
+        On startup, call this with the set of order IDs that actually exist
+        on the exchange. Orders in PLACED state that aren't on exchange will
+        be marked as STALE for review.
+
+        Args:
+            exchange_order_ids: Set of order IDs currently on exchange
+            logger: Optional logger for reconciliation events
+
+        Returns:
+            Dict mapping entry_order_id -> action taken ('STALE', 'VALID', etc.)
+        """
+        import logging
+        log = logger or logging.getLogger(__name__)
+
+        with self._lock:
+            cursor = self.conn.cursor()
+
+            # Load all PLACED orders
+            cursor.execute("""
+                SELECT entry_order_id, stop_order_id, state, symbol
+                FROM stop_orders
+                WHERE state = 'PLACED'
+            """)
+
+            results = {}
+            stale_orders = []
+
+            for row in cursor.fetchall():
+                entry_id = row['entry_order_id']
+                stop_id = row['stop_order_id']
+                symbol = row['symbol']
+
+                if stop_id and stop_id not in exchange_order_ids:
+                    # Order claims to be PLACED but doesn't exist on exchange
+                    stale_orders.append(entry_id)
+                    results[entry_id] = 'STALE'
+                    log.warning(
+                        f"P0-8: Stop order {stop_id} for {symbol} not found on exchange, "
+                        f"marking as STALE (entry_order_id={entry_id})"
+                    )
+                else:
+                    results[entry_id] = 'VALID'
+
+            # Mark stale orders
+            if stale_orders:
+                cursor.executemany(
+                    """
+                    UPDATE stop_orders
+                    SET state = 'STALE',
+                        last_error = 'P0-8: Not found on exchange during startup reconciliation'
+                    WHERE entry_order_id = ?
+                    """,
+                    [(oid,) for oid in stale_orders]
+                )
+                self.conn.commit()
+                log.info(f"P0-8: Marked {len(stale_orders)} stop orders as STALE")
+
+            return results
+
+    def get_stale_stop_orders(self) -> List[PersistedStopOrder]:
+        """AUDIT-P0-8: Get all stop orders marked as STALE for manual review."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM stop_orders
+                WHERE state = 'STALE'
+            """)
+            return [self._row_to_stop_order(row) for row in cursor.fetchall()]
+
+    def clear_stale_stop_order(self, entry_order_id: str, action: str) -> None:
+        """AUDIT-P0-8: Clear a STALE order after manual review.
+
+        Args:
+            entry_order_id: Order to clear
+            action: Action taken (e.g., 'DELETED', 'RESTORED', 'IGNORED')
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                UPDATE stop_orders
+                SET state = 'RECONCILED',
+                    last_error = ?
+                WHERE entry_order_id = ? AND state = 'STALE'
+                """,
+                (f"P0-8: Cleared by manual review, action={action}", entry_order_id)
             )
             self.conn.commit()
 

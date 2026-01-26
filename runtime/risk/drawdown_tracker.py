@@ -27,6 +27,13 @@ class DrawdownState(Enum):
     MAXIMUM_DRAWDOWN = auto()  # Hit max drawdown
 
 
+class CooldownReason(Enum):
+    """AUDIT-P0-10: Reason for entering cooldown (affects reset validation)."""
+    DAILY_LOSS = auto()      # Hit daily loss limit
+    WEEKLY_LOSS = auto()     # Hit weekly loss limit
+    CONSECUTIVE_LOSS = auto() # Hit consecutive loss halt
+
+
 @dataclass
 class DrawdownConfig:
     """Configuration for drawdown controls."""
@@ -106,6 +113,9 @@ class DrawdownTracker:
         # State
         self._state = DrawdownState.NORMAL
         self._events: List[DrawdownEvent] = []
+
+        # AUDIT-P0-10: Track reason for cooldown (affects reset validation)
+        self._cooldown_reason: Optional[CooldownReason] = None
 
         # Callbacks
         self._callbacks: List[Callable[[DrawdownState, DrawdownState], None]] = []
@@ -187,6 +197,8 @@ class DrawdownTracker:
         if self._consecutive_losses >= self._config.consecutive_loss_halt:
             if self._state != DrawdownState.DAILY_COOLDOWN:
                 self._state = DrawdownState.DAILY_COOLDOWN  # Halt trading
+                # AUDIT-P0-10: Track that this was due to consecutive losses
+                self._cooldown_reason = CooldownReason.CONSECUTIVE_LOSS
                 self._record_event(ts, 'consecutive_halt', {
                     'consecutive_losses': self._consecutive_losses
                 })
@@ -213,7 +225,18 @@ class DrawdownTracker:
         if self._state == DrawdownState.REDUCED_RISK:
             if self._consecutive_wins >= self._config.recovery_wins_required:
                 self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None  # AUDIT-P0-10: Clear reason on recovery
                 self._logger.info("Recovered from reduced risk mode")
+
+        # AUDIT-P0-10: Check for recovery from consecutive loss halt
+        # A win breaks the streak, allowing daily reset to work
+        if (self._state == DrawdownState.DAILY_COOLDOWN and
+                self._cooldown_reason == CooldownReason.CONSECUTIVE_LOSS):
+            if self._consecutive_wins >= 1:
+                # Streak broken by a win, allow transition to NORMAL
+                self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None
+                self._logger.info("Consecutive loss halt ended: streak broken by winning trade")
 
     def _check_daily_limit(self, ts: int):
         """Check daily loss limit."""
@@ -226,6 +249,8 @@ class DrawdownTracker:
         if daily_loss_pct > self._config.daily_loss_limit_pct:
             if self._state not in (DrawdownState.DAILY_COOLDOWN, DrawdownState.WEEKLY_COOLDOWN):
                 self._state = DrawdownState.DAILY_COOLDOWN
+                # AUDIT-P0-10: Track that this was due to daily loss limit
+                self._cooldown_reason = CooldownReason.DAILY_LOSS
                 self._record_event(ts, 'daily_limit', {
                     'daily_loss_pct': daily_loss_pct,
                     'daily_pnl': daily_pnl
@@ -251,6 +276,8 @@ class DrawdownTracker:
         if weekly_loss_pct > self._config.weekly_loss_limit_pct:
             if self._state != DrawdownState.WEEKLY_COOLDOWN:
                 self._state = DrawdownState.WEEKLY_COOLDOWN
+                # AUDIT-P0-10: Track that this was due to weekly loss limit
+                self._cooldown_reason = CooldownReason.WEEKLY_LOSS
                 self._record_event(ts, 'weekly_limit', {
                     'weekly_loss_pct': weekly_loss_pct,
                     'weekly_pnl': weekly_pnl
@@ -287,6 +314,7 @@ class DrawdownTracker:
             # Check for recovery
             if drawdown_pct < self._config.recovery_drawdown_pct:
                 self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None  # AUDIT-P0-10: Clear reason on recovery
                 self._logger.info(
                     f"Recovering from max drawdown: {drawdown_pct*100:.1f}%"
                 )
@@ -324,25 +352,49 @@ class DrawdownTracker:
             self._callbacks.append(callback)
 
     def reset_daily(self):
-        """Reset daily tracking (call at start of new day)."""
+        """Reset daily tracking (call at start of new day).
+
+        AUDIT-P0-10: Validates cooldown reason before allowing exit.
+        """
         with self._lock:
             self._daily_start_capital = self._current_capital
             self._daily_start_ts = self._now_ns()
 
             # Exit daily cooldown if active
             if self._state == DrawdownState.DAILY_COOLDOWN:
+                # AUDIT-P0-10: Only allow exit if cooldown was from daily loss limit
+                # Consecutive loss halt requires breaking the streak, not just time passing
+                if self._cooldown_reason == CooldownReason.CONSECUTIVE_LOSS:
+                    self._logger.warning(
+                        f"reset_daily() blocked: DAILY_COOLDOWN due to consecutive losses "
+                        f"({self._consecutive_losses} losses). Must break streak to recover."
+                    )
+                    return  # Do NOT exit cooldown
+
                 self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None
                 self._logger.info("Daily cooldown ended, trading resumed")
 
     def reset_weekly(self):
-        """Reset weekly tracking (call at start of new week)."""
+        """Reset weekly tracking (call at start of new week).
+
+        AUDIT-P0-10: Validates cooldown reason before allowing exit.
+        """
         with self._lock:
             self._weekly_start_capital = self._current_capital
             self._weekly_start_ts = self._now_ns()
 
             # Exit weekly cooldown if active
             if self._state == DrawdownState.WEEKLY_COOLDOWN:
+                # AUDIT-P0-10: Weekly reset is allowed (new week is a natural boundary)
+                # But log if we had consecutive losses so it's visible
+                if self._consecutive_losses >= self._config.consecutive_loss_halt:
+                    self._logger.warning(
+                        f"reset_weekly(): Exiting WEEKLY_COOLDOWN despite {self._consecutive_losses} "
+                        f"consecutive losses. Consider if trading should resume."
+                    )
                 self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None
                 self._logger.info("Weekly cooldown ended, trading resumed")
 
     def get_size_multiplier(self) -> float:
@@ -390,6 +442,7 @@ class DrawdownTracker:
 
             return {
                 'state': self._state.name,
+                'cooldown_reason': self._cooldown_reason.name if self._cooldown_reason else None,
                 'current_capital': self._current_capital,
                 'peak_capital': self._peak_capital,
                 'initial_capital': self._initial_capital,
@@ -410,3 +463,37 @@ class DrawdownTracker:
         """Get recent drawdown events."""
         with self._lock:
             return list(self._events[-limit:])
+
+    def force_clear_consecutive_halt(self, reason: str):
+        """AUDIT-P0-10: Force clear consecutive loss halt (admin override).
+
+        Use this when manual intervention is needed to resume trading after
+        consecutive loss halt. Requires explicit reason for audit trail.
+
+        Args:
+            reason: Why this override is being applied (logged for audit)
+        """
+        with self._lock:
+            if (self._state == DrawdownState.DAILY_COOLDOWN and
+                    self._cooldown_reason == CooldownReason.CONSECUTIVE_LOSS):
+                self._logger.warning(
+                    f"ADMIN OVERRIDE: Clearing consecutive loss halt. "
+                    f"Losses: {self._consecutive_losses}. Reason: {reason}"
+                )
+                self._record_event(self._now_ns(), 'admin_override', {
+                    'consecutive_losses': self._consecutive_losses,
+                    'reason': reason
+                })
+                self._consecutive_losses = 0
+                self._state = DrawdownState.NORMAL
+                self._cooldown_reason = None
+            else:
+                self._logger.info(
+                    f"force_clear_consecutive_halt called but not in consecutive loss halt "
+                    f"(state={self._state}, reason={self._cooldown_reason})"
+                )
+
+    def get_cooldown_reason(self) -> Optional[CooldownReason]:
+        """AUDIT-P0-10: Get reason for current cooldown state."""
+        with self._lock:
+            return self._cooldown_reason

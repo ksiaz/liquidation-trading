@@ -12,12 +12,12 @@ from typing import List
 class NodeAdapterConfig:
     """Configuration for HyperliquidNodeAdapter."""
 
-    # ========== Node Paths (WSL) ==========
-    # Base path to Hyperliquid node data
-    node_data_path: str = "/root/hl/data"
+    # ========== Node Paths ==========
+    # Base path to Hyperliquid node data (native Ubuntu)
+    node_data_path: str = "~/hl/data"
 
     # Path to state files
-    node_state_path: str = "/root/hl/hyperliquid_data"
+    node_state_path: str = "~/hl/hyperliquid_data"
 
     # ========== Streaming Configuration ==========
     # Maximum blocks to buffer before backpressure

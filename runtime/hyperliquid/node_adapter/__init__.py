@@ -1,20 +1,23 @@
 """
 Hyperliquid Node Adapter
 
-Production adapter between Hyperliquid node (WSL) and observation system.
+Production adapter between Hyperliquid node and observation system.
 Extracts prices, liquidations, and positions with minimal latency.
 
 Components:
+- DirectNodeIntegration: Native Ubuntu integration (no TCP)
+- ObservationBridge: Connect to M1/Governance
 - ReplicaCmdStreamer: inotify-based file streaming for replica_cmds
 - BlockActionExtractor: Parse SetGlobalAction, forceOrder, order actions
 - SyncMonitor: Node sync status monitoring
-- HyperliquidNodeAdapter: Main orchestrator with TCP server
 
-Usage:
-    # In WSL, run as service:
-    python -m runtime.hyperliquid.node_adapter.adapter --host 127.0.0.1 --port 8090
+Usage (Native Ubuntu - recommended):
+    from runtime.hyperliquid.node_adapter import create_integrated_node
 
-    # Or programmatically:
+    integration, bridge = create_integrated_node(observation_system)
+    await integration.start()
+
+Legacy Usage (WSL with TCP):
     from runtime.hyperliquid.node_adapter import HyperliquidNodeAdapter, NodeAdapterConfig
 
     config = NodeAdapterConfig()
@@ -41,6 +44,8 @@ from .action_extractor import (
 )
 from .sync_monitor import SyncMonitor, SyncStatus
 from .adapter import HyperliquidNodeAdapter
+from .direct_integration import DirectNodeIntegration
+from .observation_bridge import ObservationBridge, create_integrated_node
 from .position_state import (
     PositionStateManager,
     PositionCache,
@@ -72,6 +77,9 @@ __all__ = [
     'BlockActionExtractor',
     'SyncMonitor',
     'HyperliquidNodeAdapter',
+    'DirectNodeIntegration',
+    'ObservationBridge',
+    'create_integrated_node',
 
     # Types
     'PriceEvent',

@@ -257,6 +257,33 @@ subsystems:
       - "runtime/exchange/slippage_tracker.py"
       - "execution/hyperliquid_adapter.py"
     frozen: false
+
+  hyperliquid_node_adapter:
+    modules:
+      - "runtime/hyperliquid/node_adapter/__init__.py"
+      - "runtime/hyperliquid/node_adapter/action_extractor.py"
+      - "runtime/hyperliquid/node_adapter/adapter.py"
+      - "runtime/hyperliquid/node_adapter/asset_mapping.py"
+      - "runtime/hyperliquid/node_adapter/config.py"
+      - "runtime/hyperliquid/node_adapter/metrics.py"
+      - "runtime/hyperliquid/node_adapter/position_state.py"
+      - "runtime/hyperliquid/node_adapter/replica_streamer.py"
+      - "runtime/hyperliquid/node_adapter/sync_monitor.py"
+      - "runtime/hyperliquid/windows_connector.py"
+    frozen: false
+    allowed_inputs:
+      - node_replica_data
+      - block_actions
+      - position_updates
+      - liquidation_events
+    forbidden_knowledge:
+      - observation_interpretation
+      - strategy_logic
+    responsibilities:
+      - node_data_streaming
+      - action_extraction
+      - position_state_tracking
+      - asset_mapping
     allowed_inputs:
       - order_intent
       - price_updates

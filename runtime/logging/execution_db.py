@@ -835,6 +835,68 @@ class ResearchDatabase:
             )
         """)
 
+        # Trade Gating: Gating decisions log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_gating_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                execution_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                size_factor REAL NOT NULL,
+                delay_ns INTEGER NOT NULL DEFAULT 0,
+                latency_p50_ns INTEGER,
+                latency_p95_ns INTEGER,
+                latency_p99_ns INTEGER,
+                slippage_mean_bps REAL,
+                slippage_p95_bps REAL,
+                sample_count INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Strategy Performance: Performance snapshots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_strategy_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                strategy_id TEXT NOT NULL,
+                window_type TEXT NOT NULL,
+                trade_count INTEGER NOT NULL,
+                win_count INTEGER NOT NULL,
+                loss_count INTEGER NOT NULL,
+                win_rate REAL NOT NULL,
+                total_pnl REAL NOT NULL,
+                total_pnl_bps REAL NOT NULL,
+                gross_profit REAL NOT NULL,
+                gross_loss REAL NOT NULL,
+                profit_factor REAL NOT NULL,
+                expectancy_bps REAL NOT NULL,
+                avg_slippage_bps REAL NOT NULL,
+                max_slippage_bps REAL NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Alpha Decay Governor: Governor decisions log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_governor_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                strategy_id TEXT,
+                symbol TEXT,
+                size_factor REAL NOT NULL,
+                win_rate REAL,
+                expectancy_bps REAL,
+                profit_factor REAL,
+                sample_count INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # HLP24 table indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
@@ -889,6 +951,22 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_catastrophe_type ON hl_catastrophe_events(event_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_ts ON hl_recovery_attempts(ts_ns)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_type ON hl_recovery_attempts(failure_type)")
+
+        # Trade Gating indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_ts ON hl_gating_decisions(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_decision ON hl_gating_decisions(decision)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_state ON hl_gating_decisions(execution_state)")
+
+        # Strategy Performance indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_ts ON hl_strategy_performance(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_strategy ON hl_strategy_performance(strategy_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_window ON hl_strategy_performance(window_type)")
+
+        # Alpha Decay Governor indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_ts ON hl_governor_decisions(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_action ON hl_governor_decisions(action)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_severity ON hl_governor_decisions(severity)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_strategy ON hl_governor_decisions(strategy_id)")
 
         self.conn.commit()
     
@@ -2928,6 +3006,305 @@ class ResearchDatabase:
 
         cursor.execute(f"""
             SELECT * FROM hl_recovery_attempts
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================
+    # Trade Gating Methods
+    # ==========================================
+
+    def log_gating_decision(
+        self,
+        ts_ns: int,
+        decision: str,
+        execution_state: str,
+        reason: str,
+        size_factor: float,
+        delay_ns: int = 0,
+        latency_p50_ns: int = None,
+        latency_p95_ns: int = None,
+        latency_p99_ns: int = None,
+        slippage_mean_bps: float = None,
+        slippage_p95_bps: float = None,
+        sample_count: int = None,
+    ) -> int:
+        """Log a trade gating decision.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            decision: Gating decision (ALLOW/REDUCE_SIZE/DELAY/BLOCK)
+            execution_state: Current execution state
+            reason: Reason for decision
+            size_factor: Size adjustment factor
+            delay_ns: Recommended delay in nanoseconds
+            latency_p50_ns: P50 latency at decision time
+            latency_p95_ns: P95 latency at decision time
+            latency_p99_ns: P99 latency at decision time
+            slippage_mean_bps: Mean slippage in bps
+            slippage_p95_bps: P95 slippage in bps
+            sample_count: Number of samples used
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_gating_decisions (
+                ts_ns, decision, execution_state, reason, size_factor, delay_ns,
+                latency_p50_ns, latency_p95_ns, latency_p99_ns,
+                slippage_mean_bps, slippage_p95_bps, sample_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, decision, execution_state, reason, size_factor, delay_ns,
+            latency_p50_ns, latency_p95_ns, latency_p99_ns,
+            slippage_mean_bps, slippage_p95_bps, sample_count
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_gating_decisions(
+        self,
+        decision: str = None,
+        execution_state: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get gating decisions.
+
+        Args:
+            decision: Filter by decision type
+            execution_state: Filter by execution state
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of gating decisions
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if decision:
+            conditions.append("decision = ?")
+            params.append(decision)
+        if execution_state:
+            conditions.append("execution_state = ?")
+            params.append(execution_state)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_gating_decisions
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================
+    # Strategy Performance Methods
+    # ==========================================
+
+    def log_strategy_performance(
+        self,
+        ts_ns: int,
+        strategy_id: str,
+        window_type: str,
+        trade_count: int,
+        win_count: int,
+        loss_count: int,
+        win_rate: float,
+        total_pnl: float,
+        total_pnl_bps: float,
+        gross_profit: float,
+        gross_loss: float,
+        profit_factor: float,
+        expectancy_bps: float,
+        avg_slippage_bps: float,
+        max_slippage_bps: float,
+    ) -> int:
+        """Log strategy performance snapshot.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            strategy_id: Strategy identifier
+            window_type: Window type (recent/baseline)
+            trade_count: Number of trades in window
+            win_count: Number of winning trades
+            loss_count: Number of losing trades
+            win_rate: Win rate (0.0 to 1.0)
+            total_pnl: Total PnL
+            total_pnl_bps: Total PnL in basis points
+            gross_profit: Gross profit
+            gross_loss: Gross loss
+            profit_factor: Profit factor
+            expectancy_bps: Expectancy in basis points
+            avg_slippage_bps: Average slippage in bps
+            max_slippage_bps: Maximum slippage in bps
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_strategy_performance (
+                ts_ns, strategy_id, window_type, trade_count,
+                win_count, loss_count, win_rate, total_pnl, total_pnl_bps,
+                gross_profit, gross_loss, profit_factor, expectancy_bps,
+                avg_slippage_bps, max_slippage_bps
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, strategy_id, window_type, trade_count,
+            win_count, loss_count, win_rate, total_pnl, total_pnl_bps,
+            gross_profit, gross_loss, profit_factor, expectancy_bps,
+            avg_slippage_bps, max_slippage_bps
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_strategy_performance(
+        self,
+        strategy_id: str = None,
+        window_type: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get strategy performance snapshots.
+
+        Args:
+            strategy_id: Filter by strategy ID
+            window_type: Filter by window type
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of performance snapshots
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if strategy_id:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+        if window_type:
+            conditions.append("window_type = ?")
+            params.append(window_type)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_strategy_performance
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================
+    # Alpha Decay Governor Methods
+    # ==========================================
+
+    def log_governor_decision(
+        self,
+        ts_ns: int,
+        action: str,
+        severity: str,
+        reason: str,
+        size_factor: float,
+        strategy_id: str = None,
+        symbol: str = None,
+        win_rate: float = None,
+        expectancy_bps: float = None,
+        profit_factor: float = None,
+        sample_count: int = None,
+    ) -> int:
+        """Log alpha decay governor decision.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            action: Governor action (NONE/REDUCE_SIZE/DISABLE_STRATEGY/etc.)
+            severity: Decay severity (NONE/LOW/MEDIUM/HIGH/CRITICAL)
+            reason: Reason for decision
+            size_factor: Size adjustment factor
+            strategy_id: Affected strategy ID
+            symbol: Affected symbol
+            win_rate: Win rate at decision time
+            expectancy_bps: Expectancy at decision time
+            profit_factor: Profit factor at decision time
+            sample_count: Sample count at decision time
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_governor_decisions (
+                ts_ns, action, severity, reason, size_factor,
+                strategy_id, symbol, win_rate, expectancy_bps,
+                profit_factor, sample_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, action, severity, reason, size_factor,
+            strategy_id, symbol, win_rate, expectancy_bps,
+            profit_factor, sample_count
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_governor_decisions(
+        self,
+        action: str = None,
+        severity: str = None,
+        strategy_id: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get governor decisions.
+
+        Args:
+            action: Filter by action
+            severity: Filter by severity
+            strategy_id: Filter by strategy ID
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of governor decisions
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if action:
+            conditions.append("action = ?")
+            params.append(action)
+        if severity:
+            conditions.append("severity = ?")
+            params.append(severity)
+        if strategy_id:
+            conditions.append("strategy_id = ?")
+            params.append(strategy_id)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_governor_decisions
             WHERE {where_clause}
             ORDER BY ts_ns DESC
             LIMIT ?

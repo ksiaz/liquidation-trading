@@ -183,6 +183,91 @@ class ExecutionMetrics:
         self.avg_fill_latency_ms = (prev_total + latency_ms) / self.total_fills
 
 
+@dataclass(frozen=True)
+class LatencyStats:
+    """
+    Latency statistics for a time window.
+
+    Used for edge preservation latency instrumentation.
+    All values in nanoseconds.
+    """
+    window_name: str
+    sample_count: int
+    p50_ns: int
+    p75_ns: int
+    p95_ns: int
+    p99_ns: int
+    max_ns: int
+    mean_ns: int = 0
+
+    @property
+    def p50_ms(self) -> float:
+        """P50 latency in milliseconds."""
+        return self.p50_ns / 1_000_000
+
+    @property
+    def p95_ms(self) -> float:
+        """P95 latency in milliseconds."""
+        return self.p95_ns / 1_000_000
+
+    @property
+    def p99_ms(self) -> float:
+        """P99 latency in milliseconds."""
+        return self.p99_ns / 1_000_000
+
+    @property
+    def max_ms(self) -> float:
+        """Max latency in milliseconds."""
+        return self.max_ns / 1_000_000
+
+
+@dataclass
+class LatencyBreakdown:
+    """
+    Breakdown of latency across execution stages.
+
+    Tracks: detection -> order_submit -> exchange_ack -> fill
+    All timestamps in nanoseconds.
+    """
+    detection_ts_ns: int = 0        # When opportunity detected
+    order_submit_ts_ns: int = 0     # When order sent to exchange
+    exchange_ack_ts_ns: int = 0     # When exchange acknowledged
+    fill_ts_ns: int = 0             # When fill received
+
+    @property
+    def detection_to_submit_ns(self) -> int:
+        """Time from detection to order submission."""
+        if self.order_submit_ts_ns and self.detection_ts_ns:
+            return self.order_submit_ts_ns - self.detection_ts_ns
+        return 0
+
+    @property
+    def submit_to_ack_ns(self) -> int:
+        """Time from submission to exchange acknowledgment."""
+        if self.exchange_ack_ts_ns and self.order_submit_ts_ns:
+            return self.exchange_ack_ts_ns - self.order_submit_ts_ns
+        return 0
+
+    @property
+    def ack_to_fill_ns(self) -> int:
+        """Time from acknowledgment to fill."""
+        if self.fill_ts_ns and self.exchange_ack_ts_ns:
+            return self.fill_ts_ns - self.exchange_ack_ts_ns
+        return 0
+
+    @property
+    def total_latency_ns(self) -> int:
+        """Total latency from detection to fill."""
+        if self.fill_ts_ns and self.detection_ts_ns:
+            return self.fill_ts_ns - self.detection_ts_ns
+        return 0
+
+    @property
+    def total_latency_ms(self) -> float:
+        """Total latency in milliseconds."""
+        return self.total_latency_ns / 1_000_000
+
+
 @dataclass
 class ReconciliationResult:
     """Result of position reconciliation."""

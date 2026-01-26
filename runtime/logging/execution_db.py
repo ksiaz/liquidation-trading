@@ -762,6 +762,79 @@ class ResearchDatabase:
             )
         """)
 
+        # Edge Preservation: Time-windowed metric snapshots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_metric_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                window_name TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                mean_value REAL,
+                p50 REAL,
+                p75 REAL,
+                p95 REAL,
+                p99 REAL,
+                max_value REAL,
+                min_value REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Edge Preservation: Decay signal log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_decay_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                metric_name TEXT NOT NULL,
+                recent_window TEXT NOT NULL,
+                baseline_window TEXT NOT NULL,
+                recent_value REAL NOT NULL,
+                baseline_value REAL NOT NULL,
+                change_pct REAL NOT NULL,
+                z_score REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Catastrophe Playbooks: Event log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_catastrophe_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                details TEXT,
+                previous_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Catastrophe Playbooks: Kill switch state (single row)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_kill_switch_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                triggered INTEGER NOT NULL DEFAULT 0,
+                trigger_ts_ns INTEGER,
+                trigger_reason TEXT,
+                manual_override_required INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Catastrophe Playbooks: Recovery attempt log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_recovery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                failure_type TEXT NOT NULL,
+                attempt_num INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                details TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # HLP24 table indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
@@ -803,6 +876,19 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_review ON hl_threshold_configs(next_review_date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_name ON hl_threshold_optimization_runs(threshold_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_ts ON hl_threshold_optimization_runs(run_ts)")
+
+        # Edge Preservation indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_ts ON hl_metric_snapshots(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_name ON hl_metric_snapshots(metric_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_window ON hl_metric_snapshots(window_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_decay_ts ON hl_decay_signals(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_decay_metric ON hl_decay_signals(metric_name)")
+
+        # Catastrophe Playbooks indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_catastrophe_ts ON hl_catastrophe_events(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_catastrophe_type ON hl_catastrophe_events(event_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_ts ON hl_recovery_attempts(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_type ON hl_recovery_attempts(failure_type)")
 
         self.conn.commit()
     
@@ -2539,6 +2625,313 @@ class ResearchDatabase:
             ORDER BY run_ts DESC
             LIMIT ?
         """, (threshold_name, limit))
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================
+    # Edge Preservation Methods
+    # ==========================================
+
+    def log_metric_snapshot(
+        self,
+        ts_ns: int,
+        window_name: str,
+        metric_name: str,
+        sample_count: int,
+        mean_value: float = None,
+        p50: float = None,
+        p75: float = None,
+        p95: float = None,
+        p99: float = None,
+        max_value: float = None,
+        min_value: float = None,
+    ) -> int:
+        """Log a time-windowed metric snapshot.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            window_name: Window name (e.g., "1min", "5min")
+            metric_name: Metric name
+            sample_count: Number of samples in window
+            mean_value: Mean value
+            p50-p99: Percentile values
+            max_value: Maximum value
+            min_value: Minimum value
+
+        Returns:
+            Row ID of inserted snapshot
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_metric_snapshots (
+                ts_ns, window_name, metric_name, sample_count,
+                mean_value, p50, p75, p95, p99, max_value, min_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, window_name, metric_name, sample_count,
+            mean_value, p50, p75, p95, p99, max_value, min_value
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def log_decay_signal(
+        self,
+        ts_ns: int,
+        metric_name: str,
+        recent_window: str,
+        baseline_window: str,
+        recent_value: float,
+        baseline_value: float,
+        change_pct: float,
+        z_score: float = None,
+    ) -> int:
+        """Log a decay signal.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            metric_name: Metric name
+            recent_window: Recent window name
+            baseline_window: Baseline window name
+            recent_value: Value in recent window
+            baseline_value: Value in baseline window
+            change_pct: Percentage change
+            z_score: Z-score if computed
+
+        Returns:
+            Row ID of inserted signal
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_decay_signals (
+                ts_ns, metric_name, recent_window, baseline_window,
+                recent_value, baseline_value, change_pct, z_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, metric_name, recent_window, baseline_window,
+            recent_value, baseline_value, change_pct, z_score
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_decay_signals(
+        self,
+        metric_name: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get decay signals.
+
+        Args:
+            metric_name: Filter by metric name (optional)
+            since_ts_ns: Filter by timestamp (optional)
+            limit: Maximum records
+
+        Returns:
+            List of decay signals
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if metric_name:
+            conditions.append("metric_name = ?")
+            params.append(metric_name)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_decay_signals
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================
+    # Catastrophe Playbooks Methods
+    # ==========================================
+
+    def log_catastrophe_event(
+        self,
+        ts_ns: int,
+        event_type: str,
+        previous_state: str,
+        new_state: str,
+        details: str = None,
+    ) -> int:
+        """Log a catastrophe state transition.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            event_type: Type of event (e.g., "websocket_disconnect")
+            previous_state: Previous catastrophe state
+            new_state: New catastrophe state
+            details: Additional details
+
+        Returns:
+            Row ID of inserted event
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_catastrophe_events (
+                ts_ns, event_type, details, previous_state, new_state
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (ts_ns, event_type, details, previous_state, new_state))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_catastrophe_events(
+        self,
+        since_ts_ns: int = None,
+        event_type: str = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get catastrophe events.
+
+        Args:
+            since_ts_ns: Filter by timestamp
+            event_type: Filter by event type
+            limit: Maximum records
+
+        Returns:
+            List of catastrophe events
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_catastrophe_events
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_kill_switch_state(self) -> Optional[Dict]:
+        """Get current kill switch state.
+
+        Returns:
+            Kill switch state dict or None if not initialized
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM hl_kill_switch_state WHERE id = 1")
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def set_kill_switch_state(
+        self,
+        triggered: bool,
+        trigger_ts_ns: int = None,
+        trigger_reason: str = None,
+        manual_override_required: bool = False,
+    ) -> None:
+        """Set kill switch state (upsert).
+
+        Args:
+            triggered: Whether kill switch is triggered
+            trigger_ts_ns: Timestamp when triggered
+            trigger_reason: Reason for trigger
+            manual_override_required: Whether manual reset required
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_kill_switch_state (
+                id, triggered, trigger_ts_ns, trigger_reason,
+                manual_override_required, updated_at
+            ) VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                triggered = excluded.triggered,
+                trigger_ts_ns = excluded.trigger_ts_ns,
+                trigger_reason = excluded.trigger_reason,
+                manual_override_required = excluded.manual_override_required,
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            1 if triggered else 0,
+            trigger_ts_ns,
+            trigger_reason,
+            1 if manual_override_required else 0,
+        ))
+        self.conn.commit()
+
+    def log_recovery_attempt(
+        self,
+        ts_ns: int,
+        failure_type: str,
+        attempt_num: int,
+        success: bool,
+        details: str = None,
+    ) -> int:
+        """Log a recovery attempt.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            failure_type: Type of failure being recovered
+            attempt_num: Attempt number
+            success: Whether recovery succeeded
+            details: Additional details
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_recovery_attempts (
+                ts_ns, failure_type, attempt_num, success, details
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (ts_ns, failure_type, attempt_num, 1 if success else 0, details))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_recovery_attempts(
+        self,
+        failure_type: str = None,
+        since_ts_ns: int = None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Get recovery attempts.
+
+        Args:
+            failure_type: Filter by failure type
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of recovery attempts
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if failure_type:
+            conditions.append("failure_type = ?")
+            params.append(failure_type)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_recovery_attempts
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
         return [dict(row) for row in cursor.fetchall()]
 
     def close(self):

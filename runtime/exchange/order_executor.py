@@ -49,6 +49,8 @@ from .types import (
     ExecutionMetrics,
     ExecutionLog,
     FillType,
+    LatencyBreakdown,
+    LatencyStats,
 )
 from .asset_metadata import get_asset_metadata_service, AssetMetadataService
 
@@ -187,6 +189,12 @@ class OrderExecutor:
         self._on_stop_filled: Optional[Callable[[StopOrderStatus], None]] = None
         self._on_stop_cancelled: Optional[Callable[[StopOrderStatus], None]] = None
 
+        # Latency instrumentation: order_id -> LatencyBreakdown
+        self._latency_breakdowns: Dict[str, LatencyBreakdown] = {}
+
+        # Optional: WindowedMetricsCollector for edge preservation
+        self._windowed_metrics = None  # Set via set_windowed_metrics()
+
         self._lock = RLock()
 
     def _now_ns(self) -> int:
@@ -266,6 +274,16 @@ class OrderExecutor:
                     remaining_size=request.size,
                     timestamp_ns=submit_ts
                 )
+
+                # Update latency breakdown with submit time
+                if request.client_order_id in self._latency_breakdowns:
+                    breakdown = self._latency_breakdowns[request.client_order_id]
+                    self._latency_breakdowns[request.client_order_id] = LatencyBreakdown(
+                        detection_ts_ns=breakdown.detection_ts_ns,
+                        order_submit_ts_ns=submit_ts,
+                    )
+                    # Also store by exchange order_id for fill matching
+                    self._latency_breakdowns[response.order_id] = self._latency_breakdowns[request.client_order_id]
 
                 self._log_execution('order_submitted', request, order_id=response.order_id)
                 self._metrics.add_order(success=True)
@@ -724,6 +742,22 @@ class OrderExecutor:
                 latency_ms = (fill.timestamp_ns - submit_time) / 1_000_000
                 self._metrics.add_fill(slippage_bps, latency_ms, partial=update.status == OrderStatus.PARTIAL)
 
+                # Update latency breakdown with fill time and record to windowed metrics
+                if order_id in self._latency_breakdowns:
+                    breakdown = self._latency_breakdowns[order_id]
+                    completed_breakdown = LatencyBreakdown(
+                        detection_ts_ns=breakdown.detection_ts_ns,
+                        order_submit_ts_ns=breakdown.order_submit_ts_ns,
+                        exchange_ack_ts_ns=breakdown.exchange_ack_ts_ns or submit_time,
+                        fill_ts_ns=fill.timestamp_ns,
+                    )
+                    self._latency_breakdowns[order_id] = completed_breakdown
+                    self._record_latency_to_windowed_metrics(completed_breakdown)
+
+                # Record slippage to windowed metrics
+                if self._windowed_metrics:
+                    self._windowed_metrics.record("slippage_bps", slippage_bps, fill.timestamp_ns)
+
                 self._log_execution(
                     'order_filled',
                     request,
@@ -938,6 +972,108 @@ class OrderExecutor:
         """Get execution metrics."""
         with self._lock:
             return self._metrics
+
+    def set_windowed_metrics(self, windowed_metrics) -> None:
+        """
+        Set windowed metrics collector for edge preservation latency tracking.
+
+        Args:
+            windowed_metrics: WindowedMetricsCollector instance
+        """
+        self._windowed_metrics = windowed_metrics
+
+    def record_detection_time(self, order_id: str, detection_ts_ns: int = None) -> None:
+        """
+        Record detection timestamp for latency instrumentation.
+
+        Call this when the trading opportunity is first detected,
+        before submitting the order.
+
+        Args:
+            order_id: Client order ID (will be used to match later)
+            detection_ts_ns: Detection timestamp (uses current if None)
+        """
+        if detection_ts_ns is None:
+            detection_ts_ns = self._now_ns()
+
+        with self._lock:
+            self._latency_breakdowns[order_id] = LatencyBreakdown(
+                detection_ts_ns=detection_ts_ns
+            )
+
+    def get_latency_breakdown(self, order_id: str) -> Optional[LatencyBreakdown]:
+        """Get latency breakdown for an order."""
+        with self._lock:
+            return self._latency_breakdowns.get(order_id)
+
+    def _record_latency_to_windowed_metrics(self, breakdown: LatencyBreakdown) -> None:
+        """Record latency breakdown to windowed metrics if configured."""
+        if self._windowed_metrics is None:
+            return
+
+        now_ns = self._now_ns()
+
+        # Record total detection-to-fill latency
+        if breakdown.total_latency_ns > 0:
+            self._windowed_metrics.record(
+                "detection_to_fill_latency_ns",
+                float(breakdown.total_latency_ns),
+                now_ns
+            )
+
+        # Record individual segments
+        if breakdown.detection_to_submit_ns > 0:
+            self._windowed_metrics.record(
+                "detection_to_submit_latency_ns",
+                float(breakdown.detection_to_submit_ns),
+                now_ns
+            )
+
+        if breakdown.submit_to_ack_ns > 0:
+            self._windowed_metrics.record(
+                "submit_to_ack_latency_ns",
+                float(breakdown.submit_to_ack_ns),
+                now_ns
+            )
+
+        if breakdown.ack_to_fill_ns > 0:
+            self._windowed_metrics.record(
+                "ack_to_fill_latency_ns",
+                float(breakdown.ack_to_fill_ns),
+                now_ns
+            )
+
+    def get_latency_stats(self, window_name: str = "1hour") -> Optional[LatencyStats]:
+        """
+        Get latency statistics for a time window.
+
+        Args:
+            window_name: Window name (e.g., "1min", "5min", "1hour")
+
+        Returns:
+            LatencyStats or None if windowed metrics not configured
+        """
+        if self._windowed_metrics is None:
+            return None
+
+        stats = self._windowed_metrics.get_stats(
+            "detection_to_fill_latency_ns",
+            window_name,
+        )
+
+        if stats is None or stats.sample_count == 0:
+            return None
+
+        return LatencyStats(
+            window_name=window_name,
+            sample_count=stats.sample_count,
+            p50_ns=int(stats.p50 or 0),
+            p75_ns=int(stats.p75 or 0),
+            p95_ns=int(stats.p95 or 0),
+            p99_ns=int(stats.p99 or 0),
+            max_ns=int(stats.max_value or 0),
+            mean_ns=int(stats.mean or 0),
+        )
 
     def set_fill_callback(self, callback: Callable[[OrderFill], None]):
         """Set callback for fill events."""

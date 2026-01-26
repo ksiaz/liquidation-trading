@@ -31,6 +31,88 @@ class TradeDecision(Enum):
     REJECTED_SIZE_ZERO = auto()
     REJECTED_INVALID_PARAMS = auto()
     REJECTED_COOLDOWN = auto()  # H1-A: Entry cooldown active
+    REJECTED_DAILY_LIMIT = auto()  # Daily trade limit exceeded
+
+
+@dataclass
+class DailyLimits:
+    """
+    Daily trading limits.
+
+    Prevents runaway trading by capping entries/exits per day.
+    """
+    max_entries_per_day: int = 50
+    max_exits_per_day: int = 100
+    max_total_orders_per_day: int = 200
+
+    # Current counts
+    entries_today: int = 0
+    exits_today: int = 0
+    orders_today: int = 0
+
+    # Day boundary tracking
+    day_start_ts_ns: int = 0
+
+    def _now_ns(self) -> int:
+        return int(time.time() * 1_000_000_000)
+
+    def _check_day_rollover(self) -> None:
+        """Reset counts if new day started."""
+        now_ns = self._now_ns()
+        # Day boundary at midnight UTC
+        day_ns = 24 * 60 * 60 * 1_000_000_000
+        current_day = now_ns // day_ns
+        start_day = self.day_start_ts_ns // day_ns
+
+        if current_day != start_day or self.day_start_ts_ns == 0:
+            self.entries_today = 0
+            self.exits_today = 0
+            self.orders_today = 0
+            self.day_start_ts_ns = now_ns
+
+    def can_enter(self) -> bool:
+        """Check if entry is allowed."""
+        self._check_day_rollover()
+        return (
+            self.entries_today < self.max_entries_per_day and
+            self.orders_today < self.max_total_orders_per_day
+        )
+
+    def can_exit(self) -> bool:
+        """Check if exit is allowed."""
+        self._check_day_rollover()
+        return (
+            self.exits_today < self.max_exits_per_day and
+            self.orders_today < self.max_total_orders_per_day
+        )
+
+    def record_entry(self) -> None:
+        """Record an entry order."""
+        self._check_day_rollover()
+        self.entries_today += 1
+        self.orders_today += 1
+
+    def record_exit(self) -> None:
+        """Record an exit order."""
+        self._check_day_rollover()
+        self.exits_today += 1
+        self.orders_today += 1
+
+    def get_remaining(self) -> dict:
+        """Get remaining counts."""
+        self._check_day_rollover()
+        return {
+            "entries_remaining": max(0, self.max_entries_per_day - self.entries_today),
+            "exits_remaining": max(0, self.max_exits_per_day - self.exits_today),
+            "orders_remaining": max(0, self.max_total_orders_per_day - self.orders_today),
+        }
+
+    def force_reset(self) -> None:
+        """Force reset counts (requires operator confirmation in practice)."""
+        self.entries_today = 0
+        self.exits_today = 0
+        self.orders_today = 0
+        self.day_start_ts_ns = self._now_ns()
 
 
 @dataclass
@@ -39,6 +121,7 @@ class CapitalManagerConfig:
     sizing: SizingConfig = field(default_factory=SizingConfig)
     limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
     drawdown: DrawdownConfig = field(default_factory=DrawdownConfig)
+    daily_limits: DailyLimits = field(default_factory=DailyLimits)
 
     # H1-A: Entry cooldown (prevents over-trading)
     min_entry_cooldown_sec: float = 60.0  # Minimum seconds between entries
@@ -46,6 +129,9 @@ class CapitalManagerConfig:
 
     # H9-B: Stacked multiplier floor (prevents under-sizing)
     min_stacked_multiplier: float = 0.25  # Floor for combined multipliers (25%)
+
+    # Daily limits toggle
+    enable_daily_limits: bool = True
 
 
 @dataclass
@@ -93,6 +179,9 @@ class CapitalManager:
         self._logger = logger or logging.getLogger(__name__)
 
         self._capital = initial_capital
+
+        # Daily limits tracking
+        self._daily_limits = self._config.daily_limits
 
         # Initialize components
         self._sizer = PositionSizer(
@@ -175,6 +264,24 @@ class CapitalManager:
                         'cooldown_sec': self._config.min_entry_cooldown_sec,
                         'time_since_last': time_since_last,
                         'remaining': remaining
+                    }
+                )
+
+        # Check daily limits
+        if self._config.enable_daily_limits:
+            if not self._daily_limits.can_enter():
+                remaining = self._daily_limits.get_remaining()
+                return TradeApproval(
+                    decision=TradeDecision.REJECTED_DAILY_LIMIT,
+                    approved_size=0,
+                    position_value=0,
+                    risk_amount=0,
+                    risk_pct=0,
+                    rejection_reasons=['Daily entry limit reached'],
+                    details={
+                        'entries_today': self._daily_limits.entries_today,
+                        'max_entries': self._daily_limits.max_entries_per_day,
+                        'remaining': remaining,
                     }
                 )
 
@@ -268,6 +375,10 @@ class CapitalManager:
         # H1-A: Update entry timestamp on approval
         self._last_entry_timestamp = time.time()
 
+        # Record daily entry
+        if self._config.enable_daily_limits:
+            self._daily_limits.record_entry()
+
         return TradeApproval(
             decision=TradeDecision.APPROVED,
             approved_size=adjusted_size,
@@ -335,6 +446,7 @@ class CapitalManager:
             'drawdown': self._drawdown.get_summary(),
             'exposure': self._limits.get_exposure_summary(self._capital),
             'sizing': self._sizer.get_streak_info(),
+            'daily_limits': self.get_daily_limits_status(),
             'trading_allowed': self.is_trading_allowed()
         }
 
@@ -361,3 +473,40 @@ class CapitalManager:
 
         # H9-B: Floor to prevent under-sizing
         return max(combined, self._config.min_stacked_multiplier)
+
+    # ==========================================
+    # Daily Limits Methods
+    # ==========================================
+
+    def record_exit_order(self) -> None:
+        """Record an exit order for daily limits."""
+        if self._config.enable_daily_limits:
+            self._daily_limits.record_exit()
+
+    def can_place_exit(self) -> bool:
+        """Check if exit order is allowed by daily limits."""
+        if not self._config.enable_daily_limits:
+            return True
+        return self._daily_limits.can_exit()
+
+    def get_daily_limits_status(self) -> Dict[str, Any]:
+        """Get daily limits status."""
+        return {
+            "enabled": self._config.enable_daily_limits,
+            "entries_today": self._daily_limits.entries_today,
+            "exits_today": self._daily_limits.exits_today,
+            "orders_today": self._daily_limits.orders_today,
+            "max_entries": self._daily_limits.max_entries_per_day,
+            "max_exits": self._daily_limits.max_exits_per_day,
+            "max_orders": self._daily_limits.max_total_orders_per_day,
+            "remaining": self._daily_limits.get_remaining(),
+        }
+
+    def reset_daily_limits(self) -> None:
+        """
+        Force reset daily limits.
+
+        Note: In production, should require operator confirmation.
+        """
+        self._daily_limits.force_reset()
+        self._logger.warning("Daily limits force reset")

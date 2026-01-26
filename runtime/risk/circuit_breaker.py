@@ -441,3 +441,202 @@ class ResourceExhaustionBreaker(CircuitBreaker):
                     f"Latency {latency_ms:.1f}ms ({multiplier:.1f}x baseline)",
                     {'latency_ms': latency_ms, 'baseline': self._baseline_latency}
                 )
+
+
+@dataclass
+class KillSwitchState:
+    """
+    Persistent kill switch state.
+
+    Survives restarts via database storage.
+    """
+    triggered: bool
+    trigger_ts_ns: Optional[int]
+    trigger_reason: Optional[str]
+    manual_override_required: bool
+
+
+class PersistentKillSwitch:
+    """
+    Kill switch that survives restarts.
+
+    Uses database for state persistence.
+    Requires explicit operator confirmation to reset.
+    """
+
+    CONFIRMATION_PHRASE = "CONFIRM KILL SWITCH RESET"
+
+    def __init__(
+        self,
+        db=None,  # ResearchDatabase
+        logger: logging.Logger = None,
+    ):
+        """
+        Initialize persistent kill switch.
+
+        Args:
+            db: ResearchDatabase instance for persistence
+            logger: Logger instance
+        """
+        self._db = db
+        self._logger = logger or logging.getLogger(__name__)
+        self._lock = Lock()
+
+        # In-memory state (loaded from DB)
+        self._state = self._load_state()
+
+    def _now_ns(self) -> int:
+        return int(time.time() * 1_000_000_000)
+
+    def _load_state(self) -> KillSwitchState:
+        """Load state from database."""
+        if self._db is None:
+            return KillSwitchState(
+                triggered=False,
+                trigger_ts_ns=None,
+                trigger_reason=None,
+                manual_override_required=True,
+            )
+
+        try:
+            row = self._db.get_kill_switch_state()
+            if row is None:
+                return KillSwitchState(
+                    triggered=False,
+                    trigger_ts_ns=None,
+                    trigger_reason=None,
+                    manual_override_required=True,
+                )
+
+            return KillSwitchState(
+                triggered=bool(row.get('triggered', 0)),
+                trigger_ts_ns=row.get('trigger_ts_ns'),
+                trigger_reason=row.get('trigger_reason'),
+                manual_override_required=bool(row.get('manual_override_required', 1)),
+            )
+        except Exception as e:
+            self._logger.error(f"Failed to load kill switch state: {e}")
+            return KillSwitchState(
+                triggered=False,
+                trigger_ts_ns=None,
+                trigger_reason=None,
+                manual_override_required=True,
+            )
+
+    def _save_state(self) -> None:
+        """Save state to database."""
+        if self._db is None:
+            return
+
+        try:
+            self._db.set_kill_switch_state(
+                triggered=self._state.triggered,
+                trigger_ts_ns=self._state.trigger_ts_ns,
+                trigger_reason=self._state.trigger_reason,
+                manual_override_required=self._state.manual_override_required,
+            )
+        except Exception as e:
+            self._logger.error(f"Failed to save kill switch state: {e}")
+
+    @property
+    def is_triggered(self) -> bool:
+        """Check if kill switch is triggered."""
+        with self._lock:
+            return self._state.triggered
+
+    @property
+    def state(self) -> KillSwitchState:
+        """Get current state."""
+        with self._lock:
+            return self._state
+
+    def trigger(self, reason: str, ts_ns: int = None) -> None:
+        """
+        Trigger the kill switch.
+
+        Args:
+            reason: Reason for trigger
+            ts_ns: Timestamp (uses current if None)
+        """
+        if ts_ns is None:
+            ts_ns = self._now_ns()
+
+        with self._lock:
+            if self._state.triggered:
+                self._logger.warning(f"Kill switch already triggered: {self._state.trigger_reason}")
+                return
+
+            self._state = KillSwitchState(
+                triggered=True,
+                trigger_ts_ns=ts_ns,
+                trigger_reason=reason,
+                manual_override_required=True,
+            )
+            self._save_state()
+
+            self._logger.error(f"KILL SWITCH TRIGGERED: {reason}")
+
+    def reset(self, operator_confirmation: str) -> bool:
+        """
+        Reset the kill switch.
+
+        Requires exact confirmation phrase.
+
+        Args:
+            operator_confirmation: Must be CONFIRM_PHRASE
+
+        Returns:
+            True if reset successful
+        """
+        if operator_confirmation != self.CONFIRMATION_PHRASE:
+            self._logger.warning(
+                f"Invalid kill switch reset confirmation. "
+                f"Expected: '{self.CONFIRMATION_PHRASE}'"
+            )
+            return False
+
+        with self._lock:
+            if not self._state.triggered:
+                self._logger.info("Kill switch not triggered, nothing to reset")
+                return True
+
+            previous_reason = self._state.trigger_reason
+
+            self._state = KillSwitchState(
+                triggered=False,
+                trigger_ts_ns=None,
+                trigger_reason=None,
+                manual_override_required=True,
+            )
+            self._save_state()
+
+            self._logger.warning(
+                f"KILL SWITCH RESET by operator. Previous reason: {previous_reason}"
+            )
+            return True
+
+    def allows_trading(self) -> bool:
+        """Check if trading is allowed (not triggered)."""
+        return not self.is_triggered
+
+    def allows_entry(self) -> bool:
+        """Check if new position entry is allowed."""
+        return not self.is_triggered
+
+    def allows_exit(self) -> bool:
+        """
+        Check if position exit is allowed.
+
+        Exits are always allowed, even when triggered.
+        """
+        return True
+
+    def get_summary(self) -> Dict:
+        """Get kill switch summary."""
+        with self._lock:
+            return {
+                "triggered": self._state.triggered,
+                "trigger_ts_ns": self._state.trigger_ts_ns,
+                "trigger_reason": self._state.trigger_reason,
+                "manual_override_required": self._state.manual_override_required,
+            }

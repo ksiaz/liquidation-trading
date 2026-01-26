@@ -35,6 +35,10 @@ class M1IngestionEngine:
         # Hyperliquid buffers
         self.hl_positions: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=trade_buffer_size))
         self.hl_liquidations: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=liquidation_buffer_size))
+        self.hl_prices: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=100))  # Price history per symbol
+
+        # Latest Hyperliquid oracle prices (for proximity calculations)
+        self.latest_hl_prices: Dict[str, Dict] = {}  # symbol -> {oracle_price, mark_price, timestamp}
 
         # Counters
         self.counters = {
@@ -45,6 +49,7 @@ class M1IngestionEngine:
             'depth': 0,
             'hl_positions': 0,
             'hl_liquidations': 0,
+            'hl_prices': 0,
             'errors': 0,
             # P2: Side derivation validation counters
             'side_validated': 0,
@@ -399,3 +404,71 @@ class M1IngestionEngine:
         except Exception:
             self.counters['errors'] += 1
             return None
+
+    def normalize_hl_price(self, symbol: str, payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Hyperliquid price event from SetGlobalAction.
+
+        Oracle prices are authoritative - they determine liquidation triggers.
+        These come from the node's SetGlobalAction messages (~every 2.93s).
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            payload: Price data with keys:
+                - oracle_price: Oracle price (authoritative)
+                - mark_price: Mark price (may be None)
+                - timestamp: Event timestamp
+
+        Returns:
+            Normalized event dict or None on error
+        """
+        try:
+            oracle_price = payload.get('oracle_price')
+            if oracle_price is None:
+                return None
+
+            event = {
+                'timestamp': float(payload.get('timestamp', 0)),
+                'symbol': symbol,
+                'oracle_price': float(oracle_price),
+                'mark_price': float(payload['mark_price']) if payload.get('mark_price') else None,
+                'event_type': 'HL_PRICE',
+                'exchange': 'HYPERLIQUID'
+            }
+
+            # Store in buffer
+            self.hl_prices[symbol].append(event)
+
+            # Update latest price (for proximity calculations)
+            self.latest_hl_prices[symbol] = {
+                'oracle_price': event['oracle_price'],
+                'mark_price': event['mark_price'],
+                'timestamp': event['timestamp']
+            }
+
+            self.counters['hl_prices'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def get_latest_hl_price(self, symbol: str) -> Optional[float]:
+        """
+        Get latest Hyperliquid oracle price for a symbol.
+
+        Used for real-time proximity calculations.
+        """
+        price_data = self.latest_hl_prices.get(symbol)
+        return price_data['oracle_price'] if price_data else None
+
+    def get_all_hl_prices(self) -> Dict[str, float]:
+        """
+        Get all latest Hyperliquid oracle prices.
+
+        Returns dict of symbol -> oracle_price.
+        """
+        return {
+            symbol: data['oracle_price']
+            for symbol, data in self.latest_hl_prices.items()
+        }

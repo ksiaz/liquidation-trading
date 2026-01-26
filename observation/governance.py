@@ -162,6 +162,23 @@ class ObservationSystem:
             self._hl_liquidation_timestamps[symbol].pop(0)
             self._hl_liquidation_values[symbol].pop(0)
 
+    def get_hl_oracle_price(self, symbol: str) -> Optional[float]:
+        """
+        Get latest Hyperliquid oracle price for a symbol.
+
+        Oracle prices come from SetGlobalAction and are authoritative
+        for liquidation calculations.
+        """
+        return self._m1.get_latest_hl_price(symbol)
+
+    def get_all_hl_prices(self) -> Dict[str, float]:
+        """
+        Get all latest Hyperliquid oracle prices.
+
+        Returns dict of symbol -> oracle_price.
+        """
+        return self._m1.get_all_hl_prices()
+
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
         Push external fact into memory.
@@ -200,6 +217,12 @@ class ObservationSystem:
                 self._m1.record_oi(symbol)
             elif event_type == 'DEPTH':
                 normalized_event = self._m1.normalize_depth(symbol, payload)
+            elif event_type == 'HL_PRICE':
+                normalized_event = self._m1.normalize_hl_price(symbol, payload)
+            elif event_type == 'HL_LIQUIDATION':
+                normalized_event = self._m1.normalize_hl_liquidation(symbol, payload)
+            elif event_type == 'HL_POSITION':
+                normalized_event = self._m1.normalize_hl_position(symbol, payload)
 
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
@@ -227,6 +250,14 @@ class ObservationSystem:
                     ask_size=normalized_event['ask_size'],
                     best_bid_price=normalized_event['best_bid_price'],
                     best_ask_price=normalized_event['best_ask_price']
+                )
+
+            # Record HL liquidations for cascade state tracking
+            if normalized_event and event_type == 'HL_LIQUIDATION':
+                self.record_hl_liquidation(
+                    symbol=normalized_event['symbol'],
+                    timestamp=normalized_event['timestamp'],
+                    value=normalized_event['value']
                 )
         except Exception as e:
             # Internal crash -> FAILED state

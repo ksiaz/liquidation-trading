@@ -71,7 +71,7 @@ EXCEPTIONS: Dict[str, Dict[int, str]] = {
     'runtime/m6_executor.py': {
         # R6-M6Interpretation rule catches basic Python patterns (false positives)
         # Class definitions and instance variables are constitutional
-        # Line numbers updated 2026-01-25 after FROZEN notice added (+7 lines)
+        # Line numbers updated 2026-01-26 after HL integration changes
         94: "Class definition: M6Config dataclass",
         123: "Class definition: ExecutionCycleResult dataclass",
         134: "Class definition: M6Executor class",
@@ -90,31 +90,40 @@ EXCEPTIONS: Dict[str, Dict[int, str]] = {
         231: "Loop: iterating over symbols for tracking",
         243: "List slicing: cycle history truncation",
         297: "Generator expression: counting active positions",
+        356: "List comprehension: filtering EXIT mandates for priority check",
+        362: "List comprehension: filtering BLOCK mandates for priority check",
         492: "Instance variable assignment: minute tracker reset",
         493: "Instance variable assignment: action counter reset",
+        500: "Instance variable assignment: minute start tracking",
+        501: "Instance variable assignment: action counter reset",
         521: "Instance variable assignment: action time tracking",
         526: "Instance variable assignment: action time tracking",
+        529: "Instance variable assignment: action time tracking",
+        534: "Instance variable assignment: action time tracking",
         541: "Instance variable assignment: action time tracking",
+        549: "Instance variable assignment: action time tracking",
         580: "State transition: stopped state on shutdown",
+        588: "State transition: stopped state on shutdown",
     },
     'observation/governance.py': {
         # Structural thresholds (factual boundaries, not interpretation)
         95: "Structural config: time window for price correlation in seconds",
         # Trade handling - Binance API semantic field names
-        361: "Binance API semantic: is_taker_sell indicates trade aggressor side",
-        373: "Parameter passing Binance API field to M2 store",
-        380: "Local variable derived from Binance trade side field",
+        # Line numbers updated 2026-01-26 after HL price ingestion added (+31 lines at top)
+        392: "Binance API semantic: is_taker_sell indicates trade aggressor side",
+        404: "Parameter passing Binance API field to M2 store",
+        411: "Local variable derived from Binance trade side field",
         # Orderbook primitive parameters
-        480: "Structural parameter: minimum consumption size threshold",
-        491: "Structural parameter: minimum consumption size threshold",
-        497: "Data access: recent_prices is collection name, not semantic claim",
-        516: "Structural parameter: maximum price movement percentage",
-        527: "Structural parameter: minimum refill size threshold",
-        538: "Structural parameter: minimum refill size threshold",
+        511: "Structural parameter: minimum consumption size threshold",
+        522: "Structural parameter: minimum consumption size threshold",
+        528: "Data access: recent_prices is collection name, not semantic claim",
+        547: "Structural parameter: maximum price movement percentage",
+        558: "Structural parameter: minimum refill size threshold",
+        569: "Structural parameter: minimum refill size threshold",
         # Clustering parameter
-        651: "Structural parameter: maximum gap percentage for clustering",
+        682: "Structural parameter: maximum gap percentage for clustering",
         # HLP proximity threshold
-        848: "Structural parameter: threshold percentage for HLP proximity",
+        879: "Structural parameter: threshold percentage for HLP proximity",
     },
     'runtime/collector/service.py': {
         196: "Factual error logging: reports initialization exception",

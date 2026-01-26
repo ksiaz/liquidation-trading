@@ -77,6 +77,9 @@ WORD_EXEMPTIONS = {
         'native_app/',  # Qt Signal class, UI signal handling
         'terminal_app/',  # Python signal module
         'entry_quality',  # Documentation about signal strength
+        'analytics/decay_detector',  # DecaySignal data structure (observable metric change)
+        'governance/unknown_unknown_detector',  # UnknownThreatSignal data structure
+        'logging/execution_db',  # Database logging for decay signals
     ],
     'opportunity': [
         'ep2_effcs_strategy',  # Method name (constitutional: no semantic interpretation)
@@ -86,19 +89,34 @@ WORD_EXEMPTIONS = {
         'ep4_ghost_tracker',  # Entry opportunity method
         'stop_hunt_detector',  # Entry opportunity method
         'entry_quality',  # Entry opportunity scoring method
+        'exchange/order_executor',  # Opportunity detection timestamp
+        'exchange/types',  # Opportunity detection field
     ],
     'edge': [
         'ep2_slbrs_strategy',  # "block edge" - geometric term, not semantic
         'meta/',  # System edge detector (legitimate component)
         'native_app/',  # Chart edge positioning (geometric)
+        'analytics/decay_detector',  # Edge preservation decay detection
+        'exchange/order_executor',  # Edge preservation latency tracking
+        'exchange/types',  # Edge preservation type definitions
+        'governance/capital_governor',  # Edge preservation doctrine
+        'governance/confidence_engine',  # Edge stability scoring
+        'risk/alpha_decay_governor',  # Edge weakening detection
+        'risk/latency_gate',  # Edge degradation tracking
+        'logging/execution_db',  # Edge metrics logging
     ],
     'setup': [
         'env_setup',  # File name
         'position_tracker',  # Method name (setup wallets)
         'entry_quality',  # "reversal setup" - technical term
+        'hyperliquid/node_adapter/',  # inotify setup method (Linux technical term)
     ],
     'alpha': [
         'indicators/',  # EMA alpha smoothing constant (mathematical)
+        'governance/capital_governor',  # Alpha Decay Governor reference
+        'governance/meta_governor',  # Alpha trust scoring
+        'risk/alpha_decay_governor',  # Alpha decay detection module
+        'logging/execution_db',  # Alpha decay logging
     ],
     'momentum': [
         'm4_cascade_momentum',  # M4 primitive name
@@ -137,6 +155,7 @@ WORD_EXEMPTIONS = {
         'ep2_strategy_cascade_sniper',  # Strategy uses trend for reversal blocking
         'policy_adapter',  # Wires trend context to strategies
         'stop_hunt_detector',  # F6: Trend filtering for stop-hunt entries
+        'risk/latency_gate',  # Latency trend analysis (statistical, not market prediction)
     ],
 }
 

@@ -74,6 +74,57 @@ DEFAULT_DANGEROUS_ACTIONS: Dict[str, DangerousAction] = {
         description="Manually close a position",
         cooldown_ns=10 * 1_000_000_000,
     ),
+    # Pillar 4 + 5: Capital & Meta Governor Override Actions
+    "force_scale_up": DangerousAction(
+        name="force_scale_up",
+        confirmation_phrase="CONFIRM FORCE SCALE UP I ACCEPT RISK",
+        description="Force capital allocation increase (requires trust >= 0.60)",
+        cooldown_ns=600 * 1_000_000_000,  # 10 minute cooldown
+    ),
+    "force_resume_critical": DangerousAction(
+        name="force_resume_critical",
+        confirmation_phrase="CONFIRM RESUME FROM CRITICAL I ACCEPT FULL RISK",
+        description="Force resume from CRITICAL trust state",
+        cooldown_ns=600 * 1_000_000_000,  # 10 minute cooldown
+    ),
+    "increase_exposure": DangerousAction(
+        name="increase_exposure",
+        confirmation_phrase="CONFIRM INCREASE EXPOSURE",
+        description="Manually increase exposure beyond governor recommendation",
+        cooldown_ns=300 * 1_000_000_000,  # 5 minute cooldown
+    ),
+    "disable_capital_governor": DangerousAction(
+        name="disable_capital_governor",
+        confirmation_phrase="CONFIRM DISABLE CAPITAL GOVERNOR I ACCEPT ALL CONSEQUENCES",
+        description="Temporarily disable capital governor",
+        cooldown_ns=600 * 1_000_000_000,  # 10 minute cooldown
+    ),
+    "disable_meta_governor": DangerousAction(
+        name="disable_meta_governor",
+        confirmation_phrase="CONFIRM DISABLE META GOVERNOR I ACCEPT ALL CONSEQUENCES",
+        description="Temporarily disable meta governor",
+        cooldown_ns=600 * 1_000_000_000,  # 10 minute cooldown
+    ),
+    "release_quarantine": DangerousAction(
+        name="release_quarantine",
+        confirmation_phrase="CONFIRM RELEASE QUARANTINE",
+        description="Manually release capital from quarantine",
+        cooldown_ns=300 * 1_000_000_000,  # 5 minute cooldown
+    ),
+    "reset_meta_governor": DangerousAction(
+        name="reset_meta_governor",
+        confirmation_phrase="CONFIRM RESET META GOVERNOR",
+        description="Reset meta governor after critical state",
+        cooldown_ns=600 * 1_000_000_000,  # 10 minute cooldown
+    ),
+}
+
+# Actions that require minimum trust level to execute
+TRUST_GATED_ACTIONS: Dict[str, float] = {
+    "force_scale_up": 0.60,           # Cannot force scale-up when trust < 0.60
+    "increase_exposure": 0.60,         # Cannot increase exposure when trust < 0.60
+    "disable_capital_governor": 0.40,  # Cannot disable when trust < 0.40
+    "disable_meta_governor": 0.40,     # Cannot disable when trust < 0.40
 }
 
 
@@ -312,3 +363,107 @@ class OperatorGate:
                 "cooldowns_seconds": cooldowns,
                 "registered_actions": list(self._actions.keys()),
             }
+
+    def is_trust_gated(self, action: str) -> bool:
+        """Check if action requires minimum trust level."""
+        return action in TRUST_GATED_ACTIONS
+
+    def get_minimum_trust(self, action: str) -> Optional[float]:
+        """Get minimum trust level required for action."""
+        return TRUST_GATED_ACTIONS.get(action)
+
+    def check_trust_requirement(
+        self,
+        action: str,
+        current_trust: float,
+    ) -> tuple:
+        """
+        Check if trust requirement is met for action.
+
+        Args:
+            action: Action name
+            current_trust: Current system trust score
+
+        Returns:
+            Tuple of (allowed: bool, reason: str)
+        """
+        if action not in TRUST_GATED_ACTIONS:
+            return True, "no_trust_requirement"
+
+        min_trust = TRUST_GATED_ACTIONS[action]
+        if current_trust >= min_trust:
+            return True, f"trust_{current_trust:.2f}_meets_requirement_{min_trust:.2f}"
+        else:
+            return False, f"trust_{current_trust:.2f}_below_requirement_{min_trust:.2f}"
+
+    def request_trust_gated_confirmation(
+        self,
+        action: str,
+        current_trust: float,
+    ) -> tuple:
+        """
+        Request confirmation for a trust-gated action.
+
+        Combines trust check and cooldown check.
+
+        Args:
+            action: Action name
+            current_trust: Current system trust score
+
+        Returns:
+            Tuple of (can_proceed: bool, reason: str)
+        """
+        # First check trust requirement
+        trust_ok, trust_reason = self.check_trust_requirement(action, current_trust)
+        if not trust_ok:
+            self._logger.warning(
+                f"Action '{action}' blocked by trust requirement: {trust_reason}"
+            )
+            return False, trust_reason
+
+        # Then check if confirmation can proceed
+        if not self.request_confirmation(action):
+            return False, "on_cooldown"
+
+        return True, "awaiting_confirmation"
+
+    def verify_trust_gated_confirmation(
+        self,
+        action: str,
+        operator_input: str,
+        current_trust: float,
+    ) -> tuple:
+        """
+        Verify confirmation for a trust-gated action.
+
+        Re-checks trust requirement at verification time.
+
+        Args:
+            action: Action name
+            operator_input: Input from operator
+            current_trust: Current system trust score
+
+        Returns:
+            Tuple of (success: bool, reason: str)
+        """
+        # Re-check trust requirement (may have changed)
+        trust_ok, trust_reason = self.check_trust_requirement(action, current_trust)
+        if not trust_ok:
+            self._logger.warning(
+                f"Action '{action}' blocked at verification by trust: {trust_reason}"
+            )
+            # Remove from pending
+            with self._lock:
+                self._pending.discard(action)
+            return False, trust_reason
+
+        # Verify confirmation phrase
+        success = self.verify_confirmation(action, operator_input)
+        if success:
+            return True, "confirmed"
+        else:
+            return False, "invalid_confirmation_phrase"
+
+    def get_trust_gated_actions(self) -> Dict[str, float]:
+        """Get all trust-gated actions and their minimum requirements."""
+        return dict(TRUST_GATED_ACTIONS)

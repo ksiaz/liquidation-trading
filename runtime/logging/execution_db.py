@@ -897,6 +897,100 @@ class ResearchDatabase:
             )
         """)
 
+        # =====================================================================
+        # Pillar 4: Sovereign Capital Governor Tables
+        # =====================================================================
+
+        # Capital Governor State (single row - current scaling state)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_capital_governor_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                scaling_state TEXT NOT NULL,
+                confidence_score REAL NOT NULL,
+                allowed_capital_fraction REAL NOT NULL,
+                freeze_until_ns INTEGER,
+                freeze_reason TEXT,
+                quarantine_active INTEGER DEFAULT 0,
+                quarantine_pct REAL DEFAULT 0.0,
+                last_ath_ns INTEGER,
+                ath_value REAL,
+                consecutive_wins INTEGER DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Capital Governor Decision Log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_capital_governor_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                scaling_state TEXT NOT NULL,
+                confidence_score REAL NOT NULL,
+                allowed_capital_fraction REAL NOT NULL,
+                edge_stability REAL,
+                market_stability REAL,
+                execution_quality REAL,
+                impact_containment REAL,
+                drawdown_discipline REAL,
+                strategy_diversification REAL,
+                reason TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # =====================================================================
+        # Pillar 5: Sovereign Meta-Governor Tables
+        # =====================================================================
+
+        # Meta Governor State (single row - current trust state)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_meta_governor_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                trust_state TEXT NOT NULL,
+                trust_score REAL NOT NULL,
+                allows_trading INTEGER NOT NULL,
+                allows_entries INTEGER NOT NULL,
+                allows_exits INTEGER NOT NULL,
+                capital_override REAL,
+                requires_manual_reset INTEGER DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Meta Governor Decision Log
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_meta_governor_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                trust_state TEXT NOT NULL,
+                trust_score REAL NOT NULL,
+                data_trust REAL,
+                execution_trust REAL,
+                alpha_trust REAL,
+                risk_trust REAL,
+                consistency_trust REAL,
+                allows_trading INTEGER NOT NULL,
+                capital_override REAL,
+                reason TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Unknown Threat Signals (anomaly detection log)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hl_unknown_threat_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                metric_name TEXT NOT NULL,
+                observed_value REAL NOT NULL,
+                baseline_mean REAL NOT NULL,
+                baseline_std REAL NOT NULL,
+                z_score REAL NOT NULL,
+                description TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # HLP24 table indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
@@ -967,6 +1061,18 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_action ON hl_governor_decisions(action)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_severity ON hl_governor_decisions(severity)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_strategy ON hl_governor_decisions(strategy_id)")
+
+        # Capital Governor indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cap_gov_dec_ts ON hl_capital_governor_decisions(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cap_gov_dec_state ON hl_capital_governor_decisions(scaling_state)")
+
+        # Meta Governor indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_meta_gov_dec_ts ON hl_meta_governor_decisions(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_meta_gov_dec_state ON hl_meta_governor_decisions(trust_state)")
+
+        # Unknown Threat Signal indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_threat_ts ON hl_unknown_threat_signals(ts_ns)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_threat_metric ON hl_unknown_threat_signals(metric_name)")
 
         self.conn.commit()
     
@@ -3305,6 +3411,361 @@ class ResearchDatabase:
 
         cursor.execute(f"""
             SELECT * FROM hl_governor_decisions
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # Pillar 4: Capital Governor Logging
+    # =========================================================================
+
+    def log_capital_governor_decision(
+        self,
+        ts_ns: int,
+        scaling_state: str,
+        confidence_score: float,
+        allowed_capital_fraction: float,
+        reason: str,
+        edge_stability: float = None,
+        market_stability: float = None,
+        execution_quality: float = None,
+        impact_containment: float = None,
+        drawdown_discipline: float = None,
+        strategy_diversification: float = None,
+    ) -> int:
+        """Log capital governor decision.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            scaling_state: Current scaling state (GROW/HOLD/SHRINK/FREEZE/QUARANTINE)
+            confidence_score: Composite confidence score (0.0 to 1.0)
+            allowed_capital_fraction: Allowed capital fraction (0.0 to 1.0)
+            reason: Reason for decision
+            edge_stability: Sub-score for edge stability
+            market_stability: Sub-score for market stability
+            execution_quality: Sub-score for execution quality
+            impact_containment: Sub-score for impact containment
+            drawdown_discipline: Sub-score for drawdown discipline
+            strategy_diversification: Sub-score for strategy diversification
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_capital_governor_decisions (
+                ts_ns, scaling_state, confidence_score, allowed_capital_fraction,
+                edge_stability, market_stability, execution_quality,
+                impact_containment, drawdown_discipline, strategy_diversification,
+                reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, scaling_state, confidence_score, allowed_capital_fraction,
+            edge_stability, market_stability, execution_quality,
+            impact_containment, drawdown_discipline, strategy_diversification,
+            reason
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def save_capital_governor_state(
+        self,
+        scaling_state: str,
+        confidence_score: float,
+        allowed_capital_fraction: float,
+        freeze_until_ns: int = None,
+        freeze_reason: str = None,
+        quarantine_active: bool = False,
+        quarantine_pct: float = 0.0,
+        last_ath_ns: int = None,
+        ath_value: float = None,
+        consecutive_wins: int = 0,
+    ) -> None:
+        """Save capital governor state (upsert single row).
+
+        Args:
+            scaling_state: Current scaling state
+            confidence_score: Current confidence score
+            allowed_capital_fraction: Current allowed fraction
+            freeze_until_ns: Freeze end timestamp (if frozen)
+            freeze_reason: Reason for freeze
+            quarantine_active: Whether quarantine is active
+            quarantine_pct: Percentage of capital quarantined
+            last_ath_ns: Timestamp of last ATH
+            ath_value: Value at ATH
+            consecutive_wins: Current win streak count
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO hl_capital_governor_state (
+                id, scaling_state, confidence_score, allowed_capital_fraction,
+                freeze_until_ns, freeze_reason, quarantine_active, quarantine_pct,
+                last_ath_ns, ath_value, consecutive_wins, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            scaling_state, confidence_score, allowed_capital_fraction,
+            freeze_until_ns, freeze_reason, 1 if quarantine_active else 0,
+            quarantine_pct, last_ath_ns, ath_value, consecutive_wins
+        ))
+        self.conn.commit()
+
+    def load_capital_governor_state(self) -> Optional[Dict]:
+        """Load capital governor state.
+
+        Returns:
+            State dict or None if not found
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM hl_capital_governor_state WHERE id = 1")
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_capital_governor_decisions(
+        self,
+        scaling_state: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get capital governor decisions.
+
+        Args:
+            scaling_state: Filter by scaling state
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of capital governor decisions
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if scaling_state:
+            conditions.append("scaling_state = ?")
+            params.append(scaling_state)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_capital_governor_decisions
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # Pillar 5: Meta Governor Logging
+    # =========================================================================
+
+    def log_meta_governor_decision(
+        self,
+        ts_ns: int,
+        trust_state: str,
+        trust_score: float,
+        allows_trading: bool,
+        reason: str,
+        capital_override: float = None,
+        data_trust: float = None,
+        execution_trust: float = None,
+        alpha_trust: float = None,
+        risk_trust: float = None,
+        consistency_trust: float = None,
+    ) -> int:
+        """Log meta governor decision.
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            trust_state: Current trust state (OPERATIONAL/DEGRADED/WARNING/CRITICAL/UNKNOWN_THREAT)
+            trust_score: Composite trust score (0.0 to 1.0)
+            allows_trading: Whether trading is allowed
+            reason: Reason for decision
+            capital_override: Capital override if any
+            data_trust: Sub-score for data trust
+            execution_trust: Sub-score for execution trust
+            alpha_trust: Sub-score for alpha trust
+            risk_trust: Sub-score for risk trust
+            consistency_trust: Sub-score for internal consistency
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_meta_governor_decisions (
+                ts_ns, trust_state, trust_score, data_trust, execution_trust,
+                alpha_trust, risk_trust, consistency_trust, allows_trading,
+                capital_override, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, trust_state, trust_score, data_trust, execution_trust,
+            alpha_trust, risk_trust, consistency_trust,
+            1 if allows_trading else 0, capital_override, reason
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def save_meta_governor_state(
+        self,
+        trust_state: str,
+        trust_score: float,
+        allows_trading: bool,
+        allows_entries: bool,
+        allows_exits: bool,
+        capital_override: float = None,
+        requires_manual_reset: bool = False,
+    ) -> None:
+        """Save meta governor state (upsert single row).
+
+        Args:
+            trust_state: Current trust state
+            trust_score: Current trust score
+            allows_trading: Whether trading is allowed
+            allows_entries: Whether entries are allowed
+            allows_exits: Whether exits are allowed
+            capital_override: Capital override if any
+            requires_manual_reset: Whether manual reset is required
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO hl_meta_governor_state (
+                id, trust_state, trust_score, allows_trading, allows_entries,
+                allows_exits, capital_override, requires_manual_reset, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            trust_state, trust_score,
+            1 if allows_trading else 0,
+            1 if allows_entries else 0,
+            1 if allows_exits else 0,
+            capital_override,
+            1 if requires_manual_reset else 0
+        ))
+        self.conn.commit()
+
+    def load_meta_governor_state(self) -> Optional[Dict]:
+        """Load meta governor state.
+
+        Returns:
+            State dict or None if not found
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM hl_meta_governor_state WHERE id = 1")
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_meta_governor_decisions(
+        self,
+        trust_state: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get meta governor decisions.
+
+        Args:
+            trust_state: Filter by trust state
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of meta governor decisions
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if trust_state:
+            conditions.append("trust_state = ?")
+            params.append(trust_state)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_meta_governor_decisions
+            WHERE {where_clause}
+            ORDER BY ts_ns DESC
+            LIMIT ?
+        """, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def log_unknown_threat_signal(
+        self,
+        ts_ns: int,
+        metric_name: str,
+        observed_value: float,
+        baseline_mean: float,
+        baseline_std: float,
+        z_score: float,
+        description: str,
+    ) -> int:
+        """Log unknown threat signal (anomaly detection).
+
+        Args:
+            ts_ns: Timestamp in nanoseconds
+            metric_name: Name of the metric that triggered the signal
+            observed_value: Observed value
+            baseline_mean: Baseline mean value
+            baseline_std: Baseline standard deviation
+            z_score: Z-score of the observation
+            description: Description of the threat
+
+        Returns:
+            Row ID of inserted record
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO hl_unknown_threat_signals (
+                ts_ns, metric_name, observed_value, baseline_mean,
+                baseline_std, z_score, description
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ts_ns, metric_name, observed_value, baseline_mean,
+            baseline_std, z_score, description
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_unknown_threat_signals(
+        self,
+        metric_name: str = None,
+        since_ts_ns: int = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Get unknown threat signals.
+
+        Args:
+            metric_name: Filter by metric name
+            since_ts_ns: Filter by timestamp
+            limit: Maximum records
+
+        Returns:
+            List of unknown threat signals
+        """
+        cursor = self.conn.cursor()
+        conditions = []
+        params = []
+
+        if metric_name:
+            conditions.append("metric_name = ?")
+            params.append(metric_name)
+        if since_ts_ns:
+            conditions.append("ts_ns >= ?")
+            params.append(since_ts_ns)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT * FROM hl_unknown_threat_signals
             WHERE {where_clause}
             ORDER BY ts_ns DESC
             LIMIT ?

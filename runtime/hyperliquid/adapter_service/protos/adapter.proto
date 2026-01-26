@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package hyperliquid.adapter;
+
+// ============ Enums ============
+
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  ACTION_TYPE_ORDER = 1;
+  ACTION_TYPE_CANCEL = 2;
+  ACTION_TYPE_FORCE_ORDER = 3;  // Liquidation
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_LIMIT = 1;
+  ORDER_TYPE_MARKET = 2;
+  ORDER_TYPE_TRIGGER = 3;
+}
+
+enum PositionChange {
+  POSITION_CHANGE_UNSPECIFIED = 0;
+  POSITION_CHANGE_NEW = 1;
+  POSITION_CHANGE_MODIFIED = 2;
+  POSITION_CHANGE_CLOSED = 3;
+}
+
+// ============ Event Messages ============
+
+// Market price from SetGlobalAction (~every 2.93s per asset)
+message MarketPriceEvent {
+  string asset = 1;              // "BTC", "ETH", etc.
+  double oracle_price = 2;       // Authoritative oracle price
+  optional double mark_price = 3;
+  optional double external_price = 4;
+  int64 timestamp_ms = 5;        // Block consensus time in milliseconds
+  uint64 block_height = 6;
+}
+
+// Action from replica_cmds (orders, cancels, liquidations)
+message ActionEvent {
+  uint64 block_height = 1;
+  int64 timestamp_ms = 2;
+  string wallet = 3;
+  ActionType action_type = 4;
+  string asset = 5;
+  Side side = 6;
+  double price = 7;
+  double size = 8;
+  OrderType order_type = 9;
+  bool is_liquidation = 10;      // True if forceOrder
+  bool is_reduce_only = 11;
+  optional string cloid = 12;    // Client order ID if present
+}
+
+// Position state from abci_state.rmp diffs
+message PositionStateEvent {
+  string wallet = 1;
+  string asset = 2;
+  double position_size = 3;      // Signed (negative = short)
+  double entry_price = 4;
+  double liquidation_price = 5;
+  double margin_ratio = 6;
+  double unrealized_pnl = 7;
+  int64 timestamp_ms = 8;
+  PositionChange change_type = 9;
+}
+
+// ============ Request Messages ============
+
+message Empty {}
+
+message StreamRequest {
+  repeated string assets = 1;    // Filter by assets (empty = all)
+  bool from_latest = 2;          // Start from latest block (vs replay)
+}
+
+message PositionStreamRequest {
+  repeated string wallets = 1;   // Filter by wallets (empty = all)
+  repeated string assets = 2;    // Filter by assets (empty = all)
+  double min_position_value = 3; // Minimum USD value to include
+}
+
+// ============ Response Messages ============
+
+message AdapterStatus {
+  bool connected = 1;
+  uint64 latest_block = 2;
+  int64 latest_timestamp_ms = 3;
+  uint64 events_emitted = 4;
+  int32 clients_connected = 5;
+  string replica_file = 6;       // Current replica file being read
+}
+
+// ============ Service Definition ============
+
+service HyperliquidNodeAdapter {
+  // Stream market prices from SetGlobalAction events
+  // Returns continuous stream of MarketPriceEvent
+  rpc StreamMarketPrices(StreamRequest) returns (stream MarketPriceEvent);
+
+  // Stream all actions (orders, cancels, liquidations)
+  // Returns continuous stream of ActionEvent
+  rpc StreamActions(StreamRequest) returns (stream ActionEvent);
+
+  // Stream position state changes from abci_state.rmp diffs
+  // Returns stream of PositionStateEvent when positions change
+  rpc StreamPositions(PositionStreamRequest) returns (stream PositionStateEvent);
+
+  // Get current adapter status
+  rpc GetStatus(Empty) returns (AdapterStatus);
+}

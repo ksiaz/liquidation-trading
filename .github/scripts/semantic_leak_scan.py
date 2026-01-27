@@ -109,21 +109,21 @@ EXCEPTIONS: Dict[str, Dict[int, str]] = {
         # Structural thresholds (factual boundaries, not interpretation)
         95: "Structural config: time window for price correlation in seconds",
         # Trade handling - Binance API semantic field names
-        # Line numbers updated 2026-01-26 after HL price ingestion added (+31 lines at top)
-        392: "Binance API semantic: is_taker_sell indicates trade aggressor side",
-        404: "Parameter passing Binance API field to M2 store",
-        411: "Local variable derived from Binance trade side field",
+        # Line numbers updated 2026-01-27 after HL_ORDER routing added
+        394: "Binance API semantic: is_taker_sell indicates trade aggressor side",
+        406: "Parameter passing Binance API field to M2 store",
+        413: "Local variable derived from Binance trade side field",
         # Orderbook primitive parameters
-        511: "Structural parameter: minimum consumption size threshold",
-        522: "Structural parameter: minimum consumption size threshold",
-        528: "Data access: recent_prices is collection name, not semantic claim",
-        547: "Structural parameter: maximum price movement percentage",
-        558: "Structural parameter: minimum refill size threshold",
-        569: "Structural parameter: minimum refill size threshold",
+        513: "Structural parameter: minimum consumption size threshold",
+        524: "Structural parameter: minimum consumption size threshold",
+        530: "Data access: recent_prices is collection name, not semantic claim",
+        549: "Structural parameter: maximum price movement percentage",
+        560: "Structural parameter: minimum refill size threshold",
+        571: "Structural parameter: minimum refill size threshold",
         # Clustering parameter
-        682: "Structural parameter: maximum gap percentage for clustering",
+        684: "Structural parameter: maximum gap percentage for clustering",
         # HLP proximity threshold
-        879: "Structural parameter: threshold percentage for HLP proximity",
+        881: "Structural parameter: threshold percentage for HLP proximity",
     },
     'runtime/collector/service.py': {
         196: "Factual error logging: reports initialization exception",

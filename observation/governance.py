@@ -223,6 +223,8 @@ class ObservationSystem:
                 normalized_event = self._m1.normalize_hl_liquidation(symbol, payload)
             elif event_type == 'HL_POSITION':
                 normalized_event = self._m1.normalize_hl_position(symbol, payload)
+            elif event_type == 'HL_ORDER':
+                normalized_event = self._m1.normalize_hl_order(symbol, payload)
 
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':

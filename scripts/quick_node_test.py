@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 
-REPLICA_PATH = '/root/hl/data/replica_cmds'
+import os
+REPLICA_PATH = os.path.expanduser('~/hl/data/replica_cmds')
 
 ASSET_ID_TO_COIN = {
     0: "BTC", 1: "ETH", 2: "ATOM", 3: "MATIC", 4: "DYDX",

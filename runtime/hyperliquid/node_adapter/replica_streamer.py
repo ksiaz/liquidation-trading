@@ -5,7 +5,7 @@ Efficiently streams new blocks from Hyperliquid node replica_cmds files.
 Uses inotify on Linux for instant notification, polling fallback on Windows.
 
 File structure:
-    /root/hl/data/replica_cmds/{session_id}/{date}/{block_start}
+    ~/hl/data/replica_cmds/{session_id}/{date}/{block_start}
 
 Each file contains newline-delimited JSON blocks.
 Files rotate when they reach a certain size/block count.
@@ -40,7 +40,7 @@ class ReplicaCmdStreamer:
     notification, falls back to polling on other platforms.
 
     Usage:
-        streamer = ReplicaCmdStreamer("/root/hl/data/replica_cmds")
+        streamer = ReplicaCmdStreamer("~/hl/data/replica_cmds")
         await streamer.start()
 
         async for block_json in streamer.stream_blocks():

@@ -354,8 +354,8 @@ async def main():
     print("HYPERLIQUID NODE ADAPTER - WSL TEST")
     print("=" * 60)
 
-    data_path = '/root/hl/data'
-    state_path = '/root/hl/hyperliquid_data'
+    data_path = os.path.expanduser('~/hl/data')
+    state_path = os.path.expanduser('~/hl/hyperliquid_data')
 
     # Check sync status
     print("\nChecking sync status...")

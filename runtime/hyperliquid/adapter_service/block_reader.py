@@ -7,6 +7,7 @@ Handles file rotation as new block files are created.
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import AsyncIterator, Optional, Dict, List
@@ -40,7 +41,7 @@ class BlockReader:
     Handles file rotation when new block files are created.
     """
 
-    DEFAULT_REPLICA_PATH = '/root/hl/data/replica_cmds'
+    DEFAULT_REPLICA_PATH = '~/hl/data/replica_cmds'
 
     def __init__(
         self,
@@ -54,7 +55,7 @@ class BlockReader:
             replica_path: Path to replica_cmds directory
             start_from_end: If True, start from latest block (don't replay history)
         """
-        self._replica_path = Path(replica_path)
+        self._replica_path = Path(os.path.expanduser(replica_path))
         self._start_from_end = start_from_end
         self._running = False
 

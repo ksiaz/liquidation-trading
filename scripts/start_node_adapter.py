@@ -231,13 +231,13 @@ Examples:
     )
     parser.add_argument(
         '--data-path',
-        default='/root/hl/data',
-        help='Path to node data directory (default: /root/hl/data)'
+        default='~/hl/data',
+        help='Path to node data directory (default: ~/hl/data)'
     )
     parser.add_argument(
         '--state-path',
-        default='/root/hl/hyperliquid_data',
-        help='Path to node state directory (default: /root/hl/hyperliquid_data)'
+        default='~/hl/hyperliquid_data',
+        help='Path to node state directory (default: ~/hl/hyperliquid_data)'
     )
     parser.add_argument(
         '--log-interval',

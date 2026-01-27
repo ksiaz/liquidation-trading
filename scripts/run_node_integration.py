@@ -55,7 +55,7 @@ class IntegrationRunner:
         symbols: List[str],
         tcp_host: str = '127.0.0.1',
         tcp_port: int = 8090,
-        state_path: str = '/root/hl/hyperliquid_data',
+        state_path: str = '~/hl/hyperliquid_data',
         enable_position_tracking: bool = True,
     ):
         """
@@ -248,8 +248,8 @@ Examples:
     )
     parser.add_argument(
         '--state-path',
-        default='/root/hl/hyperliquid_data',
-        help='Path to Hyperliquid state in WSL'
+        default='~/hl/hyperliquid_data',
+        help='Path to Hyperliquid state'
     )
     parser.add_argument(
         '--no-positions',

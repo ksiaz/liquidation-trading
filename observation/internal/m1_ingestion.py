@@ -36,6 +36,7 @@ class M1IngestionEngine:
         self.hl_positions: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=trade_buffer_size))
         self.hl_liquidations: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=liquidation_buffer_size))
         self.hl_prices: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=100))  # Price history per symbol
+        self.hl_orders: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=trade_buffer_size))  # Large orders (>$10k)
 
         # Latest Hyperliquid oracle prices (for proximity calculations)
         self.latest_hl_prices: Dict[str, Dict] = {}  # symbol -> {oracle_price, mark_price, timestamp}
@@ -50,6 +51,7 @@ class M1IngestionEngine:
             'hl_positions': 0,
             'hl_liquidations': 0,
             'hl_prices': 0,
+            'hl_orders': 0,
             'errors': 0,
             # P2: Side derivation validation counters
             'side_validated': 0,
@@ -360,6 +362,45 @@ class M1IngestionEngine:
             }
             self.hl_positions[symbol].append(event)
             self.counters['hl_positions'] += 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
+    def normalize_hl_order(self, symbol: str, payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Hyperliquid order event (Tier 1 - confirmed fact).
+
+        Only large orders (>$10k notional) are forwarded here.
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            payload: Order data with keys:
+                - wallet_address: Wallet address
+                - side: BUY or SELL
+                - size: Order size
+                - notional: USD value (size * price)
+                - is_reduce_only: Whether order reduces position
+                - timestamp: Event timestamp
+
+        Returns:
+            Normalized event dict or None on error
+        """
+        try:
+            event = {
+                'timestamp': float(payload.get('timestamp', 0)),
+                'symbol': symbol,
+                'wallet_address': payload.get('wallet_address', ''),
+                'side': payload.get('side', 'UNKNOWN'),
+                'size': float(payload.get('size', 0)),
+                'notional': float(payload.get('notional', 0)),
+                'is_reduce_only': bool(payload.get('is_reduce_only', False)),
+                'event_type': 'HL_ORDER',
+                'exchange': 'HYPERLIQUID'
+            }
+            self.hl_orders[symbol].append(event)
+            self.counters['hl_orders'] += 1
             return event
 
         except Exception:

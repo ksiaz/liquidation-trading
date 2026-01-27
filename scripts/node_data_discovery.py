@@ -14,8 +14,8 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Any, Optional
 
-# WSL paths - /root/hl is symlinked to /mnt/e/hl
-HL_ROOT = Path("/root/hl")
+# WSL paths - ~/hl is symlinked to /mnt/e/hl
+HL_ROOT = Path("~/hl")
 DATA_DIR = HL_ROOT / "data"
 HL_DATA_DIR = HL_ROOT / "hyperliquid_data"
 

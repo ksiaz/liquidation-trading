@@ -37,7 +37,7 @@ class HyperliquidNodeAdapterServicer(adapter_pb2_grpc.HyperliquidNodeAdapterServ
 
     def __init__(
         self,
-        replica_path: str = '/root/hl/data/replica_cmds',
+        replica_path: str = '~/hl/data/replica_cmds',
     ):
         """Initialize the servicer."""
         self._replica_path = replica_path
@@ -249,7 +249,7 @@ class HyperliquidNodeAdapterServicer(adapter_pb2_grpc.HyperliquidNodeAdapterServ
 async def serve(
     host: str = '0.0.0.0',
     port: int = 50051,
-    replica_path: str = '/root/hl/data/replica_cmds',
+    replica_path: str = '~/hl/data/replica_cmds',
 ):
     """Run the gRPC server."""
     # Create servicer
@@ -292,7 +292,7 @@ def main():
     parser.add_argument('--port', type=int, default=50051, help='gRPC port')
     parser.add_argument(
         '--replica-path',
-        default='/root/hl/data/replica_cmds',
+        default='~/hl/data/replica_cmds',
         help='Path to replica_cmds directory'
     )
 

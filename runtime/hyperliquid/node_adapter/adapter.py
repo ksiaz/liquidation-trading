@@ -385,8 +385,8 @@ async def main():
     parser = argparse.ArgumentParser(description='Hyperliquid Node Adapter')
     parser.add_argument('--host', default='127.0.0.1', help='TCP host')
     parser.add_argument('--port', type=int, default=8090, help='TCP port')
-    parser.add_argument('--data-path', default='/root/hl/data', help='Node data path')
-    parser.add_argument('--state-path', default='/root/hl/hyperliquid_data', help='Node state path')
+    parser.add_argument('--data-path', default='~/hl/data', help='Node data path')
+    parser.add_argument('--state-path', default='~/hl/hyperliquid_data', help='Node state path')
     parser.add_argument('--log-interval', type=int, default=1000, help='Log every N blocks')
     args = parser.parse_args()
 

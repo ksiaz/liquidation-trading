@@ -8,6 +8,7 @@ Run in WSL to expose events to Windows connector.
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, AsyncIterator, Set
@@ -202,7 +203,7 @@ class TCPAdapter:
         print(f"[TCPAdapter] Server listening on {self._host}:{self._port}")
 
         # Start streamer
-        self._streamer = ReplicaCmdStreamer('/root/hl/data/replica_cmds')
+        self._streamer = ReplicaCmdStreamer(os.path.expanduser('~/hl/data/replica_cmds'))
         await self._streamer.start()
         print(f"[TCPAdapter] Streaming from: {self._streamer._current_file}")
 

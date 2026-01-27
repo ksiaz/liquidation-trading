@@ -200,6 +200,10 @@ class PositionStateManager:
         self._running = False
         self._refresh_task: Optional[asyncio.Task] = None
 
+        # Asset metadata (populated on first state read)
+        self._sz_decimals: Dict[int, int] = {}
+        self._oracle_prices: Dict[int, float] = {}
+
     async def start(self) -> None:
         """Start the position state manager."""
         if self._running:
@@ -480,6 +484,21 @@ class PositionStateManager:
             RefreshTier.DISCOVERY: 1,
         }.get(tier, 0)
 
+    def _get_oracle_price_by_coin(self, coin: str) -> float:
+        """Get oracle price by coin name (looks up asset ID)."""
+        # First check the live prices from bridge updates
+        if coin in self._prices:
+            return self._prices[coin]
+
+        # Fall back to oracle prices from state file (keyed by asset ID)
+        # Need to reverse lookup: coin name -> asset ID
+        from .asset_mapping import COIN_TO_ASSET_ID
+        asset_id = COIN_TO_ASSET_ID.get(coin)
+        if asset_id is not None and asset_id in self._oracle_prices:
+            return self._oracle_prices[asset_id]
+
+        return 0
+
     async def _update_cache_from_data(
         self,
         wallet: str,
@@ -492,7 +511,8 @@ class PositionStateManager:
             side = "LONG" if size > 0 else "SHORT"
 
             # Get current price for proximity calculation
-            price = self._prices.get(coin)
+            # Try live prices first, then oracle prices from state
+            price = self._get_oracle_price_by_coin(coin)
 
             cached = PositionCache(
                 wallet=wallet,
@@ -505,8 +525,8 @@ class PositionStateManager:
                 last_read=time.time(),
             )
 
-            # Calculate proximity if price available
-            if price:
+            # Calculate proximity if price and liq price available
+            if price > 0 and pos_data['liq'] > 0:
                 cached.last_proximity = cached.calculate_proximity(price)
                 cached.refresh_tier = self._determine_tier(cached.last_proximity)
             else:
@@ -565,10 +585,37 @@ class PositionStateManager:
             with open(self._state_file, 'rb') as f:
                 data = msgpack.unpack(f, raw=False, strict_map_key=False)
 
-            blp = data.get('exchange', {}).get('blp', {})
-            users = blp.get('u', [])
+            exchange = data.get('exchange', {})
+            perp_dexs = exchange.get('perp_dexs', [])
 
-            for item in users:
+            if not perp_dexs:
+                return None
+
+            main_dex = perp_dexs[0]
+            ch = main_dex.get('clearinghouse', {})
+
+            # Update metadata if needed
+            if not self._sz_decimals:
+                meta = ch.get('meta', {})
+                universe = meta.get('universe', [])
+                self._sz_decimals = {i: u.get('szDecimals', 0) for i, u in enumerate(universe)}
+
+            # Update oracle prices using correct scaling
+            oracle = ch.get('oracle', {})
+            pxs = oracle.get('pxs', [])
+            for asset_id, px_data in enumerate(pxs):
+                if px_data and isinstance(px_data, list) and px_data:
+                    raw_px = px_data[0].get('px', 0)
+                    sz_dec = self._sz_decimals.get(asset_id, 0)
+                    scale = 10 ** (6 - sz_dec)
+                    self._oracle_prices[asset_id] = raw_px / scale
+
+            # Get user state
+            us = ch.get('user_states', {})
+            user_to_state = us.get('user_to_state', [])
+
+            # Find target user
+            for item in user_to_state:
                 if not isinstance(item, (list, tuple)) or len(item) < 2:
                     continue
 
@@ -580,19 +627,24 @@ class PositionStateManager:
                 if not isinstance(user_data, dict):
                     continue
 
-                t = user_data.get('t', [])
-                for asset_data in t:
-                    if not isinstance(asset_data, list) or len(asset_data) < 2:
+                p_data = user_data.get('p', {})
+                pos_list = p_data.get('p', [])
+
+                for pos_item in pos_list:
+                    if not isinstance(pos_item, list) or len(pos_item) < 2:
                         continue
 
-                    asset_id = asset_data[0]
+                    asset_id = pos_item[0]
                     coin = get_coin_name(asset_id)
 
                     if coin != target_coin:
                         continue
 
-                    pos_list = asset_data[1]
-                    return self._extract_position_data(pos_list)
+                    pos = pos_item[1]
+                    if isinstance(pos, dict):
+                        return self._extract_position_data(asset_id, pos)
+
+                break  # Found user, position not found
 
             return None  # Position not found
 
@@ -613,7 +665,19 @@ class PositionStateManager:
             return {}
 
     def _parse_full_state_sync(self) -> Dict[str, Dict[str, Dict]]:
-        """Synchronously parse full state file."""
+        """
+        Synchronously parse full state file.
+
+        Position data is in: perp_dexs[0].clearinghouse.user_states.user_to_state
+        Each user has: p.p = [[asset_id, {s, e, l, M, f}], ...]
+
+        Structure:
+        - s: size (scaled by 10^szDecimals, negative for short)
+        - e: entry notional (scaled by 1e6)
+        - l: leverage info - {I: {l: leverage, u: margin_adj}} for isolated, {C: n} for cross
+        - M: margin table ID
+        - f: funding info {a, o, c}
+        """
         if not os.path.exists(self._state_file):
             return {}
 
@@ -623,68 +687,162 @@ class PositionStateManager:
             with open(self._state_file, 'rb') as f:
                 data = msgpack.unpack(f, raw=False, strict_map_key=False)
 
-            blp = data.get('exchange', {}).get('blp', {})
-            users = blp.get('u', [])
+            exchange = data.get('exchange', {})
+            perp_dexs = exchange.get('perp_dexs', [])
 
-            for item in users:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
+            if not perp_dexs:
+                return {}
+
+            main_dex = perp_dexs[0]
+            ch = main_dex.get('clearinghouse', {})
+
+            # Get asset metadata for scaling
+            meta = ch.get('meta', {})
+            universe = meta.get('universe', [])
+            self._sz_decimals = {i: u.get('szDecimals', 0) for i, u in enumerate(universe)}
+
+            # Get oracle prices
+            # Formula: price = raw_px / 10^(6 - szDecimals)
+            oracle = ch.get('oracle', {})
+            pxs = oracle.get('pxs', [])
+            self._oracle_prices = {}
+            for asset_id, px_data in enumerate(pxs):
+                if px_data and isinstance(px_data, list) and px_data:
+                    raw_px = px_data[0].get('px', 0)
+                    sz_dec = self._sz_decimals.get(asset_id, 0)
+                    scale = 10 ** (6 - sz_dec)
+                    self._oracle_prices[asset_id] = raw_px / scale
+
+            # Get user states
+            us = ch.get('user_states', {})
+            users_with_positions = set(us.get('users_with_positions', []))
+            user_to_state = us.get('user_to_state', [])
+
+            # Build user state map
+            user_state_map = {}
+            for item in user_to_state:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    user_state_map[item[0]] = item[1]
+
+            # Process users with positions
+            for wallet in users_with_positions:
+                user_data = user_state_map.get(wallet)
+                if not user_data or not isinstance(user_data, dict):
                     continue
 
-                wallet = item[0]
-                user_data = item[1]
+                p_data = user_data.get('p', {})
+                pos_list = p_data.get('p', [])
 
-                if not isinstance(user_data, dict):
-                    continue
-
-                t = user_data.get('t', [])
                 wallet_positions = {}
 
-                for asset_data in t:
-                    if not isinstance(asset_data, list) or len(asset_data) < 2:
+                for pos_item in pos_list:
+                    if not isinstance(pos_item, list) or len(pos_item) < 2:
                         continue
 
-                    asset_id = asset_data[0]
-                    coin = get_coin_name(asset_id)
-                    pos_list = asset_data[1]
+                    asset_id = pos_item[0]
+                    pos = pos_item[1]
 
-                    pos_data = self._extract_position_data(pos_list)
+                    if not isinstance(pos, dict):
+                        continue
+
+                    pos_data = self._extract_position_data(asset_id, pos)
                     if pos_data and abs(pos_data['size']) > 0.0001:
+                        coin = get_coin_name(asset_id)
                         wallet_positions[coin] = pos_data
 
                 if wallet_positions:
                     positions[wallet] = wallet_positions
 
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
         return positions
 
-    def _extract_position_data(self, pos_list) -> Optional[Dict]:
-        """Extract position data from state structure."""
-        if not isinstance(pos_list, list):
+    def _extract_position_data(self, asset_id: int, pos: Dict) -> Optional[Dict]:
+        """
+        Extract position data from state structure.
+
+        Position structure: {s, e, l, M, f}
+        - s: size (scaled by 10^szDecimals)
+        - e: entry notional (scaled by 1e6)
+        - l: {I: {l: leverage, u: margin_adj}} or {C: n}
+        - M: margin table ID
+
+        Liquidation price formula (isolated):
+        liq_price = entry_price - side * (margin - maint_margin) / |size| / correction
+        where correction = 1 - side / maintenance_leverage
+        """
+        s = pos.get('s', 0)
+        if not s:
             return None
 
-        # pos_list[0] = long position, pos_list[1] = short position
-        for i, pos in enumerate(pos_list[:2]):
-            if not isinstance(pos, dict):
-                continue
+        # Get scaling
+        sz_dec = self._sz_decimals.get(asset_id, 0)
+        size = s / (10 ** sz_dec)
 
-            s = pos.get('s', 0)
-            if not s or abs(s) < 1e6:  # Minimum 0.01 size
-                continue
+        # Entry notional (scaled by 1e6)
+        entry_ntl = pos.get('e', 0) / 1e6
 
-            size = s / 1e8
-            if i == 1:
-                size = -size  # Short positions are negative
+        # Leverage info
+        l_data = pos.get('l', {})
+        is_isolated = 'I' in l_data
 
-            return {
-                'size': size,
-                'entry': pos.get('e', 0) / 1e8,
-                'liq': pos.get('l', 0) / 1e8,
-                'margin': pos.get('m', 0) / 1e6,
-            }
+        if is_isolated:
+            leverage = l_data['I'].get('l', 1)
+            margin_adj = l_data['I'].get('u', 0) / 1e6  # Unrealized margin adjustment
+        else:
+            leverage = l_data.get('C', 1)
+            margin_adj = 0
 
-        return None
+        # Calculate entry price
+        entry_price = entry_ntl / abs(size) if size != 0 else 0
+
+        # Get oracle price for liquidation calculation
+        oracle_price = self._oracle_prices.get(asset_id, 0)
+
+        # Calculate liquidation price
+        # Formula from Hyperliquid docs:
+        # liq_price = entry_price - side * margin_available / |size| / correction
+        # where correction = 1 - side / maintenance_leverage
+        # and maintenance_leverage = max_leverage * 2 (i.e., half the margin requirement)
+        liq_price = 0
+        margin = entry_ntl / leverage if leverage > 0 else entry_ntl
+
+        if leverage > 0 and abs(size) > 0:
+            side = 1 if size > 0 else -1
+
+            # Maintenance margin is typically half of initial margin (2x the leverage)
+            maint_leverage = leverage * 2
+            maint_margin = entry_ntl / maint_leverage
+
+            # Correction factor
+            correction = 1 - side / maint_leverage
+
+            if correction != 0:
+                # For isolated: margin is per-position
+                # For cross: margin is shared, but we estimate using position's initial margin
+                # Note: Cross margin liq price is less accurate as it depends on account equity
+                margin_available = margin - maint_margin
+                liq_price = entry_price - side * margin_available / abs(size) / correction
+
+                # Sanity check: liq price should make sense
+                # For LONG: liq < entry, For SHORT: liq > entry
+                if size > 0 and liq_price >= entry_price:
+                    liq_price = 0
+                elif size < 0 and liq_price <= entry_price:
+                    liq_price = 0
+                elif liq_price <= 0 or liq_price > 1e12:
+                    liq_price = 0
+
+        return {
+            'size': size,
+            'entry': entry_price,
+            'liq': liq_price,
+            'margin': margin,
+            'leverage': leverage,
+            'is_isolated': is_isolated,
+        }
 
     async def _refresh_loop(self) -> None:
         """Background loop for periodic refreshes."""

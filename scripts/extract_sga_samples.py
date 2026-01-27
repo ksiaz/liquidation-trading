@@ -7,11 +7,11 @@ from pathlib import Path
 
 def main():
     # Use latest file
-    file_path = Path('/root/hl/data/replica_cmds/2026-01-26T09:46:38Z/20260126/873760000')
+    file_path = Path('~/hl/data/replica_cmds/2026-01-26T09:46:38Z/20260126/873760000')
 
     if not file_path.exists():
         # Try to find any file
-        base = Path('/root/hl/data/replica_cmds')
+        base = Path('~/hl/data/replica_cmds')
         for session in sorted(base.iterdir(), reverse=True):
             if not session.is_dir():
                 continue

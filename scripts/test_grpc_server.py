@@ -32,7 +32,7 @@ class TestAdapter(adapter_pb2_grpc.HyperliquidNodeAdapterServicer):
             latest_timestamp_ms=int(time.time() * 1000),
             events_emitted=self.event_count,
             clients_connected=1,
-            replica_file='/root/hl/data/replica_cmds/test',
+            replica_file='~/hl/data/replica_cmds/test',
         )
 
     def StreamMarketPrices(self, request, context):

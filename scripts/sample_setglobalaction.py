@@ -7,7 +7,7 @@ from datetime import datetime
 
 def main():
     # Find latest replica_cmds file
-    replica_base = Path('/root/hl/data/replica_cmds')
+    replica_base = Path('~/hl/data/replica_cmds')
 
     # Get latest session dir
     session_dirs = sorted([d for d in replica_base.iterdir() if d.is_dir()])

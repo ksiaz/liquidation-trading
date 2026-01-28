@@ -146,6 +146,12 @@ class CollectorService:
         self._orderflow_calculators: Dict[str, MultiWindowOrderflow] = {}
         self._liquidation_calculators: Dict[str, LiquidationZScoreCalculator] = {}
 
+        # Memory guard: track last calculator activity for pruning
+        self._calculator_last_activity: Dict[str, float] = {}
+        self._calculator_max_symbols = 500  # Limit symbols tracked
+        self._calculator_inactive_sec = 600.0  # Prune after 10 min inactive
+        self._calculators_pruned = 0
+
         # Phase 6: Liquidation burst aggregator (for cascade sniper)
         self._liquidation_burst_aggregator = LiquidationBurstAggregator(
             window_seconds=10.0,  # 10-second window
@@ -243,6 +249,55 @@ class CollectorService:
         self._diag_coins = TOP_10_SYMBOLS  # All symbols for diagnostics
         self._diag_interval = 5  # Log diagnostics every N cycles
         self._diag_cycle_count = 0
+
+    def prune_stale_calculators(self, max_age_sec: float = None) -> int:
+        """
+        Remove calculators for symbols inactive longer than threshold.
+
+        Memory guard to prevent unbounded calculator growth.
+
+        Args:
+            max_age_sec: Maximum age in seconds. If None, uses default.
+
+        Returns:
+            Number of symbols pruned.
+        """
+        if max_age_sec is None:
+            max_age_sec = self._calculator_inactive_sec
+
+        now = time.time()
+        cutoff = now - max_age_sec
+        to_remove = []
+
+        for symbol, last_time in self._calculator_last_activity.items():
+            if last_time < cutoff:
+                to_remove.append(symbol)
+
+        for symbol in to_remove:
+            self._vwap_calculators.pop(symbol, None)
+            self._atr_calculators.pop(symbol, None)
+            self._orderflow_calculators.pop(symbol, None)
+            self._liquidation_calculators.pop(symbol, None)
+            self._calculator_last_activity.pop(symbol, None)
+            self._current_prices.pop(symbol, None)
+            self._regime_states.pop(symbol, None)
+            self._regime_metrics.pop(symbol, None)
+            self._prev_regime_states.pop(symbol, None)
+            self._calculators_pruned += 1
+
+        if to_remove:
+            self._logger.debug(f"Pruned {len(to_remove)} stale calculators")
+
+        return len(to_remove)
+
+    def get_calculator_metrics(self) -> dict:
+        """Get calculator memory metrics."""
+        return {
+            'symbols_tracked': len(self._vwap_calculators),
+            'max_symbols': self._calculator_max_symbols,
+            'calculators_pruned': self._calculators_pruned,
+            'inactive_threshold_sec': self._calculator_inactive_sec,
+        }
 
     async def start(self):
         """Start all collectors."""
@@ -1225,6 +1280,11 @@ class CollectorService:
                                         timestamp = int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time()
                                         is_buyer_maker = payload.get('m', False)
 
+                                        # Memory guard: check symbol limit before adding new
+                                        is_new_symbol = symbol not in self._vwap_calculators
+                                        if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
+                                            self.prune_stale_calculators()
+
                                         # Initialize calculators for symbol if needed
                                         if symbol not in self._vwap_calculators:
                                             self._vwap_calculators[symbol] = VWAPCalculator()
@@ -1235,6 +1295,9 @@ class CollectorService:
                                             self._orderflow_calculators[symbol] = MultiWindowOrderflow()
                                         if symbol not in self._liquidation_calculators:
                                             self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
+
+                                        # Track last activity for pruning
+                                        self._calculator_last_activity[symbol] = timestamp
 
                                         # Update VWAP
                                         self._vwap_calculators[symbol].update(price, volume, timestamp)

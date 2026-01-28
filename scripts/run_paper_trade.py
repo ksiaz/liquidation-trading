@@ -125,6 +125,12 @@ async def run_paper_trade():
     if sm and hasattr(sm, '_organic_detector') and sm._organic_detector:
         cleanup.register_pruner('organic_flow_detector', sm._organic_detector.prune_stale)
 
+    # Register collector calculator pruning
+    cleanup.register_pruner('collector_calculators', service.prune_stale_calculators)
+
+    # Register governance liquidation tracking pruning
+    cleanup.register_pruner('governance_liquidations', obs.prune_hl_liquidation_tracking)
+
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
 

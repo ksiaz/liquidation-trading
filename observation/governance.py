@@ -1,3 +1,4 @@
+import time
 from typing import Dict, List, Any, Optional, TYPE_CHECKING
 from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
@@ -125,6 +126,8 @@ class ObservationSystem:
         # Hyperliquid liquidation tracking for cascade state
         self._hl_liquidation_timestamps: Dict[str, List[float]] = {}  # symbol -> timestamps
         self._hl_liquidation_values: Dict[str, List[float]] = {}      # symbol -> values
+        self._hl_liquidation_max_symbols = 500  # Memory guard
+        self._hl_liquidation_pruned = 0
         
     def set_hyperliquid_source(self, hl_collector: 'HyperliquidCollector') -> None:
         """
@@ -148,7 +151,13 @@ class ObservationSystem:
             timestamp: Event timestamp
             value: USD value liquidated
         """
+        # Memory guard: check limit before adding new symbol
         if symbol not in self._hl_liquidation_timestamps:
+            if len(self._hl_liquidation_timestamps) >= self._hl_liquidation_max_symbols:
+                self.prune_hl_liquidation_tracking()
+                # If still at limit, skip this symbol
+                if len(self._hl_liquidation_timestamps) >= self._hl_liquidation_max_symbols:
+                    return
             self._hl_liquidation_timestamps[symbol] = []
             self._hl_liquidation_values[symbol] = []
 
@@ -161,6 +170,52 @@ class ObservationSystem:
                self._hl_liquidation_timestamps[symbol][0] < cutoff):
             self._hl_liquidation_timestamps[symbol].pop(0)
             self._hl_liquidation_values[symbol].pop(0)
+
+        # Memory guard: remove empty symbol entries
+        if not self._hl_liquidation_timestamps[symbol]:
+            del self._hl_liquidation_timestamps[symbol]
+            del self._hl_liquidation_values[symbol]
+
+    def prune_hl_liquidation_tracking(self, max_age_sec: float = 120.0) -> int:
+        """
+        Prune empty symbol entries from liquidation tracking.
+
+        Memory guard to prevent unbounded symbol growth.
+
+        Args:
+            max_age_sec: Maximum age for entries (default 120s)
+
+        Returns:
+            Number of symbols pruned.
+        """
+        now = time.time()
+        cutoff = now - max_age_sec
+        to_remove = []
+
+        for symbol in list(self._hl_liquidation_timestamps.keys()):
+            timestamps = self._hl_liquidation_timestamps[symbol]
+            # Prune old entries
+            while timestamps and timestamps[0] < cutoff:
+                timestamps.pop(0)
+                self._hl_liquidation_values[symbol].pop(0)
+            # Mark empty symbols for removal
+            if not timestamps:
+                to_remove.append(symbol)
+
+        for symbol in to_remove:
+            del self._hl_liquidation_timestamps[symbol]
+            del self._hl_liquidation_values[symbol]
+            self._hl_liquidation_pruned += 1
+
+        return len(to_remove)
+
+    def get_hl_liquidation_metrics(self) -> dict:
+        """Get liquidation tracking metrics."""
+        return {
+            'symbols_tracked': len(self._hl_liquidation_timestamps),
+            'max_symbols': self._hl_liquidation_max_symbols,
+            'symbols_pruned': self._hl_liquidation_pruned,
+        }
 
     def get_hl_oracle_price(self, symbol: str) -> Optional[float]:
         """

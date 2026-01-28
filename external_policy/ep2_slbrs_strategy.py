@@ -61,6 +61,7 @@ class StrategyProposal:
     confidence: str  # Opaque label (NOT numeric) - per constitutional constraint
     justification_ref: str  # Reference ID only
     timestamp: float
+    direction: str = None  # "LONG" | "SHORT" for ENTRY
 
 
 @dataclass(frozen=True)

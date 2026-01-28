@@ -117,6 +117,7 @@ class StrategyProposal:
     confidence: str  # Opaque label (NOT numeric)
     justification_ref: str  # Reference ID only
     timestamp: float
+    direction: str = None  # "LONG" | "SHORT" for ENTRY (derived from zone type)
 
 
 # ==============================================================================
@@ -435,12 +436,15 @@ def generate_geometry_proposal(
         if has_pattern_primitive and _is_zone_confirmed(supply_demand_zone, config):
             _record_entry_zone(symbol, supply_demand_zone)
             _entry_method[symbol] = "PATTERN"
+            # Derive direction from zone type: demand=LONG (buy support), supply=SHORT (sell resistance)
+            entry_direction = "LONG" if supply_demand_zone.zone_type == "demand" else "SHORT"
             return StrategyProposal(
                 strategy_id="EP2-GEOMETRY-V2",
                 action_type="ENTRY",
                 confidence="ZONE_CONFIRMED",
                 justification_ref=f"B5_SDZ|{supply_demand_zone.zone_type.upper()}|RT{supply_demand_zone.retest_count}",
-                timestamp=context.timestamp
+                timestamp=context.timestamp,
+                direction=entry_direction
             )
 
         # Priority 2: Instantaneous fallback with stability requirement
@@ -451,17 +455,14 @@ def generate_geometry_proposal(
             stability = _update_stability(symbol, conditions_met)
 
             # Entry only if conditions stable for MIN_STABILITY_CYCLES
-            if conditions_met and _check_stability(symbol):
-                _entry_method[symbol] = "INSTANTANEOUS"
-                # Reset stability counter after entry
-                _stability_counter[symbol] = 0
-                return StrategyProposal(
-                    strategy_id="EP2-GEOMETRY-V2",
-                    action_type="ENTRY",
-                    confidence="STABLE_CONDITIONS",
-                    justification_ref=f"A6|A4|A8|STABLE{MIN_STABILITY_CYCLES}",
-                    timestamp=context.timestamp
-                )
+            # NOTE: Instantaneous path disabled - cannot determine direction without zone context
+            # F5 requires direction for all ENTRY mandates
+            # Re-enable when zone_penetration includes directional context
+            # if conditions_met and _check_stability(symbol):
+            #     _entry_method[symbol] = "INSTANTANEOUS"
+            #     _stability_counter[symbol] = 0
+            #     return StrategyProposal(...)
+            pass
 
     # No action warranted
     return None

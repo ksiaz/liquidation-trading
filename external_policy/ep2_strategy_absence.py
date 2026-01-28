@@ -77,6 +77,7 @@ class StrategyProposal:
     confidence: str  # Opaque label (NOT numeric)
     justification_ref: str  # Reference ID only
     timestamp: float
+    direction: str = None  # "LONG" | "SHORT" for ENTRY
 
 
 # ==============================================================================

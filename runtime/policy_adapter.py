@@ -27,6 +27,7 @@ Authority: Architectural ruling 2026-01-10
 import time
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
+from decimal import Decimal
 
 from observation.types import ObservationSnapshot, ObservationStatus
 from runtime.arbitration.types import Mandate, MandateType
@@ -76,6 +77,10 @@ class AdapterConfig:
     # Phase 5: Regime-gated strategies (SLBRS/EFFCS)
     enable_slbrs: bool = False  # SLBRS strategy (SIDEWAYS regime)
     enable_effcs: bool = False  # EFFCS strategy (EXPANSION regime)
+
+    # Position sizing: default notional value per trade (USD)
+    # F5: Real quantity calculation for mandates
+    default_notional_usd: float = 100.0  # $100 per trade
 
     # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
     enable_cascade_sniper: bool = False  # Cascade sniper (liquidation proximity)
@@ -312,13 +317,16 @@ class PolicyAdapter:
                 proposals.append(proposal)
 
         # Convert proposals to mandates (pure normalization)
-        mandates = self._proposals_to_mandates(proposals, symbol, timestamp)
+        # F5: Pass current_price for quantity calculation
+        mandates = self._proposals_to_mandates(proposals, symbol, timestamp, current_price)
 
         # Only log when mandates are generated (not empty cycles)
         if len(mandates) > 0:
             print(f"[PolicyAdapter] {symbol}: {len(proposals)} proposals → {len(mandates)} mandates")
             for mandate in mandates:
-                print(f"  - Mandate: {mandate.type.name}")
+                direction_str = f", dir={mandate.direction}" if mandate.direction else ""
+                quantity_str = f", qty={mandate.quantity}" if mandate.quantity else ""
+                print(f"  - Mandate: {mandate.type.name}{direction_str}{quantity_str}")
 
         return mandates
 
@@ -395,16 +403,19 @@ class PolicyAdapter:
         self,
         proposals: List[StrategyProposal],
         symbol: str,
-        timestamp: float
+        timestamp: float,
+        current_price: Optional[float] = None
     ) -> List[Mandate]:
         """Convert strategy proposals to execution mandates.
 
         Pure normalization - no interpretation, no aggregation, no scoring.
+        F5: Copies direction, strategy_id, and calculates quantity from proposal.
 
         Args:
             proposals: List of strategy proposals
             symbol: Symbol mandates apply to
             timestamp: Current timestamp
+            current_price: Current market price (for quantity calculation)
 
         Returns:
             List of Mandates
@@ -416,11 +427,30 @@ class PolicyAdapter:
             # This is opaque translation - no interpretation
             mandate_type = self._map_action_to_mandate(proposal.action_type)
 
+            # F5: Extract direction from proposal (if available)
+            direction = getattr(proposal, 'direction', None)
+
+            # F5: Extract strategy_id from proposal
+            strategy_id = getattr(proposal, 'strategy_id', None)
+
+            # F5: Calculate quantity from notional and current price
+            # Only for ENTRY mandates with valid price
+            quantity = None
+            entry_price = None
+            if mandate_type == MandateType.ENTRY and current_price and current_price > 0:
+                entry_price = Decimal(str(current_price))
+                # quantity = notional / price
+                quantity = Decimal(str(self.config.default_notional_usd)) / entry_price
+
             mandates.append(Mandate(
                 symbol=symbol,
                 type=mandate_type,
                 authority=self.config.default_authority,
-                timestamp=timestamp
+                timestamp=timestamp,
+                direction=direction,
+                strategy_id=strategy_id,
+                quantity=quantity,
+                entry_price=entry_price
             ))
 
         return mandates

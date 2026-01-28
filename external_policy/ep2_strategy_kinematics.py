@@ -111,6 +111,7 @@ class StrategyProposal:
     confidence: str  # Opaque label (NOT numeric)
     justification_ref: str  # Reference ID only
     timestamp: float
+    direction: str = None  # "LONG" | "SHORT" for ENTRY (derived from order block type)
 
 
 # ==============================================================================
@@ -375,30 +376,26 @@ def generate_kinematics_proposal(
         if has_pattern and _is_orderblock_confirmed(order_block, config):
             _record_entry_orderblock(symbol, order_block)
             _entry_method[symbol] = "PATTERN"
+            # Derive direction from order block side: bid=LONG (buy support), ask=SHORT (sell resistance)
+            entry_direction = "LONG" if order_block.side == "bid" else "SHORT"
             return StrategyProposal(
                 strategy_id="EP2-KINEMATICS-V2",
                 action_type="ENTRY",
                 confidence="ORDERBLOCK_CONFIRMED",
                 justification_ref=f"B5_OB|{order_block.side.upper()}|INT{order_block.interaction_count}",
-                timestamp=context.timestamp
+                timestamp=context.timestamp,
+                direction=entry_direction
             )
 
         # Priority 2: Instantaneous fallback with stability
         if has_instantaneous:
-            conditions_met = _instantaneous_conditions_met(
-                velocity, compactness, acceptance, instantaneous_config
-            )
-            _update_stability(symbol, conditions_met)
-
-            if conditions_met and _check_stability(symbol):
-                _entry_method[symbol] = "INSTANTANEOUS"
-                _stability_counter[symbol] = 0
-                return StrategyProposal(
-                    strategy_id="EP2-KINEMATICS-V2",
-                    action_type="ENTRY",
-                    confidence="STABLE_CONDITIONS",
-                    justification_ref=f"A3|A4|A5|STABLE{MIN_STABILITY_CYCLES}",
-                    timestamp=context.timestamp
-                )
+            # NOTE: Instantaneous path disabled - cannot determine direction without order block
+            # F5 requires direction for all ENTRY mandates
+            # Re-enable when velocity/compactness includes directional context
+            # conditions_met = _instantaneous_conditions_met(...)
+            # if conditions_met and _check_stability(symbol):
+            #     _entry_method[symbol] = "INSTANTANEOUS"
+            #     ...
+            pass
 
     return None

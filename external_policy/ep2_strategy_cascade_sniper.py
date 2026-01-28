@@ -53,6 +53,37 @@ if TYPE_CHECKING:
 # Configuration
 # ==============================================================================
 
+# Per-coin liquidation trigger thresholds (P95 from research)
+# These represent the 95th percentile of typical burst sizes per coin
+# Bursts exceeding these values are statistically significant
+COIN_LIQUIDATION_THRESHOLDS = {
+    # Major coins (high liquidity, need larger bursts to cascade)
+    'BTC': 50_000.0,
+    'ETH': 30_000.0,
+    'BNB': 20_000.0,
+
+    # High volatility / meme coins (lower thresholds)
+    'HYPE': 20_000.0,
+    'SOL': 2_300.0,
+    'DOGE': 1_000.0,
+    'XRP': 5_000.0,
+    'PEPE': 1_000.0,
+    'WIF': 1_500.0,
+    'BONK': 500.0,
+
+    # Mid-cap alts
+    'AVAX': 5_000.0,
+    'LINK': 3_000.0,
+    'ARB': 2_000.0,
+    'OP': 2_000.0,
+    'SUI': 2_000.0,
+    'APT': 2_000.0,
+}
+
+# Default threshold for coins not in the list
+DEFAULT_LIQUIDATION_THRESHOLD = 10_000.0
+
+
 @dataclass(frozen=True)
 class CascadeSniperConfig:
     """Configuration for cascade sniper strategy."""
@@ -69,9 +100,12 @@ class CascadeSniperConfig:
     # e.g., 0.7 means 70% of value must be on one side
     dominance_ratio: float = 0.65
 
-    # Liquidation trigger threshold
-    # How much liquidation volume confirms cascade start ($USD)
+    # Liquidation trigger threshold (DEPRECATED - use per-coin thresholds)
+    # Kept for backwards compatibility, used as fallback
     liquidation_trigger_volume: float = 50_000.0
+
+    # Use per-coin liquidation thresholds (research-backed P95 values)
+    use_per_coin_thresholds: bool = True
 
     # Liquidation lookback window (seconds)
     liquidation_window_sec: float = 10.0
@@ -309,7 +343,7 @@ class CascadeStateMachine:
                 new_state = CascadeState.NONE
 
             # Check for liquidation trigger
-            elif self._is_cascade_triggered(liquidations):
+            elif self._is_cascade_triggered(liquidations, symbol):
                 self._states[symbol] = CascadeState.TRIGGERED
                 self._triggered_at[symbol] = timestamp
                 new_state = CascadeState.TRIGGERED
@@ -446,12 +480,24 @@ class CascadeStateMachine:
 
         return True
 
-    def _is_cascade_triggered(self, liquidations: Optional[LiquidationBurst]) -> bool:
-        """Check if liquidation activity indicates cascade start."""
+    def _is_cascade_triggered(self, liquidations: Optional[LiquidationBurst], symbol: Optional[str] = None) -> bool:
+        """
+        Check if liquidation activity indicates cascade start.
+
+        Uses per-coin thresholds if enabled (research-backed P95 values).
+        """
         if liquidations is None:
             return False
 
-        return liquidations.total_volume >= self._config.liquidation_trigger_volume
+        # Get per-coin threshold if enabled
+        if self._config.use_per_coin_thresholds and symbol:
+            # Extract coin from symbol (e.g., "BTCUSDT" -> "BTC")
+            coin = symbol.replace('USDT', '').replace('USD', '')
+            threshold = COIN_LIQUIDATION_THRESHOLDS.get(coin, DEFAULT_LIQUIDATION_THRESHOLD)
+        else:
+            threshold = self._config.liquidation_trigger_volume
+
+        return liquidations.total_volume >= threshold
 
     def _is_absorption_detected(
         self,

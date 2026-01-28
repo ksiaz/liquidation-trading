@@ -48,6 +48,15 @@ try:
 except ImportError:
     HYPERLIQUID_AVAILABLE = False
 
+# Import Node Adapter Integration (direct node access - faster, more complete)
+try:
+    from runtime.hyperliquid.node_adapter.observation_bridge import create_integrated_node
+    from runtime.hyperliquid.node_adapter.config import NodeAdapterConfig
+    from runtime.hyperliquid.node_adapter.position_state import MSGPACK_AVAILABLE
+    NODE_ADAPTER_AVAILABLE = MSGPACK_AVAILABLE
+except ImportError:
+    NODE_ADAPTER_AVAILABLE = False
+
 # Import Cascade Sniper types for absorption analysis
 from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis, ProximityData
 
@@ -156,9 +165,37 @@ class CollectorService:
         self._prev_regime_states: Dict[str, RegimeState] = {}
 
         # Hyperliquid Integration (optional)
+        # Two modes: Node Adapter (direct node access) or WebSocket Collector
+        # Set USE_HL_NODE=true to use node adapter (requires local hl-node running)
         self._hyperliquid_collector = None
         self._hyperliquid_enabled = False
-        if HYPERLIQUID_AVAILABLE:
+        self._node_integration = None
+        self._node_bridge = None
+        self._node_psm = None
+        self._use_node_mode = os.environ.get("USE_HL_NODE", "false").lower() == "true"
+
+        if self._use_node_mode and NODE_ADAPTER_AVAILABLE:
+            # Node Adapter Mode: Direct access to local hl-node
+            # Provides: 10k+ positions, real-time liquidations, full market data
+            try:
+                self._logger.info("Initializing Hyperliquid node adapter...")
+                node_config = NodeAdapterConfig()
+                # Use default paths: ~/hl/data and ~/hl/hyperliquid_data
+                self._node_integration, self._node_bridge, self._node_psm = create_integrated_node(
+                    self._obs,
+                    config=node_config,
+                    enable_position_tracking=True,
+                    min_position_value=1000.0,  # Track positions >$1k
+                    focus_coins=['BTC', 'ETH', 'SOL', 'HYPE', 'DOGE', 'XRP', 'BNB'],
+                )
+                self._hyperliquid_enabled = True
+                self._logger.info("Hyperliquid node adapter initialized (position tracking enabled)")
+            except Exception as e:
+                self._logger.warning(f"Node adapter init failed: {e}, falling back to WebSocket mode")
+                self._use_node_mode = False
+
+        if not self._use_node_mode and HYPERLIQUID_AVAILABLE:
+            # WebSocket Collector Mode: API-based position tracking
             try:
                 # Load whale wallet addresses from registry
                 whale_addresses = get_wallet_addresses()
@@ -191,7 +228,7 @@ class CollectorService:
                     config=hl_config
                 )
                 self._hyperliquid_enabled = True
-                self._logger.info("Hyperliquid collector initialized")
+                self._logger.info("Hyperliquid WebSocket collector initialized")
             except Exception as e:
                 self._logger.warning(f"Hyperliquid collector init failed: {e}")
 
@@ -218,18 +255,40 @@ class CollectorService:
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
 
-        # 2. Start Hyperliquid Collector (if enabled)
-        if self._hyperliquid_enabled and self._hyperliquid_collector:
-            try:
-                asyncio.create_task(self._hyperliquid_collector.start())
-                self._logger.info("Hyperliquid collector started")
+        # 2. Start Hyperliquid Integration (Node Adapter or WebSocket Collector)
+        if self._hyperliquid_enabled:
+            if self._use_node_mode and self._node_integration:
+                # Node Adapter Mode
+                try:
+                    # Start position state manager first (does initial discovery scan)
+                    if self._node_psm:
+                        await self._node_psm.start()
+                        self._logger.info(
+                            f"Position state manager started: {self._node_psm.metrics.positions_cached} positions, "
+                            f"{self._node_psm.metrics.critical_positions} critical"
+                        )
 
-                # Wire up Hyperliquid collector to observation system
-                # This enables M4 cascade primitives to be computed from HL data
-                self._obs.set_hyperliquid_source(self._hyperliquid_collector)
-                self._logger.info("Hyperliquid collector wired to observation system")
-            except Exception as e:
-                self._logger.warning(f"Hyperliquid collector start failed: {e}")
+                    # Start node integration (streams prices, liquidations, orders)
+                    asyncio.create_task(self._node_integration.start())
+                    self._logger.info("Node integration started (streaming prices/liquidations)")
+
+                    # Proximity provider already wired by create_integrated_node()
+                    self._logger.info("Node proximity provider wired to observation system")
+                except Exception as e:
+                    self._logger.warning(f"Node adapter start failed: {e}")
+
+            elif self._hyperliquid_collector:
+                # WebSocket Collector Mode
+                try:
+                    asyncio.create_task(self._hyperliquid_collector.start())
+                    self._logger.info("Hyperliquid WebSocket collector started")
+
+                    # Wire up Hyperliquid collector to observation system
+                    # This enables M4 cascade primitives to be computed from HL data
+                    self._obs.set_hyperliquid_source(self._hyperliquid_collector)
+                    self._logger.info("Hyperliquid collector wired to observation system")
+                except Exception as e:
+                    self._logger.warning(f"Hyperliquid collector start failed: {e}")
 
         # 3. Start Binance WebSocket (primary data source)
         await self._run_binance_stream()

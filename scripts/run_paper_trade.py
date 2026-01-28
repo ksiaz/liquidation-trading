@@ -200,7 +200,8 @@ async def run_paper_trade():
         final_report = monitor.get_report()
         logger.info(f"Final memory: {final_report.memory.rss_mb:.1f}MB ({final_report.memory.percent:.1f}%)")
         trend = monitor.get_trend()
-        logger.info(f"Memory trend: {trend['growth_rate_mb_per_min']:.2f} MB/min over {trend['duration_min']:.1f} min")
+        duration = trend.get('duration_min', 0.0)
+        logger.info(f"Memory trend: {trend['growth_rate_mb_per_min']:.2f} MB/min over {duration:.1f} min")
 
         # Log cleanup stats
         cleanup_metrics = cleanup.get_metrics()

@@ -242,18 +242,13 @@ class ObservationSystem:
         """
         Push external fact into memory.
         """
-        # Only log TRADE events to reduce verbosity
-        if event_type == 'TRADE':
-            print(f"DEBUG Governance: TRADE ingest - symbol={symbol}, timestamp={timestamp}, system_time={self._system_time}")
-
         if self._status == ObservationStatus.FAILED:
             return # Dead system accepts no input
 
         # Invariant B: Causality (No future data, no ancient history without backfill flag)
         # Tolerance: 30 seconds lag, 5 seconds future (clock skew)
         if timestamp < self._system_time - 30.0:
-            # Drop ancient history (Log warning?)
-            print(f"DEBUG Governance: DROPPING {event_type} for {symbol} - timestamp {timestamp} < system_time {self._system_time} - 30")
+            # Drop ancient history silently
             return
         # Future data tolerance: 5 seconds
         # Accept but do not modify system time
@@ -331,10 +326,6 @@ class ObservationSystem:
         """
         Force memory system to recognize time passage.
         """
-        # Only log first few times or significant changes
-        if self._system_time == 0.0 or new_timestamp - self._system_time > 10:
-            print(f"DEBUG Governance: advance_time - old={self._system_time}, new={new_timestamp}")
-
         if self._status == ObservationStatus.FAILED:
             return
 

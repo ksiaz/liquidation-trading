@@ -359,7 +359,11 @@ class CollectorService:
         await binance_task
 
     async def _drive_clock(self):
-        """Push Wall Clock time to System every 100ms and drive M6 execution cycle."""
+        """Push Wall Clock time to System every 1s and drive M6 execution cycle.
+
+        CPU Optimization (2026-01-28): Reduced from 10Hz to 5Hz.
+        - 200ms cycle provides good balance of responsiveness and CPU usage
+        """
         while self._running:
             # Use latest stream time if available, otherwise fallback to system time (or wait)
             # User mandate: Use Binance time for everything.
@@ -367,7 +371,7 @@ class CollectorService:
                 current_time = self._last_stream_time
             else:
                 # Wait for first stream event
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
                 continue
 
             try:
@@ -389,7 +393,7 @@ class CollectorService:
                 self._logger.debug(f"Clock/Execution cycle exception: {e}")
                 pass
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)  # 5Hz cycle (was 0.1s / 10Hz)
 
     def _execute_m6_cycle(self, snapshot: ObservationSnapshot, timestamp: float):
         """Execute one M6 cycle: Policies -> Arbitration -> Execution.

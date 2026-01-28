@@ -141,6 +141,8 @@ class PositionStateManager:
         # Filters
         min_position_value: float = 1000.0,   # Minimum USD to track
         focus_coins: Optional[List[str]] = None,
+        # Memory optimization
+        skip_initial_scan: bool = False,      # Skip memory-heavy initial scan
     ):
         """
         Initialize position state manager.
@@ -155,6 +157,7 @@ class PositionStateManager:
             discovery_interval: Interval for full discovery scans
             min_position_value: Minimum position value to track
             focus_coins: Only track these coins (None = all)
+            skip_initial_scan: Skip the initial discovery scan to save memory (~5GB)
         """
         self._state_path = state_path
         self._state_file = os.path.join(state_path, "abci_state.rmp")
@@ -172,6 +175,7 @@ class PositionStateManager:
         # Filters
         self._min_position_value = min_position_value
         self._focus_coins = set(focus_coins) if focus_coins else None
+        self._skip_initial_scan = skip_initial_scan
 
         # Position cache: wallet -> coin -> PositionCache
         self._cache: Dict[str, Dict[str, PositionCache]] = defaultdict(dict)
@@ -207,6 +211,10 @@ class PositionStateManager:
         self._sz_decimals: Dict[int, int] = {}
         self._oracle_prices: Dict[int, float] = {}
 
+        # State file caching (2026-01-28: Fix for OOM - 968MB file was being reloaded constantly)
+        self._cached_state: Optional[Dict] = None
+        self._cached_state_mtime: float = 0.0
+
     async def start(self) -> None:
         """Start the position state manager."""
         if self._running:
@@ -214,8 +222,12 @@ class PositionStateManager:
 
         self._running = True
 
-        # Initial discovery scan
-        await self.full_discovery_scan()
+        # Initial discovery scan (can be skipped to save ~5GB memory)
+        if not self._skip_initial_scan:
+            await self.full_discovery_scan()
+        else:
+            # Mark as scanned so periodic scans don't trigger immediately
+            self._last_discovery_scan = time.time()
 
         # Start refresh loop
         self._refresh_task = asyncio.create_task(self._refresh_loop())
@@ -743,15 +755,36 @@ class PositionStateManager:
         except Exception:
             return None
 
-    def _read_position_sync(self, target_wallet: str, target_coin: str) -> Optional[Dict]:
-        """Synchronously read position from state file."""
+    def _get_cached_state(self) -> Optional[Dict]:
+        """Get cached state, reloading only if file changed.
+
+        Memory optimization (2026-01-28): The state file is ~1GB and expands to 5-10GB
+        as Python objects. Previously we were reloading it on every position read,
+        causing OOM. Now we cache and only reload when mtime changes.
+        """
         if not os.path.exists(self._state_file):
             return None
 
         try:
-            with open(self._state_file, 'rb') as f:
-                data = msgpack.unpack(f, raw=False, strict_map_key=False)
+            current_mtime = os.path.getmtime(self._state_file)
 
+            # Only reload if file changed
+            if self._cached_state is None or current_mtime > self._cached_state_mtime:
+                with open(self._state_file, 'rb') as f:
+                    self._cached_state = msgpack.unpack(f, raw=False, strict_map_key=False)
+                self._cached_state_mtime = current_mtime
+
+            return self._cached_state
+        except Exception:
+            return None
+
+    def _read_position_sync(self, target_wallet: str, target_coin: str) -> Optional[Dict]:
+        """Synchronously read position from state file."""
+        data = self._get_cached_state()
+        if data is None:
+            return None
+
+        try:
             exchange = data.get('exchange', {})
             perp_dexs = exchange.get('perp_dexs', [])
 
@@ -845,15 +878,13 @@ class PositionStateManager:
         - M: margin table ID
         - f: funding info {a, o, c}
         """
-        if not os.path.exists(self._state_file):
+        data = self._get_cached_state()
+        if data is None:
             return {}
 
         positions = {}
 
         try:
-            with open(self._state_file, 'rb') as f:
-                data = msgpack.unpack(f, raw=False, strict_map_key=False)
-
             exchange = data.get('exchange', {})
             perp_dexs = exchange.get('perp_dexs', [])
 

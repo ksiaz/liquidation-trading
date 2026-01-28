@@ -59,6 +59,9 @@ except ImportError:
 # Import Cascade Sniper types for absorption analysis
 from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis, ProximityData
 
+# Import Binance Client for ATR warm-up
+from runtime.binance.client import BinanceClient
+
 # Import Validation modules for data integrity and manipulation detection
 from runtime.validation import (
     DataValidator,
@@ -314,6 +317,53 @@ class CollectorService:
             return self._execution_db.get_stats()
         return {}
 
+    def _warm_up_atr_calculators(self, symbols: List[str]):
+        """Pre-warm ATR calculators with historical klines.
+
+        Fetches 5m klines from Binance to initialize ATR calculators,
+        avoiding the 90-minute warm-up delay for regime classification.
+
+        Args:
+            symbols: List of symbols to warm up (e.g., ['BTCUSDT', 'ETHUSDT'])
+        """
+        try:
+            client = BinanceClient()
+            warmup_count = 0
+
+            for symbol in symbols:
+                # Need at least 20 5m klines for ATR(3) + some buffer for 30m aggregation
+                # 20 klines × 5m = 100 minutes of history
+                klines_5m = client.get_klines(symbol, interval='5m', limit=30)
+
+                if klines_5m and len(klines_5m) >= 6:
+                    # Initialize ATR calculator for this symbol
+                    if symbol not in self._atr_calculators:
+                        self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
+
+                    # Warm up from historical data
+                    self._atr_calculators[symbol].warm_up_from_klines(klines_5m)
+                    warmup_count += 1
+
+                    # Check if ATR is now available
+                    atr_5m = self._atr_calculators[symbol].get_atr_5m()
+                    atr_30m = self._atr_calculators[symbol].get_atr_30m()
+
+                    if atr_5m and atr_30m:
+                        self._logger.info(
+                            f"[ATR-WARMUP] {symbol}: ATR_5m={atr_5m:.2f}, ATR_30m={atr_30m:.2f} (ready)"
+                        )
+                    else:
+                        self._logger.warning(
+                            f"[ATR-WARMUP] {symbol}: Insufficient klines ({len(klines_5m)})"
+                        )
+                else:
+                    self._logger.warning(f"[ATR-WARMUP] {symbol}: No klines fetched")
+
+            self._logger.info(f"[ATR-WARMUP] Warmed up {warmup_count}/{len(symbols)} symbols")
+
+        except Exception as e:
+            self._logger.warning(f"[ATR-WARMUP] Failed: {e}")
+
     async def start(self):
         """Start all collectors."""
         self._running = True
@@ -321,6 +371,11 @@ class CollectorService:
         # self._startup_time = time.time()  # REMOVED: causes clock skew with Binance time
 
         # self._logger.info(f"Warmup period duration: {self._warmup_duration_sec}s from startup")
+
+        # 0. Pre-warm ATR calculators with historical data
+        # This avoids 90-minute warm-up delay for regime classification
+        self._logger.info("[ATR-WARMUP] Fetching historical klines for ATR initialization...")
+        self._warm_up_atr_calculators(TOP_10_SYMBOLS)
 
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
@@ -446,11 +501,16 @@ class CollectorService:
             self._latest_snapshot = snapshot
 
             # Phase 5: Compute regime metrics and classify regime for each symbol
+            # DIAG: Track why regime classification fails
+            _diag_regime = os.environ.get('DIAG_MANDATE', '').lower() in ('1', 'true', 'yes')
+
             for symbol in snapshot.symbols_active:
                 try:
                     # Get current price
                     price = self._current_prices.get(symbol)
                     if price is None:
+                        if _diag_regime and cycle_id and cycle_id % 10 == 1:
+                            print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
                         continue  # No price data yet
 
                     # Get calculators
@@ -460,6 +520,13 @@ class CollectorService:
                     liquidation_calc = self._liquidation_calculators.get(symbol)
 
                     if not all([vwap_calc, atr_calc, orderflow_calc, liquidation_calc]):
+                        if _diag_regime and cycle_id and cycle_id % 10 == 1:
+                            missing = []
+                            if not vwap_calc: missing.append("vwap")
+                            if not atr_calc: missing.append("atr")
+                            if not orderflow_calc: missing.append("orderflow")
+                            if not liquidation_calc: missing.append("liquidation")
+                            print(f"[REGIME] {symbol}: SKIP - missing calculators: {missing}", flush=True)
                         continue  # Calculators not initialized yet
 
                     # Compute regime metrics
@@ -471,6 +538,14 @@ class CollectorService:
 
                     # Check if all metrics available
                     if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
+                        if _diag_regime and cycle_id and cycle_id % 10 == 1:
+                            missing = []
+                            if vwap_distance is None: missing.append("vwap_dist")
+                            if atr_5m is None: missing.append("atr_5m")
+                            if atr_30m is None: missing.append("atr_30m")
+                            if orderflow_imbalance is None: missing.append("orderflow")
+                            if liquidation_zscore is None: missing.append("liq_z")
+                            print(f"[REGIME] {symbol}: SKIP - missing metrics: {missing}", flush=True)
                         continue  # Metrics not ready yet
 
                     # Create regime metrics object
@@ -509,8 +584,12 @@ class CollectorService:
             all_mandates = []
             mandate_primitives_map = {}  # Track primitives for each mandate
 
+            # DIAG: Print cycle summary when DIAG_MANDATE is set
+            if os.environ.get('DIAG_MANDATE') and cycle_id and cycle_id % 5 == 0:
+                print(f"[DIAG] Cycle {cycle_id}: {len(snapshot.symbols_active)} syms, "
+                      f"{len(self._regime_states)} regimes classified", flush=True)
+
             # DEBUG EXIT: Show all position states once per cycle (P1: gated by env)
-            import os
             if os.environ.get('DEBUG_EXIT'):
                 open_positions = []
                 for sym in snapshot.symbols_active:

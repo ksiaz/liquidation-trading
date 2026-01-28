@@ -204,3 +204,40 @@ class MultiTimeframeATR:
             return atr_5m / atr_30m
         else:
             return None
+
+    def warm_up_from_klines(self, klines_5m: list, klines_30m: list = None):
+        """Pre-warm ATR calculators from historical klines.
+
+        Used on startup to avoid 90-minute warm-up delay.
+
+        Args:
+            klines_5m: List of 5m kline dicts with high, low, close keys
+            klines_30m: Optional list of 30m kline dicts (if None, aggregated from 5m)
+        """
+        # Warm up ATR 5m from 5-minute klines
+        for k in klines_5m:
+            self.atr_5m.update(
+                high=k['high'],
+                low=k['low'],
+                close=k['close']
+            )
+
+        # Warm up ATR 30m
+        if klines_30m:
+            # Use provided 30m klines
+            for k in klines_30m:
+                self.atr_30m.update(
+                    high=k['high'],
+                    low=k['low'],
+                    close=k['close']
+                )
+        else:
+            # Aggregate 5m klines into 30m candles (6 x 5m = 30m)
+            for i in range(0, len(klines_5m) - 5, 6):
+                group = klines_5m[i:i+6]
+                if len(group) == 6:
+                    self.atr_30m.update(
+                        high=max(k['high'] for k in group),
+                        low=min(k['low'] for k in group),
+                        close=group[-1]['close']
+                    )

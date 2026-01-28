@@ -24,10 +24,14 @@ Properties:
 Authority: Architectural ruling 2026-01-10
 """
 
+import os
 import time
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from decimal import Decimal
+
+# Diagnostic logging control: set DIAG_MANDATE=1 to enable
+_DIAG_ENABLED = os.environ.get('DIAG_MANDATE', '').lower() in ('1', 'true', 'yes')
 
 from observation.types import ObservationSnapshot, ObservationStatus
 from runtime.arbitration.types import Mandate, MandateType
@@ -177,12 +181,20 @@ class PolicyAdapter:
             timestamp=timestamp
         )
 
-        # DEBUG: Log primitive availability (disabled - too verbose)
-        # print(f"DEBUG PolicyAdapter: Generating mandates for {symbol}")
-        # print(f"DEBUG PolicyAdapter: Primitives available:")
-        # for key, value in primitives.items():
-        #     if value is not None:
-        #         print(f"  - {key}: {type(value).__name__}")
+        # DIAGNOSTIC: Log inputs to mandate generation
+        if _DIAG_ENABLED:
+            # Count non-None primitives
+            active_primitives = [k for k, v in primitives.items() if v is not None]
+            print(f"\n[DIAG] {symbol} mandate generation:")
+            print(f"  position_state: {position_state}")
+            print(f"  regime_state: {regime_state.name if regime_state else 'None'}")
+            print(f"  regime_metrics: {regime_metrics is not None}")
+            print(f"  current_price: {current_price}")
+            print(f"  hl_proximity: {hl_proximity is not None}")
+            print(f"  liquidation_burst: {liquidation_burst is not None}")
+            print(f"  primitives ({len(active_primitives)}/{len(primitives)}): {active_primitives if active_primitives else 'NONE'}")
+            print(f"  policies enabled: geometry={self.config.enable_geometry}, kinematics={self.config.enable_kinematics}, "
+                  f"slbrs={self.config.enable_slbrs}, effcs={self.config.enable_effcs}, cascade={self.config.enable_cascade_sniper}")
 
         # Invoke frozen external policies
         proposals: List[StrategyProposal] = []
@@ -205,6 +217,13 @@ class PolicyAdapter:
                 traversal_compactness=primitives.get("traversal_compactness"),
                 central_tendency_deviation=primitives.get("central_tendency_deviation")
             )
+            if _DIAG_ENABLED:
+                if proposal:
+                    print(f"  [geometry] → {proposal.action_type} ({proposal.confidence})")
+                else:
+                    has_zone = primitives.get("supply_demand_zone") is not None
+                    has_pen = primitives.get("zone_penetration") is not None
+                    print(f"  [geometry] → None (zone={has_zone}, pen={has_pen})")
             if proposal:
                 proposals.append(proposal)
 
@@ -220,6 +239,13 @@ class PolicyAdapter:
                 compactness=primitives.get("traversal_compactness"),
                 acceptance=primitives.get("price_acceptance_ratio")
             )
+            if _DIAG_ENABLED:
+                if proposal:
+                    print(f"  [kinematics] → {proposal.action_type} ({proposal.confidence})")
+                else:
+                    has_ob = primitives.get("order_block") is not None
+                    has_vel = primitives.get("price_traversal_velocity") is not None
+                    print(f"  [kinematics] → None (order_block={has_ob}, velocity={has_vel})")
             if proposal:
                 proposals.append(proposal)
 
@@ -248,6 +274,9 @@ class PolicyAdapter:
                 proposals.append(proposal)
 
         # Phase 5: SLBRS/EFFCS strategies with regime gating
+        if regime_state is None or regime_metrics is None:
+            if _DIAG_ENABLED:
+                print(f"  [SLBRS/EFFCS] SKIPPED - regime_state={regime_state is not None}, regime_metrics={regime_metrics is not None}")
         if regime_state is not None and regime_metrics is not None:
             # Convert regime_state to strategy-compatible format
             regime_state_obj = SLBRSRegimeState(
@@ -275,6 +304,11 @@ class PolicyAdapter:
                     permission=permission,
                     position_state=position_state
                 )
+                if _DIAG_ENABLED:
+                    if proposal:
+                        print(f"  [slbrs] → {proposal.action_type} ({proposal.confidence})")
+                    else:
+                        print(f"  [slbrs] → None (regime={regime_state_obj.regime})")
                 if proposal:
                     proposals.append(proposal)
 
@@ -293,6 +327,11 @@ class PolicyAdapter:
                     permission=permission,
                     position_state=position_state
                 )
+                if _DIAG_ENABLED:
+                    if proposal:
+                        print(f"  [effcs] → {proposal.action_type} ({proposal.confidence})")
+                    else:
+                        print(f"  [effcs] → None (regime={regime_state_obj.regime}, liq_z={regime_metrics.liquidation_zscore:.2f})")
                 if proposal:
                     proposals.append(proposal)
 
@@ -313,8 +352,17 @@ class PolicyAdapter:
                 absorption=absorption,  # Pass orderbook absorption analysis
                 trend_context=trend_context  # Pass trend context for kill-switch
             )
+            if _DIAG_ENABLED:
+                if proposal:
+                    print(f"  [cascade] → {proposal.action_type} ({proposal.confidence})")
+                else:
+                    prox_count = hl_proximity.total_positions_at_risk if hl_proximity else 0
+                    burst_vol = liquidation_burst.total_volume if liquidation_burst else 0
+                    print(f"  [cascade] → None (proximity_pos={prox_count}, burst_vol={burst_vol:.0f})")
             if proposal:
                 proposals.append(proposal)
+        elif self.config.enable_cascade_sniper and _DIAG_ENABLED:
+            print(f"  [cascade] SKIPPED - no proximity or burst data")
 
         # Convert proposals to mandates (pure normalization)
         # F5: Pass current_price for quantity calculation

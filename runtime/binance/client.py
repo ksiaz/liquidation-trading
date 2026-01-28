@@ -98,12 +98,16 @@ class BinanceClient:
         """Convert Hyperliquid symbol to Binance symbol.
 
         Args:
-            hl_symbol: Hyperliquid symbol (e.g., 'BTC')
+            hl_symbol: Hyperliquid symbol (e.g., 'BTC' or 'BTCUSDT')
 
         Returns:
             Binance symbol (e.g., 'BTCUSDT')
         """
-        return self.SYMBOL_MAP.get(hl_symbol.upper(), f"{hl_symbol.upper()}USDT")
+        symbol = hl_symbol.upper()
+        # If already has USDT suffix, return as-is
+        if symbol.endswith('USDT'):
+            return symbol
+        return self.SYMBOL_MAP.get(symbol, f"{symbol}USDT")
 
     def _rate_limit(self):
         """Apply rate limiting between requests."""
@@ -416,3 +420,59 @@ class BinanceClient:
         except Exception as e:
             self._logger.error(f"Failed to get async spot price for {symbol}: {e}")
             return None
+
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str = '5m',
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get historical klines/candlesticks.
+
+        Used for warm-up of ATR calculators on startup.
+
+        Args:
+            symbol: Hyperliquid symbol (e.g., 'BTC')
+            interval: Kline interval (1m, 5m, 15m, 30m, 1h, etc.)
+            limit: Number of klines to fetch (max 1500)
+
+        Returns:
+            List of kline dicts with keys: open_time, open, high, low, close, volume
+        """
+        if not REQUESTS_AVAILABLE:
+            self._logger.error("requests library not available")
+            return []
+
+        binance_symbol = self._to_binance_symbol(symbol)
+        url = f"{self.FUTURES_BASE}/fapi/v1/klines"
+
+        params = {
+            'symbol': binance_symbol,
+            'interval': interval,
+            'limit': min(limit, 1500)
+        }
+
+        try:
+            self._rate_limit()
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            # Binance klines format: [open_time, open, high, low, close, volume, ...]
+            results = []
+            for k in data:
+                results.append({
+                    'open_time': int(k[0]) / 1000.0,  # Convert ms to seconds
+                    'open': float(k[1]),
+                    'high': float(k[2]),
+                    'low': float(k[3]),
+                    'close': float(k[4]),
+                    'volume': float(k[5]),
+                    'close_time': int(k[6]) / 1000.0
+                })
+
+            return results
+
+        except Exception as e:
+            self._logger.error(f"Failed to get klines for {symbol}: {e}")
+            return []

@@ -17,8 +17,99 @@ import logging
 from typing import Optional, Dict, Callable, Awaitable
 
 from .action_extractor import PriceEvent, LiquidationEvent, OrderActivity
+from runtime.hyperliquid.types import LiquidationProximity
 
 logger = logging.getLogger(__name__)
+
+
+class _TrackerAdapter:
+    """
+    Adapter to make PositionStateManager look like PositionTracker for governance.
+
+    Governance accesses _hl_collector._tracker.get_positions(coin) to retrieve
+    position data for M4 primitive computation.
+    """
+
+    def __init__(self, psm):
+        self._psm = psm
+
+    def get_positions(self, coin: str) -> list:
+        """
+        Get positions for a coin in the format governance expects.
+
+        Returns list of objects with: position_size, position_value, leverage, liquidation_price
+        """
+        positions = self._psm.get_positions_by_coin(coin)
+
+        # Convert to dict format governance expects
+        result = []
+        for pos in positions:
+            # Estimate leverage from margin/value ratio
+            leverage = 1.0
+            if pos.margin > 0:
+                leverage = pos.position_value / pos.margin
+
+            result.append({
+                'position_size': pos.size,
+                'position_value': pos.position_value,
+                'leverage': leverage,
+                'liquidation_price': pos.liquidation_price,
+            })
+        return result
+
+
+class NodeProximityProvider:
+    """
+    Adapter to make PositionStateManager compatible with governance.set_hyperliquid_source().
+
+    This provides the same interface as HyperliquidCollector for proximity data:
+    - get_proximity(coin) -> LiquidationProximity
+    - _tracker.get_positions(coin) -> list of position dicts
+
+    Usage:
+        psm = PositionStateManager(...)
+        provider = NodeProximityProvider(psm)
+        governance.set_hyperliquid_source(provider)
+    """
+
+    def __init__(self, psm):
+        """
+        Initialize provider.
+
+        Args:
+            psm: PositionStateManager instance
+        """
+        self._psm = psm
+        self._tracker = _TrackerAdapter(psm)
+
+    def get_proximity(self, coin: str) -> Optional[LiquidationProximity]:
+        """
+        Get liquidation proximity for a coin.
+
+        Args:
+            coin: Coin symbol (e.g., "BTC")
+
+        Returns:
+            LiquidationProximity or None if no positions at risk
+        """
+        return self._psm.get_coin_proximity(coin)
+
+    def get_all_proximity(self) -> Dict[str, LiquidationProximity]:
+        """Get proximity for all tracked coins."""
+        result = {}
+
+        # Get unique coins from all positions
+        coins = set()
+        for pos in self._psm.get_all_positions():
+            coins.add(pos.coin)
+
+        # Compute proximity for each
+        for coin in coins:
+            proximity = self._psm.get_coin_proximity(coin)
+            if proximity:
+                result[coin] = proximity
+
+        return result
 
 # Minimum notional value to forward orders to M1
 MIN_ORDER_NOTIONAL = 10_000.0  # $10k
@@ -249,11 +340,23 @@ class ObservationBridge:
 
         return metrics
 
+    def get_proximity_provider(self) -> Optional[NodeProximityProvider]:
+        """
+        Get proximity provider for governance integration.
+
+        Returns:
+            NodeProximityProvider that can be passed to governance.set_hyperliquid_source()
+            or None if position tracking is not enabled.
+        """
+        if self._psm:
+            return NodeProximityProvider(self._psm)
+        return None
+
 
 def create_integrated_node(
     observation_system,
     config=None,
-    enable_position_tracking: bool = False,  # Disabled by default - requires API integration
+    enable_position_tracking: bool = False,  # Disabled by default - requires state file parsing
     min_position_value: float = 1000.0,
     focus_coins: list = None,
 ):
@@ -261,24 +364,32 @@ def create_integrated_node(
     Factory function to create fully wired node integration.
 
     Args:
-        observation_system: ObservationSystem instance
+        observation_system: ObservationSystem instance (governance layer)
         config: Optional NodeAdapterConfig
         enable_position_tracking: Whether to enable position state tracking
-            NOTE: Position tracking from state file is disabled by default.
-            The abci_state.rmp only contains raw position data (size, balance)
-            but not derived values (entry_price, liquidation_price, margin).
-            For full position tracking, use Hyperliquid API integration instead.
+            NOTE: Position tracking requires msgpack and state file parsing.
+            When enabled, automatically wires proximity provider to governance
+            for M4 cascade primitive computation.
         min_position_value: Minimum position value to track (default $1000)
         focus_coins: Only track these coins (None = all)
 
     Returns:
         Tuple of (DirectNodeIntegration, ObservationBridge, Optional[PositionStateManager])
 
+    When position tracking is enabled:
+        - PositionStateManager reads positions from abci_state.rmp
+        - Proximity provider is automatically wired to governance
+        - M4 primitives (LiquidationCascadeProximity) become available
+        - Cascade Sniper strategy can operate
+
     Usage:
-        integration, bridge, psm = create_integrated_node(obs_system)
+        integration, bridge, psm = create_integrated_node(
+            obs_system,
+            enable_position_tracking=True
+        )
         if psm:
-            await psm.start()
-        await integration.start()
+            await psm.start()  # Do initial position discovery
+        await integration.start()  # Start streaming prices/liquidations
     """
     from .direct_integration import DirectNodeIntegration
     from .config import NodeAdapterConfig
@@ -317,6 +428,13 @@ def create_integrated_node(
         on_order_activity=bridge.on_order_activity,
         config=cfg,
     )
+
+    # Wire proximity provider to governance if position tracking is enabled
+    if psm and hasattr(observation_system, 'set_hyperliquid_source'):
+        provider = bridge.get_proximity_provider()
+        if provider:
+            observation_system.set_hyperliquid_source(provider)
+            logger.info("Proximity provider wired to observation system")
 
     return integration, bridge, psm
 

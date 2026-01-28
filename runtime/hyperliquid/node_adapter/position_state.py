@@ -31,6 +31,9 @@ except ImportError:
 from .asset_mapping import get_coin_name, PRIORITY_COINS
 from .metrics import PositionStateMetrics
 
+# Import LiquidationProximity for governance compatibility
+from runtime.hyperliquid.types import LiquidationProximity
+
 
 class RefreshTier(Enum):
     """Position refresh tier based on proximity to liquidation."""
@@ -328,6 +331,125 @@ class PositionStateManager:
         for wallet, positions in self._cache.items():
             result.extend(positions.values())
         return result
+
+    def get_positions_by_coin(self, coin: str) -> List[PositionCache]:
+        """
+        Get all positions for a specific coin.
+
+        Args:
+            coin: Coin symbol (e.g., "BTC")
+
+        Returns:
+            List of PositionCache for the coin
+        """
+        result = []
+        for wallet, positions in self._cache.items():
+            if coin in positions:
+                result.append(positions[coin])
+        return result
+
+    def get_coin_proximity(
+        self,
+        coin: str,
+        threshold_pct: float = 0.02,
+    ) -> Optional[LiquidationProximity]:
+        """
+        Compute aggregate liquidation proximity for a coin.
+
+        This aggregates all positions within threshold_pct of liquidation
+        and returns a LiquidationProximity object compatible with governance.
+
+        Args:
+            coin: Coin symbol (e.g., "BTC")
+            threshold_pct: Proximity threshold (default 0.02 = 2%)
+
+        Returns:
+            LiquidationProximity or None if no positions at risk
+        """
+        positions = self.get_positions_by_coin(coin)
+        if not positions:
+            return None
+
+        # Get current price from stored prices
+        current_price = self._prices.get(coin, 0.0)
+        if not current_price:
+            # Fallback to entry price if no oracle price
+            for pos in positions:
+                if pos.entry_price > 0:
+                    current_price = pos.entry_price
+                    break
+        if not current_price:
+            return None
+
+        # Aggregate by side
+        long_positions = []
+        short_positions = []
+        now = time.time()
+
+        for pos in positions:
+            if pos.liquidation_price <= 0:
+                continue
+
+            # Calculate proximity
+            proximity = pos.calculate_proximity(current_price)
+
+            if proximity > threshold_pct:
+                continue  # Not at risk
+
+            pos_data = {
+                'size': abs(pos.size),
+                'value': pos.position_value,
+                'liq_price': pos.liquidation_price,
+                'distance_pct': proximity,
+            }
+
+            if pos.side == 'LONG':
+                long_positions.append(pos_data)
+            elif pos.side == 'SHORT':
+                short_positions.append(pos_data)
+
+        total_count = len(long_positions) + len(short_positions)
+        if total_count == 0:
+            return None
+
+        # Compute long aggregates
+        long_count = len(long_positions)
+        long_size = sum(p['size'] for p in long_positions)
+        long_value = sum(p['value'] for p in long_positions)
+        long_closest = min((p['liq_price'] for p in long_positions), default=None)
+        long_avg_dist = (
+            sum(p['distance_pct'] for p in long_positions) / long_count
+            if long_count > 0 else 0.0
+        )
+
+        # Compute short aggregates
+        short_count = len(short_positions)
+        short_size = sum(p['size'] for p in short_positions)
+        short_value = sum(p['value'] for p in short_positions)
+        short_closest = max((p['liq_price'] for p in short_positions), default=None)
+        short_avg_dist = (
+            sum(p['distance_pct'] for p in short_positions) / short_count
+            if short_count > 0 else 0.0
+        )
+
+        return LiquidationProximity(
+            coin=coin,
+            current_price=current_price,
+            threshold_pct=threshold_pct,
+            long_positions_count=long_count,
+            long_positions_size=long_size,
+            long_positions_value=long_value,
+            long_avg_distance_pct=long_avg_dist,
+            long_closest_liquidation=long_closest,
+            short_positions_count=short_count,
+            short_positions_size=short_size,
+            short_positions_value=short_value,
+            short_avg_distance_pct=short_avg_dist,
+            short_closest_liquidation=short_closest,
+            total_positions_at_risk=total_count,
+            total_value_at_risk=long_value + short_value,
+            timestamp=now,
+        )
 
     def has_position(self, wallet: str, coin: Optional[str] = None) -> bool:
         """Check if wallet has cached position(s)."""

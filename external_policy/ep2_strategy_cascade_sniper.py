@@ -37,6 +37,11 @@ from memory.m4_absorption_confirmation import (
     TrendRegimeContext,
     TrendDirection,
 )
+from runtime.hyperliquid.node_adapter.organic_flow_detector import (
+    OrganicFlowDetector,
+    CascadeDirection,
+    AbsorptionSignal,
+)
 
 if TYPE_CHECKING:
     from observation.types import M4PrimitiveBundle
@@ -97,6 +102,22 @@ class CascadeSniperConfig:
 
     # Use entry quality scoring (if False, skip quality check)
     use_entry_quality_filter: bool = True
+
+    # Organic flow detection (research-backed absorption detection)
+    # Replaces static orderbook depth with dynamic organic flow analysis
+    use_organic_flow_detection: bool = True
+
+    # Organic flow window (seconds)
+    organic_flow_window_sec: float = 10.0
+
+    # Minimum organic volume to confirm absorption ($USD)
+    min_organic_volume: float = 5000.0
+
+    # Minimum quiet time since last liquidation (seconds)
+    organic_quiet_time_sec: float = 2.0
+
+    # Minimum organic ratio (|net|/total) for conviction
+    organic_ratio_threshold: float = 0.3
 
 
 # ==============================================================================
@@ -238,6 +259,19 @@ class CascadeStateMachine:
         self._triggered_at: Dict[str, float] = {}
         self._absorption_data: Dict[str, AbsorptionAnalysis] = {}
 
+        # Organic flow detector (research-backed absorption detection)
+        self._organic_detector: Optional[OrganicFlowDetector] = None
+        if config.use_organic_flow_detection:
+            self._organic_detector = OrganicFlowDetector(
+                window_sec=config.organic_flow_window_sec,
+                min_organic_volume=config.min_organic_volume,
+                min_quiet_time=config.organic_quiet_time_sec,
+                organic_ratio_threshold=config.organic_ratio_threshold,
+            )
+
+        # Last absorption signal per symbol (for diagnostics)
+        self._last_absorption_signal: Dict[str, AbsorptionSignal] = {}
+
     def update(
         self,
         symbol: str,
@@ -279,6 +313,22 @@ class CascadeStateMachine:
                 self._states[symbol] = CascadeState.TRIGGERED
                 self._triggered_at[symbol] = timestamp
                 new_state = CascadeState.TRIGGERED
+
+                # Set cascade direction for organic flow detector
+                if self._organic_detector:
+                    dominant = self.get_dominant_side(symbol)
+                    primed_data = self._primed_data.get(symbol)
+                    cluster_value = primed_data.total_value_at_risk if primed_data else 0
+                    if dominant == "LONG":
+                        # Long liqs → price dropping → DOWN cascade
+                        self._organic_detector.set_cascade_active(
+                            symbol, CascadeDirection.DOWN, cluster_value
+                        )
+                    elif dominant == "SHORT":
+                        # Short liqs → price rising → UP cascade
+                        self._organic_detector.set_cascade_active(
+                            symbol, CascadeDirection.UP, cluster_value
+                        )
             else:
                 # Update primed data
                 if proximity:
@@ -289,8 +339,8 @@ class CascadeStateMachine:
             trigger_time = self._triggered_at.get(symbol, 0)
             elapsed = timestamp - trigger_time
 
-            # Check for absorption using orderbook depth analysis
-            if self._is_absorption_detected(symbol, liquidations, proximity):
+            # Check for absorption using organic flow (primary) or orderbook depth (fallback)
+            if self._is_absorption_detected(symbol, liquidations, proximity, timestamp):
                 self._states[symbol] = CascadeState.ABSORBING
                 new_state = CascadeState.ABSORBING
             # Timeout: cascade exhausted after 30 seconds
@@ -407,24 +457,36 @@ class CascadeStateMachine:
         self,
         symbol: str,
         liquidations: Optional[LiquidationBurst],
-        proximity: Optional[ProximityData]
+        proximity: Optional[ProximityData],
+        timestamp: Optional[float] = None
     ) -> bool:
         """
         Check if cascade is being absorbed.
 
-        Absorption detection uses orderbook depth analysis:
-        - If absorption_ratio > threshold, book can absorb remaining liquidations
-        - Fallback: positions at risk decreased significantly
-
-        Absorption indicators:
-        1. Order book depth > liquidation value (primary)
-        2. Positions at risk count dropping (fallback)
+        Detection methods (in priority order):
+        1. PRIMARY: Organic flow detection (research-backed)
+           - liqs_stopped AND organic_net opposes cascade
+        2. FALLBACK: Orderbook depth analysis
+           - absorption_ratio > threshold
+        3. FALLBACK: Position count drop
+           - positions at risk decreased >50%
         """
         primed = self._primed_data.get(symbol)
         if primed is None:
             return False
 
-        # PRIMARY: Check orderbook absorption if data available
+        # PRIMARY: Organic flow detection (research-backed)
+        if self._organic_detector and self._config.use_organic_flow_detection:
+            signal = self._organic_detector.check_absorption(symbol, timestamp)
+            self._last_absorption_signal[symbol] = signal
+
+            if signal.absorption_detected:
+                print(f"[ORGANIC FLOW] {symbol}: Absorption detected!")
+                print(f"  liqs_stopped: {signal.liqs_stopped}, organic_net: ${signal.organic_net:,.0f}")
+                print(f"  organic_ratio: {signal.organic_ratio:.1%}, entry: {signal.entry_direction}")
+                return True
+
+        # FALLBACK 1: Check orderbook absorption if data available
         absorption = self._absorption_data.get(symbol)
         if absorption is not None:
             # Determine which side is being liquidated
@@ -438,7 +500,7 @@ class CascadeStateMachine:
                 if absorption.absorption_ratio_shorts >= self._config.min_absorption_ratio_for_reversal:
                     return True
 
-        # FALLBACK: Positions at risk decreased significantly
+        # FALLBACK 2: Positions at risk decreased significantly
         if proximity is not None:
             if proximity.total_positions_at_risk < primed.total_positions_at_risk * 0.5:
                 return True
@@ -510,6 +572,68 @@ class CascadeStateMachine:
             return "SHORT"
         return None
 
+    def feed_liquidation(
+        self,
+        symbol: str,
+        side: str,  # "long" or "short"
+        value: float,
+        timestamp: float
+    ):
+        """
+        Feed a liquidation event to the organic flow detector.
+
+        Should be called for every liquidation event detected.
+        """
+        if not self._organic_detector:
+            return
+
+        # Create a minimal LiquidationEvent for the detector
+        from runtime.hyperliquid.node_adapter.action_extractor import LiquidationEvent
+        event = LiquidationEvent(
+            symbol=symbol,
+            wallet_address="",  # Not needed for flow detection
+            liquidated_size=0,  # Not needed
+            liquidation_price=0,  # Not needed
+            side=side,
+            value=value,
+            timestamp=timestamp,
+        )
+        self._organic_detector.add_liquidation(event)
+
+    def feed_organic_trade(
+        self,
+        symbol: str,
+        side: str,  # "BUY" or "SELL"
+        value: float,
+        timestamp: float,
+        wallet_address: Optional[str] = None
+    ):
+        """
+        Feed an organic (non-liquidation) trade to the detector.
+
+        Should be called for regular trades to track organic flow.
+        """
+        if not self._organic_detector:
+            return
+
+        self._organic_detector.add_organic_trade(
+            symbol=symbol,
+            timestamp=timestamp,
+            side=side,
+            value=value,
+            wallet_address=wallet_address,
+        )
+
+    def get_absorption_signal(self, symbol: str) -> Optional[AbsorptionSignal]:
+        """Get the last absorption signal for a symbol (for diagnostics)."""
+        return self._last_absorption_signal.get(symbol)
+
+    def get_organic_flow_metrics(self) -> Optional[Dict]:
+        """Get organic flow detector metrics."""
+        if self._organic_detector:
+            return self._organic_detector.get_metrics()
+        return None
+
 
 # ==============================================================================
 # EP-2 Strategy: Cascade Sniper
@@ -558,6 +682,63 @@ def record_liquidation_event(
     """
     scorer = _get_entry_quality_scorer()
     scorer.record_liquidation(symbol, side, value, timestamp)
+
+    # Also feed to organic flow detector for absorption detection
+    # Convert "BUY"/"SELL" to "short"/"long" (opposite mapping)
+    liq_side = "short" if side == "BUY" else "long"
+    sm = _get_state_machine()
+    sm.feed_liquidation(symbol, liq_side, value, timestamp)
+
+
+def record_organic_trade(
+    symbol: str,
+    side: str,  # "BUY" or "SELL"
+    value: float,
+    timestamp: float,
+    wallet_address: Optional[str] = None
+):
+    """
+    Record an organic (non-liquidation) trade for absorption detection.
+
+    Call this for regular trades to track organic flow.
+    The organic flow detector uses this to determine when absorption occurs.
+
+    Args:
+        symbol: Trading symbol (e.g., "BTCUSDT")
+        side: "BUY" or "SELL"
+        value: USD value of trade
+        timestamp: Event timestamp
+        wallet_address: Optional wallet for liquidator filtering
+    """
+    sm = _get_state_machine()
+    sm.feed_organic_trade(symbol, side, value, timestamp, wallet_address)
+
+
+def get_absorption_signal(symbol: str) -> Optional[AbsorptionSignal]:
+    """
+    Get the last absorption signal for a symbol.
+
+    Useful for diagnostics and monitoring absorption detection.
+
+    Args:
+        symbol: Trading symbol (e.g., "BTCUSDT")
+
+    Returns:
+        AbsorptionSignal with detection details, or None
+    """
+    sm = _get_state_machine()
+    return sm.get_absorption_signal(symbol)
+
+
+def get_organic_flow_metrics() -> Optional[Dict]:
+    """
+    Get organic flow detector metrics.
+
+    Returns:
+        Dict with detector statistics, or None if not enabled
+    """
+    sm = _get_state_machine()
+    return sm.get_organic_flow_metrics()
 
 
 # Trend strength threshold for blocking reversal entries

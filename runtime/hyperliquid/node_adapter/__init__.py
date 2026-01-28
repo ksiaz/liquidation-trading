@@ -52,6 +52,12 @@ from .observation_bridge import (
     LiquidationBurstAggregator,
     NodeProximityProvider,
 )
+from .organic_flow_detector import (
+    OrganicFlowDetector,
+    OrganicFlowWindow,
+    AbsorptionSignal,
+    CascadeDirection,
+)
 from .position_state import (
     PositionStateManager,
     PositionCache,
@@ -103,4 +109,10 @@ __all__ = [
     # Cascade Support
     'LiquidationBurstAggregator',
     'NodeProximityProvider',
+
+    # Organic Flow Detection (Research-backed)
+    'OrganicFlowDetector',
+    'OrganicFlowWindow',
+    'AbsorptionSignal',
+    'CascadeDirection',
 ]

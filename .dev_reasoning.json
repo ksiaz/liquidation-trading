@@ -1,0 +1,43 @@
+{
+  "assumptions": {},
+  "unknowns": {},
+  "lessons": [
+    {
+      "statement": "hl-node needs --write-trades flag for liquidation data in node_trades/",
+      "created_at": 1769600479.5772383,
+      "context": "Liquidations stuck at 1197 for 1+ hour, discovered missing flag",
+      "tags": [
+        "node",
+        "configuration",
+        "liquidations"
+      ]
+    },
+    {
+      "statement": "Historical validation results (759 trades) were from API mode, not node mode",
+      "created_at": 1769600479.5777016,
+      "context": "Performance metrics may not transfer to node-based system",
+      "tags": [
+        "validation",
+        "testing"
+      ]
+    },
+    {
+      "statement": "node_trades files are written per-hour (0, 1, 2... 23), not continuously updated",
+      "created_at": 1769600479.5780532,
+      "context": "Need to check for file existence and modification time",
+      "tags": [
+        "node",
+        "data-format"
+      ]
+    },
+    {
+      "statement": "Node bootstrap phase does not write output files until sync complete",
+      "created_at": 1769600479.5784338,
+      "context": "After restart, node needs to catch up before producing data",
+      "tags": [
+        "node",
+        "startup"
+      ]
+    }
+  ]
+}

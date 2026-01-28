@@ -14,12 +14,173 @@ Usage:
 
 import asyncio
 import logging
-from typing import Optional, Dict, Callable, Awaitable
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional, Dict, Callable, Awaitable, List
 
 from .action_extractor import PriceEvent, LiquidationEvent, OrderActivity
 from runtime.hyperliquid.types import LiquidationProximity
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Liquidation Burst Aggregator
+# ==============================================================================
+
+@dataclass
+class LiquidationBurst:
+    """
+    Aggregated liquidation activity over a time window.
+
+    Compatible with external_policy.ep2_strategy_cascade_sniper.LiquidationBurst.
+    """
+    symbol: str
+    total_volume: float          # Total liquidation volume in window
+    long_liquidations: float     # Volume of long liquidations
+    short_liquidations: float    # Volume of short liquidations
+    liquidation_count: int       # Number of liquidation events
+    window_start: float          # Window start timestamp
+    window_end: float            # Window end timestamp
+
+
+class LiquidationBurstAggregator:
+    """
+    Aggregates individual liquidation events into bursts over a rolling window.
+
+    Used to provide LiquidationBurst data to the cascade state machine without
+    requiring external websocket connections (e.g., Binance).
+
+    Usage:
+        aggregator = LiquidationBurstAggregator(window_sec=10.0)
+        aggregator.add_event(liq_event)
+        burst = aggregator.get_burst('BTCUSDT')
+    """
+
+    def __init__(
+        self,
+        window_sec: float = 10.0,
+        min_burst_volume: float = 10_000.0,  # Minimum volume to report as burst
+    ):
+        """
+        Initialize aggregator.
+
+        Args:
+            window_sec: Rolling window size in seconds (default 10s)
+            min_burst_volume: Minimum total volume to report as burst (default $10k)
+        """
+        self._window_sec = window_sec
+        self._min_burst_volume = min_burst_volume
+
+        # Events by symbol: symbol -> list of (timestamp, side, value)
+        self._events: Dict[str, List[tuple]] = defaultdict(list)
+
+        # Metrics
+        self._events_received = 0
+        self._bursts_generated = 0
+
+    def add_event(self, event: LiquidationEvent) -> None:
+        """
+        Add a liquidation event to the aggregator.
+
+        Args:
+            event: LiquidationEvent from node
+        """
+        self._events_received += 1
+
+        # Extract coin from symbol (BTCUSDT -> BTC)
+        symbol = event.symbol
+        if symbol.endswith('USDT'):
+            symbol = symbol[:-4] + 'USDT'  # Normalize
+
+        self._events[symbol].append((
+            event.timestamp,
+            event.side,  # 'long' or 'short'
+            event.value,
+        ))
+
+        # Clean old events
+        self._cleanup_old_events(symbol)
+
+    def _cleanup_old_events(self, symbol: str) -> None:
+        """Remove events outside the window."""
+        now = time.time()
+        cutoff = now - self._window_sec
+
+        self._events[symbol] = [
+            (ts, side, val) for ts, side, val in self._events[symbol]
+            if ts >= cutoff
+        ]
+
+    def get_burst(self, symbol: str) -> Optional[LiquidationBurst]:
+        """
+        Get current liquidation burst for a symbol.
+
+        Returns:
+            LiquidationBurst if activity exceeds minimum, None otherwise
+        """
+        if symbol not in self._events:
+            return None
+
+        # Clean old events first
+        self._cleanup_old_events(symbol)
+
+        events = self._events[symbol]
+        if not events:
+            return None
+
+        now = time.time()
+
+        # Aggregate
+        total_volume = 0.0
+        long_liqs = 0.0
+        short_liqs = 0.0
+        oldest_ts = now
+        newest_ts = 0.0
+
+        for ts, side, val in events:
+            total_volume += val
+            if side == 'long':
+                long_liqs += val
+            else:
+                short_liqs += val
+            oldest_ts = min(oldest_ts, ts)
+            newest_ts = max(newest_ts, ts)
+
+        # Check minimum threshold
+        if total_volume < self._min_burst_volume:
+            return None
+
+        self._bursts_generated += 1
+
+        return LiquidationBurst(
+            symbol=symbol,
+            total_volume=total_volume,
+            long_liquidations=long_liqs,
+            short_liquidations=short_liqs,
+            liquidation_count=len(events),
+            window_start=oldest_ts,
+            window_end=newest_ts,
+        )
+
+    def get_all_bursts(self) -> Dict[str, LiquidationBurst]:
+        """Get bursts for all symbols with activity."""
+        bursts = {}
+        for symbol in list(self._events.keys()):
+            burst = self.get_burst(symbol)
+            if burst:
+                bursts[symbol] = burst
+        return bursts
+
+    def get_metrics(self) -> Dict:
+        """Get aggregator metrics."""
+        return {
+            'events_received': self._events_received,
+            'bursts_generated': self._bursts_generated,
+            'symbols_tracked': len(self._events),
+            'window_sec': self._window_sec,
+        }
 
 
 class _TrackerAdapter:
@@ -65,6 +226,7 @@ class NodeProximityProvider:
     This provides the same interface as HyperliquidCollector for proximity data:
     - get_proximity(coin) -> LiquidationProximity
     - _tracker.get_positions(coin) -> list of position dicts
+    - get_burst(symbol) -> LiquidationBurst (for cascade triggering)
 
     Usage:
         psm = PositionStateManager(...)
@@ -72,15 +234,17 @@ class NodeProximityProvider:
         governance.set_hyperliquid_source(provider)
     """
 
-    def __init__(self, psm):
+    def __init__(self, psm, burst_aggregator: Optional[LiquidationBurstAggregator] = None):
         """
         Initialize provider.
 
         Args:
             psm: PositionStateManager instance
+            burst_aggregator: Optional LiquidationBurstAggregator for cascade triggering
         """
         self._psm = psm
         self._tracker = _TrackerAdapter(psm)
+        self._burst_aggregator = burst_aggregator
 
     def get_proximity(self, coin: str) -> Optional[LiquidationProximity]:
         """
@@ -111,6 +275,28 @@ class NodeProximityProvider:
 
         return result
 
+    def get_burst(self, symbol: str) -> Optional[LiquidationBurst]:
+        """
+        Get current liquidation burst for a symbol.
+
+        Used by cascade state machine to detect trigger conditions.
+
+        Args:
+            symbol: Symbol to get burst for (e.g., 'BTCUSDT')
+
+        Returns:
+            LiquidationBurst if activity exceeds threshold, None otherwise
+        """
+        if self._burst_aggregator:
+            return self._burst_aggregator.get_burst(symbol)
+        return None
+
+    def get_all_bursts(self) -> Dict[str, LiquidationBurst]:
+        """Get all active liquidation bursts."""
+        if self._burst_aggregator:
+            return self._burst_aggregator.get_all_bursts()
+        return {}
+
 # Minimum notional value to forward orders to M1
 MIN_ORDER_NOTIONAL = 10_000.0  # $10k
 
@@ -130,6 +316,8 @@ class ObservationBridge:
         observation_system,
         position_state_manager=None,
         min_order_notional: float = MIN_ORDER_NOTIONAL,
+        burst_window_sec: float = 10.0,
+        min_burst_volume: float = 10_000.0,
     ):
         """
         Initialize bridge.
@@ -138,6 +326,8 @@ class ObservationBridge:
             observation_system: ObservationSystem instance (governance layer)
             position_state_manager: Optional PositionStateManager for position tracking
             min_order_notional: Minimum USD value to forward orders (default $10k)
+            burst_window_sec: Liquidation burst aggregation window (default 10s)
+            min_burst_volume: Minimum volume to report as burst (default $10k)
         """
         self._obs = observation_system
         self._psm = position_state_manager
@@ -145,6 +335,12 @@ class ObservationBridge:
 
         # Track prices for position manager
         self._latest_prices: Dict[str, float] = {}
+
+        # Liquidation burst aggregator for cascade triggering
+        self._burst_aggregator = LiquidationBurstAggregator(
+            window_sec=burst_window_sec,
+            min_burst_volume=min_burst_volume,
+        )
 
         # Metrics
         self._prices_forwarded = 0
@@ -200,7 +396,7 @@ class ObservationBridge:
         """
         Handle liquidation event from node.
 
-        Converts to observation format and forwards to M1.
+        Converts to observation format, forwards to M1, and aggregates for bursts.
         """
         try:
             payload = {
@@ -220,6 +416,9 @@ class ObservationBridge:
             )
 
             self._liquidations_forwarded += 1
+
+            # Add to burst aggregator for cascade triggering
+            self._burst_aggregator.add_event(event)
 
             # Log liquidations - these are important
             logger.info(
@@ -338,7 +537,33 @@ class ObservationBridge:
                 'watchlist_positions': self._psm.metrics.watchlist_positions,
             }
 
+        # Add burst aggregator metrics
+        metrics['burst_aggregator'] = self._burst_aggregator.get_metrics()
+
         return metrics
+
+    def get_burst(self, symbol: str) -> Optional[LiquidationBurst]:
+        """
+        Get current liquidation burst for a symbol.
+
+        Used by cascade state machine to determine if trigger threshold is met.
+
+        Args:
+            symbol: Symbol to get burst for (e.g., 'BTCUSDT')
+
+        Returns:
+            LiquidationBurst if activity exceeds minimum threshold, None otherwise
+        """
+        return self._burst_aggregator.get_burst(symbol)
+
+    def get_all_bursts(self) -> Dict[str, LiquidationBurst]:
+        """
+        Get all current liquidation bursts.
+
+        Returns:
+            Dict of symbol -> LiquidationBurst for all active bursts
+        """
+        return self._burst_aggregator.get_all_bursts()
 
     def get_proximity_provider(self) -> Optional[NodeProximityProvider]:
         """
@@ -347,9 +572,13 @@ class ObservationBridge:
         Returns:
             NodeProximityProvider that can be passed to governance.set_hyperliquid_source()
             or None if position tracking is not enabled.
+
+        The provider includes:
+        - Proximity data (positions at risk)
+        - Burst data (aggregated liquidations for cascade triggering)
         """
         if self._psm:
-            return NodeProximityProvider(self._psm)
+            return NodeProximityProvider(self._psm, self._burst_aggregator)
         return None
 
 

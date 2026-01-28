@@ -45,7 +45,13 @@ from .action_extractor import (
 from .sync_monitor import SyncMonitor, SyncStatus
 from .adapter import HyperliquidNodeAdapter
 from .direct_integration import DirectNodeIntegration
-from .observation_bridge import ObservationBridge, create_integrated_node
+from .observation_bridge import (
+    ObservationBridge,
+    create_integrated_node,
+    LiquidationBurst,
+    LiquidationBurstAggregator,
+    NodeProximityProvider,
+)
 from .position_state import (
     PositionStateManager,
     PositionCache,
@@ -86,10 +92,15 @@ __all__ = [
     'LiquidationEvent',
     'OrderActivity',
     'SyncStatus',
+    'LiquidationBurst',
 
     # Position State
     'PositionStateManager',
     'PositionCache',
     'ProximityAlert',
     'RefreshTier',
+
+    # Cascade Support
+    'LiquidationBurstAggregator',
+    'NodeProximityProvider',
 ]

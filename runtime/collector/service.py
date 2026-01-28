@@ -38,7 +38,7 @@ import os
 from runtime.regime import RegimeState, RegimeMetrics, classify_regime
 from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
-from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator
+from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 
 # Import Hyperliquid Integration
 try:
@@ -528,7 +528,24 @@ class CollectorService:
                                     print(f"  ⚠️ CIRCUIT BREAKER ACTIVE: {remaining:.0f}s remaining")
 
                     # Phase 6: Get liquidation burst data
-                    liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
+                    # In node mode, use node bridge's aggregator (fed by node_trades liquidations)
+                    # Otherwise, use collector's aggregator (fed by Binance forceOrder stream)
+                    liquidation_burst = None
+                    if self._use_node_mode and self._node_bridge:
+                        node_burst = self._node_bridge.get_burst(symbol)
+                        if node_burst:
+                            # Convert node burst to policy adapter format
+                            liquidation_burst = LiquidationBurst(
+                                symbol=node_burst.symbol,
+                                total_volume=node_burst.total_volume,
+                                long_liquidations=node_burst.long_liquidations,
+                                short_liquidations=node_burst.short_liquidations,
+                                liquidation_count=node_burst.liquidation_count,
+                                window_start=node_burst.window_start,
+                                window_end=node_burst.window_end,
+                            )
+                    else:
+                        liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
 
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(

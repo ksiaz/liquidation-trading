@@ -92,6 +92,14 @@ class NodeAdapterConfig:
     # Maximum acceptable sync lag (seconds) before error
     max_sync_lag_error: float = 30.0
 
+    # ========== Catchup Configuration ==========
+    # Skip historical catchup on startup (start from current position)
+    # Set to True for paper trading where old data would be dropped anyway
+    skip_catchup: bool = False
+
+    # Hours of historical data to catch up (if skip_catchup=False)
+    catchup_hours: int = 6
+
 
 @dataclass
 class WindowsConnectorConfig:

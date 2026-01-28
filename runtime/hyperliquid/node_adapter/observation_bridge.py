@@ -407,16 +407,25 @@ class ObservationBridge:
 
         Converts to observation format and forwards to M1.
         Also updates PositionStateManager with new prices.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        Original event.timestamp preserved in payload for data accuracy.
         """
         try:
+            # Use wall clock for governance freshness check
+            # Node timestamps are from when events occurred on HL network,
+            # which can be "in the past" relative to Binance-driven system_time
+            now = time.time()
+
             payload = {
                 'oracle_price': event.oracle_price,
                 'mark_price': event.mark_price,
-                'timestamp': event.timestamp,
+                'timestamp': event.timestamp,  # Original timestamp for data accuracy
             }
 
             self._obs.ingest_observation(
-                timestamp=event.timestamp,
+                timestamp=now,  # Wall clock for governance validation
                 symbol=event.symbol,
                 event_type='HL_PRICE',
                 payload=payload,
@@ -442,19 +451,28 @@ class ObservationBridge:
         Handle liquidation event from node.
 
         Converts to observation format, forwards to M1, and aggregates for bursts.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        Original event.timestamp preserved in payload for data accuracy.
         """
         try:
+            # Use wall clock for governance freshness check
+            # Node timestamps are from when events occurred on HL network,
+            # which can be "in the past" relative to Binance-driven system_time
+            now = time.time()
+
             payload = {
                 'wallet_address': event.wallet_address,
                 'liquidated_size': event.liquidated_size,
                 'liquidation_price': event.liquidation_price,
                 'side': event.side,
                 'value': event.value,
-                'timestamp': event.timestamp,
+                'timestamp': event.timestamp,  # Original timestamp for data accuracy
             }
 
             self._obs.ingest_observation(
-                timestamp=event.timestamp,
+                timestamp=now,  # Wall clock for governance validation
                 symbol=event.symbol,
                 event_type='HL_LIQUIDATION',
                 payload=payload,
@@ -494,17 +512,20 @@ class ObservationBridge:
                 self._orders_filtered += 1
                 return
 
+            # Use wall clock for governance freshness check
+            now = time.time()
+
             payload = {
                 'wallet_address': event.wallet,
                 'side': event.side,
                 'size': event.size,
                 'notional': event.notional,
                 'is_reduce_only': event.is_reduce_only,
-                'timestamp': event.timestamp,
+                'timestamp': event.timestamp,  # Original timestamp for data accuracy
             }
 
             self._obs.ingest_observation(
-                timestamp=event.timestamp,
+                timestamp=now,  # Wall clock for governance validation
                 symbol=event.coin,
                 event_type='HL_ORDER',
                 payload=payload,
@@ -521,15 +542,20 @@ class ObservationBridge:
         Handle position update from PositionStateManager.
 
         Called when position state changes (new position, closed, or refreshed).
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
         """
         try:
+            # Use wall clock for governance freshness check
+            now = time.time()
             symbol = position_data.get('symbol', '')
 
             self._obs.ingest_observation(
-                timestamp=position_data.get('timestamp', 0),
+                timestamp=now,  # Wall clock for governance validation
                 symbol=symbol,
                 event_type='HL_POSITION',
-                payload=position_data,
+                payload=position_data,  # Original timestamp preserved in payload
             )
 
             self._positions_forwarded += 1

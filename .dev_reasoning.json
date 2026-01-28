@@ -3,13 +3,63 @@
   "unknowns": {},
   "lessons": [
     {
-      "statement": "hl-node needs --write-trades flag for liquidation data in node_trades/",
+      "statement": "hl-node needs --write-fills flag (not --write-trades) for liquidation data in node_fills/",
       "created_at": 1769600479.5772383,
-      "context": "Liquidations stuck at 1197 for 1+ hour, discovered missing flag",
+      "context": "Liquidations in node_fills have 'liquidation':{}  object. --write-fills overrides --write-trades",
       "tags": [
         "node",
         "configuration",
         "liquidations"
+      ]
+    },
+    {
+      "statement": "hl-node requires jemalloc to prevent OOM crashes - default malloc causes 50GB spikes, jemalloc keeps at 29GB",
+      "created_at": 1738077766.0,
+      "context": "OOM crash with 64GB RAM. Solution: LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./hl-visor",
+      "tags": [
+        "node",
+        "memory",
+        "critical"
+      ]
+    },
+    {
+      "statement": "--disable-output-file-buffering is REQUIRED for real-time data streaming from node",
+      "created_at": 1738077766.0,
+      "context": "Without this flag, data is buffered and delayed. Per Discord: must-have for trading systems",
+      "tags": [
+        "node",
+        "configuration",
+        "latency"
+      ]
+    },
+    {
+      "statement": "--write-order-statuses generates ~20GB/hour - must implement pruning or disk fills up",
+      "created_at": 1738077766.0,
+      "context": "Required for order_book_server but massive disk usage. Cron prune keeping 4hr: find ~/hl/data/node_order_statuses -mmin +240 -delete",
+      "tags": [
+        "node",
+        "configuration",
+        "storage"
+      ]
+    },
+    {
+      "statement": "order_book_server requires --write-order-statuses, --write-raw-book-diffs, --batch-by-block",
+      "created_at": 1738077766.0,
+      "context": "For local orderbook. Known bug: state corruption after 30-40 min. Currently using REST API for orderbook instead",
+      "tags": [
+        "node",
+        "orderbook",
+        "configuration"
+      ]
+    },
+    {
+      "statement": "Official hl-node RAM requirement is 64GB non-validator, 128GB validator",
+      "created_at": 1738077766.0,
+      "context": "With jemalloc, 48GB can work. Without jemalloc, even 64GB will OOM",
+      "tags": [
+        "node",
+        "hardware",
+        "memory"
       ]
     },
     {

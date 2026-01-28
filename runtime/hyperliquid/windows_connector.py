@@ -462,18 +462,24 @@ class ObservationSystemConnector:
     # ==================== Event Handlers ====================
 
     async def _handle_price(self, event: Dict) -> None:
-        """Handle price event - feed to M1 and position manager."""
+        """Handle price event - feed to M1 and position manager.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        """
         try:
             symbol = event.get('symbol')
-            timestamp = event.get('timestamp')
 
-            if symbol and timestamp:
+            if symbol:
+                # Use wall clock for governance freshness check
+                now = time.time()
+
                 # Feed to M1
                 self._obs.ingest_observation(
-                    timestamp=timestamp,
+                    timestamp=now,  # Wall clock for governance validation
                     symbol=symbol,
                     event_type='HL_PRICE',
-                    payload=event,
+                    payload=event,  # Original timestamp preserved in payload
                 )
 
                 # Update position manager with new prices
@@ -486,17 +492,23 @@ class ObservationSystemConnector:
             pass
 
     async def _handle_liquidation(self, event: Dict) -> None:
-        """Handle liquidation event - feed to M1."""
+        """Handle liquidation event - feed to M1.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        """
         try:
             symbol = event.get('symbol')
-            timestamp = event.get('timestamp')
 
-            if symbol and timestamp:
+            if symbol:
+                # Use wall clock for governance freshness check
+                now = time.time()
+
                 self._obs.ingest_observation(
-                    timestamp=timestamp,
+                    timestamp=now,  # Wall clock for governance validation
                     symbol=symbol,
                     event_type='HL_LIQUIDATION',
-                    payload=event,
+                    payload=event,  # Original timestamp preserved in payload
                 )
         except Exception:
             pass
@@ -519,17 +531,23 @@ class ObservationSystemConnector:
             pass
 
     async def _handle_position_update(self, event: Dict) -> None:
-        """Handle position update from position manager - feed to M1."""
+        """Handle position update from position manager - feed to M1.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        """
         try:
             symbol = event.get('symbol')
-            timestamp = event.get('timestamp')
 
-            if symbol and timestamp:
+            if symbol:
+                # Use wall clock for governance freshness check
+                now = time.time()
+
                 self._obs.ingest_observation(
-                    timestamp=timestamp,
+                    timestamp=now,  # Wall clock for governance validation
                     symbol=symbol,
                     event_type='HL_POSITION',
-                    payload=event,
+                    payload=event,  # Original timestamp preserved in payload
                 )
         except Exception:
             pass

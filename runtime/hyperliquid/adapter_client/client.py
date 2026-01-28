@@ -253,10 +253,16 @@ class ObservationBridge:
         self._client.on_action = self._handle_action
 
     def _handle_price(self, event: adapter_pb2.MarketPriceEvent) -> None:
-        """Handle price event - feed to M1."""
+        """Handle price event - feed to M1.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        """
         try:
+            # Use wall clock for governance freshness check
+            now = time.time()
             self._obs.ingest_observation(
-                timestamp=event.timestamp_ms / 1000.0,
+                timestamp=now,  # Wall clock for governance validation
                 symbol=event.asset,
                 event_type='HL_PRICE',
                 payload={
@@ -264,18 +270,25 @@ class ObservationBridge:
                     'mark_price': event.mark_price if event.mark_price else None,
                     'block_height': event.block_height,
                     'exchange': 'HYPERLIQUID',
+                    'timestamp': event.timestamp_ms / 1000.0,  # Original timestamp for data accuracy
                 },
             )
         except Exception as e:
             print(f"[ObservationBridge] Error handling price: {e}")
 
     def _handle_action(self, event: adapter_pb2.ActionEvent) -> None:
-        """Handle action event - feed to M1 if relevant."""
+        """Handle action event - feed to M1 if relevant.
+
+        Note: Uses time.time() for governance freshness check to avoid
+        dropping data due to node/Binance time domain mismatch.
+        """
         try:
             # Only feed liquidations to M1
             if event.is_liquidation:
+                # Use wall clock for governance freshness check
+                now = time.time()
                 self._obs.ingest_observation(
-                    timestamp=event.timestamp_ms / 1000.0,
+                    timestamp=now,  # Wall clock for governance validation
                     symbol=event.asset,
                     event_type='HL_LIQUIDATION',
                     payload={
@@ -286,6 +299,7 @@ class ObservationBridge:
                         'value': event.size * event.price,
                         'block_height': event.block_height,
                         'exchange': 'HYPERLIQUID',
+                        'timestamp': event.timestamp_ms / 1000.0,  # Original timestamp for data accuracy
                     },
                 )
         except Exception as e:

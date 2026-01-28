@@ -343,10 +343,17 @@ class DirectNodeIntegration:
 
                 # If new file, reset position
                 if block_file != self._current_file:
+                    is_first_file = self._current_file is None
                     if self._current_file:
                         logger.debug(f"New block file: {block_file.name}")
                     self._current_file = block_file
-                    self._file_position = 0
+                    # Skip to end ONLY on first file if skip_catchup enabled
+                    # For subsequent files, read from beginning (they're new data)
+                    if self._config.skip_catchup and is_first_file:
+                        self._file_position = block_file.stat().st_size
+                        logger.info(f"Skip catchup: starting from end of {block_file.name} (pos={self._file_position})")
+                    else:
+                        self._file_position = 0
 
                 # Read new lines from file
                 await self._process_file()

@@ -91,27 +91,63 @@ Save to `~/override_gossip_config.json`
 ./hl-visor run-non-validator
 ```
 
-### With data output
+### Recommended Production Setup (with jemalloc)
 ```bash
-./hl-visor run-non-validator \
-  --write-trades \
+# CRITICAL: Use jemalloc to prevent OOM crashes
+# Without jemalloc: ~50GB RAM spikes, OOM with 64GB
+# With jemalloc: ~29GB RAM stable
+
+sudo apt install libjemalloc2
+
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+  ./hl-visor run-non-validator \
   --write-fills \
-  --write-order-statuses
+  --write-order-statuses \
+  --write-raw-book-diffs \
+  --disable-output-file-buffering
+```
+
+### Flag Reference
+
+| Flag | Output Location | Data Volume | Purpose |
+|------|-----------------|-------------|---------|
+| `--write-fills` | `node_fills/hourly/` | ~300MB/day | **Liquidations** (required for our system) |
+| `--write-trades` | `node_trades/hourly/` | ~1.3GB/day | Trade data (overridden by --write-fills) |
+| `--write-order-statuses` | `node_order_statuses/hourly/` | **~20GB/hr** | Order status history (for order_book_server) |
+| `--write-raw-book-diffs` | `node_raw_book_diffs/hourly/` | **~3GB/hr** | Orderbook deltas (for order_book_server) |
+| `--disable-output-file-buffering` | - | - | **Real-time data** (required for low latency) |
+| `--batch-by-block` | - | - | One block per line (for order_book_server) |
+| `--serve-info` | - | - | Local /info API endpoint |
+| `--serve-eth-rpc` | - | - | Local EVM RPC endpoint |
+
+### Flag Dependencies
+
+**For liquidation trading (our use case):**
+- `--write-fills` - Required (liquidation data from `node_fills`)
+- `--disable-output-file-buffering` - Required (real-time streaming)
+
+**For local orderbook (order_book_server):**
+- `--write-order-statuses` - Required
+- `--write-raw-book-diffs` - Required
+- `--batch-by-block` - Required
+- Note: order_book_server has known corruption bug after 30-40 min
+
+### Data Pruning (CRITICAL)
+
+`--write-order-statuses` and `--write-raw-book-diffs` generate **~25GB/hour**.
+
+**Must implement pruning cron job:**
+```bash
+# /home/user/hl/prune-old-data.sh - keep last 4 hours
+find ~/hl/data/node_order_statuses -type f -mmin +240 -delete
+find ~/hl/data/node_raw_book_diffs -type f -mmin +240 -delete
+
+# Crontab: 0 * * * * /home/user/hl/prune-old-data.sh
 ```
 
 ### With API servers
 ```bash
 ./hl-visor run-non-validator \
-  --serve-info \       # /info endpoint
-  --serve-eth-rpc      # EVM RPC endpoint
-```
-
-### Full setup
-```bash
-./hl-visor run-non-validator \
-  --write-trades \
-  --write-fills \
-  --write-order-statuses \
   --serve-info \
   --serve-eth-rpc
 ```
@@ -208,9 +244,81 @@ curl -X POST -H "Content-Type: application/json" \
 
 ---
 
+## Memory Issues & OOM Prevention
+
+### Problem: OOM Crashes with 64GB RAM
+
+The default glibc malloc causes memory fragmentation, leading to:
+- RAM spikes to ~50GB even with 64GB available
+- OOM kills by kernel or systemd-oomd
+- Session crashes
+
+### Solution: jemalloc
+
+```bash
+sudo apt install libjemalloc2
+
+# Run with jemalloc preloaded
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./hl-visor run-non-validator ...
+```
+
+**Results:**
+| Metric | Default malloc | With jemalloc |
+|--------|----------------|---------------|
+| RAM usage | ~50GB (spikes) | ~29GB (stable) |
+| OOM risk | High | Low |
+
+### Official Hardware Requirements
+
+| Node Type | CPU | RAM | Storage |
+|-----------|-----|-----|---------|
+| Validator | 32 cores | 128 GB | 1 TB SSD |
+| Non-validator | 16 cores | 64 GB | 500 GB SSD |
+
+### Data Generation Rates
+
+With all flags enabled, expect:
+- **~100 GB/day** total data generation
+- `node_order_statuses`: ~20GB/hour
+- `node_raw_book_diffs`: ~3GB/hour
+- `node_fills`: ~15MB/hour
+
+**Archive or delete old files regularly.**
+
+### Startup Script Location
+
+Production startup script: `~/hl/start-node.sh`
+Prune script: `~/hl/prune-old-data.sh`
+Cron: hourly prune keeping 4 hours of data
+
+### tmux Session Management
+
+```bash
+# Start node (creates tmux session 'hl-node')
+~/hl/start-node.sh
+
+# Attach to view output
+tmux attach -t hl-node
+
+# Detach (node keeps running)
+Ctrl+B, then D
+
+# View logs without attaching
+tail -f ~/hl/node.log
+
+# Stop node
+tmux kill-session -t hl-node
+
+# Check if running
+tmux has-session -t hl-node && echo "Running" || echo "Not running"
+```
+
+---
+
 ## References
 
 - Node repo: https://github.com/hyperliquid-dex/node
 - HyperEVM docs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm
 - nanoreth: https://github.com/hl-archive-node/nanoreth
 - Discord: #node-operators channel
+- jemalloc fix source: https://x.com/janklimo/status/1954393065210466695

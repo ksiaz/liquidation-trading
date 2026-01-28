@@ -1,5 +1,5 @@
 import time
-from typing import Dict, List, Any, Optional, TYPE_CHECKING
+from typing import Dict, List, Any, Optional, Set, TYPE_CHECKING
 from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
@@ -104,8 +104,9 @@ class ObservationSystem:
     The sealed Observation System.
     """
 
-    def __init__(self, allowed_symbols: List[str]):
-        self._allowed_symbols = set(allowed_symbols)
+    def __init__(self, allowed_symbols: Optional[List[str]] = None):
+        # None means allow ALL symbols dynamically
+        self._allowed_symbols: Optional[Set[str]] = set(allowed_symbols) if allowed_symbols else None
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
         self._failure_reason = ""
@@ -122,6 +123,9 @@ class ObservationSystem:
 
         # Hyperliquid collector (optional, for cascade primitives)
         self._hl_collector: Optional['HyperliquidCollector'] = None
+
+        # Track observed symbols when allowed_symbols is None (dynamic mode)
+        self._observed_symbols: Set[str] = set()
 
         # Hyperliquid liquidation tracking for cascade state
         self._hl_liquidation_timestamps: Dict[str, List[float]] = {}  # symbol -> timestamps
@@ -254,10 +258,13 @@ class ObservationSystem:
         # Future data tolerance: 5 seconds
         # Accept but do not modify system time
 
-        # M5 Governance Check: Symbol Whitelist
-        if symbol not in self._allowed_symbols:
-            return 
-            
+        # M5 Governance Check: Symbol Whitelist (None = allow all)
+        if self._allowed_symbols is not None and symbol not in self._allowed_symbols:
+            return
+
+        # Track observed symbols in dynamic mode
+        self._observed_symbols.add(symbol)
+
         # Dispatch to M1 (Normalize & Buffer)
         normalized_event = None
         
@@ -490,15 +497,18 @@ class ObservationSystem:
 
         Amendment 2026-01-10: Added primitive computation per ANNEX_M4_PRIMITIVE_FLOW.md
         """
+        # Use allowed_symbols if set, otherwise use dynamically observed symbols
+        active_symbols = self._allowed_symbols if self._allowed_symbols is not None else self._observed_symbols
+
         # Compute primitives for all active symbols
         primitives = {}
-        for symbol in sorted(self._allowed_symbols):
+        for symbol in sorted(active_symbols):
             primitives[symbol] = self._compute_primitives_for_symbol(symbol)
 
         return ObservationSnapshot(
             status=self._status,
             timestamp=self._system_time,
-            symbols_active=sorted(self._allowed_symbols),
+            symbols_active=sorted(active_symbols),
             counters=SystemCounters(
                 intervals_processed=None,
                 dropped_events=None

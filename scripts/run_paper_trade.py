@@ -46,7 +46,7 @@ logger = logging.getLogger('PaperTrade')
 
 from observation.governance import ObservationSystem
 from runtime.collector.service import CollectorService
-from runtime.monitoring import ResourceMonitor, HealthStatus
+from runtime.monitoring import ResourceMonitor, HealthStatus, CleanupCoordinator
 
 
 # Symbols to trade
@@ -100,12 +100,30 @@ async def run_paper_trade():
         monitor.register_component('position_state_manager', service._node_psm)
 
     # Register cascade state machine if available
+    sm = None
     try:
         from external_policy.ep2_strategy_cascade_sniper import _get_state_machine
         sm = _get_state_machine()
         monitor.register_component('cascade_state_machine', sm)
     except Exception as e:
         logger.debug(f"Could not register cascade state machine: {e}")
+
+    # Create cleanup coordinator (Phase 2: Memory Guards)
+    logger.info('Creating CleanupCoordinator...')
+    cleanup = CleanupCoordinator(interval_sec=300.0)  # Every 5 minutes
+
+    # Register pruners for each component
+    if service._node_bridge:
+        burst_agg = getattr(service._node_bridge, '_burst_aggregator', None)
+        if burst_agg:
+            cleanup.register_pruner('burst_aggregator', burst_agg.prune_stale)
+
+    if service._node_psm:
+        cleanup.register_pruner('position_manager_wallets', service._node_psm.prune_empty_wallets)
+        cleanup.register_pruner('position_manager_prices', service._node_psm.prune_stale_prices)
+
+    if sm and hasattr(sm, '_organic_detector') and sm._organic_detector:
+        cleanup.register_pruner('organic_flow_detector', sm._organic_detector.prune_stale)
 
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
@@ -126,6 +144,10 @@ async def run_paper_trade():
     # Start resource monitor
     logger.info('Starting resource monitor...')
     await monitor.start()
+
+    # Start cleanup coordinator
+    logger.info('Starting cleanup coordinator...')
+    await cleanup.start()
 
     # Start service
     logger.info('Starting service...')
@@ -173,6 +195,13 @@ async def run_paper_trade():
         logger.info(f"Final memory: {final_report.memory.rss_mb:.1f}MB ({final_report.memory.percent:.1f}%)")
         trend = monitor.get_trend()
         logger.info(f"Memory trend: {trend['growth_rate_mb_per_min']:.2f} MB/min over {trend['duration_min']:.1f} min")
+
+        # Log cleanup stats
+        cleanup_metrics = cleanup.get_metrics()
+        logger.info(f"Cleanup: {cleanup_metrics['cycles_completed']} cycles, {cleanup_metrics['total_items_pruned']} items pruned")
+
+        # Stop cleanup coordinator
+        await cleanup.stop()
 
         # Stop monitor
         await monitor.stop()

@@ -203,11 +203,15 @@ class OrganicFlowDetector:
         min_organic_volume: float = 5000.0, # Minimum organic volume for signal
         min_quiet_time: float = 2.0,        # Min seconds since last liq
         organic_ratio_threshold: float = 0.3,  # Min |net|/total ratio
+        max_symbols: int = 500,             # Max symbols to track (memory guard)
+        inactive_prune_sec: float = 300.0,  # Prune windows inactive for 5 min
     ):
         self._window_sec = window_sec
         self._min_organic_volume = min_organic_volume
         self._min_quiet_time = min_quiet_time
         self._organic_ratio_threshold = organic_ratio_threshold
+        self._max_symbols = max_symbols
+        self._inactive_prune_sec = inactive_prune_sec
 
         # Flow windows per symbol
         self._windows: Dict[str, OrganicFlowWindow] = {}
@@ -216,9 +220,13 @@ class OrganicFlowDetector:
         self._cascade_directions: Dict[str, CascadeDirection] = {}
         self._cascade_start_value: Dict[str, float] = {}  # Total liq value at cascade start
 
+        # Last activity timestamp per symbol (for pruning)
+        self._last_activity: Dict[str, float] = {}
+
         # Metrics
         self._signals_generated = 0
         self._absorptions_detected = 0
+        self._windows_pruned = 0
 
     def set_cascade_active(
         self,
@@ -239,6 +247,13 @@ class OrganicFlowDetector:
         """Record a liquidation event."""
         symbol = event.symbol
 
+        # Memory guard: check symbol limit before adding new
+        if symbol not in self._windows and len(self._windows) >= self._max_symbols:
+            self._prune_inactive(event.timestamp)
+            # If still at limit, skip this symbol
+            if len(self._windows) >= self._max_symbols:
+                return
+
         # Get or create window
         if symbol not in self._windows:
             self._windows[symbol] = OrganicFlowWindow(
@@ -247,6 +262,7 @@ class OrganicFlowDetector:
             )
 
         window = self._windows[symbol]
+        self._last_activity[symbol] = event.timestamp
 
         # Map liquidation side to trade side
         # Long liquidation = position closed by SELLING
@@ -273,6 +289,13 @@ class OrganicFlowDetector:
         if wallet_address and wallet_address in self.LIQUIDATOR_ADDRESSES:
             return  # Skip liquidator trades
 
+        # Memory guard: check symbol limit before adding new
+        if symbol not in self._windows and len(self._windows) >= self._max_symbols:
+            self._prune_inactive(timestamp)
+            # If still at limit, skip this symbol
+            if len(self._windows) >= self._max_symbols:
+                return
+
         # Get or create window
         if symbol not in self._windows:
             self._windows[symbol] = OrganicFlowWindow(
@@ -281,6 +304,8 @@ class OrganicFlowDetector:
             )
 
         window = self._windows[symbol]
+        self._last_activity[symbol] = timestamp
+
         window.add_trade(
             timestamp=timestamp,
             side=side,
@@ -409,6 +434,40 @@ class OrganicFlowDetector:
             "events_in_window": len(window.events),
         }
 
+    def _prune_inactive(self, current_time: float) -> int:
+        """
+        Remove windows for symbols inactive longer than threshold.
+
+        Returns number of windows pruned.
+        """
+        cutoff = current_time - self._inactive_prune_sec
+        to_remove = []
+
+        for symbol, last_time in self._last_activity.items():
+            if last_time < cutoff:
+                # Don't prune symbols with active cascades
+                if symbol not in self._cascade_directions:
+                    to_remove.append(symbol)
+
+        for symbol in to_remove:
+            self._windows.pop(symbol, None)
+            self._last_activity.pop(symbol, None)
+            self._windows_pruned += 1
+
+        return len(to_remove)
+
+    def prune_stale(self, current_time: Optional[float] = None) -> int:
+        """
+        Public method to prune stale windows.
+
+        Call periodically (e.g., every 60s) to prevent memory growth.
+
+        Returns number of windows pruned.
+        """
+        if current_time is None:
+            current_time = time.time()
+        return self._prune_inactive(current_time)
+
     def get_metrics(self) -> Dict:
         """Get detector metrics."""
         return {
@@ -420,4 +479,6 @@ class OrganicFlowDetector:
                 self._absorptions_detected / self._signals_generated
                 if self._signals_generated > 0 else 0.0
             ),
+            "windows_pruned": self._windows_pruned,
+            "max_symbols": self._max_symbols,
         }

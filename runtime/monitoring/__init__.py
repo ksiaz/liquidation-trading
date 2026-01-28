@@ -1,7 +1,7 @@
 """
 Runtime Monitoring Package
 
-Provides resource monitoring, health tracking, and alerting.
+Provides resource monitoring, health tracking, alerting, and memory cleanup.
 """
 
 from .resource_monitor import (
@@ -16,7 +16,16 @@ from .resource_monitor import (
     get_memory_snapshot,
 )
 
+from .memory_cleanup import (
+    CleanupCoordinator,
+    CleanupReport,
+    PruneResult,
+    get_coordinator,
+    reset_coordinator,
+)
+
 __all__ = [
+    # Resource Monitor
     'ResourceMonitor',
     'ResourceReport',
     'MemorySnapshot',
@@ -26,4 +35,10 @@ __all__ = [
     'get_monitor',
     'reset_monitor',
     'get_memory_snapshot',
+    # Cleanup Coordinator
+    'CleanupCoordinator',
+    'CleanupReport',
+    'PruneResult',
+    'get_coordinator',
+    'reset_coordinator',
 ]

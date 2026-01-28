@@ -62,6 +62,8 @@ class LiquidationBurstAggregator:
         self,
         window_sec: float = 10.0,
         min_burst_volume: float = 10_000.0,  # Minimum volume to report as burst
+        max_symbols: int = 500,              # Max symbols to track (memory guard)
+        inactive_prune_sec: float = 300.0,   # Prune symbols inactive for 5 min
     ):
         """
         Initialize aggregator.
@@ -69,16 +71,24 @@ class LiquidationBurstAggregator:
         Args:
             window_sec: Rolling window size in seconds (default 10s)
             min_burst_volume: Minimum total volume to report as burst (default $10k)
+            max_symbols: Maximum symbols to track (memory guard)
+            inactive_prune_sec: Remove symbols inactive longer than this
         """
         self._window_sec = window_sec
         self._min_burst_volume = min_burst_volume
+        self._max_symbols = max_symbols
+        self._inactive_prune_sec = inactive_prune_sec
 
         # Events by symbol: symbol -> list of (timestamp, side, value)
         self._events: Dict[str, List[tuple]] = defaultdict(list)
 
+        # Last activity per symbol (for pruning)
+        self._last_activity: Dict[str, float] = {}
+
         # Metrics
         self._events_received = 0
         self._bursts_generated = 0
+        self._symbols_pruned = 0
 
     def add_event(self, event: LiquidationEvent) -> None:
         """
@@ -94,11 +104,19 @@ class LiquidationBurstAggregator:
         if symbol.endswith('USDT'):
             symbol = symbol[:-4] + 'USDT'  # Normalize
 
+        # Memory guard: check symbol limit before adding new
+        if symbol not in self._events and len(self._events) >= self._max_symbols:
+            self._prune_inactive()
+            # If still at limit, skip
+            if len(self._events) >= self._max_symbols:
+                return
+
         self._events[symbol].append((
             event.timestamp,
             event.side,  # 'long' or 'short'
             event.value,
         ))
+        self._last_activity[symbol] = event.timestamp
 
         # Clean old events
         self._cleanup_old_events(symbol)
@@ -173,6 +191,31 @@ class LiquidationBurstAggregator:
                 bursts[symbol] = burst
         return bursts
 
+    def _prune_inactive(self) -> int:
+        """Remove symbols inactive longer than threshold."""
+        now = time.time()
+        cutoff = now - self._inactive_prune_sec
+        to_remove = []
+
+        for symbol, last_time in self._last_activity.items():
+            if last_time < cutoff:
+                to_remove.append(symbol)
+
+        for symbol in to_remove:
+            self._events.pop(symbol, None)
+            self._last_activity.pop(symbol, None)
+            self._symbols_pruned += 1
+
+        return len(to_remove)
+
+    def prune_stale(self) -> int:
+        """
+        Public method to prune stale symbols.
+
+        Call periodically to prevent memory growth.
+        """
+        return self._prune_inactive()
+
     def get_metrics(self) -> Dict:
         """Get aggregator metrics."""
         return {
@@ -180,6 +223,8 @@ class LiquidationBurstAggregator:
             'bursts_generated': self._bursts_generated,
             'symbols_tracked': len(self._events),
             'window_sec': self._window_sec,
+            'symbols_pruned': self._symbols_pruned,
+            'max_symbols': self._max_symbols,
         }
 
 

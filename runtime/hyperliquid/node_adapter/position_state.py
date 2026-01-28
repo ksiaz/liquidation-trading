@@ -231,6 +231,47 @@ class PositionStateManager:
             except asyncio.CancelledError:
                 pass
 
+    def prune_empty_wallets(self) -> int:
+        """
+        Remove empty wallet entries from cache (memory guard).
+
+        Call periodically to clean up wallets with no positions.
+
+        Returns number of wallets pruned.
+        """
+        empty_wallets = [
+            wallet for wallet, positions in self._cache.items()
+            if not positions
+        ]
+
+        for wallet in empty_wallets:
+            del self._cache[wallet]
+
+        return len(empty_wallets)
+
+    def prune_stale_prices(self, keep_coins: Optional[set] = None) -> int:
+        """
+        Remove prices for coins not in cache (memory guard).
+
+        Args:
+            keep_coins: Optional set of coins to always keep. If None,
+                       keeps only coins that have positions in cache.
+
+        Returns number of prices pruned.
+        """
+        if keep_coins is None:
+            # Get all coins with active positions
+            keep_coins = set()
+            for wallet_positions in self._cache.values():
+                keep_coins.update(wallet_positions.keys())
+
+        to_remove = [coin for coin in self._prices.keys() if coin not in keep_coins]
+
+        for coin in to_remove:
+            del self._prices[coin]
+
+        return len(to_remove)
+
     def update_prices(self, prices: Dict[str, float]) -> List[ProximityAlert]:
         """
         Update oracle prices and recalculate all proximities.
@@ -490,6 +531,10 @@ class PositionStateManager:
                 old = self._cache[wallet][coin]
                 self._by_tier[old.refresh_tier].discard((wallet, coin))
                 del self._cache[wallet][coin]
+
+                # Clean up empty wallet dict (memory guard)
+                if not self._cache[wallet]:
+                    del self._cache[wallet]
 
                 # Emit closed position event
                 if self.on_position_update:

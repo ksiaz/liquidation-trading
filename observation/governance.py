@@ -1,8 +1,12 @@
+import os
 import time
 from typing import Dict, List, Any, Optional, Set, TYPE_CHECKING
 from .types import ObservationSnapshot, SystemCounters, ObservationStatus, SystemHaltedException, M4PrimitiveBundle
 from .internal.m1_ingestion import M1IngestionEngine
 from .internal.m3_temporal import M3TemporalEngine
+
+# Diagnostic flag for M2 node tracing
+_DIAG_M2 = os.environ.get('DIAG_M2', '').lower() in ('1', 'true', 'yes')
 
 # Tier B-6: Cascade observation primitives
 from memory.m4_cascade_proximity import LiquidationCascadeProximity, compute_liquidation_cascade_proximity
@@ -132,6 +136,12 @@ class ObservationSystem:
         self._hl_liquidation_values: Dict[str, List[float]] = {}      # symbol -> values
         self._hl_liquidation_max_symbols = 500  # Memory guard
         self._hl_liquidation_pruned = 0
+
+        # M2 diagnostic counters
+        self._m2_diag_liquidations = 0
+        self._m2_diag_trades = 0
+        self._m2_diag_nodes_created = 0
+        self._m2_diag_last_report = 0
         
     def set_hyperliquid_source(self, hl_collector: 'HyperliquidCollector') -> None:
         """
@@ -311,13 +321,15 @@ class ObservationSystem:
                     best_ask_price=normalized_event['best_ask_price']
                 )
 
-            # Record HL liquidations for cascade state tracking
+            # Record HL liquidations for cascade state tracking AND create M2 nodes
             if normalized_event and event_type == 'HL_LIQUIDATION':
                 self.record_hl_liquidation(
                     symbol=normalized_event['symbol'],
                     timestamp=normalized_event['timestamp'],
                     value=normalized_event['value']
                 )
+                # Also create M2 nodes from HL liquidations (same as Binance liquidations)
+                self._create_or_update_node_from_liquidation(normalized_event)
         except Exception as e:
             # Internal crash -> FAILED state
              self._trigger_failure(f"Internal Processing Error: {e}")
@@ -412,6 +424,8 @@ class ObservationSystem:
         # Check if node exists
         existing_node = self._m2_store.get_node(node_id)
 
+        self._m2_diag_liquidations += 1
+
         if existing_node:
             # Update existing node
             self._m2_store.record_liquidation_at_node(node_id, timestamp, side)
@@ -429,6 +443,7 @@ class ObservationSystem:
                 initial_strength=0.5,
                 volume=volume
             )
+            self._m2_diag_nodes_created += 1
 
     def _associate_trade_with_nodes(self, normalized_event: Dict) -> None:
         """Associate trade with nearby M2 nodes.
@@ -448,6 +463,8 @@ class ObservationSystem:
 
         # Find nodes near this price
         nearby_nodes = self._m2_store.get_nodes_near_price(symbol, price)
+
+        self._m2_diag_trades += 1
 
         if nearby_nodes:
             # Update all nearby nodes with trade evidence
@@ -480,6 +497,14 @@ class ObservationSystem:
                     initial_strength=0.3,
                     volume=volume
                 )
+                self._m2_diag_nodes_created += 1
+
+        # DIAG: Periodic M2 stats
+        if _DIAG_M2 and time.time() - self._m2_diag_last_report > 10:
+            self._m2_diag_last_report = time.time()
+            total_nodes = len(self._m2_store._active_nodes)
+            print(f"[M2-DIAG] Stats: {self._m2_diag_trades} trades, {self._m2_diag_liquidations} liqs, "
+                  f"{self._m2_diag_nodes_created} nodes created, {total_nodes} active", flush=True)
 
     def _get_snapshot(self) -> ObservationSnapshot:
         """Construct public snapshot from internal states.
@@ -712,6 +737,11 @@ class ObservationSystem:
             # Get M2 nodes for this symbol
             active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
 
+            # DIAG: Log M2 node counts
+            if _DIAG_M2 and self._cycle_count % 10 == 1:
+                total_nodes = len(self._m2_store._active_nodes)
+                print(f"[M2-DIAG] {symbol}: {len(active_nodes)} active nodes (total store: {total_nodes})", flush=True)
+
             if active_nodes:
                 # Detect order blocks from individual nodes
                 # Find strongest order block candidate
@@ -739,6 +769,11 @@ class ObservationSystem:
                         # Find clusters
                         clusters = find_node_clusters(active_nodes, max_gap_pct=0.2)
 
+                        # DIAG: Log cluster info
+                        if _DIAG_M2 and self._cycle_count % 10 == 1:
+                            cluster_sizes = [len(c) for c in clusters]
+                            print(f"[M2-DIAG] {symbol}: {len(clusters)} clusters, sizes={cluster_sizes}", flush=True)
+
                         # Detect zones from clusters
                         zones = []
                         for cluster in clusters:
@@ -750,12 +785,20 @@ class ObservationSystem:
                             if zone:
                                 zones.append(zone)
 
+                        # DIAG: Log zone detection
+                        if _DIAG_M2 and zones and self._cycle_count % 10 == 1:
+                            for z in zones:
+                                print(f"[M2-DIAG] {symbol}: ZONE {z.zone_type} @ {z.zone_center:.2f} "
+                                      f"(disp={z.displacement_detected}, retest={z.retest_detected})", flush=True)
+
                         # Return strongest zone (highest total volume)
                         if zones:
                             supply_demand_zone_primitive = max(
                                 zones,
                                 key=lambda z: z.total_volume
                             )
+                elif _DIAG_M2 and self._cycle_count % 10 == 1:
+                    print(f"[M2-DIAG] {symbol}: {len(active_nodes)} nodes (need >=3 for zone)", flush=True)
 
         except Exception as e:
             # Pattern detection failures should not crash snapshot

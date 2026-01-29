@@ -569,6 +569,7 @@ class ObservationBridge:
         Handle proximity alert from PositionStateManager.
 
         Called when a position crosses a tier threshold.
+        Creates M2 nodes at liquidation prices for CRITICAL/WATCHLIST positions.
         """
         try:
             self._proximity_alerts += 1
@@ -580,8 +581,29 @@ class ObservationBridge:
                 f"({alert.proximity_pct:.2f}% to liquidation, ${alert.position_value:,.0f})"
             )
 
-            # Could also ingest as a special event type if needed
-            # For now, just log - the position update will be ingested separately
+            # Create M2 node at liquidation price for CRITICAL/WATCHLIST positions
+            # These mark important price levels where liquidations are imminent
+            from runtime.hyperliquid.node_adapter.position_state import RefreshTier
+            if alert.new_tier in (RefreshTier.CRITICAL, RefreshTier.WATCHLIST):
+                # Convert coin to symbol format (BTC -> BTCUSDT)
+                symbol = f"{alert.coin}USDT" if not alert.coin.endswith('USDT') else alert.coin
+
+                # Ingest as a synthetic liquidation at the liquidation price level
+                # This creates M2 nodes at key price levels before actual liquidations
+                payload = {
+                    'price': alert.liquidation_price,
+                    'side': alert.side,
+                    'value': alert.position_value,  # USD value at risk
+                    'liquidated_size': 0,  # Not yet liquidated
+                    'timestamp': alert.timestamp,
+                    'wallet_address': alert.wallet[:10],  # Truncated for privacy
+                }
+                self._obs.ingest_observation(
+                    timestamp=time.time(),
+                    symbol=symbol,
+                    event_type='HL_LIQUIDATION',  # Reuse liquidation path to create M2 nodes
+                    payload=payload,
+                )
 
         except Exception as e:
             self._errors += 1

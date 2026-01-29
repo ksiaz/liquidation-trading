@@ -74,7 +74,7 @@ class M3TemporalEngine:
 
         # Sub-components
         self._baseline = BaselineCalculator(baseline_windows)
-        self._promoted_events: List[PromotedEventInternal] = []
+        self._promoted_events: deque = deque(maxlen=1000)  # Bounded to prevent memory leak
 
         # Counters (Internal M4)
         self.stats = {

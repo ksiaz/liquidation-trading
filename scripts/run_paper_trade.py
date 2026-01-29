@@ -131,6 +131,9 @@ async def run_paper_trade():
     # Register governance liquidation tracking pruning
     cleanup.register_pruner('governance_liquidations', obs.prune_hl_liquidation_tracking)
 
+    # Register M2 archived nodes pruning (prevents memory leak from old nodes)
+    cleanup.register_pruner('m2_archived_nodes', obs._m2_store.prune_archived_nodes)
+
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
 

@@ -32,24 +32,27 @@ class ContinuityMemoryStore:
     """
     
     
-    def __init__(self, event_logger=None):
+    def __init__(self, event_logger=None, max_archived_nodes: int = 1000):
         """Initialize store with three collections.
-        
+
         Args:
             event_logger: Optional database logger for event-level capture
+            max_archived_nodes: Maximum archived nodes to retain (memory guard)
         """
         self._active_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
         self._dormant_evidence: Dict[str, HistoricalEvidence] = {}
         self._archived_nodes: Dict[str, EnrichedLiquidityMemoryNode] = {}
-        
+
         self._total_nodes_created = 0
         self._total_interactions = 0
         self._last_state_update_ts: Optional[float] = None
-        
+        self._archived_nodes_pruned = 0
+        self._max_archived_nodes = max_archived_nodes
+
         # Event logger for research
         self._event_logger = event_logger
-        
+
         # Topology and pressure analyzers
         self.topology = MemoryTopology()
         self.pressure_analyzer = MemoryPressureAnalyzer()
@@ -143,10 +146,14 @@ class ContinuityMemoryStore:
         
         for node_id in to_archived:
             self._transition_to_archived(node_id)
-        
+
+        # Prune old archived nodes to prevent unbounded growth
+        pruned = self.prune_archived_nodes()
+
         return {
             'transitioned_to_dormant': len(to_dormant),
-            'transitioned_to_archived': len(to_archived)
+            'transitioned_to_archived': len(to_archived),
+            'archived_pruned': pruned
         }
     
     def decay_nodes(self, current_ts: float):
@@ -685,9 +692,58 @@ class ContinuityMemoryStore:
             'active_nodes': len(self._active_nodes),
             'dormant_nodes': len(self._dormant_nodes),
             'archived_nodes': len(self._archived_nodes),
+            'archived_nodes_pruned': self._archived_nodes_pruned,
+            'max_archived_nodes': self._max_archived_nodes,
             'total_interactions': self._total_interactions,
             'last_state_update_ts': self._last_state_update_ts,
         }
+
+    def prune_archived_nodes(self, max_age_sec: float = 3600.0) -> int:
+        """
+        Prune old archived nodes to prevent unbounded memory growth.
+
+        Args:
+            max_age_sec: Maximum age for archived nodes (default 1 hour)
+
+        Returns:
+            Number of nodes pruned
+        """
+        if not self._archived_nodes:
+            return 0
+
+        current_ts = self._last_state_update_ts or 0.0
+        cutoff = current_ts - max_age_sec
+
+        # Find nodes to prune (oldest first if over limit, or too old)
+        to_prune = []
+
+        for node_id, node in self._archived_nodes.items():
+            if node.last_interaction_ts < cutoff:
+                to_prune.append(node_id)
+
+        # If still over limit, prune oldest
+        if len(self._archived_nodes) - len(to_prune) > self._max_archived_nodes:
+            # Sort by last interaction (oldest first)
+            remaining = [
+                (nid, n.last_interaction_ts)
+                for nid, n in self._archived_nodes.items()
+                if nid not in to_prune
+            ]
+            remaining.sort(key=lambda x: x[1])
+
+            # Prune oldest to get under limit
+            excess = len(self._archived_nodes) - len(to_prune) - self._max_archived_nodes
+            for nid, _ in remaining[:excess]:
+                to_prune.append(nid)
+
+        # Actually prune
+        for node_id in to_prune:
+            del self._archived_nodes[node_id]
+            # Also clean up dormant evidence if any
+            self._dormant_evidence.pop(node_id, None)
+            self._archived_nodes_pruned += 1
+
+        return len(to_prune)
     
     # ==================== M3: TEMPORAL EVIDENCE QUERY INTERFACE ====================
     

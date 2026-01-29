@@ -221,9 +221,15 @@ class PolicyAdapter:
                 if proposal:
                     print(f"  [geometry] → {proposal.action_type} ({proposal.confidence})")
                 else:
-                    has_zone = primitives.get("supply_demand_zone") is not None
-                    has_pen = primitives.get("zone_penetration") is not None
-                    print(f"  [geometry] → None (zone={has_zone}, pen={has_pen})")
+                    zone = primitives.get("supply_demand_zone")
+                    if zone:
+                        # Show why zone isn't confirmed
+                        print(f"  [geometry] → None (zone={zone.zone_type}, disp={zone.displacement_detected}, "
+                              f"retest={zone.retest_detected}, rt_count={zone.retest_count}, "
+                              f"nodes={zone.node_count}, strength={zone.avg_node_strength:.2f})")
+                    else:
+                        has_pen = primitives.get("zone_penetration") is not None
+                        print(f"  [geometry] → None (zone=None, pen={has_pen})")
             if proposal:
                 proposals.append(proposal)
 

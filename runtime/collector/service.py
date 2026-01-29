@@ -629,8 +629,16 @@ class CollectorService:
                     # BTCUSDT -> BTC, ETHUSDT -> ETH
                     hl_proximity = None
                     absorption = None
-                    if self._hyperliquid_enabled and self._hyperliquid_collector:
-                        coin = symbol.replace('USDT', '')
+                    coin = symbol.replace('USDT', '')
+
+                    # Try node mode first (has more complete data)
+                    if self._use_node_mode and self._node_bridge:
+                        proximity_provider = self._node_bridge.get_proximity_provider()
+                        if proximity_provider:
+                            hl_proximity = proximity_provider.get_proximity(coin)
+
+                    # Fallback to WebSocket collector if no node data
+                    if hl_proximity is None and self._hyperliquid_enabled and self._hyperliquid_collector:
                         hl_proximity = self._hyperliquid_collector.get_proximity(coin)
 
                         # Phase 6: Compute absorption analysis from orderbook + proximity

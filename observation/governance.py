@@ -409,10 +409,14 @@ class ObservationSystem:
             normalized_event: Normalized liquidation event from M1
         """
         symbol = normalized_event['symbol']
-        price = normalized_event['price']
+        # Handle both Binance (price) and HL (liquidation_price) liquidation events
+        price = normalized_event.get('price') or normalized_event.get('liquidation_price', 0)
+        if not price or price <= 0:
+            return  # Skip if no valid price
         side = normalized_event['side']
         timestamp = normalized_event['timestamp']
-        volume = normalized_event.get('quote_qty', 0.0)
+        # Handle both Binance (quote_qty) and HL (value) volume fields
+        volume = normalized_event.get('quote_qty') or normalized_event.get('value', 0.0)
 
         # Generate node ID: {symbol}_{side}_{price_bucket}
         # Price bucket: round to 0.1% precision

@@ -583,8 +583,9 @@ class ObservationBridge:
 
             # Create M2 node at liquidation price for CRITICAL/WATCHLIST positions
             # These mark important price levels where liquidations are imminent
-            from runtime.hyperliquid.node_adapter.position_state import RefreshTier
-            if alert.new_tier in (RefreshTier.CRITICAL, RefreshTier.WATCHLIST):
+            # Check tier match using .value for robustness against enum import issues
+            tier_val = alert.new_tier.value if hasattr(alert.new_tier, 'value') else str(alert.new_tier)
+            if tier_val in ('CRITICAL', 'WATCHLIST'):
                 # Convert coin to symbol format (BTC -> BTCUSDT)
                 symbol = f"{alert.coin}USDT" if not alert.coin.endswith('USDT') else alert.coin
 

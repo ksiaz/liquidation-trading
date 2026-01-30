@@ -17,10 +17,11 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, Dict, Callable, Awaitable, List
+from typing import Optional, Dict, Callable, Awaitable, List, Tuple
 
 from .action_extractor import PriceEvent, LiquidationEvent, OrderActivity
 from runtime.hyperliquid.types import LiquidationProximity
+from memory.candidate_zones import CandidateZoneManager, CandidateZoneConfig
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +364,7 @@ class ObservationBridge:
         min_order_notional: float = MIN_ORDER_NOTIONAL,
         burst_window_sec: float = 10.0,
         min_burst_volume: float = 10_000.0,
+        enable_candidate_zones: bool = True,
     ):
         """
         Initialize bridge.
@@ -373,6 +375,7 @@ class ObservationBridge:
             min_order_notional: Minimum USD value to forward orders (default $10k)
             burst_window_sec: Liquidation burst aggregation window (default 10s)
             min_burst_volume: Minimum volume to report as burst (default $10k)
+            enable_candidate_zones: Enable M2.5 candidate zone tracking (default True)
         """
         self._obs = observation_system
         self._psm = position_state_manager
@@ -386,6 +389,14 @@ class ObservationBridge:
             window_sec=burst_window_sec,
             min_burst_volume=min_burst_volume,
         )
+
+        # M2.5 Candidate Zone Manager - tracks potential liquidation zones
+        self._candidate_zone_manager: Optional[CandidateZoneManager] = None
+        if enable_candidate_zones:
+            self._candidate_zone_manager = CandidateZoneManager()
+
+        # Last validated context (for governance to retrieve when creating M2 nodes)
+        self._last_validated_context: Optional[dict] = None
 
         # Metrics
         self._prices_forwarded = 0
@@ -434,6 +445,7 @@ class ObservationBridge:
             self._prices_forwarded += 1
 
             # Track price for position manager
+            prev_price = self._latest_prices.get(event.symbol)
             self._latest_prices[event.symbol] = event.oracle_price
 
             # Update position manager with new prices (batched)
@@ -441,6 +453,12 @@ class ObservationBridge:
             if self._psm and self._prices_forwarded % 50 == 0:
                 # Batch update every ~50 prices to reduce overhead
                 self._psm.update_prices(self._latest_prices)
+
+            # Update candidate zones with price movement
+            if self._candidate_zone_manager:
+                self._candidate_zone_manager.update_from_price(
+                    event.symbol, event.oracle_price, prev_price
+                )
 
         except Exception as e:
             self._errors += 1
@@ -483,10 +501,26 @@ class ObservationBridge:
             # Add to burst aggregator for cascade triggering
             self._burst_aggregator.add_event(event)
 
+            # Validate candidate zones - if liquidation matches a candidate zone,
+            # get context to attach to the M2 node
+            candidate_context = None
+            if self._candidate_zone_manager:
+                candidate_context = self._candidate_zone_manager.validate_zone(
+                    event.symbol, event.liquidation_price
+                )
+                if candidate_context:
+                    # Store context for governance to retrieve when creating M2 node
+                    self._last_validated_context = {
+                        'symbol': event.symbol,
+                        'price': event.liquidation_price,
+                        'context': candidate_context
+                    }
+
             # Log liquidations - these are important
+            context_info = " [VALIDATED ZONE]" if candidate_context else ""
             logger.info(
                 f"Liquidation: {event.symbol} {event.side} "
-                f"${event.value:,.0f} @ {event.liquidation_price}"
+                f"${event.value:,.0f} @ {event.liquidation_price}{context_info}"
             )
 
         except Exception as e:
@@ -569,9 +603,8 @@ class ObservationBridge:
         Handle proximity alert from PositionStateManager.
 
         Called when a position crosses a tier threshold.
-        Logs the alert for monitoring. Does NOT create M2 nodes - per M2 constitutional
-        spec, nodes should only be created from ACTUAL liquidations, not proximity alerts.
-        Proximity data is used by CASCADE_SNIPER for cluster detection, not for zone creation.
+        Forwards to CandidateZoneManager for potential zone tracking (M2.5 layer).
+        Does NOT create M2 nodes - per constitutional spec, M2 nodes only from actual liquidations.
         """
         try:
             self._proximity_alerts += 1
@@ -583,12 +616,12 @@ class ObservationBridge:
                 f"({alert.proximity_pct:.2f}% to liquidation, ${alert.position_value:,.0f})"
             )
 
-            # NOTE: Previously this created M2 nodes from proximity alerts, but this
-            # violated the M2 constitutional spec which states:
-            # "Nodes are created ONLY on liquidation events."
-            # Proximity alerts are predictions (positions that MIGHT liquidate),
-            # not observations (positions that DID liquidate).
-            # This caused the geometry strategy to create zones from noise.
+            # Forward to M2.5 Candidate Zone Manager
+            # This tracks potential liquidation zones without creating M2 nodes.
+            # Candidate zones accumulate price action evidence and get validated
+            # when actual liquidations occur (providing context to M2 nodes).
+            if self._candidate_zone_manager:
+                self._candidate_zone_manager.process_proximity_alert(alert)
 
         except Exception as e:
             self._errors += 1
@@ -617,6 +650,18 @@ class ObservationBridge:
 
         # Add burst aggregator metrics
         metrics['burst_aggregator'] = self._burst_aggregator.get_metrics()
+
+        # Add candidate zone metrics if available
+        if self._candidate_zone_manager:
+            czm = self._candidate_zone_manager.get_metrics()
+            metrics['candidate_zones'] = {
+                'zones_created': czm.zones_created,
+                'zones_validated': czm.zones_validated,
+                'zones_expired': czm.zones_expired,
+                'zones_active': czm.zones_active,
+                'zones_dormant': czm.zones_dormant,
+                'validation_rate': czm.validation_rate,
+            }
 
         return metrics
 
@@ -658,6 +703,42 @@ class ObservationBridge:
         if self._psm:
             return NodeProximityProvider(self._psm, self._burst_aggregator)
         return None
+
+    def get_candidate_zone_manager(self) -> Optional[CandidateZoneManager]:
+        """Get the candidate zone manager for direct access."""
+        return self._candidate_zone_manager
+
+    def get_candidate_zones(self, symbol: str) -> list:
+        """Get active candidate zones for a symbol."""
+        if self._candidate_zone_manager:
+            return self._candidate_zone_manager.get_zones(symbol, state='ACTIVE')
+        return []
+
+    def get_strongest_candidate_zones(self, symbol: str, limit: int = 5) -> list:
+        """Get strongest candidate zones for a symbol."""
+        if self._candidate_zone_manager:
+            return self._candidate_zone_manager.get_strongest_zones(symbol, limit)
+        return []
+
+    def decay_candidate_zones(self) -> int:
+        """Run decay on candidate zones. Returns number of expired zones."""
+        if self._candidate_zone_manager:
+            return self._candidate_zone_manager.decay_zones()
+        return 0
+
+    def prune_candidate_zones(self) -> int:
+        """Prune stale proximity buffer entries. Returns count pruned."""
+        if self._candidate_zone_manager:
+            return self._candidate_zone_manager.prune_proximity_buffer()
+        return 0
+
+    def estimate_candidate_zone_memory(self) -> Tuple[float, int]:
+        """Estimate candidate zone memory usage. Returns (MB, item_count)."""
+        if self._candidate_zone_manager:
+            bytes_used = self._candidate_zone_manager.estimate_memory_bytes()
+            item_count = self._candidate_zone_manager.get_item_count()
+            return bytes_used / (1024 * 1024), item_count
+        return 0.0, 0
 
 
 def create_integrated_node(

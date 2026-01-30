@@ -262,8 +262,11 @@ def detect_supply_demand_zone(
             retest_detected = True
             retest_count = len(recent_nodes)
 
-    # Generate zone ID
-    zone_id = f"{nodes[0].symbol}_{zone_type}_{int(zone_center)}"
+    # Generate zone ID with coarse rounding to prevent oscillation at boundaries
+    # Round to ~0.1% of price (min 1.0) so small movements don't flip zone_id
+    granularity = max(zone_center * 0.001, 1.0)
+    rounded_center = round(zone_center / granularity) * granularity
+    zone_id = f"{nodes[0].symbol}_{zone_type}_{rounded_center:.0f}"
 
     return SupplyDemandZonePrimitive(
         zone_id=zone_id,

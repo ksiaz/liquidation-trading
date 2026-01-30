@@ -301,9 +301,23 @@ def _is_zone_invalidated(
     if zone is None:
         return True
 
-    # Zone ID changed (different zone now in same region)
+    # Zone ID changed - check if it's actually a different zone geometrically
     if zone.zone_id != entry_context["zone_id"]:
-        return True
+        # If geometry is similar (bounds shifted < 10% of zone width), treat as same zone
+        entry_width = entry_context.get("zone_width", 0)
+        if entry_width > 0:
+            low_shift = abs(zone.zone_low - entry_context.get("zone_low", 0))
+            high_shift = abs(zone.zone_high - entry_context.get("zone_high", 0))
+            max_shift = max(low_shift, high_shift)
+            if max_shift < entry_width * 0.1:
+                # Geometry similar, don't invalidate (zone_id just drifted)
+                pass
+            else:
+                # Geometry actually changed, invalidate
+                return True
+        else:
+            # No width info, fall back to ID comparison
+            return True
 
     # Check for zone break (price closed beyond bounds)
     if current_price is not None:

@@ -569,42 +569,26 @@ class ObservationBridge:
         Handle proximity alert from PositionStateManager.
 
         Called when a position crosses a tier threshold.
-        Creates M2 nodes at liquidation prices for CRITICAL/WATCHLIST positions.
+        Logs the alert for monitoring. Does NOT create M2 nodes - per M2 constitutional
+        spec, nodes should only be created from ACTUAL liquidations, not proximity alerts.
+        Proximity data is used by CASCADE_SNIPER for cluster detection, not for zone creation.
         """
         try:
             self._proximity_alerts += 1
 
-            # Log the alert
+            # Log the alert for monitoring
             logger.warning(
                 f"Proximity Alert: {alert.wallet[:10]}... {alert.coin} "
                 f"{alert.old_tier.value} -> {alert.new_tier.value} "
                 f"({alert.proximity_pct:.2f}% to liquidation, ${alert.position_value:,.0f})"
             )
 
-            # Create M2 node at liquidation price for CRITICAL/WATCHLIST positions
-            # These mark important price levels where liquidations are imminent
-            # Check tier match using .value for robustness against enum import issues
-            tier_val = alert.new_tier.value if hasattr(alert.new_tier, 'value') else str(alert.new_tier)
-            if tier_val in ('CRITICAL', 'WATCHLIST'):
-                # Convert coin to symbol format (BTC -> BTCUSDT)
-                symbol = f"{alert.coin}USDT" if not alert.coin.endswith('USDT') else alert.coin
-
-                # Ingest as a synthetic liquidation at the liquidation price level
-                # This creates M2 nodes at key price levels before actual liquidations
-                payload = {
-                    'price': alert.liquidation_price,
-                    'side': alert.side,
-                    'value': alert.position_value,  # USD value at risk
-                    'liquidated_size': 0,  # Not yet liquidated
-                    'timestamp': alert.timestamp,
-                    'wallet_address': alert.wallet[:10],  # Truncated for privacy
-                }
-                self._obs.ingest_observation(
-                    timestamp=time.time(),
-                    symbol=symbol,
-                    event_type='HL_LIQUIDATION',  # Reuse liquidation path to create M2 nodes
-                    payload=payload,
-                )
+            # NOTE: Previously this created M2 nodes from proximity alerts, but this
+            # violated the M2 constitutional spec which states:
+            # "Nodes are created ONLY on liquidation events."
+            # Proximity alerts are predictions (positions that MIGHT liquidate),
+            # not observations (positions that DID liquidate).
+            # This caused the geometry strategy to create zones from noise.
 
         except Exception as e:
             self._errors += 1

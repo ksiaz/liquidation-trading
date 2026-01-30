@@ -166,12 +166,10 @@ class SLBRSStrategy:
         # Rule 2: Regime gate - SLBRS only active in SIDEWAYS regime
         if regime_state is None or regime_state.regime != "SIDEWAYS_ACTIVE":
             # Regime not sideways -> SLBRS disabled
-            # If position open, exit due to regime change
-            if position_state in (PositionState.ENTERING, PositionState.OPEN, PositionState.REDUCING):
-                return self._generate_exit_proposal(
-                    reason="REGIME_CHANGE",
-                    context=context
-                )
+            # Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT
+            # SLBRS cannot exit positions it didn't open (or even ones it did) based
+            # solely on regime change - that violates thesis invalidation principle.
+            # Return None to prevent new entries; let owning strategy handle exits.
             return None
 
         # Rule 3: Check position state and generate appropriate action

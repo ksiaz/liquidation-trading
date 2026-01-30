@@ -73,6 +73,18 @@ class VWAPCalculator:
         else:
             return None
 
+    def get_vwap(self) -> Optional[float]:
+        """
+        Get current VWAP value.
+
+        Returns:
+            Current VWAP if volume accumulated, None otherwise
+        """
+        if self._cumulative_volume > 0:
+            return self._cumulative_pv / self._cumulative_volume
+        else:
+            return None
+
     def get_distance(self, current_price: float) -> Optional[float]:
         """
         Get absolute distance from current price to VWAP.

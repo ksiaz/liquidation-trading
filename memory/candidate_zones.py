@@ -9,16 +9,198 @@ Constitutional Compliance:
 - Candidate zones are NOT M2 nodes
 - M2 nodes still only created from actual liquidations
 - Candidate zones track factual price action, not predictions
+
+Archive:
+- Expired zones are archived to SQLite for long-term learning
+- Historical zone data enriches new zones at similar price levels
+- System builds knowledge: "more time = richer understanding"
 """
 
 import math
 import time
 import logging
-from dataclasses import dataclass, field
+import sqlite3
+import os
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Zone Archive (Persistent Storage)
+# ==============================================================================
+
+class CandidateZoneArchive:
+    """
+    SQLite archive for expired candidate zones.
+
+    Enables long-term learning by preserving price action history
+    at liquidation price levels across sessions.
+    """
+
+    def __init__(self, db_path: str = "candidate_zones.db"):
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Initialize database schema."""
+        self._conn = sqlite3.connect(self._db_path)
+        self._conn.row_factory = sqlite3.Row
+
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS archived_zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zone_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                price_center REAL NOT NULL,
+                price_low REAL NOT NULL,
+                price_high REAL NOT NULL,
+
+                -- Origin
+                created_at REAL NOT NULL,
+                expired_at REAL NOT NULL,
+                initial_positions_at_risk INTEGER,
+                initial_value_at_risk REAL,
+                dominant_side TEXT,
+
+                -- Price action evidence
+                price_visits INTEGER DEFAULT 0,
+                price_rejections INTEGER DEFAULT 0,
+                price_breakthroughs INTEGER DEFAULT 0,
+                time_in_zone_sec REAL DEFAULT 0,
+                max_penetration_depth REAL DEFAULT 0,
+
+                -- Volume evidence
+                total_volume_in_zone REAL DEFAULT 0,
+                buy_volume_in_zone REAL DEFAULT 0,
+                sell_volume_in_zone REAL DEFAULT 0,
+
+                -- Absorption evidence
+                absorption_events INTEGER DEFAULT 0,
+
+                -- Outcome
+                was_validated INTEGER DEFAULT 0,  -- 1 if liquidation occurred
+                final_strength REAL DEFAULT 0,
+
+                -- Indexing
+                price_bucket TEXT NOT NULL  -- For fast lookup of nearby zones
+            )
+        """)
+
+        # Index for fast price-level lookups
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zones_symbol_bucket
+            ON archived_zones(symbol, price_bucket)
+        """)
+
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_zones_created
+            ON archived_zones(created_at)
+        """)
+
+        self._conn.commit()
+        logger.info(f"[CANDIDATE_ZONES] Archive initialized: {self._db_path}")
+
+    def archive_zone(self, zone: 'CandidateZone', was_validated: bool = False) -> None:
+        """Archive an expired or validated zone."""
+        # Calculate price bucket for fast lookups (0.5% granularity)
+        bucket_size = zone.price_center * 0.005
+        price_bucket = f"{zone.symbol}_{int(zone.price_center / bucket_size) * bucket_size:.0f}"
+
+        self._conn.execute("""
+            INSERT INTO archived_zones (
+                zone_id, symbol, price_center, price_low, price_high,
+                created_at, expired_at, initial_positions_at_risk,
+                initial_value_at_risk, dominant_side,
+                price_visits, price_rejections, price_breakthroughs,
+                time_in_zone_sec, max_penetration_depth,
+                total_volume_in_zone, buy_volume_in_zone, sell_volume_in_zone,
+                absorption_events, was_validated, final_strength, price_bucket
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            zone.zone_id, zone.symbol, zone.price_center, zone.price_low, zone.price_high,
+            zone.created_at, time.time(), zone.initial_positions_at_risk,
+            zone.initial_value_at_risk, zone.dominant_side,
+            zone.price_visits, zone.price_rejections, zone.price_breakthroughs,
+            zone.time_in_zone_sec, zone.max_penetration_depth,
+            zone.total_volume_in_zone, zone.buy_volume_in_zone, zone.sell_volume_in_zone,
+            zone.absorption_events, 1 if was_validated else 0, zone.strength, price_bucket
+        ))
+        self._conn.commit()
+
+    def get_historical_context(
+        self,
+        symbol: str,
+        price: float,
+        tolerance_pct: float = 0.01,
+        max_age_days: float = 30.0
+    ) -> Dict:
+        """
+        Get aggregated historical data for zones near a price level.
+
+        Returns context that can enrich a new zone forming at this level.
+        """
+        price_low = price * (1 - tolerance_pct)
+        price_high = price * (1 + tolerance_pct)
+        min_created = time.time() - (max_age_days * 86400)
+
+        rows = self._conn.execute("""
+            SELECT
+                COUNT(*) as zone_count,
+                SUM(price_visits) as total_visits,
+                SUM(price_rejections) as total_rejections,
+                SUM(price_breakthroughs) as total_breakthroughs,
+                SUM(time_in_zone_sec) as total_time_in_zone,
+                SUM(was_validated) as times_validated,
+                AVG(final_strength) as avg_final_strength,
+                MAX(initial_value_at_risk) as max_value_at_risk
+            FROM archived_zones
+            WHERE symbol = ?
+              AND price_center BETWEEN ? AND ?
+              AND created_at > ?
+        """, (symbol, price_low, price_high, min_created)).fetchone()
+
+        if rows['zone_count'] == 0:
+            return {}
+
+        return {
+            'historical_zone_count': rows['zone_count'],
+            'total_historical_visits': rows['total_visits'] or 0,
+            'total_historical_rejections': rows['total_rejections'] or 0,
+            'total_historical_breakthroughs': rows['total_breakthroughs'] or 0,
+            'total_historical_time_sec': rows['total_time_in_zone'] or 0,
+            'times_validated': rows['times_validated'] or 0,
+            'avg_final_strength': rows['avg_final_strength'] or 0,
+            'max_historical_value': rows['max_value_at_risk'] or 0,
+        }
+
+    def get_stats(self) -> Dict:
+        """Get archive statistics."""
+        row = self._conn.execute("""
+            SELECT
+                COUNT(*) as total_archived,
+                SUM(was_validated) as total_validated,
+                COUNT(DISTINCT symbol) as symbols,
+                MIN(created_at) as oldest,
+                MAX(expired_at) as newest
+            FROM archived_zones
+        """).fetchone()
+
+        return {
+            'total_archived': row['total_archived'],
+            'total_validated': row['total_validated'] or 0,
+            'symbols_tracked': row['symbols'],
+            'oldest_zone': row['oldest'],
+            'newest_zone': row['newest'],
+        }
+
+    def close(self) -> None:
+        """Close database connection."""
+        if self._conn:
+            self._conn.close()
 
 
 # ==============================================================================
@@ -108,6 +290,7 @@ class CandidateZone:
     # Internal tracking
     _currently_in_zone: bool = field(default=False, repr=False)
     _zone_entry_time: float = field(default=0.0, repr=False)
+    _last_decay_time: float = field(default=0.0, repr=False)
 
     @property
     def zone_width(self) -> float:
@@ -208,13 +391,16 @@ class CandidateZoneManager:
     - Decay and expire old zones
     """
 
-    def __init__(self, config: CandidateZoneConfig = DEFAULT_CONFIG):
+    def __init__(self, config: CandidateZoneConfig = DEFAULT_CONFIG, db_path: str = "candidate_zones.db"):
         self._config = config
         self._zones: Dict[str, Dict[str, CandidateZone]] = defaultdict(dict)  # symbol -> zone_id -> zone
         self._proximity_buffer: Dict[str, Dict[float, ProximityCluster]] = defaultdict(dict)  # symbol -> price_bucket -> cluster
         self._prev_prices: Dict[str, float] = {}
         self._metrics = CandidateZoneMetrics()
         self._validation_times: List[float] = []
+
+        # Archive for long-term learning
+        self._archive = CandidateZoneArchive(db_path)
 
         logger.info("[CANDIDATE_ZONES] Manager initialized")
 
@@ -315,6 +501,24 @@ class CandidateZoneManager:
 
         # Create new zone
         now = time.time()
+
+        # Query historical context for this price level
+        historical = self._archive.get_historical_context(symbol, price_center)
+
+        # Calculate initial strength based on historical activity
+        initial_strength = 1.0
+        if historical:
+            # Boost strength if this level has been significant before
+            hist_visits = historical.get('total_historical_visits', 0)
+            hist_rejections = historical.get('total_historical_rejections', 0)
+            times_validated = historical.get('times_validated', 0)
+
+            # +0.1 for every 5 historical visits, capped at +0.5
+            initial_strength += min(0.5, hist_visits / 50)
+            # +0.2 for every validated zone at this level, capped at +0.4
+            initial_strength += min(0.4, times_validated * 0.2)
+            initial_strength = min(2.0, initial_strength)  # Cap at 2.0
+
         zone = CandidateZone(
             zone_id=zone_id,
             symbol=symbol,
@@ -329,7 +533,7 @@ class CandidateZoneManager:
             current_value_at_risk=cluster.total_value,
             last_proximity_update=now,
             last_interaction=now,
-            strength=1.0,
+            strength=initial_strength,
             state='ACTIVE'
         )
 
@@ -337,11 +541,17 @@ class CandidateZoneManager:
         self._metrics.zones_created += 1
         self._metrics.zones_active += 1
 
+        # Log with historical context if available
+        hist_info = ""
+        if historical and historical.get('historical_zone_count', 0) > 0:
+            hist_info = f", historical: {historical['historical_zone_count']} zones, {historical.get('times_validated', 0)} validated"
+
         logger.info(
             f"[CANDIDATE_ZONES] Created {zone_id}: "
             f"${zone.initial_value_at_risk:,.0f} at risk, "
             f"{zone.initial_positions_at_risk} positions, "
-            f"price {zone.price_low:.2f}-{zone.price_high:.2f}"
+            f"price {zone.price_low:.2f}-{zone.price_high:.2f}, "
+            f"strength={initial_strength:.2f}{hist_info}"
         )
 
         return zone
@@ -524,10 +734,16 @@ class CandidateZoneManager:
             else:
                 self._metrics.zones_dormant -= 1
 
+            # Archive validated zone (for long-term learning - this one actually worked!)
+            try:
+                self._archive.archive_zone(zone, was_validated=True)
+            except Exception as e:
+                logger.warning(f"[CANDIDATE_ZONES] Failed to archive validated {zone.zone_id}: {e}")
+
             del self._zones[symbol][zone.zone_id]
 
             logger.info(
-                f"[CANDIDATE_ZONES] Validated {zone.zone_id}: "
+                f"[CANDIDATE_ZONES] Validated & archived {zone.zone_id}: "
                 f"age={age:.0f}s, visits={zone.price_visits}, "
                 f"rejections={zone.price_rejections}"
             )
@@ -565,25 +781,47 @@ class CandidateZoneManager:
                     self._metrics.zones_active -= 1
                     self._metrics.zones_dormant += 1
 
-                # Apply decay
+                # Apply decay based on time since LAST DECAY (not last interaction)
+                # This prevents re-applying decay for the same time period
+                last_decay = zone._last_decay_time if zone._last_decay_time > 0 else zone.created_at
+                time_since_decay = now - last_decay
+
                 decay_rate = (
                     self._config.active_decay_rate
                     if zone.state == 'ACTIVE'
                     else self._config.dormant_decay_rate
                 )
-                zone.strength *= math.exp(-decay_rate * time_since_interaction)
+                zone.strength *= math.exp(-decay_rate * time_since_decay)
+                zone._last_decay_time = now
 
                 # Check for expiration
                 if zone.strength < self._config.expire_threshold_strength:
+                    # Track state before marking expired for correct metric update
+                    was_active = zone.state == 'ACTIVE'
                     zone.state = 'EXPIRED'
                     self._metrics.zones_expired += 1
-                    if zone.state == 'ACTIVE':
+                    if was_active:
                         self._metrics.zones_active -= 1
                     else:
                         self._metrics.zones_dormant -= 1
 
+                    # Archive zone before deletion (for long-term learning)
+                    try:
+                        self._archive.archive_zone(zone, was_validated=False)
+                    except Exception as e:
+                        logger.warning(f"[CANDIDATE_ZONES] Failed to archive {zone_id}: {e}")
+
+                    logger.info(
+                        f"[CANDIDATE_ZONES] Expired & archived {zone_id}: "
+                        f"age={zone.age_sec:.0f}s, visits={zone.price_visits}, "
+                        f"rejections={zone.price_rejections}"
+                    )
+
                     del self._zones[symbol][zone_id]
                     expired_count += 1
+
+        if expired_count > 0:
+            logger.info(f"[CANDIDATE_ZONES] Decay cycle: {expired_count} zones expired")
 
         return expired_count
 
@@ -659,6 +897,10 @@ class CandidateZoneManager:
             self._metrics.validation_rate = self._metrics.zones_validated / total_resolved
 
         return self._metrics
+
+    def get_archive_stats(self) -> Dict:
+        """Get archive statistics for monitoring."""
+        return self._archive.get_stats()
 
     def compute_zone_quality(self, zone: CandidateZone) -> float:
         """

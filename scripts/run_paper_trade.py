@@ -134,6 +134,11 @@ async def run_paper_trade():
     # Register M2 archived nodes pruning (prevents memory leak from old nodes)
     cleanup.register_pruner('m2_archived_nodes', obs._m2_store.prune_archived_nodes)
 
+    # Register candidate zone decay and pruning (prevents memory leak from unbounded zones)
+    if service._node_bridge:
+        cleanup.register_pruner('candidate_zone_decay', service._node_bridge.decay_candidate_zones)
+        cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
+
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
 

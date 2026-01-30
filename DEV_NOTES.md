@@ -1,4 +1,69 @@
 
+## 2026-01-30: Candidate Zone Archive (Long-term Learning)
+
+**Issue:** Expired zones were deleted, losing all accumulated price action data.
+
+**Root cause:** Original design deleted zones on expiration without archival:
+```python
+del self._zones[symbol][zone_id]  # Data lost forever
+```
+
+**Impact:** System couldn't learn from history - each zone started fresh with no knowledge of what happened at that price level before.
+
+**Fix:** Added `CandidateZoneArchive` class with SQLite persistence:
+1. Archive zones on expiration AND validation (both outcomes valuable)
+2. Query historical context when creating new zones at similar price levels
+3. Enrich new zones with historical strength boost:
+   - +0.1 per 5 historical visits (capped at +0.5)
+   - +0.2 per validated zone at level (capped at +0.4)
+
+**Database:** `candidate_zones.db` with indexed lookup by symbol/price bucket
+
+**Key methods:**
+- `archive_zone(zone, was_validated)` - persist zone data
+- `get_historical_context(symbol, price, tolerance)` - aggregate historical stats
+- `get_archive_stats()` - monitoring/metrics
+
+**Long-term value:**
+- System learns which levels repeatedly attract liquidations
+- Validated zones boost confidence at that level in future
+- Price action history accumulates across sessions
+
+---
+
+## 2026-01-30: Candidate Zone Memory Leak Fix
+
+**Issue:** Paper trader using 11.5GB RAM with 97.8% CPU. Candidate zones accumulating without expiration.
+
+**Root cause:** Two bugs in candidate zone implementation:
+1. `decay_zones()` and `prune_candidate_zones()` methods existed but were never called
+2. Decay calculation used `time_since_interaction` repeatedly, causing zones to over-decay on each call (exponential over-decay bug)
+
+**Impact:**
+- 800+ zones created but none expired
+- Memory grew unboundedly as zones accumulated
+
+**Fix:**
+1. Register decay/prune in cleanup coordinator (`run_paper_trade.py`):
+   ```python
+   cleanup.register_pruner('candidate_zone_decay', service._node_bridge.decay_candidate_zones)
+   cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
+   ```
+
+2. Fix decay calculation to track `_last_decay_time` per zone:
+   ```python
+   last_decay = zone._last_decay_time if zone._last_decay_time > 0 else zone.created_at
+   time_since_decay = now - last_decay
+   zone.strength *= math.exp(-decay_rate * time_since_decay)
+   zone._last_decay_time = now
+   ```
+
+3. Add logging when zones expire for observability
+
+**Lesson:** Always verify cleanup/decay mechanisms are actually wired up, not just defined.
+
+---
+
 ## 2026-01-30: M2 Node Creation Fix (Constitutional Violation)
 
 **Issue:** System overreacting to tiny price changes, entering/exiting positions every few seconds on noise.

@@ -99,6 +99,7 @@ class PolicyAdapter:
     2. Invoke frozen external policies
     3. Convert proposals to Mandates
     4. No interpretation, scoring, or aggregation
+    5. Enforce global entry grace period (prevent immediate exits)
 
     Not Responsible For:
     - Strategy logic (in external_policy/)
@@ -106,6 +107,13 @@ class PolicyAdapter:
     - Arbitration (in runtime/arbitration/)
     - State management (in runtime/position/)
     """
+
+    # Global entry tracking: symbol -> (entry_time, entry_strategy)
+    # Prevents immediate exit oscillation by enforcing grace period
+    _entry_tracker: dict = {}
+
+    # Grace period (seconds) - no EXIT allowed within this time of ENTRY
+    ENTRY_GRACE_PERIOD_SEC = 10.0
 
     def __init__(self, config: Optional[AdapterConfig] = None):
         """Initialize adapter with configuration."""
@@ -465,6 +473,9 @@ class PolicyAdapter:
         Pure normalization - no interpretation, no aggregation, no scoring.
         F5: Copies direction, strategy_id, and calculates quantity from proposal.
 
+        GRACE PERIOD: Blocks EXIT proposals within ENTRY_GRACE_PERIOD_SEC of entry
+        to prevent immediate oscillation from zone/condition instability.
+
         Args:
             proposals: List of strategy proposals
             symbol: Symbol mandates apply to
@@ -486,6 +497,24 @@ class PolicyAdapter:
 
             # F5: Extract strategy_id from proposal
             strategy_id = getattr(proposal, 'strategy_id', None)
+
+            # GRACE PERIOD: Block EXIT within grace period of ENTRY
+            if mandate_type == MandateType.EXIT:
+                entry_info = PolicyAdapter._entry_tracker.get(symbol)
+                if entry_info:
+                    entry_time, entry_strategy = entry_info
+                    time_since_entry = timestamp - entry_time
+                    if time_since_entry < self.ENTRY_GRACE_PERIOD_SEC:
+                        # Within grace period - skip this EXIT proposal
+                        print(f"[PolicyAdapter] {symbol}: EXIT blocked (grace period: {time_since_entry:.1f}s < {self.ENTRY_GRACE_PERIOD_SEC}s)")
+                        continue
+                    else:
+                        # Grace period passed - allow EXIT and clear tracker
+                        PolicyAdapter._entry_tracker.pop(symbol, None)
+
+            # Track ENTRY for grace period enforcement
+            if mandate_type == MandateType.ENTRY:
+                PolicyAdapter._entry_tracker[symbol] = (timestamp, strategy_id)
 
             # F5: Calculate quantity from notional and current price
             # Only for ENTRY mandates with valid price

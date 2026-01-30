@@ -183,6 +183,7 @@ def _record_entry_zone(symbol: str, zone: 'SupplyDemandZonePrimitive'):
         "zone_low": zone.zone_low,
         "zone_high": zone.zone_high,
         "zone_center": zone.zone_center,
+        "zone_width": zone.zone_high - zone.zone_low,  # Required for geometric tolerance check
         "retest_count_at_entry": zone.retest_count,
         "timestamp": zone.timestamp
     }
@@ -411,6 +412,14 @@ def generate_geometry_proposal(
         entry_context = _get_entry_zone(symbol)
 
         if entry_method == "PATTERN" and entry_context is not None:
+            # Grace period: don't check invalidation for first N seconds after entry
+            # This prevents noise-driven exits from zone recomputation between cycles
+            INVALIDATION_GRACE_PERIOD_SEC = 10.0
+            time_in_position = context.timestamp - entry_context.get("timestamp", 0)
+            if time_in_position < INVALIDATION_GRACE_PERIOD_SEC:
+                # Within grace period - hold position, ignore zone changes
+                return None
+
             # Pattern-based exit: check zone invalidation
             if _is_zone_invalidated(supply_demand_zone, entry_context, context.current_price, config):
                 _clear_entry_zone(symbol)

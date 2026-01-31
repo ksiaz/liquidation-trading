@@ -1,4 +1,73 @@
 
+## 2026-01-31: Binance Liquidation Forwarding (M2 Node Creation)
+
+**Issue:** HL node `--write-trades` flag not producing `node_trades` output. System had no liquidation data to create M2 nodes → no supply/demand zones → no geometry trades.
+
+**Root cause:** Unknown - HL node syncs correctly and `--write-trades` is set, but `node_trades/hourly/` stays empty. `node_fills` has data but no liquidations. Possibly a HL binary bug or missing config.
+
+**Workaround:** Forward Binance liquidations to M2 node creation path:
+
+1. **Global liquidation stream** (`runtime/collector/service.py`):
+   - Add `!forceOrder@arr` to combined Binance streams (catches ALL liquidations)
+   - Fix symbol extraction: use `order.get('s')` not `stream.split('@')[0]`
+
+2. **M2 node creation from Binance** (Phase 8 in forceorder handler):
+   ```python
+   if self._node_bridge is not None:
+       liq_event = LiquidationEvent(
+           timestamp=timestamp,
+           symbol=symbol,
+           wallet_address='BINANCE',
+           liquidated_size=quantity,
+           liquidation_price=price,
+           side='LONG' if side == 'SELL' else 'SHORT',
+           value=price * quantity,
+           event_type='BINANCE_LIQUIDATION',
+           exchange='BINANCE'
+       )
+       self._node_bridge.on_liquidation(liq_event)
+   ```
+
+**Limitation:** Binance liquidations are mostly on shitcoins not in our tracked symbols. Still enables cascade sniper detection and validates candidate zones when prices match.
+
+**TODO:** Investigate HL node `--write-trades` not working. Should be primary liquidation source for HL-specific price levels.
+
+---
+
+## 2026-01-30: Oscillation Fix (Entry Grace Period)
+
+**Issue:** System enters trades then exits 1-2 seconds later with $0 PNL. Recurring problem despite multiple previous fixes.
+
+**Root Causes Identified:**
+
+1. **Missing zone_width** in geometry entry context - tolerance check failed, falling back to strict ID comparison
+2. **No grace period** - zone/condition changes between cycles trigger immediate EXIT
+3. **Cross-strategy exits** - cascade sniper enters, geometry/SLBRS/EFFCS can exit immediately
+4. **Zone instability** - supply/demand zones recompute each cycle, IDs drift
+
+**Fixes Applied:**
+
+1. **Geometry strategy** (`ep2_strategy_geometry.py`):
+   - Store `zone_width` in `_record_entry_zone()` for proper tolerance check
+   - Add 10s grace period before checking zone invalidation
+
+2. **Policy adapter** (`runtime/policy_adapter.py`):
+   - Add global `_entry_tracker` to track entry time per symbol
+   - Block ALL EXIT proposals within `ENTRY_GRACE_PERIOD_SEC` (10s) of entry
+   - Log blocked exits for debugging: `[PolicyAdapter] {symbol}: EXIT blocked (grace period: Xs < 10s)`
+
+**Why this works:**
+- Grace period allows zone/conditions to stabilize after entry
+- Prevents any strategy from exiting another strategy's position immediately
+- Still allows genuine exits after grace period (thesis invalidation)
+
+**Trade-off:** Minimum 10s hold time, even if conditions change immediately. Acceptable because:
+- Real thesis invalidation should take longer than 10s to develop
+- Prevents noise-driven oscillation
+- Can be tuned per-strategy if needed
+
+---
+
 ## 2026-01-30: Candidate Zone Archive (Long-term Learning)
 
 **Issue:** Expired zones were deleted, losing all accumulated price action data.

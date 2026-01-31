@@ -26,6 +26,9 @@ from .circuit_breaker import (
     AbnormalPriceBreaker,
     StrategyMalfunctionBreaker,
     ResourceExhaustionBreaker,
+    CircuitBreakerManager,
+    PersistentKillSwitch,
+    KillSwitchState,
 )
 
 from .health_monitor import (
@@ -98,6 +101,9 @@ __all__ = [
     'AbnormalPriceBreaker',
     'StrategyMalfunctionBreaker',
     'ResourceExhaustionBreaker',
+    'CircuitBreakerManager',
+    'PersistentKillSwitch',
+    'KillSwitchState',
     # HLP16: Health Monitor
     'HealthMonitor',
     'HealthConfig',

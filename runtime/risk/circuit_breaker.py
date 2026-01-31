@@ -640,3 +640,138 @@ class PersistentKillSwitch:
                 "trigger_reason": self._state.trigger_reason,
                 "manual_override_required": self._state.manual_override_required,
             }
+
+
+class CircuitBreakerManager:
+    """
+    Unified manager for all circuit breakers.
+
+    Provides:
+    - Single check_all_triggers() method
+    - Integration with DegradationManager
+    - Integration with failure handling modules
+    - Unified reset and status
+    """
+
+    def __init__(
+        self,
+        config: CircuitBreakerConfig = None,
+        logger: logging.Logger = None
+    ):
+        self._config = config or CircuitBreakerConfig()
+        self._logger = logger or logging.getLogger(__name__)
+
+        # Initialize all breakers
+        self._rapid_loss = RapidLossBreaker(self._config, self._logger)
+        self._abnormal_price = AbnormalPriceBreaker(self._config, self._logger)
+        self._strategy_malfunction = StrategyMalfunctionBreaker(self._config, self._logger)
+        self._resource_exhaustion = ResourceExhaustionBreaker(self._config, self._logger)
+
+        self._all_breakers = [
+            self._rapid_loss,
+            self._abnormal_price,
+            self._strategy_malfunction,
+            self._resource_exhaustion,
+        ]
+
+        # Callbacks
+        self._on_trip: Optional[Callable] = None
+        self._on_reset: Optional[Callable] = None
+
+        self._lock = Lock()
+
+    @property
+    def rapid_loss(self) -> RapidLossBreaker:
+        return self._rapid_loss
+
+    @property
+    def abnormal_price(self) -> AbnormalPriceBreaker:
+        return self._abnormal_price
+
+    @property
+    def strategy_malfunction(self) -> StrategyMalfunctionBreaker:
+        return self._strategy_malfunction
+
+    @property
+    def resource_exhaustion(self) -> ResourceExhaustionBreaker:
+        return self._resource_exhaustion
+
+    def set_trip_callback(self, callback: Callable):
+        """Set callback for any breaker trip."""
+        self._on_trip = callback
+
+    def set_reset_callback(self, callback: Callable):
+        """Set callback for breaker reset."""
+        self._on_reset = callback
+
+    def check_all_triggers(self) -> Optional[str]:
+        """
+        Check all circuit breakers.
+
+        Returns:
+            First triggered breaker name, or None if all clear
+        """
+        for breaker in self._all_breakers:
+            if breaker.is_open:
+                return breaker.name
+        return None
+
+    def is_any_tripped(self) -> bool:
+        """Check if any breaker is tripped."""
+        return any(b.is_open for b in self._all_breakers)
+
+    def is_trading_allowed(self) -> bool:
+        """Check if trading is allowed (no breakers tripped)."""
+        return not self.is_any_tripped()
+
+    def get_tripped_breakers(self) -> List[str]:
+        """Get list of tripped breaker names."""
+        return [b.name for b in self._all_breakers if b.is_open]
+
+    def reset_all(self, manual: bool = False) -> bool:
+        """
+        Reset all breakers.
+
+        Args:
+            manual: Whether this is a manual reset
+
+        Returns:
+            True if all breakers reset successfully
+        """
+        success = True
+        for breaker in self._all_breakers:
+            if breaker.is_open:
+                if not breaker.reset(manual):
+                    success = False
+
+        if success and self._on_reset:
+            try:
+                self._on_reset()
+            except Exception as e:
+                self._logger.error(f"Reset callback error: {e}")
+
+        return success
+
+    def get_summary(self) -> Dict:
+        """Get summary of all breakers."""
+        return {
+            'any_tripped': self.is_any_tripped(),
+            'trading_allowed': self.is_trading_allowed(),
+            'tripped_breakers': self.get_tripped_breakers(),
+            'breakers': {
+                b.name: {
+                    'state': b.state.name,
+                    'is_open': b.is_open,
+                }
+                for b in self._all_breakers
+            }
+        }
+
+    def get_all_events(self) -> List[CircuitBreakerEvent]:
+        """Get events from all breakers."""
+        events = []
+        for breaker in self._all_breakers:
+            events.extend(breaker.get_events())
+        # Sort by timestamp
+        events.sort(key=lambda e: e.timestamp)
+        return events

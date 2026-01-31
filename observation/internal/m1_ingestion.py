@@ -432,7 +432,7 @@ class M1IngestionEngine:
                 'symbol': symbol,
                 'wallet_address': payload.get('wallet_address', ''),
                 'liquidated_size': abs(float(payload.get('liquidated_size', 0))),
-                'liquidation_price': float(payload.get('price', 0)),
+                'liquidation_price': float(payload.get('liquidation_price', payload.get('price', 0))),
                 'side': payload.get('side', 'UNKNOWN'),
                 'value': float(payload.get('value', 0)),
                 'event_type': 'HL_LIQUIDATION',

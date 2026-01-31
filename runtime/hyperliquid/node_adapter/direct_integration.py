@@ -10,7 +10,11 @@ Usage:
 
 Data sources:
 - replica_cmds: Block data with SetGlobalAction (prices), orders
-- node_trades: Trade fills including liquidations (trade_dir_override: "LiquidatedMarket")
+- node_fills: User fills including liquidations (has "liquidation" field with liquidatedUser)
+
+Note: node_fills format changed - liquidations now identified by "liquidation" field,
+not trade_dir_override. Example:
+{"coin":"ADA","px":"0.31441","sz":"1948.0","side":"B",...,"liquidation":{"liquidatedUser":"0x...","markPx":"0.31447","method":"market"}}
 """
 
 import asyncio
@@ -30,23 +34,24 @@ logger = logging.getLogger(__name__)
 
 class TradeFileReader:
     """
-    Reads trade fills from node_trades directory.
+    Reads fills from node_fills directory.
 
-    Liquidations are identified by trade_dir_override: "LiquidatedMarket"
+    Liquidations are identified by presence of "liquidation" field.
 
-    Trade file format (NDJSON):
-    {
-        "coin": "BTC",
+    Fill file format (NDJSON - each line is [address, fill_data]):
+    ["0x...", {
+        "coin": "ADA",
         "side": "B",  # B=buy, A=ask/sell
-        "time": "2026-01-27T05:03:22.622306903",
-        "px": "97500.0",
-        "sz": "1.5",
-        "trade_dir_override": "LiquidatedMarket" | "Na",
-        "side_info": [
-            {"user": "0x...", "start_pos": "-17.23", "oid": 123, ...},
-            {"user": "0x...", "start_pos": "10.5", "oid": 456, ...}
-        ]
-    }
+        "time": 1769835752163,  # Unix timestamp in ms
+        "px": "0.31441",
+        "sz": "1948.0",
+        "dir": "Open Long" | "Close Long" | ...,
+        "liquidation": {  # Present only for liquidations
+            "liquidatedUser": "0x...",
+            "markPx": "0.31447",
+            "method": "market"
+        }
+    }]
     """
 
     def __init__(self, data_path: Path, catchup_hours: int = 6):
@@ -65,12 +70,14 @@ class TradeFileReader:
         self._catchup_hours = catchup_hours
 
     def read_new_liquidations(self) -> list[LiquidationEvent]:
-        """Read new liquidation trades from node_trades."""
+        """Read new liquidation fills from node_fills."""
         liquidations = []
 
-        trades_dir = self._data_path / "node_trades" / "hourly"
-        if not trades_dir.exists():
+        # Use node_fills instead of node_trades - fills have liquidation info
+        fills_dir = self._data_path / "node_fills" / "hourly"
+        if not fills_dir.exists():
             return liquidations
+        trades_dir = fills_dir  # Alias for minimal code changes
 
         # Find latest date directory
         date_dirs = sorted(trades_dir.iterdir(), reverse=True)
@@ -115,7 +122,7 @@ class TradeFileReader:
         return liquidations
 
     def _read_file_liquidations(self, file_path: Path, from_position: int = 0) -> list[LiquidationEvent]:
-        """Read liquidations from a specific file."""
+        """Read liquidations from a node_fills file."""
         liquidations = []
 
         try:
@@ -132,11 +139,17 @@ class TradeFileReader:
                         continue
 
                     try:
-                        trade = json.loads(line)
+                        # node_fills format: [address, fill_data]
+                        fill_entry = json.loads(line)
+                        if not isinstance(fill_entry, list) or len(fill_entry) < 2:
+                            continue
 
-                        # Only extract liquidations
-                        if trade.get('trade_dir_override') == 'LiquidatedMarket':
-                            liq = self._parse_liquidation(trade)
+                        address = fill_entry[0]
+                        fill = fill_entry[1]
+
+                        # Only extract liquidations (has "liquidation" field)
+                        if fill.get('liquidation'):
+                            liq = self._parse_liquidation(fill, address)
                             if liq:
                                 liquidations.append(liq)
                                 self._liquidations_found += 1
@@ -148,48 +161,49 @@ class TradeFileReader:
                     self._file_position = f.tell()
 
         except Exception as e:
-            logger.error(f"Error reading trade file {file_path}: {e}")
+            logger.error(f"Error reading fills file {file_path}: {e}")
 
         return liquidations
 
-    def _parse_liquidation(self, trade: Dict) -> Optional[LiquidationEvent]:
-        """Parse a liquidation trade into LiquidationEvent."""
+    def _parse_liquidation(self, fill: Dict, address: str = '') -> Optional[LiquidationEvent]:
+        """Parse a liquidation fill into LiquidationEvent.
+
+        New node_fills format has "liquidation" field with liquidatedUser.
+        """
         try:
-            coin = trade.get('coin', 'UNKNOWN')
-            side = trade.get('side', '')  # B=buy, A=sell
-            time_str = trade.get('time', '')
-            px = float(trade.get('px', 0))
-            sz = float(trade.get('sz', 0))
+            coin = fill.get('coin', 'UNKNOWN')
+            side = fill.get('side', '')  # B=buy, A=sell
+            time_val = fill.get('time', 0)
+            px = float(fill.get('px', 0))
+            sz = float(fill.get('sz', 0))
 
-            # Parse timestamp
-            timestamp = self._parse_timestamp(time_str)
-
-            # Get liquidated user (first in side_info with the closing order)
-            side_info = trade.get('side_info', [])
-            if not side_info:
-                return None
-
-            # The liquidated user is the one whose position is being closed
-            # Their start_pos tells us if they were long or short
-            liquidated_user = side_info[0]
-            wallet = liquidated_user.get('user', '')
-            start_pos = float(liquidated_user.get('start_pos', 0))
-
-            # Determine side from position being closed
-            # If start_pos is negative, they were short (being closed by buying)
-            # If start_pos is positive, they were long (being closed by selling)
-            if start_pos < 0:
-                position_side = 'SHORT'
-            elif start_pos > 0:
-                position_side = 'LONG'
+            # Parse timestamp - node_fills uses Unix ms timestamp
+            if isinstance(time_val, (int, float)):
+                timestamp = time_val / 1000.0  # Convert ms to seconds
             else:
-                position_side = 'UNKNOWN'
+                timestamp = self._parse_timestamp(str(time_val))
+
+            # Get liquidated user from liquidation field
+            liq_info = fill.get('liquidation', {})
+            wallet = liq_info.get('liquidatedUser', address)
+
+            # Determine side from fill direction
+            # "Close Long" = long position being liquidated
+            # "Close Short" = short position being liquidated
+            direction = fill.get('dir', '')
+            if 'Long' in direction:
+                position_side = 'LONG'
+            elif 'Short' in direction:
+                position_side = 'SHORT'
+            else:
+                # Fallback: B=buy (closing short), A=sell (closing long)
+                position_side = 'SHORT' if side == 'B' else 'LONG'
 
             value = px * sz
 
             return LiquidationEvent(
                 timestamp=timestamp,
-                symbol=coin,
+                symbol=coin + 'USDT' if not coin.endswith('USDT') else coin,  # Ensure USDT suffix
                 wallet_address=wallet,
                 liquidated_size=sz,
                 liquidation_price=px,

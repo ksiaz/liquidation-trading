@@ -1330,12 +1330,14 @@ class CollectorService:
         ] + [
             f"{s.lower()}@forceOrder" for s in test_symbols
         ] + [
+            "!forceOrder@arr"  # Global liquidation stream for ALL symbols
+        ] + [
             f"{s.lower()}@bookTicker" for s in test_symbols
         ] + [
             f"{s.lower()}@depth20@100ms" for s in test_symbols
         ] + [
             f"{s.lower()}@markPrice@1s" for s in test_symbols
-        ]  # 5 streams per symbol = 15 streams for 3 symbols
+        ]  # 5 streams per symbol + 1 global liquidation
 
         stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
@@ -1435,12 +1437,14 @@ class CollectorService:
                                 # Log raw liquidation event
                                 if 'o' in payload:
                                     order = payload['o']
+                                    # For global !forceOrder@arr stream, get symbol from order data
+                                    symbol = order.get('s', symbol)
                                     try:
                                         # P1: Removed DEBUG prints from hot path
                                         side_value = order.get('S', 'UNKNOWN')
                                         self._execution_db.log_liquidation_event(
                                             timestamp=ts if 'ts' in locals() else time.time(),
-                                            symbol=order.get('s', symbol),
+                                            symbol=symbol,
                                             side=side_value,
                                             price=float(order.get('p', 0)),
                                             volume=float(order.get('q', 0))
@@ -1481,6 +1485,28 @@ class CollectorService:
                                             record_liquidation_event(symbol, side, liq_value, timestamp)
                                         except ImportError:
                                             pass  # Module not available
+
+                                        # Phase 8: Forward to node bridge for M2 node creation
+                                        # This enables geometry strategy to trade from Binance liquidations
+                                        if self._node_bridge is not None:
+                                            try:
+                                                from runtime.hyperliquid.node_adapter.action_extractor import LiquidationEvent
+                                                # Convert Binance side to HL side (SELL=LONG liquidated, BUY=SHORT liquidated)
+                                                liq_side = 'LONG' if side == 'SELL' else 'SHORT'
+                                                liq_event = LiquidationEvent(
+                                                    timestamp=timestamp,
+                                                    symbol=symbol,  # Already in BTCUSDT format
+                                                    wallet_address='BINANCE',  # Marker for Binance source
+                                                    liquidated_size=quantity,
+                                                    liquidation_price=price,
+                                                    side=liq_side,
+                                                    value=price * quantity,
+                                                    event_type='BINANCE_LIQUIDATION',
+                                                    exchange='BINANCE'
+                                                )
+                                                self._node_bridge.on_liquidation(liq_event)
+                                            except Exception:
+                                                pass  # Fail silently
                                 except:
                                     pass
                             elif 'kline' in stream:

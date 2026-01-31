@@ -365,11 +365,17 @@ class ResourceMonitor:
         critical_pct: float = 85.0,
         log_interval_sec: float = 60.0,
         enable_gc_on_warning: bool = True,
+        disk_warn_pct: float = 80.0,
+        disk_critical_pct: float = 90.0,
     ):
         self._warn_pct = warn_pct
         self._critical_pct = critical_pct
         self._log_interval = log_interval_sec
         self._enable_gc_on_warning = enable_gc_on_warning
+
+        # Disk space thresholds
+        self._disk_warn_pct = disk_warn_pct
+        self._disk_critical_pct = disk_critical_pct
 
         # Registered components
         self._components: Dict[str, Any] = {}
@@ -382,6 +388,10 @@ class ResourceMonitor:
         # Callbacks
         self._on_warning: Optional[Callable] = None
         self._on_critical: Optional[Callable] = None
+        self._on_disk_warning: Optional[Callable] = None
+
+        # Cleanup coordinator reference (for triggering cleanup on disk warning)
+        self._cleanup_coordinator: Optional[Any] = None
 
         # State
         self._running = False
@@ -418,6 +428,14 @@ class ResourceMonitor:
     def set_critical_callback(self, callback: Callable[[ResourceReport], None]):
         """Set callback for critical threshold."""
         self._on_critical = callback
+
+    def set_disk_warning_callback(self, callback: Callable[[dict], None]):
+        """Set callback for disk space warning."""
+        self._on_disk_warning = callback
+
+    def set_cleanup_coordinator(self, coordinator):
+        """Set cleanup coordinator for triggering cleanup on disk warning."""
+        self._cleanup_coordinator = coordinator
 
     def get_report(self) -> ResourceReport:
         """Generate current resource report."""
@@ -498,9 +516,66 @@ class ResourceMonitor:
             if comp.details:
                 logger.debug(f"[RESOURCES] {comp.name} details: {comp.details}")
 
+    def _check_disk_space(self) -> Optional[dict]:
+        """Check disk space and return status if warning/critical.
+
+        Returns:
+            dict with disk status or None if healthy
+        """
+        try:
+            import psutil
+            # Check the disk where we're running from
+            disk = psutil.disk_usage('/')
+            result = {
+                'total_gb': disk.total / (1024**3),
+                'used_gb': disk.used / (1024**3),
+                'free_gb': disk.free / (1024**3),
+                'percent': disk.percent,
+            }
+
+            if disk.percent >= self._disk_critical_pct:
+                result['status'] = 'CRITICAL'
+                logger.error(
+                    f"[DISK CRITICAL] {disk.percent:.1f}% used, "
+                    f"{disk.free / (1024**3):.1f}GB free"
+                )
+            elif disk.percent >= self._disk_warn_pct:
+                result['status'] = 'WARNING'
+                logger.warning(
+                    f"[DISK WARNING] {disk.percent:.1f}% used, "
+                    f"{disk.free / (1024**3):.1f}GB free"
+                )
+            else:
+                return None  # Healthy, no action needed
+
+            return result
+
+        except ImportError:
+            # psutil not available, try alternative
+            try:
+                import shutil
+                total, used, free = shutil.disk_usage('/')
+                percent = (used / total) * 100
+                if percent >= self._disk_warn_pct:
+                    return {
+                        'total_gb': total / (1024**3),
+                        'used_gb': used / (1024**3),
+                        'free_gb': free / (1024**3),
+                        'percent': percent,
+                        'status': 'CRITICAL' if percent >= self._disk_critical_pct else 'WARNING',
+                    }
+            except Exception:
+                pass
+
+        return None
+
     async def _monitor_loop(self):
         """Main monitoring loop."""
-        logger.info(f"[RESOURCES] Monitor started (warn={self._warn_pct}%, critical={self._critical_pct}%)")
+        logger.info(
+            f"[RESOURCES] Monitor started (mem_warn={self._warn_pct}%, "
+            f"mem_crit={self._critical_pct}%, disk_warn={self._disk_warn_pct}%, "
+            f"disk_crit={self._disk_critical_pct}%)"
+        )
 
         while self._running:
             try:
@@ -539,6 +614,24 @@ class ResourceMonitor:
                     if self._enable_gc_on_warning:
                         import gc
                         gc.collect()
+
+                # Check disk space
+                disk_status = self._check_disk_space()
+                if disk_status:
+                    # Trigger disk warning callback
+                    if self._on_disk_warning:
+                        try:
+                            self._on_disk_warning(disk_status)
+                        except Exception as e:
+                            logger.error(f"Disk warning callback failed: {e}")
+
+                    # Trigger immediate cleanup if coordinator registered
+                    if self._cleanup_coordinator:
+                        try:
+                            logger.info("[RESOURCES] Triggering cleanup due to disk space warning")
+                            await self._cleanup_coordinator.run_cleanup()
+                        except Exception as e:
+                            logger.error(f"Cleanup coordinator trigger failed: {e}")
 
             except Exception as e:
                 logger.error(f"[RESOURCES] Monitor error: {e}")

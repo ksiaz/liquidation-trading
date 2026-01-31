@@ -3772,6 +3772,269 @@ class ResearchDatabase:
         """, params)
         return [dict(row) for row in cursor.fetchall()]
 
+    # =========================================================================
+    # Data Retention & Pruning
+    # =========================================================================
+
+    def prune_old_data(self, max_age_hours: int = 48) -> dict:
+        """Prune data older than max_age_hours from all tables.
+
+        This is critical for disk space management. The database can grow
+        to several GB per day without pruning.
+
+        Args:
+            max_age_hours: Maximum data age in hours (default 48h)
+
+        Returns:
+            dict with deleted row counts per table and space reclaimed
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        cutoff_ts = time.time() - (max_age_hours * 3600)
+        cutoff_ns = int(cutoff_ts * 1_000_000_000)
+
+        # Tables with 'timestamp' column (float seconds)
+        tables_with_timestamp = [
+            'execution_cycles',
+            'liquidation_events',
+            'ohlc_candles',
+            'orderbook_events',
+            'orderbook_depth',
+            'mark_prices',
+            'trade_events',
+            'policy_outcomes',
+            'm2_node_events',
+            'hl_positions',
+            'hl_liquidation_proximity',
+            'hl_cascade_events',
+        ]
+
+        # Tables with 'ts_ns' column (nanoseconds)
+        tables_with_ts_ns = [
+            'hl_metric_snapshots',
+            'hl_decay_signals',
+            'hl_catastrophe_events',
+            'hl_recovery_attempts',
+            'hl_gating_decisions',
+            'hl_strategy_performance',
+            'hl_governor_decisions',
+            'hl_capital_governor_decisions',
+            'hl_meta_governor_decisions',
+            'hl_unknown_threat_signals',
+        ]
+
+        # Tables with 'snapshot_ts' column (nanoseconds)
+        tables_with_snapshot_ts = [
+            'hl_position_snapshots',
+            'hl_wallet_snapshots',
+            'hl_oi_snapshots',
+            'hl_mark_prices_raw',
+            'hl_funding_snapshots',
+            'binance_funding_snapshots',
+            'spot_price_snapshots',
+        ]
+
+        # Tables with 'detected_ts' column (nanoseconds)
+        tables_with_detected_ts = [
+            'hl_liquidation_events_raw',
+        ]
+
+        # Tables with 'cycle_ts' column (nanoseconds)
+        tables_with_cycle_ts = [
+            'hl_poll_cycles',
+        ]
+
+        # Tables with 'discovery_ts' column (nanoseconds)
+        tables_with_discovery_ts = [
+            'hl_wallet_discovery',
+        ]
+
+        # Tables with 'start_ts' column (nanoseconds)
+        tables_with_start_ts = [
+            'hl_labeled_cascades',
+        ]
+
+        # Tables with 'run_ts' column (nanoseconds)
+        tables_with_run_ts = [
+            'hl_validation_results',
+            'hl_threshold_optimization_runs',
+        ]
+
+        # Child tables that need cycle_id-based deletion
+        child_tables = [
+            'm2_nodes',
+            'primitive_values',
+            'policy_evaluations',
+            'mandates',
+            'arbitration_rounds',
+        ]
+
+        cursor = self.conn.cursor()
+        deleted_counts = {}
+
+        # Get initial db size
+        cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
+        initial_size = cursor.fetchone()[0]
+
+        try:
+            # Delete from tables with 'timestamp' column
+            for table in tables_with_timestamp:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff_ts,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'ts_ns' column
+            for table in tables_with_ts_ns:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE ts_ns < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'snapshot_ts' column
+            for table in tables_with_snapshot_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE snapshot_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'detected_ts' column
+            for table in tables_with_detected_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE detected_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'cycle_ts' column
+            for table in tables_with_cycle_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE cycle_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'discovery_ts' column
+            for table in tables_with_discovery_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE discovery_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'start_ts' column
+            for table in tables_with_start_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE start_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete from tables with 'run_ts' column
+            for table in tables_with_run_ts:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE run_ts < ?", (cutoff_ns,))
+                    deleted_counts[table] = cursor.rowcount
+                except Exception as e:
+                    logger.debug(f"Error pruning {table}: {e}")
+                    deleted_counts[table] = 0
+
+            # Delete child tables based on old cycle_ids
+            old_cycle_ids_query = "SELECT id FROM execution_cycles WHERE timestamp < ?"
+            cursor.execute(old_cycle_ids_query, (cutoff_ts,))
+            old_cycle_ids = [row[0] for row in cursor.fetchall()]
+
+            if old_cycle_ids:
+                placeholders = ','.join('?' * len(old_cycle_ids))
+                for table in child_tables:
+                    try:
+                        cursor.execute(
+                            f"DELETE FROM {table} WHERE cycle_id IN ({placeholders})",
+                            old_cycle_ids
+                        )
+                        deleted_counts[table] = cursor.rowcount
+                    except Exception as e:
+                        logger.debug(f"Error pruning {table}: {e}")
+                        deleted_counts[table] = 0
+
+            # Delete orphaned cascade_waves
+            try:
+                cursor.execute("""
+                    DELETE FROM hl_cascade_waves
+                    WHERE cascade_id NOT IN (SELECT id FROM hl_labeled_cascades)
+                """)
+                deleted_counts['hl_cascade_waves'] = cursor.rowcount
+            except Exception as e:
+                logger.debug(f"Error pruning hl_cascade_waves: {e}")
+
+            self.conn.commit()
+
+            # VACUUM to reclaim disk space
+            cursor.execute("VACUUM")
+
+            # Get final db size
+            cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
+            final_size = cursor.fetchone()[0]
+
+            total_deleted = sum(deleted_counts.values())
+            space_reclaimed_mb = (initial_size - final_size) / (1024 * 1024)
+
+            logger.info(
+                f"[PRUNE] Deleted {total_deleted} rows, reclaimed {space_reclaimed_mb:.1f}MB "
+                f"(max_age={max_age_hours}h)"
+            )
+
+            return {
+                'deleted_counts': deleted_counts,
+                'total_deleted': total_deleted,
+                'initial_size_mb': initial_size / (1024 * 1024),
+                'final_size_mb': final_size / (1024 * 1024),
+                'space_reclaimed_mb': space_reclaimed_mb,
+                'max_age_hours': max_age_hours,
+            }
+
+        except Exception as e:
+            logger.error(f"[PRUNE] Error during pruning: {e}")
+            self.conn.rollback()
+            return {
+                'error': str(e),
+                'deleted_counts': deleted_counts,
+                'total_deleted': sum(deleted_counts.values()),
+            }
+
+    def get_table_sizes(self) -> dict:
+        """Get row counts for all tables (for monitoring).
+
+        Returns:
+            dict mapping table names to row counts
+        """
+        cursor = self.conn.cursor()
+
+        # Get all table names
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        sizes = {}
+        for table in tables:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                sizes[table] = cursor.fetchone()[0]
+            except Exception:
+                sizes[table] = -1
+
+        return sizes
+
     def close(self):
         """Close database connection."""
         self.conn.close()

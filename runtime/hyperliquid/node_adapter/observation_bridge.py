@@ -627,6 +627,10 @@ class ObservationBridge:
             self._errors += 1
             logger.error(f"Error handling proximity alert: {e}")
 
+    def get_latest_prices(self) -> Dict[str, float]:
+        """Get latest prices from HL node for strategy evaluation."""
+        return self._latest_prices.copy()
+
     def get_metrics(self) -> dict:
         """Get bridge metrics."""
         metrics = {
@@ -747,6 +751,7 @@ def create_integrated_node(
     enable_position_tracking: bool = False,  # Disabled by default - requires state file parsing
     min_position_value: float = 1000.0,
     focus_coins: list = None,
+    skip_initial_scan: bool = True,  # Skip memory-heavy initial scan (~5GB) - build cache incrementally
 ):
     """
     Factory function to create fully wired node integration.
@@ -760,6 +765,9 @@ def create_integrated_node(
             for M4 cascade primitive computation.
         min_position_value: Minimum position value to track (default $1000)
         focus_coins: Only track these coins (None = all)
+        skip_initial_scan: Skip memory-heavy initial discovery scan (~5GB).
+            When True (default), positions are discovered incrementally from
+            price updates instead of loading entire state file on startup.
 
     Returns:
         Tuple of (DirectNodeIntegration, ObservationBridge, Optional[PositionStateManager])
@@ -795,6 +803,7 @@ def create_integrated_node(
                 state_path=state_path,
                 min_position_value=min_position_value,
                 focus_coins=focus_coins,
+                skip_initial_scan=skip_initial_scan,
             )
             logger.info(f"Position tracking enabled (state: {state_path})")
         except Exception as e:

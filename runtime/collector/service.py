@@ -439,6 +439,12 @@ class CollectorService:
             # User mandate: Use Binance time for everything.
             if self._last_stream_time is not None:
                 current_time = self._last_stream_time
+            elif self._node_bridge and self._node_bridge.get_latest_prices():
+                # HL node has data - use wall clock
+                current_time = time.time()
+                if not hasattr(self, '_hl_clock_logged'):
+                    self._logger.info(f"Using HL node clock, {len(self._node_bridge.get_latest_prices())} prices available")
+                    self._hl_clock_logged = True
             else:
                 # Wait for first stream event
                 await asyncio.sleep(0.5)
@@ -504,10 +510,17 @@ class CollectorService:
             # DIAG: Track why regime classification fails
             _diag_regime = os.environ.get('DIAG_MANDATE', '').lower() in ('1', 'true', 'yes')
 
+            # Get HL node prices as primary source
+            node_prices = {}
+            if self._node_bridge:
+                node_prices = self._node_bridge.get_latest_prices()
+
             for symbol in snapshot.symbols_active:
                 try:
-                    # Get current price
-                    price = self._current_prices.get(symbol)
+                    # Get current price - prefer HL node, fallback to Binance
+                    # Convert symbol format: BTCUSDT -> BTC for HL node
+                    hl_symbol = symbol.replace('USDT', '')
+                    price = node_prices.get(hl_symbol) or self._current_prices.get(symbol)
                     if price is None:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
@@ -1319,12 +1332,13 @@ class CollectorService:
             return None
 
     async def _run_binance_stream(self):
-        """Connect to Binance Filtered Stream with exponential backoff reconnection."""
+        """Connect to Binance WebSocket with dynamic subscription."""
         import websockets
 
         # Use all TOP_10_SYMBOLS for full liquidation coverage
         test_symbols = TOP_10_SYMBOLS  # All 10 symbols for cascade detection
 
+        # Build stream list for subscription
         streams = [
             f"{s.lower()}@aggTrade" for s in test_symbols
         ] + [
@@ -1339,29 +1353,45 @@ class CollectorService:
             f"{s.lower()}@markPrice@1s" for s in test_symbols
         ]  # 5 streams per symbol + 1 global liquidation
 
-        stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+        # Connect to /stream endpoint for combined format (stream/data wrapper)
+        base_url = "wss://fstream.binance.com/stream"
 
         # Exponential backoff parameters
-        reconnect_delay = 1  # Start with 1 second
-        max_reconnect_delay = 60  # Cap at 60 seconds
+        # WAF ban is typically 5 minutes - start high to let it expire
+        reconnect_delay = 30  # Start with 30 seconds
+        max_reconnect_delay = 300  # Cap at 5 minutes
 
         while self._running:
             try:
                 import websockets
-                # Binance Futures WebSocket keepalive requirements:
-                # - Server sends ping every 3 minutes
-                # - Must respond with pong within 10 minutes or disconnect
-                # Configure client to send ping every 60s and wait up to 300s for pong
-                self._logger.info(f"Connecting to Binance ({len(streams)} streams)...")
+                self._logger.info(f"Connecting to Binance WebSocket...")
                 async with websockets.connect(
-                    stream_url,
-                    open_timeout=30,     # 30s handshake timeout per Binance docs
-                    ping_interval=60,    # Send ping every 60 seconds
-                    ping_timeout=300,    # Wait up to 5 minutes for pong
+                    base_url,
+                    open_timeout=30,     # 30s handshake timeout
+                    ping_interval=60,    # Send ping every 60 seconds (Binance sends every 3 min)
+                    ping_timeout=30,     # Detect dead connection within 30s
                     close_timeout=10     # Clean connection close timeout
                 ) as ws:
-                    self._logger.info("Connected to Binance Stream")
-                    reconnect_delay = 1  # Reset backoff on successful connection
+                    self._logger.info("Connected to Binance, subscribing to streams...")
+
+                    # Subscribe to streams in batches (max 10 messages/sec)
+                    # Send all streams in one SUBSCRIBE message (allowed up to 1024)
+                    subscribe_msg = {
+                        "method": "SUBSCRIBE",
+                        "params": streams,
+                        "id": 1
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+
+                    # Wait for subscription confirmation
+                    response = await asyncio.wait_for(ws.recv(), timeout=10)
+                    resp_data = json.loads(response)
+                    if resp_data.get("result") is None and resp_data.get("id") == 1:
+                        self._logger.info(f"Subscribed to {len(streams)} streams")
+                    else:
+                        self._logger.warning(f"Subscription response: {resp_data}")
+
+                    reconnect_delay = 5  # Reset backoff on successful connection
                     while self._running:
                         try:
                             msg = await ws.recv()
@@ -1601,6 +1631,9 @@ class CollectorService:
                             # INGEST (P1: removed debug print from hot path)
                             self._obs.ingest_observation(ts, symbol, event_type, payload)
 
+                        except websockets.exceptions.ConnectionClosed:
+                            # Let connection errors bubble up to trigger reconnect
+                            raise
                         except Exception as e:
                             print(f"Processing Error: {e}")
                             import traceback

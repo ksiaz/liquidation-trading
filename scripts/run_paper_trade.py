@@ -44,15 +44,69 @@ logging.getLogger('aiohttp').setLevel(logging.WARNING)
 
 logger = logging.getLogger('PaperTrade')
 
+from pathlib import Path
+import time
+
 from observation.governance import ObservationSystem
 from runtime.collector.service import CollectorService
 from runtime.monitoring import ResourceMonitor, HealthStatus, CleanupCoordinator
 
 
-# Symbols to trade
+def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
+    """Remove orphaned temp databases on startup.
+
+    These accumulate from test runs with delete=False.
+
+    Args:
+        tmp_dir: Directory to clean (default: project tmp/)
+        max_age_days: Delete files older than this many days
+
+    Returns:
+        Number of files deleted
+    """
+    if tmp_dir is None:
+        # Default to project tmp directory
+        project_root = Path(__file__).parent.parent
+        tmp_dir = project_root / 'tmp'
+
+    tmp_path = Path(tmp_dir)
+    if not tmp_path.exists():
+        return 0
+
+    cutoff = time.time() - (max_age_days * 86400)
+    deleted = 0
+
+    for db_file in tmp_path.glob('tmp*.db'):
+        try:
+            if db_file.stat().st_mtime < cutoff:
+                db_file.unlink()
+                deleted += 1
+        except (OSError, PermissionError):
+            pass
+
+    # Also clean up any WAL/SHM files
+    for wal_file in tmp_path.glob('tmp*.db-wal'):
+        try:
+            if wal_file.stat().st_mtime < cutoff:
+                wal_file.unlink()
+        except (OSError, PermissionError):
+            pass
+
+    for shm_file in tmp_path.glob('tmp*.db-shm'):
+        try:
+            if shm_file.stat().st_mtime < cutoff:
+                shm_file.unlink()
+        except (OSError, PermissionError):
+            pass
+
+    return deleted
+
+
+# Symbols to trade - 10 highest volume coins
+# Reduced from 15 to lower memory pressure on node state parsing
 SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'HYPEUSDT',
-    'DOGEUSDT', 'XRPUSDT', 'BNBUSDT'
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
+    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'ADAUSDT', 'NEARUSDT',
 ]
 
 
@@ -65,6 +119,11 @@ async def run_paper_trade():
     logger.info('Node mode: USE_HL_NODE=true')
     logger.info('Dry run: True (no real orders)')
     logger.info('=' * 60)
+
+    # Cleanup orphaned temp databases on startup
+    deleted = cleanup_temp_databases()
+    if deleted > 0:
+        logger.info(f'Cleaned up {deleted} orphaned temp databases')
 
     # Create resource monitor
     logger.info('Creating ResourceMonitor...')
@@ -139,6 +198,28 @@ async def run_paper_trade():
         cleanup.register_pruner('candidate_zone_decay', service._node_bridge.decay_candidate_zones)
         cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
 
+    # Register execution.db pruning (48h retention to prevent unbounded growth)
+    # Run every cleanup cycle - the prune method is fast when little to prune
+    if hasattr(service, '_execution_db') and hasattr(service._execution_db, '_db'):
+        cleanup.register_pruner(
+            'execution_db',
+            lambda: service._execution_db._db.prune_old_data(max_age_hours=48).get('total_deleted', 0)
+        )
+
+    # Register HL node data cleanup (keeps 24h of data, cleans diagnostics)
+    # Import here to avoid circular imports
+    from scripts.cleanup_hl_data import cleanup_hl_data
+    cleanup.register_pruner(
+        'hl_node_data',
+        lambda: cleanup_hl_data(
+            data_dir='~/hl/data',
+            keep_hours=24,
+            keep_abci_states=5,
+            dry_run=False,
+            verbose=False
+        ).get('total_files', 0)
+    )
+
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
 
@@ -154,6 +235,9 @@ async def run_paper_trade():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Wire up cleanup coordinator with resource monitor for disk space warnings
+    monitor.set_cleanup_coordinator(cleanup)
 
     # Start resource monitor
     logger.info('Starting resource monitor...')

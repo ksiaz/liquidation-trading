@@ -30,6 +30,7 @@ except ImportError:
 
 from .asset_mapping import get_coin_name, PRIORITY_COINS
 from .metrics import PositionStateMetrics
+from .streaming_parser import StreamingStateParser, StreamingParserConfig
 
 # Import LiquidationProximity for governance compatibility
 from runtime.hyperliquid.types import LiquidationProximity
@@ -142,7 +143,13 @@ class PositionStateManager:
         min_position_value: float = 1000.0,   # Minimum USD to track
         focus_coins: Optional[List[str]] = None,
         # Memory optimization
-        skip_initial_scan: bool = False,      # Skip memory-heavy initial scan
+        skip_initial_scan: bool = True,       # Skip memory-heavy initial scan (default: True for safety)
+        # Batch discovery (memory-safe alternative to full_discovery_scan)
+        discovery_batch_size: int = 500,      # Wallets per batch
+        discovery_batch_interval: float = 10.0,  # Seconds between batches
+        enable_fills_bootstrap: bool = True,  # Bootstrap from node_fills on startup
+        fills_bootstrap_hours: int = 6,       # Hours of fills to read for bootstrap
+        node_data_path: Optional[str] = None,  # Path to node data (for fills bootstrap)
     ):
         """
         Initialize position state manager.
@@ -158,6 +165,11 @@ class PositionStateManager:
             min_position_value: Minimum position value to track
             focus_coins: Only track these coins (None = all)
             skip_initial_scan: Skip the initial discovery scan to save memory (~5GB)
+            discovery_batch_size: Number of wallets to process per batch
+            discovery_batch_interval: Seconds between batch discovery cycles
+            enable_fills_bootstrap: Whether to bootstrap from node_fills on startup
+            fills_bootstrap_hours: Hours of fills history to read for bootstrap
+            node_data_path: Path to node data directory (for fills bootstrap)
         """
         self._state_path = state_path
         self._state_file = os.path.join(state_path, "abci_state.rmp")
@@ -177,6 +189,17 @@ class PositionStateManager:
         self._focus_coins = set(focus_coins) if focus_coins else None
         self._skip_initial_scan = skip_initial_scan
 
+        # Batch discovery settings
+        self._discovery_batch_size = discovery_batch_size
+        self._discovery_batch_interval = discovery_batch_interval
+        self._enable_fills_bootstrap = enable_fills_bootstrap
+        self._fills_bootstrap_hours = fills_bootstrap_hours
+        self._node_data_path = node_data_path or os.path.expanduser("~/hl/data")
+
+        # Memory guards
+        self._max_cached_positions = 50_000
+        self._max_cached_wallets = 10_000
+
         # Position cache: wallet -> coin -> PositionCache
         self._cache: Dict[str, Dict[str, PositionCache]] = defaultdict(dict)
 
@@ -195,6 +218,17 @@ class PositionStateManager:
         self._last_discovery_scan = 0.0
         self._last_watchlist_refresh = 0.0
         self._last_monitored_refresh = 0.0
+        self._last_discovery_batch = 0.0
+
+        # Streaming parser for memory-safe batch discovery
+        self._streaming_parser = StreamingStateParser(
+            self._state_file,
+            StreamingParserConfig(
+                batch_size=discovery_batch_size,
+                min_position_value=min_position_value,
+                focus_coins=self._focus_coins,
+            )
+        )
 
         # Metrics
         self.metrics = PositionStateMetrics()
@@ -211,9 +245,8 @@ class PositionStateManager:
         self._sz_decimals: Dict[int, int] = {}
         self._oracle_prices: Dict[int, float] = {}
 
-        # State file caching (2026-01-28: Fix for OOM - 968MB file was being reloaded constantly)
-        self._cached_state: Optional[Dict] = None
-        self._cached_state_mtime: float = 0.0
+        # NOTE: Cached state removed in 2026-01-31 memory safety refactor.
+        # The 5-10GB cached state caused OOM. Now using streaming parser instead.
 
     async def start(self) -> None:
         """Start the position state manager."""
@@ -222,14 +255,16 @@ class PositionStateManager:
 
         self._running = True
 
-        # Initial discovery scan (can be skipped to save ~5GB memory)
-        if not self._skip_initial_scan:
-            await self.full_discovery_scan()
-        else:
-            # Mark as scanned so periodic scans don't trigger immediately
-            self._last_discovery_scan = time.time()
+        # Bootstrap from fills if enabled (memory-safe alternative to full_discovery_scan)
+        if self._enable_fills_bootstrap:
+            print("[PositionStateManager] Bootstrapping from node_fills...")
+            await self.bootstrap_from_fills()
 
-        # Start refresh loop
+        # Mark discovery times to prevent immediate full scans
+        self._last_discovery_scan = time.time()
+        self._last_discovery_batch = time.time()
+
+        # Start refresh loop (uses incremental batch discovery, NOT full_discovery_scan)
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
     async def stop(self) -> None:
@@ -283,6 +318,82 @@ class PositionStateManager:
             del self._prices[coin]
 
         return len(to_remove)
+
+    def estimate_memory_bytes(self) -> int:
+        """
+        Estimate current memory usage of position cache.
+
+        Rough estimates:
+        - PositionCache object: ~500 bytes (strings, floats, refs)
+        - Wallet dict entry: ~100 bytes overhead
+        - Price entry: ~50 bytes
+
+        Returns:
+            Estimated memory usage in bytes
+        """
+        position_count = sum(len(p) for p in self._cache.values())
+        wallet_count = len(self._cache)
+        price_count = len(self._prices)
+
+        return (position_count * 500) + (wallet_count * 100) + (price_count * 50)
+
+    def enforce_memory_limits(self) -> int:
+        """
+        Evict low-priority positions if cache limits exceeded.
+
+        Eviction priority (lowest tier first):
+        1. DISCOVERY tier positions
+        2. MONITORED tier positions
+        Never evicts CRITICAL or WATCHLIST.
+
+        Returns:
+            Number of positions evicted
+        """
+        position_count = sum(len(p) for p in self._cache.values())
+        wallet_count = len(self._cache)
+
+        # Check if limits exceeded
+        if position_count <= self._max_cached_positions and wallet_count <= self._max_cached_wallets:
+            return 0
+
+        evicted = 0
+
+        # Evict DISCOVERY tier first
+        if position_count > self._max_cached_positions:
+            to_evict = position_count - self._max_cached_positions
+            for wallet, coin in list(self._by_tier[RefreshTier.DISCOVERY]):
+                if evicted >= to_evict:
+                    break
+
+                if wallet in self._cache and coin in self._cache[wallet]:
+                    del self._cache[wallet][coin]
+                    self._by_tier[RefreshTier.DISCOVERY].discard((wallet, coin))
+                    evicted += 1
+
+                    # Clean up empty wallet
+                    if not self._cache[wallet]:
+                        del self._cache[wallet]
+
+        # If still over, evict MONITORED tier
+        position_count = sum(len(p) for p in self._cache.values())
+        if position_count > self._max_cached_positions:
+            to_evict = position_count - self._max_cached_positions
+            for wallet, coin in list(self._by_tier[RefreshTier.MONITORED]):
+                if evicted >= to_evict:
+                    break
+
+                if wallet in self._cache and coin in self._cache[wallet]:
+                    del self._cache[wallet][coin]
+                    self._by_tier[RefreshTier.MONITORED].discard((wallet, coin))
+                    evicted += 1
+
+                    if not self._cache[wallet]:
+                        del self._cache[wallet]
+
+        if evicted > 0:
+            print(f"[PositionStateManager] Memory limit enforced: evicted {evicted} positions")
+
+        return evicted
 
     def update_prices(self, prices: Dict[str, float]) -> List[ProximityAlert]:
         """
@@ -641,6 +752,170 @@ class PositionStateManager:
 
         return discovered
 
+    async def incremental_discovery_batch(self, batch_size: Optional[int] = None) -> int:
+        """
+        Discover positions in batches using streaming parser.
+
+        This is the memory-safe alternative to full_discovery_scan().
+        Processes a batch of wallets, then releases memory.
+
+        Args:
+            batch_size: Override default batch size
+
+        Returns:
+            Number of positions discovered in this batch
+        """
+        start_time = time.time()
+
+        # Get next batch of wallets
+        wallets, is_complete = self._streaming_parser.get_next_discovery_batch()
+
+        if not wallets:
+            self._last_discovery_batch = time.time()
+            return 0
+
+        discovered = 0
+
+        try:
+            # Process positions for this batch
+            for wallet, coin, pos_data in self._streaming_parser.iter_positions_batch(wallets):
+                cached = await self._update_cache_from_data(wallet, coin, pos_data)
+                if cached:
+                    discovered += 1
+
+            # Update metrics
+            self.metrics.positions_cached = sum(
+                len(positions) for positions in self._cache.values()
+            )
+            self.metrics.wallets_tracked = len(self._cache)
+            self.metrics.critical_positions = len(self._by_tier[RefreshTier.CRITICAL])
+            self.metrics.watchlist_positions = len(self._by_tier[RefreshTier.WATCHLIST])
+            self.metrics.monitored_positions = len(self._by_tier[RefreshTier.MONITORED])
+
+        except Exception as e:
+            print(f"[PositionStateManager] Batch discovery error: {e}")
+
+        self._last_discovery_batch = time.time()
+
+        # Log progress periodically
+        current, total = self._streaming_parser.get_discovery_progress()
+        if is_complete:
+            print(f"[PositionStateManager] Discovery cycle complete: {self.metrics.positions_cached} positions cached")
+
+        return discovered
+
+    async def bootstrap_from_fills(self, hours: Optional[int] = None) -> int:
+        """
+        Bootstrap position cache from recent liquidations in node_fills.
+
+        Wallets that were recently liquidated likely have other at-risk positions.
+        This provides immediate position discovery without loading the full state file.
+
+        Args:
+            hours: Hours of history to read (default: self._fills_bootstrap_hours)
+
+        Returns:
+            Number of positions discovered
+        """
+        import json
+        from datetime import datetime, timedelta
+        from pathlib import Path
+
+        hours = hours or self._fills_bootstrap_hours
+        fills_dir = Path(self._node_data_path) / "node_fills" / "hourly"
+
+        if not fills_dir.exists():
+            print(f"[PositionStateManager] node_fills directory not found: {fills_dir}")
+            return 0
+
+        # Collect unique wallets from recent liquidations
+        liquidated_wallets: Set[str] = set()
+        cutoff = datetime.now() - timedelta(hours=hours)
+
+        try:
+            # Iterate through recent date directories
+            for date_dir in sorted(fills_dir.iterdir(), reverse=True):
+                if not date_dir.is_dir():
+                    continue
+
+                # Check if directory is within our time window
+                try:
+                    dir_date = datetime.strptime(date_dir.name, "%Y%m%d")
+                    if dir_date.date() < cutoff.date():
+                        break
+                except ValueError:
+                    continue
+
+                # Read fills files in this directory
+                for fills_file in sorted(date_dir.iterdir(), reverse=True):
+                    if not fills_file.is_file():
+                        continue
+
+                    try:
+                        with open(fills_file, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+
+                                try:
+                                    data = json.loads(line)
+                                    if isinstance(data, list) and len(data) >= 2:
+                                        wallet = data[0]
+                                        fill_data = data[1]
+
+                                        # Check if this is a liquidation
+                                        if isinstance(fill_data, dict) and 'liquidation' in fill_data:
+                                            liquidated_wallets.add(wallet)
+
+                                            # Also add the liquidated user
+                                            liq_info = fill_data['liquidation']
+                                            if isinstance(liq_info, dict):
+                                                liq_user = liq_info.get('liquidatedUser')
+                                                if liq_user:
+                                                    liquidated_wallets.add(liq_user)
+
+                                except (json.JSONDecodeError, TypeError):
+                                    continue
+
+                    except Exception as e:
+                        print(f"[PositionStateManager] Error reading fills file {fills_file}: {e}")
+                        continue
+
+        except Exception as e:
+            print(f"[PositionStateManager] Error bootstrapping from fills: {e}")
+
+        if not liquidated_wallets:
+            print(f"[PositionStateManager] No liquidations found in past {hours}h")
+            return 0
+
+        print(f"[PositionStateManager] Found {len(liquidated_wallets)} wallets from recent liquidations")
+
+        # Now load positions for these wallets
+        discovered = 0
+
+        try:
+            for wallet, coin, pos_data in self._streaming_parser.iter_positions_batch(list(liquidated_wallets)):
+                cached = await self._update_cache_from_data(wallet, coin, pos_data)
+                if cached:
+                    discovered += 1
+
+            # Update metrics
+            self.metrics.positions_cached = sum(
+                len(positions) for positions in self._cache.values()
+            )
+            self.metrics.wallets_tracked = len(self._cache)
+            self.metrics.critical_positions = len(self._by_tier[RefreshTier.CRITICAL])
+            self.metrics.watchlist_positions = len(self._by_tier[RefreshTier.WATCHLIST])
+            self.metrics.monitored_positions = len(self._by_tier[RefreshTier.MONITORED])
+
+        except Exception as e:
+            print(f"[PositionStateManager] Error loading positions for liquidated wallets: {e}")
+
+        print(f"[PositionStateManager] Bootstrap complete: {discovered} positions from {len(liquidated_wallets)} wallets")
+
+        return discovered
+
     # ==================== Internal Methods ====================
 
     def _determine_tier(self, proximity: float) -> RefreshTier:
@@ -755,101 +1030,31 @@ class PositionStateManager:
         except Exception:
             return None
 
-    def _get_cached_state(self) -> Optional[Dict]:
-        """Get cached state, reloading only if file changed.
-
-        Memory optimization (2026-01-28): The state file is ~1GB and expands to 5-10GB
-        as Python objects. Previously we were reloading it on every position read,
-        causing OOM. Now we cache and only reload when mtime changes.
-        """
-        if not os.path.exists(self._state_file):
-            return None
-
-        try:
-            current_mtime = os.path.getmtime(self._state_file)
-
-            # Only reload if file changed
-            if self._cached_state is None or current_mtime > self._cached_state_mtime:
-                with open(self._state_file, 'rb') as f:
-                    self._cached_state = msgpack.unpack(f, raw=False, strict_map_key=False)
-                self._cached_state_mtime = current_mtime
-
-            return self._cached_state
-        except Exception:
-            return None
+    # NOTE: _get_cached_state was removed in 2026-01-31 memory safety refactor.
+    # The 5-10GB cached state caused OOM. Now using streaming parser instead.
+    # See incremental_discovery_batch() and bootstrap_from_fills() for memory-safe alternatives.
 
     def _read_position_sync(self, target_wallet: str, target_coin: str) -> Optional[Dict]:
-        """Synchronously read position from state file."""
-        data = self._get_cached_state()
-        if data is None:
+        """
+        Synchronously read position from state file.
+
+        Uses streaming parser for memory-safe access (loads, reads, releases).
+        """
+        # Use streaming parser to get position for specific wallet/coin
+        result = self._streaming_parser.get_position_for_wallet(target_wallet, target_coin)
+
+        if result is None:
             return None
 
-        try:
-            exchange = data.get('exchange', {})
-            perp_dexs = exchange.get('perp_dexs', [])
+        # If we got a single position back (coin was specified)
+        if isinstance(result, dict) and 'size' in result:
+            return result
 
-            if not perp_dexs:
-                return None
+        # If we got all positions for wallet, extract the one we want
+        if isinstance(result, dict) and target_coin in result:
+            return result[target_coin]
 
-            main_dex = perp_dexs[0]
-            ch = main_dex.get('clearinghouse', {})
-
-            # Update metadata if needed
-            if not self._sz_decimals:
-                meta = ch.get('meta', {})
-                universe = meta.get('universe', [])
-                self._sz_decimals = {i: u.get('szDecimals', 0) for i, u in enumerate(universe)}
-
-            # Update oracle prices using correct scaling
-            oracle = ch.get('oracle', {})
-            pxs = oracle.get('pxs', [])
-            for asset_id, px_data in enumerate(pxs):
-                if px_data and isinstance(px_data, list) and px_data:
-                    raw_px = px_data[0].get('px', 0)
-                    sz_dec = self._sz_decimals.get(asset_id, 0)
-                    scale = 10 ** (6 - sz_dec)
-                    self._oracle_prices[asset_id] = raw_px / scale
-
-            # Get user state
-            us = ch.get('user_states', {})
-            user_to_state = us.get('user_to_state', [])
-
-            # Find target user
-            for item in user_to_state:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-
-                wallet = item[0]
-                if wallet != target_wallet:
-                    continue
-
-                user_data = item[1]
-                if not isinstance(user_data, dict):
-                    continue
-
-                p_data = user_data.get('p', {})
-                pos_list = p_data.get('p', [])
-
-                for pos_item in pos_list:
-                    if not isinstance(pos_item, list) or len(pos_item) < 2:
-                        continue
-
-                    asset_id = pos_item[0]
-                    coin = get_coin_name(asset_id)
-
-                    if coin != target_coin:
-                        continue
-
-                    pos = pos_item[1]
-                    if isinstance(pos, dict):
-                        return self._extract_position_data(asset_id, pos)
-
-                break  # Found user, position not found
-
-            return None  # Position not found
-
-        except Exception:
-            return None
+        return None
 
     async def _parse_full_state(self) -> Dict[str, Dict[str, Dict]]:
         """Parse full state file for discovery scan."""
@@ -868,6 +1073,9 @@ class PositionStateManager:
         """
         Synchronously parse full state file.
 
+        WARNING: This method loads the entire state file (5-10GB in memory).
+        Use incremental_discovery_batch() for memory-safe discovery instead.
+
         Position data is in: perp_dexs[0].clearinghouse.user_states.user_to_state
         Each user has: p.p = [[asset_id, {s, e, l, M, f}], ...]
 
@@ -878,8 +1086,15 @@ class PositionStateManager:
         - M: margin table ID
         - f: funding info {a, o, c}
         """
-        data = self._get_cached_state()
-        if data is None:
+        import gc
+
+        if not os.path.exists(self._state_file):
+            return {}
+
+        try:
+            with open(self._state_file, 'rb') as f:
+                data = msgpack.unpack(f, raw=False, strict_map_key=False)
+        except Exception:
             return {}
 
         positions = {}
@@ -954,6 +1169,11 @@ class PositionStateManager:
         except Exception as e:
             import traceback
             traceback.print_exc()
+        finally:
+            # Release memory from parsed state (important: don't cache this!)
+            if 'data' in dir():
+                data.clear()
+            gc.collect()
 
         return positions
 
@@ -1058,9 +1278,13 @@ class PositionStateManager:
                     if self._by_tier[RefreshTier.MONITORED]:
                         await self.refresh_monitored()
 
-                # Check discovery scan
-                if now - self._last_discovery_scan >= self._discovery_interval:
-                    await self.full_discovery_scan()
+                # Incremental batch discovery (memory-safe alternative to full_discovery_scan)
+                # Processes a batch of wallets every discovery_batch_interval seconds
+                if now - self._last_discovery_batch >= self._discovery_batch_interval:
+                    await self.incremental_discovery_batch()
+
+                    # Enforce memory limits after discovery
+                    self.enforce_memory_limits()
 
                 # Sleep a bit
                 await asyncio.sleep(1.0)

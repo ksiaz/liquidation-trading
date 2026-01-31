@@ -126,3 +126,4 @@ oracle_pubkey.md
 analyze_*.py
 check_*.py
 cleanup_*.py
+*.ntfs-3g-*

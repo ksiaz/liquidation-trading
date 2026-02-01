@@ -8,6 +8,9 @@ from .internal.m3_temporal import M3TemporalEngine
 # Diagnostic flag for M2 node tracing
 _DIAG_M2 = os.environ.get('DIAG_M2', '').lower() in ('1', 'true', 'yes')
 
+# Structured diagnostics for silent paths
+from runtime.diagnostics import diag, ReasonCode
+
 # Tier B-6: Cascade observation primitives
 from memory.m4_cascade_proximity import LiquidationCascadeProximity, compute_liquidation_cascade_proximity
 from memory.m4_cascade_state import CascadeStateObservation, compute_cascade_state, CascadePhase
@@ -307,8 +310,15 @@ class ObservationSystem:
                 self._associate_trade_with_nodes(normalized_event)
 
             # M2 Population: Create/update nodes from liquidations
+            # Also record for cascade state tracking (source-agnostic)
             if normalized_event and event_type == 'LIQUIDATION':
                 self._create_or_update_node_from_liquidation(normalized_event)
+                # Record for cascade state detection (all sources)
+                self.record_hl_liquidation(
+                    symbol=normalized_event['symbol'],
+                    timestamp=normalized_event['timestamp'],
+                    value=normalized_event['quote_qty']
+                )
 
             # Update M2 nodes with orderbook state if it's a depth event
             if normalized_event and event_type == 'DEPTH':
@@ -321,14 +331,14 @@ class ObservationSystem:
                     best_ask_price=normalized_event['best_ask_price']
                 )
 
-            # Record HL liquidations for cascade state tracking AND create M2 nodes
+            # DEPRECATED: HL_LIQUIDATION path - kept for backward compatibility
+            # New HL liquidations use canonical LIQUIDATION event type
             if normalized_event and event_type == 'HL_LIQUIDATION':
                 self.record_hl_liquidation(
                     symbol=normalized_event['symbol'],
                     timestamp=normalized_event['timestamp'],
                     value=normalized_event['value']
                 )
-                # Also create M2 nodes from HL liquidations (same as Binance liquidations)
                 self._create_or_update_node_from_liquidation(normalized_event)
         except Exception as e:
             # Internal crash -> FAILED state
@@ -447,6 +457,8 @@ class ObservationSystem:
                 initial_strength=0.5,
                 volume=volume
             )
+            # Record causal liquidation evidence on newly created node
+            self._m2_store.record_liquidation_at_node(node_id, timestamp, side)
             self._m2_diag_nodes_created += 1
 
     def _associate_trade_with_nodes(self, normalized_event: Dict) -> None:
@@ -500,6 +512,13 @@ class ObservationSystem:
                     creation_reason="large_trade",
                     initial_strength=0.3,
                     volume=volume
+                )
+                # Record causal trade evidence on newly created node
+                self._m2_store.record_trade_at_node(
+                    node_id=node_id,
+                    timestamp=timestamp,
+                    volume=volume,
+                    is_buyer_maker=is_taker_sell
                 )
                 self._m2_diag_nodes_created += 1
 
@@ -969,12 +988,32 @@ class ObservationSystem:
         open_interest_bias_primitive = None
 
         try:
+            if not self._hl_collector:
+                # DIAGNOSTIC: HL collector not wired - all cascade primitives will be None
+                diag.record_skip(
+                    component="ObservationSystem",
+                    function="_compute_primitives_for_symbol",
+                    reason_code=ReasonCode.M4_CASCADE_COLLECTOR_MISSING,
+                    symbol=symbol,
+                    context={}
+                )
+
             if self._hl_collector:
                 # Convert symbol to Hyperliquid coin format (BTCUSDT -> BTC)
                 hl_coin = symbol.replace('USDT', '').replace('PERP', '')
 
                 # Get proximity data from collector
                 hl_proximity = self._hl_collector.get_proximity(hl_coin)
+
+                if not hl_proximity:
+                    # DIAGNOSTIC: Proximity data missing - cascade primitives will be None
+                    diag.record_skip(
+                        component="ObservationSystem",
+                        function="_compute_primitives_for_symbol",
+                        reason_code=ReasonCode.M4_PROXIMITY_DATA_MISSING,
+                        symbol=symbol,
+                        context={"hl_coin": hl_coin}
+                    )
 
                 if hl_proximity:
                     # Convert to constitutional M4 primitive
@@ -1009,6 +1048,15 @@ class ObservationSystem:
 
                 # Get position data for leverage and open interest primitives
                 tracker = self._hl_collector._tracker if hasattr(self._hl_collector, '_tracker') else None
+                if not tracker:
+                    # DIAGNOSTIC: Tracker missing - leverage/OI primitives will be None
+                    diag.record_skip(
+                        component="ObservationSystem",
+                        function="_compute_primitives_for_symbol",
+                        reason_code=ReasonCode.M4_TRACKER_MISSING,
+                        symbol=symbol,
+                        context={"hl_coin": hl_coin}
+                    )
                 if tracker:
                     # Extract positions for coin (HL uses BTC not BTCUSDT)
                     # Use get_positions method which accesses _positions_by_coin (the aggregated index)
@@ -1047,10 +1095,25 @@ class ObservationSystem:
                             positions=positions,
                             timestamp=self._system_time
                         )
+                    else:
+                        # DIAGNOSTIC: No positions found - leverage/OI primitives will be None
+                        diag.record_skip(
+                            component="ObservationSystem",
+                            function="_compute_primitives_for_symbol",
+                            reason_code=ReasonCode.M4_NO_POSITIONS,
+                            symbol=symbol,
+                            context={"hl_coin": hl_coin}
+                        )
 
-        except Exception:
-            # Cascade primitive computation failures should not crash snapshot
-            pass
+        except Exception as e:
+            # DIAGNOSTIC: Cascade primitive computation failed
+            diag.record_skip(
+                component="ObservationSystem",
+                function="_compute_primitives_for_symbol",
+                reason_code=ReasonCode.M4_COMPUTATION_EXCEPTION,
+                symbol=symbol,
+                context={"error": str(e)}
+            )
 
         # Return bundle with computed primitives
         return M4PrimitiveBundle(

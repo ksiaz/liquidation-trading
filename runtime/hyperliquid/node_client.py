@@ -5,13 +5,14 @@ Connects to the node proxy running on the VM for unlimited data access.
 No rate limits, sub-second latency.
 """
 
+import os
 import requests
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
-# Node proxy endpoint
-NODE_PROXY_URL = "http://64.176.65.252:8080"
+# Node proxy endpoint - configurable via environment
+NODE_PROXY_URL = os.environ.get("HL_NODE_PROXY_URL", "http://localhost:8080")
 
 # Asset ID to coin name mapping (Hyperliquid perps)
 ASSET_ID_TO_COIN = {

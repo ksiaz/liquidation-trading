@@ -1,0 +1,21 @@
+# Optional Dependencies - Graceful Degradation
+# Install with: pip install -r requirements-optional.txt
+
+# Desktop UI (native app)
+PySide6>=6.0.0,<7.0.0
+
+# Analysis & Visualization
+scipy>=1.7.0,<2.0.0
+matplotlib>=3.4.0,<4.0.0
+seaborn>=0.11.0,<1.0.0
+
+# S3 & Compression (indexer mode)
+boto3>=1.17.0,<2.0.0
+msgpack>=1.0.0,<2.0.0
+lz4>=3.1.0,<5.0.0
+
+# Web Scraping (research)
+selenium>=4.0.0,<5.0.0
+
+# Alternative Exchange (research)
+ccxt>=4.0.0,<5.0.0

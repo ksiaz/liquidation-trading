@@ -46,6 +46,9 @@ from runtime.risk.monitor import RiskMonitor
 from runtime.risk.types import RiskConfig, AccountState
 from .types import ExecutionResult, CycleStats
 
+# Structured diagnostics for silent paths
+from runtime.diagnostics import diag, ReasonCode
+
 
 class ExecutionController:
     """
@@ -118,12 +121,28 @@ class ExecutionController:
         # Step 3: Execute actions
         for symbol, action in actions.items():
             if action.type == ActionType.NO_ACTION:
+                # DIAGNOSTIC: Arbitration produced NO_ACTION
+                diag.record_skip(
+                    component="ExecutionController",
+                    function="process_cycle",
+                    reason_code=ReasonCode.ARB_NO_ACTION,
+                    symbol=symbol,
+                    context={}
+                )
                 continue  # Skip NO_ACTION
-            
+
             # Step 3a: Validate ENTRY actions against risk constraints
             if action.type == ActionType.ENTRY:
                 # F5: Require real parameters - reject placeholder/missing values
                 if action.quantity is None or action.quantity <= 0:
+                    # DIAGNOSTIC: ENTRY rejected due to missing quantity
+                    diag.record_skip(
+                        component="ExecutionController",
+                        function="process_cycle",
+                        reason_code=ReasonCode.EC_ENTRY_MISSING_QUANTITY,
+                        symbol=symbol,
+                        context={"quantity": action.quantity}
+                    )
                     self._execution_log.append(ExecutionResult(
                         symbol=symbol,
                         action=action.type,
@@ -137,6 +156,14 @@ class ExecutionController:
                     continue
 
                 if action.direction is None:
+                    # DIAGNOSTIC: ENTRY rejected due to missing direction
+                    diag.record_skip(
+                        component="ExecutionController",
+                        function="process_cycle",
+                        reason_code=ReasonCode.EC_ENTRY_MISSING_DIRECTION,
+                        symbol=symbol,
+                        context={}
+                    )
                     self._execution_log.append(ExecutionResult(
                         symbol=symbol,
                         action=action.type,
@@ -265,6 +292,20 @@ class ExecutionController:
                         quantity=action.quantity,  # F5: Real quantity
                         entry_price=entry_price
                     )
+
+                    # Save strategy context for restart recovery
+                    if self._repository and action.strategy_id:
+                        try:
+                            from external_policy.ep2_strategy_geometry import get_entry_context_for_persistence
+                            entry_context = get_entry_context_for_persistence(symbol)
+                            if entry_context:
+                                self._repository.save(
+                                    new_position,
+                                    strategy_id=action.strategy_id,
+                                    entry_context=entry_context
+                                )
+                        except ImportError:
+                            pass  # Geometry module not available
             elif state_action == StateAction.EXIT:
                 new_position = self.state_machine.transition(symbol, state_action)
 
@@ -272,6 +313,10 @@ class ExecutionController:
                 # In live trading, this would happen after exchange confirms fill
                 if new_position.state == PositionState.CLOSING:
                     new_position = self.state_machine.transition(symbol, "SUCCESS")
+
+                    # Clear strategy context on exit
+                    if self._repository and new_position.state == PositionState.FLAT:
+                        self._repository.clear_entry_context(symbol)
 
             elif state_action == StateAction.REDUCE:
                 new_position = self.state_machine.transition(symbol, state_action)

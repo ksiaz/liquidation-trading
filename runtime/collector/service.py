@@ -47,17 +47,22 @@ try:
 except ImportError:
     HYPERLIQUID_AVAILABLE = False
 
-# Import Node Adapter Integration (direct node access - faster, more complete)
+# Import Node Adapter Integration (out-of-process gRPC adapter)
+# See docs/NODE_ADAPTER_REDESIGN.md for architecture plan.
 try:
-    from runtime.hyperliquid.node_adapter.observation_bridge import create_integrated_node
-    from runtime.hyperliquid.node_adapter.config import NodeAdapterConfig
-    from runtime.hyperliquid.node_adapter.position_state import MSGPACK_AVAILABLE
-    NODE_ADAPTER_AVAILABLE = MSGPACK_AVAILABLE
+    from runtime.node_client import NodeBridge, create_node_bridge, SyncStatusCode
+    NODE_ADAPTER_AVAILABLE = True
 except ImportError:
     NODE_ADAPTER_AVAILABLE = False
 
 # Import Cascade Sniper types for absorption analysis
 from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis, ProximityData
+
+# Import geometry strategy restore function for position state recovery
+from external_policy.ep2_strategy_geometry import restore_entry_context_from_positions
+
+# Phase E: StabilityObserver attachment (passive, read-only)
+from runtime.stability_observer import stability_observer
 
 # Import Binance Client for ATR warm-up
 from runtime.binance.client import BinanceClient
@@ -117,7 +122,13 @@ class CollectorService:
             cascade_sniper_entry_mode="CASCADE_MOMENTUM"  # Aggressive: ride the cascade
         ))
         self.arbitrator = MandateArbitrator()
-        self.executor = ExecutionController(RiskConfig())
+        # Fix: Enable position persistence to survive restarts
+        # Without this, EXIT signals never trigger (position state lost on restart)
+        self.executor = ExecutionController(RiskConfig(), db_path="logs/positions.db")
+
+        # Restore strategy state from persisted positions
+        # This enables EXIT signals for positions opened in previous sessions
+        self._restore_strategy_state()
 
         # Track mark prices for execution (estimated from trade stream)
         self._mark_prices: Dict[str, Decimal] = {}
@@ -191,25 +202,28 @@ class CollectorService:
         self._use_node_mode = os.environ.get("USE_HL_NODE", "false").lower() == "true"
 
         if self._use_node_mode and NODE_ADAPTER_AVAILABLE:
-            # Node Adapter Mode: Direct access to local hl-node
-            # Provides: 10k+ positions, real-time liquidations, full market data
+            # Node Adapter Mode: gRPC client to out-of-process adapter
+            # Provides: real-time prices and liquidations from hl-node
+            # Requires: hl-node-adapter/server.py running on localhost:50051
             try:
-                self._logger.info("Initializing Hyperliquid node adapter...")
-                node_config = NodeAdapterConfig(
-                    skip_catchup=True,  # Don't catch up on old data - governance drops it anyway
+                adapter_address = os.environ.get("HL_ADAPTER_ADDRESS", "localhost:50051")
+                self._logger.info(f"Initializing Hyperliquid node bridge to {adapter_address}...")
+
+                # Filter to priority coins for initial testing
+                focus_symbols = ['BTC', 'ETH', 'SOL', 'HYPE', 'DOGE', 'XRP', 'BNB']
+
+                self._node_bridge = create_node_bridge(
+                    observation_system=self._obs,
+                    address=adapter_address,
+                    symbols=focus_symbols,
                 )
-                # Use default paths: ~/hl/data and ~/hl/hyperliquid_data
-                self._node_integration, self._node_bridge, self._node_psm = create_integrated_node(
-                    self._obs,
-                    config=node_config,
-                    enable_position_tracking=True,
-                    min_position_value=1000.0,  # Track positions >$1k
-                    focus_coins=['BTC', 'ETH', 'SOL', 'HYPE', 'DOGE', 'XRP', 'BNB'],
-                )
+
+                # Note: Bridge.start() is called in run() to ensure proper async context
                 self._hyperliquid_enabled = True
-                self._logger.info("Hyperliquid node adapter initialized (position tracking enabled)")
+                self._logger.info(f"Hyperliquid node bridge configured for {len(focus_symbols)} symbols")
+
             except Exception as e:
-                self._logger.warning(f"Node adapter init failed: {e}, falling back to WebSocket mode")
+                self._logger.warning(f"Node bridge init failed: {e}, falling back to WebSocket mode")
                 self._use_node_mode = False
 
         if not self._use_node_mode and HYPERLIQUID_AVAILABLE:
@@ -261,6 +275,41 @@ class CollectorService:
         self._diag_coins = TOP_10_SYMBOLS  # All symbols for diagnostics
         self._diag_interval = 5  # Log diagnostics every N cycles
         self._diag_cycle_count = 0
+
+    def _restore_strategy_state(self):
+        """Restore strategy state from persisted positions.
+
+        Called on startup to reconstruct internal strategy state from the position
+        database. This enables EXIT signals to trigger for positions that were
+        opened in previous sessions.
+
+        Without this, the geometry strategy's internal tracking (_entry_zone_context,
+        _entry_method) would be empty on restart, causing:
+        - All positions to appear FLAT to strategies
+        - ENTRY signals generated for already-open positions
+        - EXIT signals never triggering (no recorded entry to exit from)
+        """
+        try:
+            # Get all non-FLAT positions from state machine
+            open_positions = []
+            for symbol in TOP_10_SYMBOLS:
+                position = self.executor.state_machine.get_position(symbol)
+                if position and position.state.name != 'FLAT':
+                    open_positions.append({
+                        "symbol": symbol,
+                        "direction": position.direction.value if position.direction else "LONG",
+                        "entry_price": float(position.entry_price) if position.entry_price else 0,
+                        "state": position.state.name
+                    })
+
+            if open_positions:
+                self._logger.info(f"Restoring strategy state for {len(open_positions)} open positions")
+                restore_entry_context_from_positions(open_positions)
+            else:
+                self._logger.debug("No open positions to restore")
+
+        except Exception as e:
+            self._logger.warning(f"Failed to restore strategy state: {e}")
 
     def prune_stale_calculators(self, max_age_sec: float = None) -> int:
         """
@@ -317,23 +366,76 @@ class CollectorService:
             return self._execution_db.get_stats()
         return {}
 
-    def _warm_up_atr_calculators(self, symbols: List[str]):
+    async def _recover_position_contexts(self):
+        """Recover position contexts from database on startup.
+
+        Enables EXIT signals to fire for positions opened in previous sessions.
+        """
+        try:
+            # Get repository from executor's state machine
+            repository = getattr(self.executor.state_machine, '_repository', None)
+            if not repository:
+                self._logger.debug("No position repository configured, skipping context recovery")
+                return
+
+            # Load open positions
+            open_positions = repository.load_open_positions()
+            if not open_positions:
+                self._logger.info("No open positions to recover")
+                return
+
+            self._logger.info(f"Recovering context for {len(open_positions)} open positions")
+
+            # Load entry contexts for each position
+            persisted_contexts = {}
+            for symbol in open_positions:
+                ctx = repository.get_entry_context(symbol)
+                if ctx:
+                    persisted_contexts[symbol] = ctx
+                    self._logger.info(f"  {symbol}: restored entry context (strategy={ctx.get('entry_method', 'unknown')})")
+
+            # Restore geometry strategy context
+            from external_policy.ep2_strategy_geometry import restore_entry_context_from_positions
+
+            # Convert positions to list format expected by restore function
+            positions_list = [
+                {
+                    "symbol": pos.symbol,
+                    "direction": pos.direction.value if pos.direction else None,
+                    "entry_price": float(pos.entry_price) if pos.entry_price else 0,
+                    "state": pos.state.value
+                }
+                for pos in open_positions.values()
+            ]
+
+            restore_entry_context_from_positions(positions_list, persisted_contexts)
+            self._logger.info(f"Strategy contexts restored for {len(positions_list)} positions")
+
+        except Exception as e:
+            self._logger.warning(f"Position context recovery failed: {e}")
+
+    async def _warm_up_atr_calculators(self, symbols: List[str]):
         """Pre-warm ATR calculators with historical klines.
 
-        Fetches 5m klines from Binance to initialize ATR calculators,
+        Fetches 5m klines from Binance asynchronously to initialize ATR calculators,
         avoiding the 90-minute warm-up delay for regime classification.
 
         Args:
             symbols: List of symbols to warm up (e.g., ['BTCUSDT', 'ETHUSDT'])
         """
         try:
+            import asyncio
             client = BinanceClient()
             warmup_count = 0
 
-            for symbol in symbols:
-                # Need at least 20 5m klines for ATR(3) + some buffer for 30m aggregation
-                # 20 klines × 5m = 100 minutes of history
-                klines_5m = client.get_klines(symbol, interval='5m', limit=30)
+            # Fetch all klines concurrently
+            tasks = [client.get_klines_async(symbol, interval='5m', limit=30) for symbol in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for symbol, klines_5m in zip(symbols, results):
+                if isinstance(klines_5m, Exception):
+                    self._logger.warning(f"[ATR-WARMUP] {symbol}: Failed to fetch - {klines_5m}")
+                    continue
 
                 if klines_5m and len(klines_5m) >= 6:
                     # Initialize ATR calculator for this symbol
@@ -370,12 +472,15 @@ class CollectorService:
         # Don't set _startup_time here - will be set on first stream data
         # self._startup_time = time.time()  # REMOVED: causes clock skew with Binance time
 
+        # 0a. Recover persisted positions and strategy contexts (for restart recovery)
+        await self._recover_position_contexts()
+
         # self._logger.info(f"Warmup period duration: {self._warmup_duration_sec}s from startup")
 
-        # 0. Pre-warm ATR calculators with historical data
+        # 0. Pre-warm ATR calculators with historical data (async - non-blocking)
         # This avoids 90-minute warm-up delay for regime classification
         self._logger.info("[ATR-WARMUP] Fetching historical klines for ATR initialization...")
-        self._warm_up_atr_calculators(TOP_10_SYMBOLS)
+        await self._warm_up_atr_calculators(TOP_10_SYMBOLS)
 
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
@@ -389,28 +494,25 @@ class CollectorService:
 
         # 3. Start Hyperliquid Integration (Node Adapter or WebSocket Collector)
         if self._hyperliquid_enabled:
-            if self._use_node_mode and self._node_integration:
-                # Node Adapter Mode
+            if self._use_node_mode and self._node_bridge:
+                # Node Adapter Mode (gRPC to out-of-process adapter)
                 try:
-                    # Start position state manager (does initial discovery scan)
-                    # This loads ~25k positions - yield periodically
-                    if self._node_psm:
-                        await self._node_psm.start()
-                        self._logger.info(
-                            f"Position state manager started: {self._node_psm.metrics.positions_cached} positions, "
-                            f"{self._node_psm.metrics.critical_positions} critical"
-                        )
-                        # Yield to let Binance process messages
-                        await asyncio.sleep(0)
+                    if self._node_bridge.start():
+                        self._logger.info("Node bridge started (streaming prices/liquidations via gRPC)")
 
-                    # Start node integration (streams prices, liquidations, orders)
-                    asyncio.create_task(self._node_integration.start())
-                    self._logger.info("Node integration started (streaming prices/liquidations)")
-
-                    # Proximity provider already wired by create_integrated_node()
-                    self._logger.info("Node proximity provider wired to observation system")
+                        # Check initial status
+                        status = self._node_bridge.get_status()
+                        if status:
+                            self._logger.info(
+                                f"Node adapter status: {status.status.name}, "
+                                f"block={status.latest_block_height}, "
+                                f"prices={status.prices_emitted}, liqs={status.liquidations_emitted}"
+                            )
+                    else:
+                        self._logger.warning("Node bridge failed to connect, falling back to WebSocket mode")
+                        self._use_node_mode = False
                 except Exception as e:
-                    self._logger.warning(f"Node adapter start failed: {e}")
+                    self._logger.warning(f"Node bridge start failed: {e}")
 
             elif self._hyperliquid_collector:
                 # WebSocket Collector Mode
@@ -434,19 +536,17 @@ class CollectorService:
         CPU Optimization (2026-01-28): Reduced from 10Hz to 5Hz.
         - 200ms cycle provides good balance of responsiveness and CPU usage
         """
+        self._logger.info("[CLOCK] Drive clock loop started")
         while self._running:
-            # Use latest stream time if available, otherwise fallback to system time (or wait)
-            # User mandate: Use Binance time for everything.
-            if self._last_stream_time is not None:
-                current_time = self._last_stream_time
-            elif self._node_bridge and self._node_bridge.get_latest_prices():
-                # HL node has data - use wall clock
+            # Simple clock source selection:
+            # - Node mode: use wall clock (node is synced, data is flowing)
+            # - WebSocket mode: use Binance stream time
+            if self._use_node_mode:
                 current_time = time.time()
-                if not hasattr(self, '_hl_clock_logged'):
-                    self._logger.info(f"Using HL node clock, {len(self._node_bridge.get_latest_prices())} prices available")
-                    self._hl_clock_logged = True
+            elif self._last_stream_time is not None:
+                current_time = self._last_stream_time
             else:
-                # Wait for first stream event
+                # Wait for first Binance stream event
                 await asyncio.sleep(0.5)
                 continue
 
@@ -511,9 +611,12 @@ class CollectorService:
             _diag_regime = os.environ.get('DIAG_MANDATE', '').lower() in ('1', 'true', 'yes')
 
             # Get HL node prices as primary source
-            node_prices = {}
-            if self._node_bridge:
-                node_prices = self._node_bridge.get_latest_prices()
+            # Uses M1's latest_hl_prices cache populated by NodeBridge
+            node_prices = self._obs.get_all_hl_prices()
+
+            # Debug: Show HL prices available (first 3 cycles only)
+            if _diag_regime and cycle_id and cycle_id <= 3:
+                print(f"[HL_DEBUG] cycle={cycle_id} node_prices has {len(node_prices)} symbols: {list(node_prices.keys())[:5]}", flush=True)
 
             for symbol in snapshot.symbols_active:
                 try:
@@ -526,6 +629,11 @@ class CollectorService:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
                         continue  # No price data yet
 
+                    # Log when HL oracle price is used (activation proof)
+                    # Log first 5 cycles then every 50th to reduce noise
+                    if _diag_regime and node_prices.get(hl_symbol) and cycle_id and (cycle_id <= 5 or cycle_id % 50 == 1):
+                        print(f"[HL_PRICE] {symbol}: using oracle price {price:.2f} from HL node", flush=True)
+
                     # Get calculators
                     vwap_calc = self._vwap_calculators.get(symbol)
                     atr_calc = self._atr_calculators.get(symbol)
@@ -534,13 +642,15 @@ class CollectorService:
 
                     if not all([vwap_calc, atr_calc, orderflow_calc, liquidation_calc]):
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
+                            # DATA SOURCE CONTRACT: VWAP, ATR, Orderflow require Binance trades
+                            # See runtime/DATA_SOURCE_CONTRACT.py for authority map
                             missing = []
-                            if not vwap_calc: missing.append("vwap")
-                            if not atr_calc: missing.append("atr")
-                            if not orderflow_calc: missing.append("orderflow")
-                            if not liquidation_calc: missing.append("liquidation")
-                            print(f"[REGIME] {symbol}: SKIP - missing calculators: {missing}", flush=True)
-                        continue  # Calculators not initialized yet
+                            if not vwap_calc: missing.append("VWAP (Binance trades required)")
+                            if not atr_calc: missing.append("ATR (Binance OHLC required)")
+                            if not orderflow_calc: missing.append("Orderflow (Binance direction required)")
+                            if not liquidation_calc: missing.append("Liquidation Z-score")
+                            print(f"[REGIME] {symbol}: SKIP - Binance-required data missing: {missing}", flush=True)
+                        continue  # Binance data not available for this symbol
 
                     # Compute regime metrics
                     vwap_distance = vwap_calc.get_distance(price)
@@ -550,16 +660,17 @@ class CollectorService:
                     liquidation_zscore = liquidation_calc.get_zscore(timestamp)
 
                     # Check if all metrics available
+                    # DATA SOURCE CONTRACT: All metrics except liq_z require Binance trade flow
                     if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             missing = []
-                            if vwap_distance is None: missing.append("vwap_dist")
-                            if atr_5m is None: missing.append("atr_5m")
-                            if atr_30m is None: missing.append("atr_30m")
-                            if orderflow_imbalance is None: missing.append("orderflow")
-                            if liquidation_zscore is None: missing.append("liq_z")
-                            print(f"[REGIME] {symbol}: SKIP - missing metrics: {missing}", flush=True)
-                        continue  # Metrics not ready yet
+                            if vwap_distance is None: missing.append("VWAP (Binance)")
+                            if atr_5m is None: missing.append("ATR_5m (Binance)")
+                            if atr_30m is None: missing.append("ATR_30m (Binance warm-up)")
+                            if orderflow_imbalance is None: missing.append("Orderflow (Binance)")
+                            if liquidation_zscore is None: missing.append("Liq_Z (HL or Binance)")
+                            print(f"[REGIME] {symbol}: SKIP - calculator warm-up incomplete: {missing}", flush=True)
+                        continue  # Binance calculator warm-up not complete
 
                     # Create regime metrics object
                     regime_metrics = RegimeMetrics(
@@ -645,7 +756,8 @@ class CollectorService:
                     coin = symbol.replace('USDT', '')
 
                     # Try node mode first (has more complete data)
-                    if self._use_node_mode and self._node_bridge:
+                    # Note: NodeBridge doesn't have proximity provider (requires ObservationBridge)
+                    if self._use_node_mode and self._node_bridge and hasattr(self._node_bridge, 'get_proximity_provider'):
                         proximity_provider = self._node_bridge.get_proximity_provider()
                         if proximity_provider:
                             hl_proximity = proximity_provider.get_proximity(coin)
@@ -714,8 +826,9 @@ class CollectorService:
                     # Phase 6: Get liquidation burst data
                     # In node mode, use node bridge's aggregator (fed by node_trades liquidations)
                     # Otherwise, use collector's aggregator (fed by Binance forceOrder stream)
+                    # Note: NodeBridge doesn't have get_burst (requires ObservationBridge)
                     liquidation_burst = None
-                    if self._use_node_mode and self._node_bridge:
+                    if self._use_node_mode and self._node_bridge and hasattr(self._node_bridge, 'get_burst'):
                         node_burst = self._node_bridge.get_burst(symbol)
                         if node_burst:
                             # Convert node burst to policy adapter format
@@ -750,6 +863,8 @@ class CollectorService:
                             print(f"  Type: {m.type.name}, Authority: {m.authority}")
                             # Track primitives for this mandate
                             mandate_primitives_map[id(m)] = active_primitives
+                            # Phase E: Record mandate for stability observation
+                            stability_observer.record_mandate(m)
                     all_mandates.extend(mandates)
                 except Exception as e:
                     # CRITICAL: Don't silently swallow exceptions - log and continue
@@ -763,6 +878,10 @@ class CollectorService:
 
             # Arbitrate conflicts (resolve to single action per symbol or HOLD)
             actions_by_symbol = self.arbitrator.arbitrate_all(all_mandates)
+
+            # Phase E: Record actions for stability observation
+            for symbol, action in actions_by_symbol.items():
+                stability_observer.record_action(action, symbol)
 
             # Execute actions
             mark_prices = self._mark_prices  # Pass current mark prices

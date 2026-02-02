@@ -176,7 +176,7 @@ _entry_zone_context: dict = {}
 _entry_method: dict = {}  # symbol -> "PATTERN" or "INSTANTANEOUS"
 
 
-def _record_entry_zone(symbol: str, zone: 'SupplyDemandZonePrimitive'):
+def _record_entry_zone(symbol: str, zone: 'SupplyDemandZonePrimitive', entry_method: str = "PATTERN"):
     """Record the zone that triggered entry."""
     _entry_zone_context[symbol] = {
         "zone_id": zone.zone_id,
@@ -185,8 +185,21 @@ def _record_entry_zone(symbol: str, zone: 'SupplyDemandZonePrimitive'):
         "zone_center": zone.zone_center,
         "zone_width": zone.zone_high - zone.zone_low,  # Required for geometric tolerance check
         "retest_count_at_entry": zone.retest_count,
-        "timestamp": zone.timestamp
+        "timestamp": zone.timestamp,
+        "entry_method": entry_method
     }
+    _entry_method[symbol] = entry_method
+
+
+def get_entry_context_for_persistence(symbol: str) -> Optional[dict]:
+    """Get entry context in a format suitable for database persistence.
+
+    Called after ENTRY mandate is processed to save context for restart recovery.
+
+    Returns:
+        Dict with zone context, or None if no context exists
+    """
+    return _entry_zone_context.get(symbol)
 
 
 def _get_entry_zone(symbol: str) -> Optional[dict]:
@@ -206,6 +219,66 @@ def reset_entry_context():
     _entry_method = {}
     _stability_counter = {}
     _exit_stability_counter = {}
+
+
+def restore_entry_context_from_positions(open_positions: list, persisted_contexts: dict = None):
+    """Restore entry context from persisted positions.
+
+    Called on startup to reconstruct internal state from position database.
+    This enables EXIT signals to trigger for positions opened in previous sessions.
+
+    Args:
+        open_positions: List of dicts with keys: symbol, direction, entry_price, state
+                       Only positions with state != FLAT should be passed.
+        persisted_contexts: Dict of symbol -> entry_context from database.
+                           If provided, uses actual zone data instead of pseudo-zone.
+
+    Example:
+        positions = [
+            {"symbol": "BTCUSDT", "direction": "LONG", "entry_price": 95000.0, "state": "OPEN"},
+        ]
+        contexts = {"BTCUSDT": {"zone_id": "...", "zone_low": 94000, ...}}
+        restore_entry_context_from_positions(positions, contexts)
+    """
+    global _entry_zone_context, _entry_method
+
+    persisted_contexts = persisted_contexts or {}
+
+    for pos in open_positions:
+        symbol = pos.get("symbol")
+        if not symbol:
+            continue
+
+        # Check if we have persisted context (preferred)
+        if symbol in persisted_contexts and persisted_contexts[symbol]:
+            _entry_zone_context[symbol] = persisted_contexts[symbol]
+            _entry_method[symbol] = persisted_contexts[symbol].get("entry_method", "PATTERN")
+            continue
+
+        # Fallback: Reconstruct minimal entry context from entry price
+        entry_price = pos.get("entry_price", 0)
+        direction = pos.get("direction", "LONG")
+
+        # Since we don't have the original zone, use price-based pseudo-zone
+        zone_width = entry_price * 0.01 if entry_price else 100  # 1% of entry price
+
+        _entry_zone_context[symbol] = {
+            "zone_id": f"restored_{symbol}",
+            "zone_low": entry_price - zone_width / 2 if entry_price else 0,
+            "zone_high": entry_price + zone_width / 2 if entry_price else 0,
+            "zone_center": entry_price or 0,
+            "zone_width": zone_width,
+            "retest_count_at_entry": 1,
+            "timestamp": 0,
+            "restored": True  # Flag indicating this was restored, not from live zone
+        }
+
+        # Mark as instantaneous method since we don't have original zone
+        # This uses condition-absence exit logic (more lenient)
+        _entry_method[symbol] = "INSTANTANEOUS"
+
+    if open_positions:
+        print(f"[GEOMETRY] Restored entry context for {len(open_positions)} positions: {[p.get('symbol') for p in open_positions]}")
 
 
 # ==============================================================================

@@ -4,12 +4,15 @@ Provides save/load functionality for positions.
 Enables position recovery across restarts.
 
 Constitutional: Stores factual position state only.
+
+Extended (v2): Also stores strategy_id and entry_context for restart recovery.
 """
 
+import json
 import sqlite3
 import time
 from decimal import Decimal
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from pathlib import Path
 
 from .types import Position, PositionState, Direction
@@ -51,7 +54,9 @@ class PositionRepository:
                 quantity TEXT NOT NULL,
                 entry_price TEXT,
                 updated_at REAL NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                strategy_id TEXT,
+                entry_context TEXT
             )
         """)
 
@@ -61,32 +66,53 @@ class PositionRepository:
             ON positions(state)
         """)
 
+        # Add columns if they don't exist (migration for existing DBs)
+        try:
+            cursor.execute("ALTER TABLE positions ADD COLUMN strategy_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            cursor.execute("ALTER TABLE positions ADD COLUMN entry_context TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         self.conn.commit()
 
-    def save(self, position: Position) -> None:
+    def save(self, position: Position, strategy_id: Optional[str] = None,
+             entry_context: Optional[Dict[str, Any]] = None) -> None:
         """Save position to database (upsert).
 
         Args:
             position: Position to save
+            strategy_id: ID of strategy that opened position (for restart recovery)
+            entry_context: Strategy-specific context (e.g., zone bounds for geometry)
         """
         cursor = self.conn.cursor()
 
+        # Serialize entry_context to JSON if provided
+        context_json = json.dumps(entry_context) if entry_context else None
+
         cursor.execute("""
-            INSERT INTO positions (symbol, state, direction, quantity, entry_price, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (symbol, state, direction, quantity, entry_price, updated_at, strategy_id, entry_context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 state = excluded.state,
                 direction = excluded.direction,
                 quantity = excluded.quantity,
                 entry_price = excluded.entry_price,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                strategy_id = COALESCE(excluded.strategy_id, positions.strategy_id),
+                entry_context = COALESCE(excluded.entry_context, positions.entry_context)
         """, (
             position.symbol,
             position.state.value,
             position.direction.value if position.direction else None,
             str(position.quantity),
             str(position.entry_price) if position.entry_price else None,
-            time.time()
+            time.time(),
+            strategy_id,
+            context_json
         ))
 
         self.conn.commit()
@@ -229,6 +255,58 @@ class PositionRepository:
         deleted = cursor.rowcount
         self.conn.commit()
         return deleted
+
+    def get_entry_context(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get entry context for a position.
+
+        Args:
+            symbol: Symbol to get context for
+
+        Returns:
+            Entry context dict if exists, None otherwise
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT entry_context FROM positions WHERE symbol = ?",
+            (symbol,)
+        )
+        row = cursor.fetchone()
+        if row and row['entry_context']:
+            try:
+                return json.loads(row['entry_context'])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def get_strategy_id(self, symbol: str) -> Optional[str]:
+        """Get strategy ID for a position.
+
+        Args:
+            symbol: Symbol to get strategy for
+
+        Returns:
+            Strategy ID if exists, None otherwise
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT strategy_id FROM positions WHERE symbol = ?",
+            (symbol,)
+        )
+        row = cursor.fetchone()
+        return row['strategy_id'] if row else None
+
+    def clear_entry_context(self, symbol: str) -> None:
+        """Clear entry context when position is closed.
+
+        Args:
+            symbol: Symbol to clear context for
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE positions SET strategy_id = NULL, entry_context = NULL WHERE symbol = ?",
+            (symbol,)
+        )
+        self.conn.commit()
 
     def _row_to_position(self, row: sqlite3.Row) -> Position:
         """Convert database row to Position object.

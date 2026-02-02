@@ -433,7 +433,7 @@ def get_reasoner() -> Reasoner:
     global _reasoner
     if _reasoner is None:
         _reasoner = Reasoner(
-            persist_path=Path("/media/ksiaz/D/liquidation-trading/.dev_reasoning.json")
+            persist_path=Path("/home/ksiaz/liquidation-trading/.dev_reasoning.json")
         )
     return _reasoner
 

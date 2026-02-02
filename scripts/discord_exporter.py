@@ -31,8 +31,10 @@ from pathlib import Path
 from datetime import datetime
 
 # Configuration
-DCE_PATH = Path(os.getenv("DCE_PATH", "D:/tools/DiscordChatExporter/DiscordChatExporter.Cli.exe"))
-OUTPUT_DIR = Path("D:/liquidation-trading/data/discord_exports")
+_SCRIPT_DIR = Path(__file__).parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+DCE_PATH = Path(os.getenv("DCE_PATH", "DiscordChatExporter.Cli"))  # Assume in PATH on Linux
+OUTPUT_DIR = _PROJECT_ROOT / "data" / "discord_exports"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 
 # Hyperliquid Discord channels

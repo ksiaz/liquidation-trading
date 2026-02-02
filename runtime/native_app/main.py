@@ -115,8 +115,10 @@ def fetch_mids_fast() -> dict:
 # Constants
 # ==============================================================================
 
-DB_PATH = "D:/liquidation-trading/logs/execution.db"
-HL_INDEXED_DB_PATH = "D:/liquidation-trading/indexed_wallets.db"
+# Use paths relative to project root
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+DB_PATH = os.path.join(_PROJECT_ROOT, "logs/execution.db")
+HL_INDEXED_DB_PATH = os.path.join(_PROJECT_ROOT, "indexed_wallets.db")
 
 # Staleness threshold - positions older than this are considered stale for display
 POSITION_STALENESS_SECONDS = 180  # 3 minutes - accuracy over stability

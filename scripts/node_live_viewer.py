@@ -11,6 +11,7 @@ import json
 import time
 import subprocess
 import sys
+import os
 from datetime import datetime
 from typing import Dict, Optional
 from collections import defaultdict
@@ -283,7 +284,7 @@ def get_positions_near_liq_sync():
 
     # Load tracked wallets from indexed_wallets.db
     try:
-        db_path = "D:/liquidation-trading/indexed_wallets.db"
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "indexed_wallets.db")
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         # Get wallets with positions

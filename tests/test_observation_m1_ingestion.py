@@ -9,9 +9,10 @@ Authority: EPISTEMIC_CONSTITUTION.md (M1-M5 observation constraints)
 
 import pytest
 import sys
+import os
 from collections import deque
 
-sys.path.append('D:/liquidation-trading')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from observation.internal.m1_ingestion import M1IngestionEngine
 

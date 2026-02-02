@@ -15,9 +15,10 @@ Authority: EPISTEMIC_CONSTITUTION.md, SYSTEM_CANON.md
 
 import pytest
 import sys
+import os
 import time
 
-sys.path.append('D:/liquidation-trading')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from observation.governance import ObservationSystem
 from observation.types import ObservationStatus, SystemHaltedException

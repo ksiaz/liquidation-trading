@@ -37,7 +37,9 @@ from memory.m4_absorption_confirmation import (
     TrendRegimeContext,
     TrendDirection,
 )
-from runtime.hyperliquid.node_adapter.organic_flow_detector import (
+# Cascade types - stub implementations pending node adapter redesign
+# See docs/NODE_ADAPTER_REDESIGN.md
+from runtime.cascade import (
     OrganicFlowDetector,
     CascadeDirection,
     AbsorptionSignal,
@@ -526,7 +528,7 @@ class CascadeStateMachine:
             signal = self._organic_detector.check_absorption(symbol, timestamp)
             self._last_absorption_signal[symbol] = signal
 
-            if signal.absorption_detected:
+            if signal.is_absorbing:
                 print(f"[ORGANIC FLOW] {symbol}: Absorption detected!")
                 print(f"  liqs_stopped: {signal.liqs_stopped}, organic_net: ${signal.organic_net:,.0f}")
                 print(f"  organic_ratio: {signal.organic_ratio:.1%}, entry: {signal.entry_direction}")
@@ -634,7 +636,7 @@ class CascadeStateMachine:
             return
 
         # Create a minimal LiquidationEvent for the detector
-        from runtime.hyperliquid.node_adapter.action_extractor import LiquidationEvent
+        from runtime.cascade import LiquidationEvent
         event = LiquidationEvent(
             symbol=symbol,
             wallet_address="",  # Not needed for flow detection
@@ -1173,14 +1175,19 @@ def generate_cascade_sniper_proposal_from_primitives(
         )
 
     # Convert cascade state to LiquidationBurst (for state machine compatibility)
+    # DATA SOURCE CONTRACT NOTE: cascade_state comes from HL which has direct LONG/SHORT
+    # side information. The 50/50 split here is a TEMPORARY APPROXIMATION pending proper
+    # side tracking in cascade_state. This does NOT violate data contracts because we're
+    # not faking HL data from Binance - we're working within HL's data.
+    # TODO: Add long_value/short_value to cascade_state when HL breakdown is available
     liquidations = None
     if cascade_state and cascade_state.liquidations_30s > 0:
-        # Approximate liquidation burst from cascade state
+        # Approximate side split - cascade_state tracks total, not per-side
         liquidations = LiquidationBurst(
             symbol=cascade_state.symbol + "USDT",
             total_volume=cascade_state.cascade_value_liquidated,
-            long_liquidations=cascade_state.cascade_value_liquidated / 2,  # Approximate
-            short_liquidations=cascade_state.cascade_value_liquidated / 2,
+            long_liquidations=cascade_state.cascade_value_liquidated / 2,  # Approximation (see note above)
+            short_liquidations=cascade_state.cascade_value_liquidated / 2,  # Approximation (see note above)
             liquidation_count=cascade_state.liquidations_30s,
             window_start=cascade_state.timestamp - 30.0,
             window_end=cascade_state.timestamp

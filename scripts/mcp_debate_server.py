@@ -429,6 +429,9 @@ You have tools to explore the codebase. Use PROGRESSIVE DISCLOSURE:
 
 DON'T dump entire files. DO target specific functions.
 
+IMPORTANT: Use the provided tools via the API's native function calling mechanism.
+Do NOT write function calls as text like <function=...> - just call the tools directly.
+
 When you've formed your opinion:
 - State your position clearly
 - Reference specific code/lines when relevant
@@ -575,6 +578,34 @@ def call_gemini(prompt: str, allow_tools: bool = True, context_budget: int = DEF
     return text_response or "(no response)", budget.tools_used
 
 
+def _parse_text_tool_calls(content: str) -> list[tuple[str, dict]]:
+    """Parse text-based function calls that Llama sometimes outputs.
+
+    Handles formats like:
+    - <function=name{"arg": "val"}</function>
+    - <function=name>{"arg": "val"}</function>
+    """
+    if not content:
+        return []
+
+    calls = []
+    # Pattern 1: <function=name{"args"}>
+    pattern1 = r'<function=(\w+)(\{[^}]+\})(?:</function>)?'
+    # Pattern 2: <function=name>{"args"}</function>
+    pattern2 = r'<function=(\w+)>(\{[^}]+\})</function>'
+
+    for pattern in [pattern1, pattern2]:
+        for match in re.finditer(pattern, content):
+            func_name = match.group(1)
+            try:
+                args = json.loads(match.group(2))
+                calls.append((func_name, args))
+            except json.JSONDecodeError:
+                pass
+
+    return calls
+
+
 def call_groq(prompt: str, allow_tools: bool = True, context_budget: int = DEFAULT_CONTEXT_BUDGET) -> tuple[str, list]:
     """Call Llama via Groq with context-budget-aware tool use. Returns (response, tools_used)."""
     global active_backend
@@ -614,8 +645,22 @@ def call_groq(prompt: str, allow_tools: bool = True, context_budget: int = DEFAU
 
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
         else:
-            active_backend = "groq"
-            return msg.content or "", budget.tools_used
+            # Check for text-based tool calls (Llama sometimes outputs these)
+            text_calls = _parse_text_tool_calls(msg.content or "")
+            if text_calls and allow_tools and budget.remaining() > 0:
+                # Execute parsed text-based calls
+                messages.append({"role": "assistant", "content": msg.content})
+                for tool_name, tool_args in text_calls:
+                    if not budget.can_afford(tool_name):
+                        result = f"Budget exhausted ({budget.summary()}). Provide your answer now."
+                    else:
+                        result = execute_tool(tool_name, tool_args)
+                        budget.spend(tool_name, tool_args)
+                    # Append as user message with tool result (workaround since no tool_call_id)
+                    messages.append({"role": "user", "content": f"Tool result for {tool_name}({tool_args}):\n{result}"})
+            else:
+                active_backend = "groq"
+                return msg.content or "", budget.tools_used
 
     active_backend = "groq"
     return msg.content or f"(iterations exhausted, {budget.summary()})", budget.tools_used

@@ -616,15 +616,28 @@ def call_groq(prompt: str, allow_tools: bool = True, context_budget: int = DEFAU
     client = Groq()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
     budget = ContextBudget(context_budget)
+    tools_disabled_due_to_error = False
 
     max_iterations = 30  # Safety limit
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
         kwargs = {"model": GROQ_MODEL, "max_tokens": 2000, "messages": messages}
-        if allow_tools and budget.remaining() > 0:
+        if allow_tools and budget.remaining() > 0 and not tools_disabled_due_to_error:
             kwargs["tools"] = GPT_TOOLS
             kwargs["tool_choice"] = "auto"
 
-        resp = client.chat.completions.create(**kwargs)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            error_str = str(e)
+            # Llama sometimes tries to output text-based function calls which Groq rejects
+            if "tool_use_failed" in error_str or "failed_generation" in error_str:
+                if not tools_disabled_due_to_error:
+                    # Retry without tools - let Llama answer directly
+                    tools_disabled_due_to_error = True
+                    # Add instruction to answer without tools
+                    messages.append({"role": "user", "content": "Please answer the question directly using your knowledge. Do not try to call any functions."})
+                    continue
+            raise  # Re-raise if not a tool error or already retried
         msg = resp.choices[0].message
 
         if msg.tool_calls and allow_tools:

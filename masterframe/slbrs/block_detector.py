@@ -40,7 +40,6 @@ class BlockDetector:
     
     def __init__(self):
         """Initialize block detector."""
-        self.active_blocks: Dict[str, LiquidityBlock] = {}
         self.zone_liquidity_history: Dict[str, deque] = {}
     
     def detect_blocks(
@@ -121,11 +120,7 @@ class BlockDetector:
                 )
                 
                 detected_blocks.append(block)
-                self.active_blocks[block_id] = block
-        
-        # Invalidate broken blocks
-        self._invalidate_broken_blocks(zones.mid_price, current_time)
-        
+
         return detected_blocks
     
     def _check_qualification(
@@ -238,39 +233,6 @@ class BlockDetector:
         
         return sum(history) / len(history)
     
-    def _invalidate_broken_blocks(
-        self,
-        current_price: float,
-        current_time: float
-    ) -> None:
-        """
-        Invalidate blocks where price accepted through.
-        
-        Args:
-            current_price: Current mid-price
-            current_time: Current timestamp
-        
-        RULE: If price breaks through block price range, invalidate.
-        """
-        for block_id, block in list(self.active_blocks.items()):
-            # Check if price broke through
-            if block.side == 'bid':
-                # Bid block below price - broken if price goes below
-                if current_price < block.price_min:
-                    # Mark as invalidated (create new block with updated flag)
-                    # Since block is frozen, we mark it in our tracking
-                    pass  # Will be handled by tracker
-            else:  # ask
-                # Ask block above price - broken if price goes above
-                if current_price > block.price_max:
-                    # Mark as invalidated
-                    pass  # Will be handled by tracker
-    
-    def get_active_blocks(self) -> Dict[str, LiquidityBlock]:
-        """Get currently active blocks."""
-        return self.active_blocks
-    
     def reset(self) -> None:
         """Reset detector state."""
-        self.active_blocks.clear()
         self.zone_liquidity_history.clear()

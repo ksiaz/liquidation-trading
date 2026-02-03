@@ -22,21 +22,28 @@ from masterframe.slbrs import (
     BlockTracker,
     SLBRSStateMachine,
     SLBRSState,
+    LiquidityBlock,
 )
 from masterframe.effcs import EFFCSStateMachine, EFFCSState
+from masterframe.orderbook_zoning.types import OrderbookZones
 
 
 class MasterController:
     """
     Master controller for Market Regime Masterframe.
-    
+
     INVARIANT: SLBRS and EFFCS never active simultaneously.
     INVARIANT: Strategies disabled when regime = DISABLED.
     INVARIANT: Cooldown blocks all evaluations.
     """
-    
+
     # Cooldown period after trade exit (PROMPT 10: 5 minutes)
     COOLDOWN_SECONDS = 300.0
+
+    # Liquidity retention threshold for block verification at entry time.
+    # Block is only valid if current zone liquidity >= threshold * original block liquidity.
+    # This prevents entering on blocks where liquidity was pulled (spoofing).
+    LIQUIDITY_RETENTION_THRESHOLD = 0.5
     
     def __init__(self):
         """Initialize master controller."""
@@ -187,16 +194,19 @@ class MasterController:
             blocks = self.block_detector.detect_blocks(
                 zones, zone_metrics, current_time
             )
-            
-            active_blocks = self.block_tracker.update(
-                blocks, zones.mid_price, current_time
-            )
-            
+
+            self.block_tracker.update(blocks, zones.mid_price, current_time)
             tradable_blocks = self.block_tracker.get_tradable_blocks()
-            
+
+            # Filter blocks that still have sufficient liquidity (anti-spoofing)
+            verified_blocks = [
+                block for block in tradable_blocks
+                if self._verify_block_liquidity(block, zones)
+            ]
+
             return self.slbrs.update(
                 regime=regime,
-                tradable_blocks=tradable_blocks,
+                tradable_blocks=verified_blocks,
                 current_price=zones.mid_price,
                 current_time=current_time,
                 atr=metrics.atr_5m if metrics.atr_5m else 1.0
@@ -217,13 +227,47 @@ class MasterController:
     def _handle_signal(self, signal: str, current_time: float) -> None:
         """
         Handle trade signal.
-        
+
         RULE: Start cooldown on EXIT.
         """
         if signal == 'EXIT':
             self.last_trade_exit_time = current_time
             self.in_cooldown = True
-    
+
+    def _verify_block_liquidity(
+        self,
+        block: LiquidityBlock,
+        zones: OrderbookZones
+    ) -> bool:
+        """
+        Verify block still has sufficient liquidity for entry.
+
+        Compares current zone liquidity against original block liquidity
+        to detect spoofing (liquidity pulled after detection).
+
+        Args:
+            block: The liquidity block to verify
+            zones: Current orderbook zones snapshot
+
+        Returns:
+            True if block retains sufficient liquidity
+
+        RULE: Current liquidity must be >= THRESHOLD * original liquidity.
+        """
+        try:
+            current_zone = zones.get_zone(block.zone_name, block.side)
+        except ValueError:
+            return False
+
+        current_liquidity = current_zone.total_quantity
+        original_liquidity = block.zone_liquidity
+
+        if original_liquidity <= 0:
+            return False
+
+        retention_ratio = current_liquidity / original_liquidity
+        return retention_ratio >= self.LIQUIDITY_RETENTION_THRESHOLD
+
     def get_active_strategy(self) -> Optional[str]:
         """Get currently active strategy name."""
         return self.active_strategy

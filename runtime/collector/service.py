@@ -204,13 +204,13 @@ class CollectorService:
         if self._use_node_mode and NODE_ADAPTER_AVAILABLE:
             # Node Adapter Mode: gRPC client to out-of-process adapter
             # Provides: real-time prices and liquidations from hl-node
-            # Requires: hl-node-adapter/server.py running on localhost:50051
+            # Requires: hl-adapter/server.py running on localhost:50051
             try:
                 adapter_address = os.environ.get("HL_ADAPTER_ADDRESS", "localhost:50051")
                 self._logger.info(f"Initializing Hyperliquid node bridge to {adapter_address}...")
 
-                # Filter to priority coins for initial testing
-                focus_symbols = ['BTC', 'ETH', 'SOL', 'HYPE', 'DOGE', 'XRP', 'BNB']
+                # All 10 monitored symbols
+                focus_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'LINK', 'HYPE', 'ADA', 'NEAR']
 
                 self._node_bridge = create_node_bridge(
                     observation_system=self._obs,

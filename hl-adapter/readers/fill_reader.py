@@ -12,7 +12,6 @@ import json
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional, Set
 
@@ -78,14 +77,6 @@ class FillReader:
         self._fills_emitted = 0
         self._last_fill_id = 0
 
-    def _get_current_date_str(self) -> str:
-        """Get current date as YYYYMMDD string."""
-        return datetime.now().strftime('%Y%m%d')
-
-    def _get_current_hour(self) -> int:
-        """Get current hour (0-23)."""
-        return datetime.now().hour
-
     def _find_latest_date(self) -> Optional[str]:
         """Find latest date directory."""
         if not self._fills_path.exists():
@@ -134,28 +125,25 @@ class FillReader:
         return True
 
     def _check_for_new_file(self) -> bool:
-        """Check if there's a newer file to read (hour rolled over)."""
-        current_date = self._get_current_date_str()
-        current_hour = self._get_current_hour()
+        """Check if there's a newer file to read.
 
-        # Check if hour rolled over
-        if current_date != self._current_date or current_hour != self._current_hour:
-            # First try current hour
-            new_file = self._fills_path / current_date / str(current_hour)
-            if new_file.exists():
-                return self._open_file(current_date, current_hour)
+        Uses filesystem state only - no system time dependency.
+        This handles clock drift between local system and HL node.
+        """
+        # Find latest date and hour based on what actually exists
+        latest_date = self._find_latest_date()
+        if not latest_date:
+            return False
 
-            # Current hour file doesn't exist yet - find the latest available hour
-            # This handles the case where we're stuck on hour N and it's now hour N+2
-            # but only hour N+1 exists
-            latest_date = self._find_latest_date()
-            if latest_date:
-                latest_hour = self._find_latest_hour(latest_date)
-                if latest_hour >= 0:
-                    # Only switch if it's newer than what we have
-                    if (latest_date > self._current_date or
-                        (latest_date == self._current_date and latest_hour > self._current_hour)):
-                        return self._open_file(latest_date, latest_hour)
+        latest_hour = self._find_latest_hour(latest_date)
+        if latest_hour < 0:
+            return False
+
+        # Check if this is newer than what we currently have
+        if latest_date != self._current_date or latest_hour != self._current_hour:
+            print(f"[FILL] Detected newer file: {latest_date}/{latest_hour} "
+                  f"(was {self._current_date}/{self._current_hour})", file=sys.stderr)
+            return self._open_file(latest_date, latest_hour)
 
         return False
 

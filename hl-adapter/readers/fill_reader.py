@@ -140,9 +140,22 @@ class FillReader:
 
         # Check if hour rolled over
         if current_date != self._current_date or current_hour != self._current_hour:
+            # First try current hour
             new_file = self._fills_path / current_date / str(current_hour)
             if new_file.exists():
                 return self._open_file(current_date, current_hour)
+
+            # Current hour file doesn't exist yet - find the latest available hour
+            # This handles the case where we're stuck on hour N and it's now hour N+2
+            # but only hour N+1 exists
+            latest_date = self._find_latest_date()
+            if latest_date:
+                latest_hour = self._find_latest_hour(latest_date)
+                if latest_hour >= 0:
+                    # Only switch if it's newer than what we have
+                    if (latest_date > self._current_date or
+                        (latest_date == self._current_date and latest_hour > self._current_hour)):
+                        return self._open_file(latest_date, latest_hour)
 
         return False
 

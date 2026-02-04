@@ -1,0 +1,304 @@
+"""
+Node Bridge - Connects NodeSubscriber to ObservationSystem.
+
+Receives events from the gRPC adapter and feeds them to the observation layer.
+"""
+
+import sys
+import time
+import threading
+from typing import Optional, Callable
+
+from .subscriber import NodeSubscriber
+from .types import PriceEvent, LiquidationEvent, FillEvent, SyncStatus, SyncStatusCode
+
+
+class NodeBridge:
+    """
+    Bridge between NodeSubscriber and ObservationSystem.
+
+    Converts gRPC events to observation system format and ingests them.
+
+    Usage:
+        bridge = NodeBridge(observation_system, 'localhost:50051')
+        bridge.start()
+        # ... events flow automatically ...
+        bridge.stop()
+    """
+
+    def __init__(
+        self,
+        observation_system,
+        address: str = 'localhost:50051',
+        symbols: Optional[list] = None,
+        on_stale: Optional[Callable[[str], None]] = None,
+    ):
+        """
+        Initialize bridge.
+
+        Args:
+            observation_system: ObservationSystem instance
+            address: gRPC server address
+            symbols: Filter to these symbols (None = all)
+            on_stale: Callback when data becomes stale
+        """
+        self._obs = observation_system
+        self._address = address
+        self._symbols = symbols
+        self._on_stale = on_stale
+
+        # Create subscriber
+        self._subscriber = NodeSubscriber(
+            address=address,
+            client_id='observation-bridge',
+            symbols=symbols,
+        )
+
+        # Wire callbacks
+        self._subscriber.on_price(self._handle_price)
+        self._subscriber.on_liquidation(self._handle_liquidation)
+        self._subscriber.on_fill(self._handle_fill)
+        self._subscriber.on_status(self._handle_status)
+        self._subscriber.on_disconnect(self._handle_disconnect)
+
+        # State
+        self._running = False
+        self._last_status: Optional[SyncStatus] = None
+
+        # External fill callbacks (for organic flow detection)
+        self._fill_callbacks: list = []
+
+        # Metrics
+        self._prices_ingested = 0
+        self._liquidations_ingested = 0
+        self._fills_ingested = 0
+        self._organic_fills_forwarded = 0
+        self._errors = 0
+
+    def _handle_price(self, event: PriceEvent):
+        """Handle price event - feed to observation system."""
+        try:
+            # Use wall clock for governance freshness check
+            # (avoids dropping data due to node/Binance time domain mismatch)
+            now = time.time()
+
+            self._obs.ingest_observation(
+                timestamp=now,
+                symbol=event.symbol,
+                event_type='HL_PRICE',
+                payload={
+                    'oracle_price': event.oracle_float,
+                    'mark_price': event.mark_float,
+                    'block_height': event.block_height,
+                    'exchange': 'HYPERLIQUID',
+                    'timestamp': event.timestamp_ns / 1_000_000_000,  # Original timestamp
+                },
+            )
+            self._prices_ingested += 1
+
+        except Exception as e:
+            self._errors += 1
+            print(f"[NodeBridge] Error handling price: {e}", file=sys.stderr)
+
+    def _handle_liquidation(self, event: LiquidationEvent):
+        """Handle liquidation event - feed to observation system.
+
+        Normalizes HL liquidation to canonical M1 LIQUIDATION format.
+        HL uses position side (LONG/SHORT), canonical uses order side (BUY/SELL):
+        - LONG liquidation → SELL (must sell to close long)
+        - SHORT liquidation → BUY (must buy to close short)
+        """
+        try:
+            now = time.time()
+
+            # Map position side to order side (canonical format)
+            # LONG liquidation = forced SELL, SHORT liquidation = forced BUY
+            canonical_side = 'SELL' if event.side == 'LONG' else 'BUY'
+
+            # Build Binance-compatible payload for normalize_liquidation
+            # Format: {'E': timestamp_ms, 'o': {'p': price, 'q': quantity, 'S': side}}
+            self._obs.ingest_observation(
+                timestamp=now,
+                symbol=event.symbol,
+                event_type='LIQUIDATION',  # Canonical event type
+                payload={
+                    'E': event.timestamp_ms,  # Event timestamp (ms)
+                    'o': {
+                        'p': str(event.price_float),   # Price as string (Binance format)
+                        'q': str(event.size_float),    # Quantity as string
+                        'S': canonical_side,           # Order side (BUY/SELL)
+                    },
+                    # HL-specific metadata preserved but not used by normalize_liquidation
+                    '_hl_metadata': {
+                        'wallet': event.liquidated_wallet,
+                        'liquidator': event.liquidator_wallet,
+                        'mark_price': float(event.mark_price) if event.mark_price else None,
+                        'method': event.method,
+                        'fill_id': event.fill_id,
+                        'tx_hash': event.tx_hash,
+                        'original_side': event.side,  # Preserve original LONG/SHORT
+                    },
+                },
+            )
+            self._liquidations_ingested += 1
+
+        except Exception as e:
+            self._errors += 1
+            print(f"[NodeBridge] Error handling liquidation: {e}", file=sys.stderr)
+
+    def _handle_fill(self, event: FillEvent):
+        """Handle fill event - feed to observation system.
+
+        Fills are used for absorption detection during cascades.
+        Side semantics:
+        - "B" = buy (taker lifted asks) = buying pressure
+        - "A" = sell (taker hit bids) = selling pressure
+        """
+        try:
+            now = time.time()
+
+            self._obs.ingest_observation(
+                timestamp=now,
+                symbol=event.symbol,
+                event_type='HL_FILL',
+                payload={
+                    'side': event.side,  # "B" or "A"
+                    'price': event.price_float,
+                    'size': event.size_float,
+                    'value_usd': float(event.value_usd) if event.value_usd else 0.0,
+                    'timestamp_ms': event.timestamp_ms,
+                    'wallet': event.wallet,
+                    'is_liquidation': event.is_liquidation,
+                    'liquidated_wallet': event.liquidated_wallet,
+                    'method': event.method,
+                    'fill_id': event.fill_id,
+                    'exchange': 'HYPERLIQUID',
+                },
+            )
+            self._fills_ingested += 1
+
+            # Forward organic fills to external callbacks (for absorption detection)
+            # Liquidation fills are already tracked via liquidation events
+            if not event.is_liquidation and self._fill_callbacks:
+                # Convert side: "B" -> "BUY", "A" -> "SELL"
+                side = "BUY" if event.side == "B" else "SELL"
+                value = float(event.value_usd) if event.value_usd else 0.0
+                timestamp = event.timestamp_ms / 1000.0  # Convert to seconds
+
+                for callback in self._fill_callbacks:
+                    try:
+                        callback(event.symbol, side, value, timestamp)
+                        self._organic_fills_forwarded += 1
+                    except Exception as cb_err:
+                        print(f"[NodeBridge] Fill callback error: {cb_err}", file=sys.stderr)
+
+        except Exception as e:
+            self._errors += 1
+            print(f"[NodeBridge] Error handling fill: {e}", file=sys.stderr)
+
+    def on_organic_fill(self, callback: Callable[[str, str, float, float], None]):
+        """
+        Register callback for organic (non-liquidation) fills.
+
+        Callback signature: callback(symbol, side, value_usd, timestamp)
+        - symbol: Asset symbol (e.g., "BTC")
+        - side: "BUY" or "SELL" (taker side)
+        - value_usd: USD value of the fill
+        - timestamp: Unix timestamp in seconds
+
+        Use this to feed organic fills to the OrganicFlowDetector for absorption detection.
+        """
+        self._fill_callbacks.append(callback)
+
+    def _handle_status(self, status: SyncStatus):
+        """Handle status event."""
+        self._last_status = status
+
+        # Check for stale data
+        if status.is_stale and self._on_stale:
+            self._on_stale(f"Node adapter status: {status.status.name}")
+
+    def _handle_disconnect(self, reason: str):
+        """Handle disconnect from adapter."""
+        print(f"[NodeBridge] Disconnected: {reason}", file=sys.stderr)
+
+        if self._on_stale:
+            self._on_stale(f"Disconnected from adapter: {reason}")
+
+    def start(self) -> bool:
+        """
+        Start receiving events.
+
+        Returns:
+            True if connected successfully
+        """
+        if self._running:
+            return True
+
+        if not self._subscriber.start():
+            print("[NodeBridge] Failed to connect to adapter", file=sys.stderr)
+            return False
+
+        self._running = True
+        print(f"[NodeBridge] Started, connected to {self._address}", file=sys.stderr)
+        return True
+
+    def stop(self):
+        """Stop receiving events."""
+        self._running = False
+        self._subscriber.stop()
+        print(f"[NodeBridge] Stopped. Ingested {self._prices_ingested} prices, "
+              f"{self._liquidations_ingested} liquidations, "
+              f"{self._fills_ingested} fills.", file=sys.stderr)
+
+    @property
+    def is_connected(self) -> bool:
+        """True if connected to adapter."""
+        return self._subscriber.is_connected
+
+    @property
+    def is_healthy(self) -> bool:
+        """True if adapter is healthy."""
+        if not self._last_status:
+            return False
+        return self._last_status.is_healthy
+
+    def get_status(self) -> Optional[SyncStatus]:
+        """Get current adapter status."""
+        return self._subscriber.get_status()
+
+    def get_metrics(self) -> dict:
+        """Get bridge metrics."""
+        subscriber_metrics = self._subscriber.get_metrics()
+        return {
+            **subscriber_metrics,
+            'prices_ingested': self._prices_ingested,
+            'liquidations_ingested': self._liquidations_ingested,
+            'fills_ingested': self._fills_ingested,
+            'organic_fills_forwarded': self._organic_fills_forwarded,
+            'errors': self._errors,
+            'is_healthy': self.is_healthy,
+        }
+
+
+def create_node_bridge(
+    observation_system,
+    address: str = 'localhost:50051',
+    symbols: Optional[list] = None,
+) -> NodeBridge:
+    """
+    Factory function to create a NodeBridge.
+
+    Args:
+        observation_system: ObservationSystem instance
+        address: gRPC server address
+        symbols: Filter to these symbols
+
+    Returns:
+        Configured NodeBridge instance
+    """
+    return NodeBridge(
+        observation_system=observation_system,
+        address=address,
+        symbols=symbols,
+    )

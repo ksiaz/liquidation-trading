@@ -38,7 +38,6 @@ logging.basicConfig(
 )
 
 # Reduce noise from some loggers
-logging.getLogger('runtime.hyperliquid.node_adapter.observation_bridge').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('aiohttp').setLevel(logging.WARNING)
 
@@ -50,6 +49,11 @@ import time
 from observation.governance import ObservationSystem
 from runtime.collector.service import CollectorService
 from runtime.monitoring import ResourceMonitor, HealthStatus, CleanupCoordinator
+from runtime.stability_observer import stability_observer
+from trade_stream import BinanceTradeStream
+from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
+# UI server disabled pending node adapter redesign
+# See docs/NODE_ADAPTER_REDESIGN.md
 
 
 def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
@@ -104,10 +108,13 @@ def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
 
 # Symbols to trade - 10 highest volume coins
 # Reduced from 15 to lower memory pressure on node state parsing
-SYMBOLS = [
+# Include both Binance format (BTCUSDT) and HL format (BTC) for cross-exchange support
+BINANCE_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
     'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'ADAUSDT', 'NEARUSDT',
 ]
+HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
+SYMBOLS = BINANCE_SYMBOLS + HL_SYMBOLS  # Both formats for observation whitelist
 
 
 async def run_paper_trade():
@@ -167,6 +174,43 @@ async def run_paper_trade():
     except Exception as e:
         logger.debug(f"Could not register cascade state machine: {e}")
 
+    # Wire HL node fills for organic flow detection
+    # This feeds taker buy/sell data to the absorption detector via gRPC
+    # Replaces BinanceTradeStream - now uses native HL fill data
+    trade_stream = None  # Only used if node bridge unavailable
+    if service._node_bridge:
+        def on_hl_fill(symbol: str, side: str, value: float, timestamp: float):
+            """Feed organic fills from HL node to the cascade sniper's absorption detector."""
+            # HL symbols don't have USDT suffix - add it for consistency
+            normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
+            record_organic_trade(
+                symbol=normalized_symbol,
+                side=side,  # Already "BUY" or "SELL"
+                value=value,
+                timestamp=timestamp
+            )
+
+        service._node_bridge.on_organic_fill(on_hl_fill)
+        logger.info('Wired HL node fills to absorption detector (via gRPC adapter)')
+    else:
+        # Fallback to Binance trade stream if node bridge unavailable
+        logger.warning('Node bridge not available, falling back to BinanceTradeStream')
+        trade_stream = BinanceTradeStream(BINANCE_SYMBOLS)
+
+        def on_organic_trade(symbol: str, trade: dict):
+            """Feed organic trades to the cascade sniper's absorption detector."""
+            value = trade['price'] * trade['quantity']
+            record_organic_trade(
+                symbol=symbol,
+                side=trade['side'],
+                value=value,
+                timestamp=trade['timestamp']
+            )
+
+        trade_stream.add_callback(on_organic_trade)
+        trade_stream.start()
+        logger.info(f'Binance trade stream started for {len(BINANCE_SYMBOLS)} symbols')
+
     # Create cleanup coordinator (Phase 2: Memory Guards)
     logger.info('Creating CleanupCoordinator...')
     cleanup = CleanupCoordinator(interval_sec=300.0)  # Every 5 minutes
@@ -182,7 +226,7 @@ async def run_paper_trade():
         cleanup.register_pruner('position_manager_prices', service._node_psm.prune_stale_prices)
 
     if sm and hasattr(sm, '_organic_detector') and sm._organic_detector:
-        cleanup.register_pruner('organic_flow_detector', sm._organic_detector.prune_stale)
+        cleanup.register_pruner('organic_flow_detector', lambda: sm._organic_detector.cleanup(time.time()))
 
     # Register collector calculator pruning
     cleanup.register_pruner('collector_calculators', service.prune_stale_calculators)
@@ -194,7 +238,8 @@ async def run_paper_trade():
     cleanup.register_pruner('m2_archived_nodes', obs._m2_store.prune_archived_nodes)
 
     # Register candidate zone decay and pruning (prevents memory leak from unbounded zones)
-    if service._node_bridge:
+    # Note: Only available on ObservationBridge, not NodeBridge
+    if service._node_bridge and hasattr(service._node_bridge, 'decay_candidate_zones'):
         cleanup.register_pruner('candidate_zone_decay', service._node_bridge.decay_candidate_zones)
         cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
 
@@ -226,6 +271,9 @@ async def run_paper_trade():
     if service._use_node_mode and service._node_psm:
         logger.info('Position tracking enabled')
 
+    # UI server disabled pending node adapter redesign
+    # See docs/NODE_ADAPTER_REDESIGN.md
+
     # Graceful shutdown handler
     shutdown_event = asyncio.Event()
 
@@ -247,6 +295,24 @@ async def run_paper_trade():
     logger.info('Starting cleanup coordinator...')
     await cleanup.start()
 
+    # Optional: Start observatory server
+    observatory_server = None
+    if os.environ.get('ENABLE_OBSERVATORY', 'false').lower() == 'true':
+        try:
+            import uvicorn
+            from runtime.observatory import app, configure
+
+            configure(stability_observer, monitor)
+
+            config = uvicorn.Config(app, host='127.0.0.1', port=8080, log_level='warning')
+            observatory_server = uvicorn.Server(config)
+            asyncio.create_task(observatory_server.serve())
+            logger.info('Observatory server started on http://127.0.0.1:8080')
+        except ImportError as e:
+            logger.warning(f'Could not start observatory server: {e}')
+        except Exception as e:
+            logger.warning(f'Observatory server failed to start: {e}')
+
     # Start service
     logger.info('Starting service...')
     service_task = asyncio.create_task(service.start())
@@ -259,10 +325,12 @@ async def run_paper_trade():
             # Log status
             if service._node_bridge:
                 metrics = service._node_bridge.get_metrics()
+                hl_prices = service._obs.get_all_hl_prices()
                 logger.info(
-                    f'Status: prices={metrics["prices_forwarded"]}, '
-                    f'liqs={metrics["liquidations_forwarded"]}, '
-                    f'alerts={metrics["proximity_alerts"]}'
+                    f'Status: prices_ingested={metrics["prices_ingested"]}, '
+                    f'liqs_ingested={metrics["liquidations_ingested"]}, '
+                    f'errors={metrics["errors"]}, '
+                    f'hl_symbols={len(hl_prices)}'
                 )
 
             if service._node_psm:
@@ -281,12 +349,45 @@ async def run_paper_trade():
                             f'${prox.total_value_at_risk:,.0f}'
                         )
 
+            # Log trade stream stats and absorption metrics
+            if trade_stream:
+                ts_stats = trade_stream.get_stats()
+                logger.info(f'Trade stream: {ts_stats["trades_received"]} trades received')
+            elif service._node_bridge:
+                metrics = service._node_bridge.get_metrics()
+                logger.info(f'HL fills: {metrics.get("organic_fills_forwarded", 0)} forwarded to detector')
+
+            if sm and sm._organic_detector:
+                for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:
+                    metrics = sm._organic_detector.get_metrics(symbol)
+                    if metrics and (metrics['buying_volume'] > 0 or metrics['liq_selling_volume'] > 0):
+                        logger.info(
+                            f'{symbol} flow: buy=${metrics["buying_volume"]:,.0f}, '
+                            f'liq=${metrics["liq_selling_volume"]:,.0f}, '
+                            f'ratio={metrics["buying_ratio"]:.1%}, '
+                            f'absorbing={metrics["is_absorbing"]}'
+                        )
+
     except asyncio.CancelledError:
         pass
     finally:
         # Cleanup
         logger.info('Stopping...')
         service._running = False
+        if trade_stream:
+            trade_stream.stop()
+            logger.info('Trade stream stopped')
+        elif service._node_bridge:
+            logger.info('HL node bridge will be stopped with service')
+
+        # Phase E: Log stability observer summary
+        stability_summary = stability_observer.summary()
+        logger.info(f"Stability status: {stability_summary['status']}")
+        logger.info(f"Total mandates: {stability_summary['total_mandates']}, actions: {stability_summary['total_actions']}")
+        if stability_summary['issues_total'] > 0:
+            logger.warning(f"Stability issues detected: {stability_summary['issues_total']}")
+            for issue in stability_observer.get_recent_issues(5):
+                logger.warning(f"  {issue['issue']}: {issue['symbol']} ({issue['severity']})")
 
         # Log final resource report
         final_report = monitor.get_report()
@@ -299,16 +400,16 @@ async def run_paper_trade():
         cleanup_metrics = cleanup.get_metrics()
         logger.info(f"Cleanup: {cleanup_metrics['cycles_completed']} cycles, {cleanup_metrics['total_items_pruned']} items pruned")
 
+        # Stop observatory server
+        if observatory_server:
+            observatory_server.should_exit = True
+            logger.info('Observatory server stopped')
+
         # Stop cleanup coordinator
         await cleanup.stop()
 
         # Stop monitor
         await monitor.stop()
-
-        if service._node_integration:
-            await service._node_integration.stop()
-        if service._node_psm:
-            await service._node_psm.stop()
 
         service_task.cancel()
         try:

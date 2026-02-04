@@ -1,0 +1,268 @@
+// Hyperliquid Node Adapter - Event Definitions
+// Schema Version: 1.1.0
+//
+// Canonical event types emitted by the HL node adapter.
+// All consumers must use these types - no direct node access.
+//
+// SCHEMA VERSIONING:
+// - Major: Breaking changes (field removal, type change)
+// - Minor: Additive changes (new fields, new event types)
+// - Patch: Documentation/comment changes
+//
+// See: docs/NODE_ADAPTER_REDESIGN.md
+
+syntax = "proto3";
+
+package hl.events;
+
+// Schema version for compatibility checking
+// Consumers should verify they support this version
+message SchemaVersion {
+    uint32 major = 1;  // Breaking changes
+    uint32 minor = 2;  // Additive changes
+    uint32 patch = 3;  // Documentation changes
+}
+
+// Current schema version: 1.1.0
+// Defined as constants in generated code
+
+// ============================================================
+// MarketPriceEvent
+// Source: replica_cmds/SetGlobalAction
+// Frequency: Every block (~500ms)
+// ============================================================
+
+message MarketPriceEvent {
+    // Asset identifier (0 = BTC, 1 = ETH, etc.)
+    uint32 asset_id = 1;
+
+    // Human-readable symbol (BTC, ETH, SOL, etc.)
+    string symbol = 2;
+
+    // Oracle price - authoritative for liquidation calculations
+    // Scaled as string to preserve precision (e.g., "78489.5")
+    string oracle_price = 3;
+
+    // Mark price - used for unrealized PnL
+    // May be null/empty for some assets
+    string mark_price = 4;
+
+    // Block timestamp in nanoseconds since Unix epoch
+    int64 timestamp_ns = 5;
+
+    // Block height for ordering/replay
+    uint64 block_height = 6;
+}
+
+// ============================================================
+// LiquidationEvent
+// Source: node_fills/hourly (fills with liquidation field)
+// Frequency: Per liquidation trade
+// ============================================================
+
+message LiquidationEvent {
+    // Asset symbol (BTC, ETH, etc.)
+    string symbol = 1;
+
+    // Liquidated position side: "LONG" or "SHORT"
+    // LONG liquidation = forced sell, SHORT liquidation = forced buy
+    string side = 2;
+
+    // Execution price
+    string price = 3;
+
+    // Position size liquidated (always positive)
+    string size = 4;
+
+    // USD notional value (price * size)
+    string value_usd = 5;
+
+    // Wallet that received the fill (liquidator/HLP vault)
+    string liquidator_wallet = 6;
+
+    // Wallet that was liquidated
+    string liquidated_wallet = 7;
+
+    // Mark price at time of liquidation
+    string mark_price = 8;
+
+    // Liquidation method: "market" or "backstop"
+    string method = 9;
+
+    // Fill timestamp in milliseconds since Unix epoch
+    int64 timestamp_ms = 10;
+
+    // Unique fill ID for deduplication
+    uint64 fill_id = 11;
+
+    // Transaction hash
+    string tx_hash = 12;
+}
+
+// ============================================================
+// SyncStatusEvent
+// Source: Adapter internal state
+// Frequency: Every 5 seconds or on status change
+// ============================================================
+
+message SyncStatusEvent {
+    // Adapter health status
+    enum Status {
+        UNKNOWN = 0;
+        HEALTHY = 1;      // Reading data normally
+        LAGGING = 2;      // Behind by > 10 blocks
+        STALE = 3;        // No new data for > 30 seconds
+        ERROR = 4;        // Read errors occurring
+    }
+
+    Status status = 1;
+
+    // Latest block height processed
+    uint64 latest_block_height = 2;
+
+    // Timestamp of latest block processed (ns)
+    int64 latest_block_time_ns = 3;
+
+    // Estimated blocks behind tip (0 = fully synced)
+    uint32 blocks_behind = 4;
+
+    // Current replica_cmds session being read
+    string current_session = 5;
+
+    // Prices emitted since adapter start
+    uint64 prices_emitted = 6;
+
+    // Liquidations emitted since adapter start
+    uint64 liquidations_emitted = 7;
+
+    // Last error message (if status = ERROR)
+    string last_error = 8;
+
+    // Adapter uptime in seconds
+    uint64 uptime_seconds = 9;
+
+    // Status event timestamp (ns)
+    int64 timestamp_ns = 10;
+
+    // Schema version for compatibility checking
+    SchemaVersion schema_version = 11;
+}
+
+// ============================================================
+// FillEvent
+// Source: node_fills/hourly (all fills, organic and liquidation)
+// Frequency: Per trade execution
+// ============================================================
+
+message FillEvent {
+    // Asset symbol (BTC, ETH, SOL, etc.)
+    string symbol = 1;
+
+    // Taker side: "B" (buy/lift asks) or "A" (sell/hit bids)
+    // For absorption detection:
+    // - "B" = buying pressure (taker bought)
+    // - "A" = selling pressure (taker sold)
+    string side = 2;
+
+    // Execution price
+    string price = 3;
+
+    // Fill size
+    string size = 4;
+
+    // USD notional value (price * size)
+    string value_usd = 5;
+
+    // Fill timestamp in milliseconds since Unix epoch
+    int64 timestamp_ms = 6;
+
+    // Block height for ordering
+    uint64 block_height = 7;
+
+    // Wallet that received the fill
+    string wallet = 8;
+
+    // Is this a liquidation fill?
+    bool is_liquidation = 9;
+
+    // Liquidated wallet (empty if not a liquidation)
+    string liquidated_wallet = 10;
+
+    // Liquidation method: "market" or "backstop" (empty if not liquidation)
+    string method = 11;
+
+    // Mark price at time of fill (if liquidation)
+    string mark_price = 12;
+
+    // Unique fill ID for deduplication
+    uint64 fill_id = 13;
+
+    // Transaction hash
+    string tx_hash = 14;
+}
+
+// ============================================================
+// gRPC Service Definition
+// ============================================================
+
+service HLNodeAdapter {
+    // Stream market prices for all assets
+    // Client receives continuous stream of price updates
+    rpc StreamPrices(StreamRequest) returns (stream MarketPriceEvent);
+
+    // Stream liquidation events
+    // Client receives continuous stream of liquidations
+    rpc StreamLiquidations(StreamRequest) returns (stream LiquidationEvent);
+
+    // Stream ALL fills (organic + liquidation) for absorption detection
+    // Client receives continuous stream of trade executions
+    rpc StreamFills(StreamRequest) returns (stream FillEvent);
+
+    // Stream sync status updates
+    // Client receives periodic health/status updates
+    rpc StreamStatus(StreamRequest) returns (stream SyncStatusEvent);
+
+    // Get current sync status (unary, not streaming)
+    rpc GetStatus(Empty) returns (SyncStatusEvent);
+
+    // Handshake to verify schema compatibility
+    // Clients should call this before subscribing to verify version
+    rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+}
+
+// Handshake request from client
+message HandshakeRequest {
+    // Client's expected schema version
+    SchemaVersion client_version = 1;
+
+    // Client identifier for logging
+    string client_id = 2;
+}
+
+// Empty request for streams that don't need parameters
+message StreamRequest {
+    // Optional: only stream for specific symbols
+    // Empty = all symbols
+    repeated string symbols = 1;
+
+    // Optional: start from specific block height
+    // 0 = start from current (no replay)
+    uint64 start_block = 2;
+}
+
+message Empty {}
+
+// Handshake response from server
+message HandshakeResponse {
+    // Server's schema version
+    SchemaVersion server_version = 1;
+
+    // Whether versions are compatible
+    bool compatible = 2;
+
+    // Human-readable compatibility message
+    string message = 3;
+
+    // Server uptime at handshake time
+    uint64 server_uptime_seconds = 4;
+}

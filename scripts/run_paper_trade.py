@@ -111,7 +111,7 @@ def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
 # Include both Binance format (BTCUSDT) and HL format (BTC) for cross-exchange support
 BINANCE_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
-    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'ADAUSDT', 'NEARUSDT',
+    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'SUIUSDT', 'NEARUSDT',
 ]
 HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
 SYMBOLS = BINANCE_SYMBOLS + HL_SYMBOLS  # Both formats for observation whitelist

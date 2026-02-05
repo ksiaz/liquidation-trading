@@ -174,8 +174,12 @@ ASSET_MAP = {
 # Reverse mapping for symbol -> asset_id lookup
 SYMBOL_TO_ID = {v: k for k, v in ASSET_MAP.items()}
 
-# Priority coins for focused tracking
-PRIORITY_COINS = {'BTC', 'ETH', 'SOL', 'DOGE', 'XRP', 'BNB', 'HYPE', 'AVAX', 'LINK', 'ARB'}
+# Priority coins for focused tracking (15 symbols - must exist in ASSET_MAP)
+PRIORITY_COINS = {
+    'BTC', 'ETH', 'SOL', 'XRP', 'DOGE',
+    'AVAX', 'LINK', 'HYPE', 'SUI', 'NEAR',
+    'LTC', 'ATOM', 'AAVE', 'APT', 'ARB',
+}
 
 
 def get_symbol(asset_id: int) -> str:

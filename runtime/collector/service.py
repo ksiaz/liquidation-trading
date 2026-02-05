@@ -209,8 +209,12 @@ class CollectorService:
                 adapter_address = os.environ.get("HL_ADAPTER_ADDRESS", "localhost:50051")
                 self._logger.info(f"Initializing Hyperliquid node bridge to {adapter_address}...")
 
-                # All 10 monitored symbols
-                focus_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'LINK', 'HYPE', 'SUI', 'NEAR']
+                # All 15 monitored symbols
+                focus_symbols = [
+                    'BTC', 'ETH', 'SOL', 'XRP', 'DOGE',
+                    'AVAX', 'LINK', 'HYPE', 'SUI', 'NEAR',
+                    'LTC', 'ATOM', 'AAVE', 'APT', 'ARB',
+                ]
 
                 self._node_bridge = create_node_bridge(
                     observation_system=self._obs,

@@ -51,7 +51,7 @@ from runtime.collector.service import CollectorService
 from runtime.monitoring import ResourceMonitor, HealthStatus, CleanupCoordinator
 from runtime.stability_observer import stability_observer
 from trade_stream import BinanceTradeStream
-from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
+from external_policy.ep2_strategy_cascade_sniper import record_organic_trade, record_liquidation_event
 # UI server disabled pending node adapter redesign
 # See docs/NODE_ADAPTER_REDESIGN.md
 
@@ -106,12 +106,12 @@ def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
     return deleted
 
 
-# Symbols to trade - 10 highest volume coins
-# Reduced from 15 to lower memory pressure on node state parsing
+# Symbols to trade - 15 highest volume coins (must exist in HL asset map)
 # Include both Binance format (BTCUSDT) and HL format (BTC) for cross-exchange support
 BINANCE_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
     'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'SUIUSDT', 'NEARUSDT',
+    'LTCUSDT', 'ATOMUSDT', 'AAVEUSDT', 'APTUSDT', 'ARBUSDT',
 ]
 HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
 SYMBOLS = BINANCE_SYMBOLS + HL_SYMBOLS  # Both formats for observation whitelist
@@ -192,6 +192,40 @@ async def run_paper_trade():
 
         service._node_bridge.on_organic_fill(on_hl_fill)
         logger.info('Wired HL node fills to absorption detector (via gRPC adapter)')
+
+        # Wire HL liquidations for cascade detector AND burst aggregator
+        def on_hl_liquidation(symbol: str, side: str, value: float, timestamp: float):
+            """Feed liquidations from HL node to the cascade sniper's detector."""
+            # HL symbols don't have USDT suffix - add it for consistency
+            normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
+            # Convert position side (LONG/SHORT) to order side (BUY/SELL)
+            # LONG liquidation = forced SELL, SHORT liquidation = forced BUY
+            order_side = "SELL" if side == "LONG" else "BUY"
+
+            # Feed to OrganicFlowDetector (for absorption ratio)
+            record_liquidation_event(
+                symbol=normalized_symbol,
+                side=order_side,
+                value=value,
+                timestamp=timestamp
+            )
+
+            # Feed to burst aggregator (for cascade state machine triggering)
+            # This is critical - without it, cascade states never transition
+            # because the state machine uses liquidation_burst from the aggregator
+            if hasattr(service, '_liquidation_burst_aggregator'):
+                # Estimate price from value (value = price * quantity)
+                # For burst aggregator, we need quantity - use value as proxy
+                service._liquidation_burst_aggregator.add_event(
+                    timestamp=timestamp,
+                    symbol=normalized_symbol,
+                    side=order_side,
+                    price=1.0,  # Placeholder - aggregator uses value anyway
+                    quantity=value  # Value as quantity (price=1 -> value=quantity)
+                )
+
+        service._node_bridge.on_hl_liquidation(on_hl_liquidation)
+        logger.info('Wired HL node liquidations to cascade detector AND burst aggregator')
     else:
         # Fallback to Binance trade stream if node bridge unavailable
         logger.warning('Node bridge not available, falling back to BinanceTradeStream')
@@ -327,10 +361,10 @@ async def run_paper_trade():
                 metrics = service._node_bridge.get_metrics()
                 hl_prices = service._obs.get_all_hl_prices()
                 logger.info(
-                    f'Status: prices_ingested={metrics["prices_ingested"]}, '
-                    f'liqs_ingested={metrics["liquidations_ingested"]}, '
-                    f'errors={metrics["errors"]}, '
-                    f'hl_symbols={len(hl_prices)}'
+                    f'Status: prices={metrics["prices_ingested"]}, '
+                    f'liqs={metrics["liquidations_ingested"]}→{metrics.get("liquidations_forwarded", 0)}, '
+                    f'fills={metrics["fills_ingested"]}→{metrics.get("organic_fills_forwarded", 0)}, '
+                    f'errors={metrics["errors"]}, symbols={len(hl_prices)}'
                 )
 
             if service._node_psm:
@@ -349,13 +383,10 @@ async def run_paper_trade():
                             f'${prox.total_value_at_risk:,.0f}'
                         )
 
-            # Log trade stream stats and absorption metrics
+            # Log trade stream stats (WebSocket mode only)
             if trade_stream:
                 ts_stats = trade_stream.get_stats()
                 logger.info(f'Trade stream: {ts_stats["trades_received"]} trades received')
-            elif service._node_bridge:
-                metrics = service._node_bridge.get_metrics()
-                logger.info(f'HL fills: {metrics.get("organic_fills_forwarded", 0)} forwarded to detector')
 
             if sm and sm._organic_detector:
                 for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:

@@ -210,12 +210,9 @@ class CollectorService:
                 adapter_address = os.environ.get("HL_ADAPTER_ADDRESS", "localhost:50051")
                 self._logger.info(f"Initializing Hyperliquid node bridge to {adapter_address}...")
 
-                # All 15 monitored symbols
-                focus_symbols = [
-                    'BTC', 'ETH', 'SOL', 'XRP', 'DOGE',
-                    'AVAX', 'LINK', 'HYPE', 'SUI', 'NEAR',
-                    'LTC', 'ATOM', 'AAVE', 'APT', 'ARB',
-                ]
+                # Derive focus_symbols from TOP_10_SYMBOLS (strip USDT suffix)
+                # This ensures gRPC subscription matches trading symbols
+                focus_symbols = [s.replace('USDT', '') for s in TOP_10_SYMBOLS]
 
                 self._node_bridge = create_node_bridge(
                     observation_system=self._obs,
@@ -505,7 +502,17 @@ class CollectorService:
                 # Node Adapter Mode (gRPC to out-of-process adapter)
                 try:
                     if self._node_bridge.start():
-                        self._logger.info("Node bridge started (streaming prices/liquidations via gRPC)")
+                        self._logger.info("Node bridge started (streaming prices/liquidations/fills via gRPC)")
+
+                        # Wire HL fills to VWAP, ATR, and Orderflow calculators
+                        # This enables regime classification from HL data alone
+                        self._node_bridge.on_organic_fill(self._handle_hl_fill)
+                        self._logger.info("HL fill callback registered (VWAP + ATR + Orderflow)")
+
+                        # Wire HL liquidations to zscore calculator and burst aggregator
+                        # This ensures liq_z and burst_vol reflect HL liquidations in node mode
+                        self._node_bridge.on_hl_liquidation(self._handle_hl_liquidation)
+                        self._logger.info("HL liquidation callback registered (zscore + burst aggregator)")
 
                         # Check initial status
                         status = self._node_bridge.get_status()
@@ -1031,6 +1038,116 @@ class CollectorService:
             absorption_ratio_shorts=absorption_ratio_shorts,
             timestamp=time.time()
         )
+
+    def _handle_hl_fill(
+        self,
+        symbol: str,      # Coin (e.g., "BTC")
+        side: str,        # "B" (buy) or "A" (sell)
+        price: float,     # Fill price
+        size: float,      # Size in base units
+        timestamp: float  # Unix timestamp in seconds
+    ):
+        """Handle HL fill event - feed to VWAP, ATR, and Orderflow calculators.
+
+        Called by NodeBridge when HL fill events are received.
+        Only active when USE_HL_NODE=true.
+
+        Mappings applied:
+        - Symbol: coin -> f"{coin}USDT" (e.g., "BTC" -> "BTCUSDT")
+        - Side for orderflow: "B" -> is_buyer_maker=False, "A" -> is_buyer_maker=True
+          (B = buyer is taker = NOT maker, A = seller is taker = buyer IS maker)
+        - Price and size used directly
+        """
+        try:
+            # 1. Symbol normalization: HL emits "BTC", calculators use "BTCUSDT"
+            normalized_symbol = f"{symbol}USDT"
+
+            # 2. Memory guard: check symbol limit before adding new
+            is_new_symbol = normalized_symbol not in self._vwap_calculators
+            if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
+                self.prune_stale_calculators()
+
+            # 3. Initialize calculators for symbol if needed
+            if normalized_symbol not in self._vwap_calculators:
+                self._vwap_calculators[normalized_symbol] = VWAPCalculator()
+            if normalized_symbol not in self._atr_calculators:
+                self._atr_calculators[normalized_symbol] = MultiTimeframeATR(period=3)
+            if normalized_symbol not in self._orderflow_calculators:
+                self._orderflow_calculators[normalized_symbol] = MultiWindowOrderflow()
+            if normalized_symbol not in self._liquidation_calculators:
+                self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
+
+            # 4. Track last activity for pruning
+            self._calculator_last_activity[normalized_symbol] = timestamp
+
+            # 5. Update VWAP (needs price and volume)
+            self._vwap_calculators[normalized_symbol].update(price, size, timestamp)
+
+            # 6. Update ATR (needs price)
+            self._atr_calculators[normalized_symbol].update_trade(price, timestamp)
+
+            # 7. Update Orderflow (needs is_buyer_maker and volume)
+            # HL side: "B" = buyer is taker (lifted asks) = is_buyer_maker=False
+            #          "A" = seller is taker (hit bids) = is_buyer_maker=True
+            is_buyer_maker = (side == "A")
+            self._orderflow_calculators[normalized_symbol].update(is_buyer_maker, size, timestamp)
+
+            # 8. Track current price
+            self._current_prices[normalized_symbol] = price
+
+        except Exception as e:
+            # Fail silently per constitutional rules - log but don't halt
+            self._logger.debug(f"HL fill callback error: {e}")
+
+    def _handle_hl_liquidation(
+        self,
+        symbol: str,      # Coin (e.g., "BTC")
+        side: str,        # Position side: "LONG" or "SHORT"
+        price: float,     # Liquidation price
+        size: float,      # Size in base units (e.g., BTC quantity)
+        timestamp: float  # Unix timestamp in seconds
+    ):
+        """Handle HL liquidation event - feed to zscore calculator and burst aggregator.
+
+        Called by NodeBridge when HL liquidation events are received.
+        Only active when USE_HL_NODE=true.
+
+        Mappings applied:
+        - Symbol: coin -> f"{coin}USDT" (e.g., "BTC" -> "BTCUSDT")
+        - Side: LONG -> SELL, SHORT -> BUY (position side -> order side)
+        - Quantity: size in base units (same as Binance forceOrder)
+        - Timestamp: already in seconds from NodeBridge
+        """
+        try:
+            # 1. Symbol normalization: HL emits "BTC", calculators use "BTCUSDT"
+            normalized_symbol = f"{symbol}USDT"
+
+            # 2. Initialize calculator for symbol if needed
+            if normalized_symbol not in self._liquidation_calculators:
+                self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
+
+            # 3. Update liquidation Z-score calculator (uses quantity, not value)
+            self._liquidation_calculators[normalized_symbol].update(size, timestamp)
+
+            # 4. Side mapping for burst aggregator: LONG -> SELL, SHORT -> BUY
+            # (HL side is position side, aggregator expects order side)
+            order_side = 'SELL' if side == 'LONG' else 'BUY'
+
+            # 5. Update liquidation burst aggregator
+            self._liquidation_burst_aggregator.add_event(
+                timestamp=timestamp,
+                symbol=normalized_symbol,
+                side=order_side,
+                price=price,
+                quantity=size
+            )
+
+            # 6. Track activity for calculator pruning
+            self._calculator_last_activity[normalized_symbol] = timestamp
+
+        except Exception as e:
+            # Fail silently per constitutional rules - log but don't halt
+            self._logger.debug(f"HL liquidation callback error: {e}")
 
     def _process_ghost_trades(self):
         """Process ghost trades based on new execution results.
@@ -1596,44 +1713,48 @@ class CollectorService:
                                     pass
 
                                 # Phase 5: Update regime calculators with trade data
-                                try:
-                                    price = float(payload.get('p', 0))
-                                    volume = float(payload.get('q', 0))
-                                    timestamp = int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time()
-                                    is_buyer_maker = payload.get('m', False)
+                                # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), skip Binance
+                                # trades for VWAP/ATR/Orderflow. HL fills are wired via
+                                # _handle_hl_fill callback to avoid double counting.
+                                if not self._use_node_mode:
+                                    try:
+                                        price = float(payload.get('p', 0))
+                                        volume = float(payload.get('q', 0))
+                                        timestamp = int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time()
+                                        is_buyer_maker = payload.get('m', False)
 
-                                    # Memory guard: check symbol limit before adding new
-                                    is_new_symbol = symbol not in self._vwap_calculators
-                                    if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
-                                        self.prune_stale_calculators()
+                                        # Memory guard: check symbol limit before adding new
+                                        is_new_symbol = symbol not in self._vwap_calculators
+                                        if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
+                                            self.prune_stale_calculators()
 
-                                    # Initialize calculators for symbol if needed
-                                    if symbol not in self._vwap_calculators:
-                                        self._vwap_calculators[symbol] = VWAPCalculator()
-                                    if symbol not in self._atr_calculators:
-                                        # Use period=3 for testing (needs 15min for 5m, 90min for 30m instead of 70min/7hrs)
-                                        self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
-                                    if symbol not in self._orderflow_calculators:
-                                        self._orderflow_calculators[symbol] = MultiWindowOrderflow()
-                                    if symbol not in self._liquidation_calculators:
-                                        self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
+                                        # Initialize calculators for symbol if needed
+                                        if symbol not in self._vwap_calculators:
+                                            self._vwap_calculators[symbol] = VWAPCalculator()
+                                        if symbol not in self._atr_calculators:
+                                            # Use period=3 for testing (needs 15min for 5m, 90min for 30m instead of 70min/7hrs)
+                                            self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
+                                        if symbol not in self._orderflow_calculators:
+                                            self._orderflow_calculators[symbol] = MultiWindowOrderflow()
+                                        if symbol not in self._liquidation_calculators:
+                                            self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
 
-                                    # Track last activity for pruning
-                                    self._calculator_last_activity[symbol] = timestamp
+                                        # Track last activity for pruning
+                                        self._calculator_last_activity[symbol] = timestamp
 
-                                    # Update VWAP
-                                    self._vwap_calculators[symbol].update(price, volume, timestamp)
+                                        # Update VWAP
+                                        self._vwap_calculators[symbol].update(price, volume, timestamp)
 
-                                    # Update ATR
-                                    self._atr_calculators[symbol].update_trade(price, timestamp)
+                                        # Update ATR
+                                        self._atr_calculators[symbol].update_trade(price, timestamp)
 
-                                    # Update orderflow imbalance
-                                    self._orderflow_calculators[symbol].update(is_buyer_maker, volume, timestamp)
+                                        # Update orderflow imbalance
+                                        self._orderflow_calculators[symbol].update(is_buyer_maker, volume, timestamp)
 
-                                    # Track current price
-                                    self._current_prices[symbol] = price
-                                except:
-                                    pass
+                                        # Track current price
+                                        self._current_prices[symbol] = price
+                                    except:
+                                        pass
                             elif 'forceorder' in stream.lower():
                                 event_type = "LIQUIDATION"
                                 # P1: Removed DEBUG_STREAM print from hot path
@@ -1656,46 +1777,43 @@ class CollectorService:
                                         pass  # Fail silently per constitutional rules
 
                                 # Phase 5: Update liquidation Z-score calculator
-                                try:
-                                    if 'o' in payload:
-                                        order = payload['o']
-                                        quantity = float(order.get('q', 0))
-                                        timestamp = ts if 'ts' in locals() else time.time()
+                                # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), skip Binance
+                                # liquidations for zscore/burst. HL liquidations are wired via
+                                # _handle_hl_liquidation callback to avoid double counting.
+                                if not self._use_node_mode:
+                                    try:
+                                        if 'o' in payload:
+                                            order = payload['o']
+                                            quantity = float(order.get('q', 0))
+                                            timestamp = ts if 'ts' in locals() else time.time()
 
-                                        # Initialize calculator for symbol if needed
-                                        if symbol not in self._liquidation_calculators:
-                                            self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
+                                            # Initialize calculator for symbol if needed
+                                            if symbol not in self._liquidation_calculators:
+                                                self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
 
-                                        # Update liquidation Z-score
-                                        self._liquidation_calculators[symbol].update(quantity, timestamp)
+                                            # Update liquidation Z-score
+                                            self._liquidation_calculators[symbol].update(quantity, timestamp)
 
-                                        # Phase 6: Update liquidation burst aggregator (for cascade sniper)
-                                        price = float(order.get('p', 0))
-                                        side = order.get('S', 'UNKNOWN')
-                                        self._liquidation_burst_aggregator.add_event(
-                                            timestamp=timestamp,
-                                            symbol=symbol,
-                                            side=side,
-                                            price=price,
-                                            quantity=quantity
-                                        )
+                                            # Phase 6: Update liquidation burst aggregator (for cascade sniper)
+                                            price = float(order.get('p', 0))
+                                            side = order.get('S', 'UNKNOWN')
+                                            self._liquidation_burst_aggregator.add_event(
+                                                timestamp=timestamp,
+                                                symbol=symbol,
+                                                side=side,
+                                                price=price,
+                                                quantity=quantity
+                                            )
 
-                                        # Phase 7: Record to entry quality scorer for exhaustion detection
-                                        # This feeds the data-driven entry quality filter
-                                        #
-                                        # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), use HL-only
-                                        # regime - HL fills + HL liquidations. Skip Binance liquidations
-                                        # to avoid biasing absorption ratio (mixing venues distorts
-                                        # organic/liq ratio when fills come from one venue only).
-                                        if not self._use_node_mode:
+                                            # Phase 7: Record to entry quality scorer for exhaustion detection
                                             try:
                                                 from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
                                                 liq_value = price * quantity
                                                 record_liquidation_event(symbol, side, liq_value, timestamp)
                                             except ImportError:
                                                 pass  # Module not available
-                                except:
-                                    pass
+                                    except:
+                                        pass
                             elif 'kline' in stream:
                                 event_type = "KLINE"
                                 # Log OHLC candle

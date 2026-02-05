@@ -68,9 +68,13 @@ class NodeBridge:
         # External fill callbacks (for organic flow detection)
         self._fill_callbacks: list = []
 
+        # External liquidation callbacks (for cascade detector)
+        self._liquidation_callbacks: list = []
+
         # Metrics
         self._prices_ingested = 0
         self._liquidations_ingested = 0
+        self._liquidations_forwarded = 0  # Forwarded to callbacks
         self._fills_ingested = 0
         self._organic_fills_forwarded = 0
         self._errors = 0
@@ -142,6 +146,25 @@ class NodeBridge:
             )
             self._liquidations_ingested += 1
 
+            # Forward to external callbacks (for zscore calculator and burst aggregator)
+            if self._liquidation_callbacks:
+                # Pass price and size separately for flexibility
+                # Side is LONG/SHORT (position side) - caller maps to order side
+                timestamp = event.timestamp_ms / 1000.0  # Convert to seconds
+
+                for callback in self._liquidation_callbacks:
+                    try:
+                        callback(
+                            event.symbol,      # coin (e.g., "BTC")
+                            event.side,        # position side: "LONG" or "SHORT"
+                            event.price_float, # liquidation price
+                            event.size_float,  # size in base units
+                            timestamp          # Unix timestamp in seconds
+                        )
+                        self._liquidations_forwarded += 1
+                    except Exception as cb_err:
+                        print(f"[NodeBridge] Liquidation callback error: {cb_err}", file=sys.stderr)
+
         except Exception as e:
             self._errors += 1
             print(f"[NodeBridge] Error handling liquidation: {e}", file=sys.stderr)
@@ -177,17 +200,22 @@ class NodeBridge:
             )
             self._fills_ingested += 1
 
-            # Forward organic fills to external callbacks (for absorption detection)
+            # Forward organic fills to external callbacks
+            # Used for: VWAP, ATR, Orderflow calculators, absorption detection
             # Liquidation fills are already tracked via liquidation events
             if not event.is_liquidation and self._fill_callbacks:
-                # Convert side: "B" -> "BUY", "A" -> "SELL"
-                side = "BUY" if event.side == "B" else "SELL"
-                value = float(event.value_usd) if event.value_usd else 0.0
+                # Pass raw data - let callback handle mapping
                 timestamp = event.timestamp_ms / 1000.0  # Convert to seconds
 
                 for callback in self._fill_callbacks:
                     try:
-                        callback(event.symbol, side, value, timestamp)
+                        callback(
+                            event.symbol,       # coin (e.g., "BTC")
+                            event.side,         # "B" (buy) or "A" (sell)
+                            event.price_float,  # fill price
+                            event.size_float,   # size in base units
+                            timestamp           # Unix timestamp in seconds
+                        )
                         self._organic_fills_forwarded += 1
                     except Exception as cb_err:
                         print(f"[NodeBridge] Fill callback error: {cb_err}", file=sys.stderr)
@@ -196,19 +224,40 @@ class NodeBridge:
             self._errors += 1
             print(f"[NodeBridge] Error handling fill: {e}", file=sys.stderr)
 
-    def on_organic_fill(self, callback: Callable[[str, str, float, float], None]):
+    def on_organic_fill(self, callback: Callable[[str, str, float, float, float], None]):
         """
         Register callback for organic (non-liquidation) fills.
 
-        Callback signature: callback(symbol, side, value_usd, timestamp)
+        Callback signature: callback(symbol, side, price, size, timestamp)
         - symbol: Asset symbol (e.g., "BTC")
-        - side: "BUY" or "SELL" (taker side)
-        - value_usd: USD value of the fill
+        - side: "B" (buy/taker lifted asks) or "A" (sell/taker hit bids)
+        - price: Fill price
+        - size: Fill size in base units
         - timestamp: Unix timestamp in seconds
 
-        Use this to feed organic fills to the OrganicFlowDetector for absorption detection.
+        Use this to feed fills to VWAP, ATR, Orderflow calculators.
+        Caller must map:
+        - Symbol: "BTC" -> "BTCUSDT"
+        - Side for orderflow: "B" -> is_buyer_maker=False, "A" -> is_buyer_maker=True
         """
         self._fill_callbacks.append(callback)
+
+    def on_hl_liquidation(self, callback: Callable[[str, str, float, float, float], None]):
+        """
+        Register callback for HL liquidation events.
+
+        Callback signature: callback(symbol, side, price, size, timestamp)
+        - symbol: Asset symbol (e.g., "BTC")
+        - side: "LONG" or "SHORT" (position side that was liquidated)
+        - price: Liquidation price
+        - size: Liquidation size in base units (e.g., BTC quantity)
+        - timestamp: Unix timestamp in seconds
+
+        Use this to feed liquidations to zscore calculator and burst aggregator.
+        The side is the POSITION side (LONG/SHORT), not order side (BUY/SELL).
+        Caller must map: LONG -> SELL, SHORT -> BUY for order-side metrics.
+        """
+        self._liquidation_callbacks.append(callback)
 
     def _handle_status(self, status: SyncStatus):
         """Handle status event."""
@@ -274,6 +323,7 @@ class NodeBridge:
             **subscriber_metrics,
             'prices_ingested': self._prices_ingested,
             'liquidations_ingested': self._liquidations_ingested,
+            'liquidations_forwarded': self._liquidations_forwarded,
             'fills_ingested': self._fills_ingested,
             'organic_fills_forwarded': self._organic_fills_forwarded,
             'errors': self._errors,

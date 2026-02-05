@@ -629,7 +629,11 @@ class ResourceMonitor:
                     if self._cleanup_coordinator:
                         try:
                             logger.info("[RESOURCES] Triggering cleanup due to disk space warning")
+                            # Run memory cleanup
                             await self._cleanup_coordinator.run_cleanup()
+                            # Run disk cleanup (HL node data)
+                            if hasattr(self._cleanup_coordinator, 'run_disk_cleanup'):
+                                await self._cleanup_coordinator.run_disk_cleanup(keep_hours=12)
                         except Exception as e:
                             logger.error(f"Cleanup coordinator trigger failed: {e}")
 

@@ -76,6 +76,10 @@ ABCI_STATE_DIRS = [
     'periodic_abci_states',  # Legacy name
 ]
 
+# Replica commands - session directories that can grow 100GB+/day
+# Format: replica_cmds/YYYY-MM-DDTHH:MM:SSZ/
+REPLICA_CMDS_DIR = 'replica_cmds'
+
 
 def get_dir_size(path: Path) -> int:
     """Get total size of directory in bytes."""
@@ -237,6 +241,44 @@ def prune_flat_dir_by_mtime(base_path: Path, keep_hours: int, dry_run: bool, ver
     return total_files, total_bytes
 
 
+def cleanup_replica_cmds(data_dir: Path, keep_hours: int, dry_run: bool, verbose: bool) -> tuple[int, int]:
+    """
+    Clean old replica_cmds session directories.
+
+    These are session snapshots that can grow 100GB+/day.
+    Format: replica_cmds/YYYY-MM-DDTHH:MM:SSZ/
+    """
+    replica_path = data_dir / REPLICA_CMDS_DIR
+    if not replica_path.exists():
+        return 0, 0
+
+    cutoff = time.time() - (keep_hours * 3600)
+    total_files = 0
+    total_bytes = 0
+
+    for session_dir in sorted(replica_path.iterdir()):
+        if not session_dir.is_dir():
+            continue
+
+        try:
+            # Parse timestamp from directory name (e.g., 2026-02-03T02:56:41Z)
+            session_name = session_dir.name
+            # Parse ISO format timestamp
+            dt = datetime.fromisoformat(session_name.replace('Z', '+00:00'))
+            session_ts = dt.timestamp()
+
+            if session_ts < cutoff:
+                files, bytes_freed = delete_directory(session_dir, dry_run, verbose)
+                total_files += files
+                total_bytes += bytes_freed
+        except (ValueError, OSError) as e:
+            if verbose:
+                print(f"  Skipping {session_dir.name}: {e}")
+            continue
+
+    return total_files, total_bytes
+
+
 def cleanup_abci_states(data_dir: Path, keep_count: int, dry_run: bool, verbose: bool) -> tuple[int, int]:
     """
     Clean up old ABCI state snapshots, keeping only the most recent ones.
@@ -314,6 +356,7 @@ def cleanup_hl_data(
         'diagnostics': {'files': 0, 'bytes': 0},
         'hourly_data': {'files': 0, 'bytes': 0},
         'abci_states': {'files': 0, 'bytes': 0},
+        'replica_cmds': {'files': 0, 'bytes': 0},
     }
 
     # Phase 1: Delete diagnostic directories entirely
@@ -357,13 +400,23 @@ def cleanup_hl_data(
     print(f"  ABCI states: {results['abci_states']['files']} files, "
           f"{format_size(results['abci_states']['bytes'])}")
 
+    # Phase 4: Clean old replica_cmds sessions (can be 100GB+/day)
+    print("\nPhase 4: Cleaning old replica_cmds sessions...")
+    files, bytes_freed = cleanup_replica_cmds(data_path, keep_hours, dry_run, verbose)
+    results['replica_cmds']['files'] = files
+    results['replica_cmds']['bytes'] = bytes_freed
+    print(f"  Replica cmds: {results['replica_cmds']['files']} files, "
+          f"{format_size(results['replica_cmds']['bytes'])}")
+
     # Summary
     total_files = (results['diagnostics']['files'] +
                    results['hourly_data']['files'] +
-                   results['abci_states']['files'])
+                   results['abci_states']['files'] +
+                   results['replica_cmds']['files'])
     total_bytes = (results['diagnostics']['bytes'] +
                    results['hourly_data']['bytes'] +
-                   results['abci_states']['bytes'])
+                   results['abci_states']['bytes'] +
+                   results['replica_cmds']['bytes'])
 
     print()
     print("=" * 60)

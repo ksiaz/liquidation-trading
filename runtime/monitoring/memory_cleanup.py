@@ -226,6 +226,47 @@ class CleanupCoordinator:
                 pass
         logger.info("[CLEANUP] Coordinator stopped")
 
+    async def run_disk_cleanup(self, keep_hours: int = 12) -> dict:
+        """
+        Run HL node disk cleanup to reclaim disk space.
+
+        Called by resource_monitor when disk warning is triggered.
+
+        Args:
+            keep_hours: Hours of data to keep (default 12)
+
+        Returns:
+            dict with cleanup results
+        """
+        try:
+            # Import here to avoid circular imports
+            from scripts.cleanup_hl_data import cleanup_hl_data
+
+            logger.info(f"[CLEANUP] Running HL disk cleanup (keep_hours={keep_hours})")
+
+            # Run cleanup in executor to not block event loop
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: cleanup_hl_data(
+                    keep_hours=keep_hours,
+                    keep_abci_states=3,
+                    dry_run=False,
+                    verbose=False,
+                )
+            )
+
+            total_bytes = result.get('total_bytes', 0)
+            if total_bytes > 0:
+                from scripts.cleanup_hl_data import format_size
+                logger.info(f"[CLEANUP] HL disk cleanup freed {format_size(total_bytes)}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"[CLEANUP] HL disk cleanup failed: {e}")
+            return {'error': str(e)}
+
     def get_metrics(self) -> Dict:
         """Get coordinator metrics."""
         return {

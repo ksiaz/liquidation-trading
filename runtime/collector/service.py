@@ -226,8 +226,10 @@ class CollectorService:
                 self._logger.warning(f"Node bridge init failed: {e}, falling back to WebSocket mode")
                 self._use_node_mode = False
 
-        if not self._use_node_mode and HYPERLIQUID_AVAILABLE:
-            # WebSocket Collector Mode: API-based position tracking
+        # Initialize HyperliquidCollector for proximity data (whale position tracking)
+        # Node mode: gRPC adapter handles prices/liquidations/fills, API handles proximity
+        # Non-node mode: API handles everything
+        if HYPERLIQUID_AVAILABLE:
             try:
                 # Load whale wallet addresses from registry
                 whale_addresses = get_wallet_addresses()
@@ -514,11 +516,13 @@ class CollectorService:
                 except Exception as e:
                     self._logger.warning(f"Node bridge start failed: {e}")
 
-            elif self._hyperliquid_collector:
-                # WebSocket Collector Mode
+            # Start WebSocket collector for proximity data (whale position tracking)
+            # In node mode: gRPC handles prices/liqs/fills, WebSocket handles proximity
+            # In non-node mode: WebSocket handles everything
+            if self._hyperliquid_collector:
                 try:
                     asyncio.create_task(self._hyperliquid_collector.start())
-                    self._logger.info("Hyperliquid WebSocket collector started")
+                    self._logger.info("Hyperliquid WebSocket collector started (proximity tracking)")
 
                     # Wire up Hyperliquid collector to observation system
                     # This enables M4 cascade primitives to be computed from HL data
@@ -844,6 +848,11 @@ class CollectorService:
                     else:
                         liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
 
+                    # Gate B: Get price returns for trend gate
+                    # Convert symbol (BTCUSDT) to coin (BTC) for HL price lookup
+                    coin_for_returns = symbol.replace('USDT', '').replace('USD', '')
+                    price_returns = self._obs.get_hl_price_returns(coin_for_returns)
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -855,7 +864,8 @@ class CollectorService:
                         current_price=current_price,  # Phase 5: Pass current price
                         hl_proximity=hl_proximity,  # Phase 6: Hyperliquid proximity
                         liquidation_burst=liquidation_burst,  # Phase 6: Liquidation burst
-                        absorption=absorption  # Phase 6: Order book absorption analysis
+                        absorption=absorption,  # Phase 6: Order book absorption analysis
+                        price_returns=price_returns  # Gate B: Short-term price returns
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1628,34 +1638,18 @@ class CollectorService:
 
                                         # Phase 7: Record to entry quality scorer for exhaustion detection
                                         # This feeds the data-driven entry quality filter
-                                        try:
-                                            from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
-                                            liq_value = price * quantity
-                                            record_liquidation_event(symbol, side, liq_value, timestamp)
-                                        except ImportError:
-                                            pass  # Module not available
-
-                                        # Phase 8: Forward to node bridge for M2 node creation
-                                        # This enables geometry strategy to trade from Binance liquidations
-                                        if self._node_bridge is not None:
+                                        #
+                                        # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), use HL-only
+                                        # regime - HL fills + HL liquidations. Skip Binance liquidations
+                                        # to avoid biasing absorption ratio (mixing venues distorts
+                                        # organic/liq ratio when fills come from one venue only).
+                                        if not self._use_node_mode:
                                             try:
-                                                from runtime.hyperliquid.node_adapter.action_extractor import LiquidationEvent
-                                                # Convert Binance side to HL side (SELL=LONG liquidated, BUY=SHORT liquidated)
-                                                liq_side = 'LONG' if side == 'SELL' else 'SHORT'
-                                                liq_event = LiquidationEvent(
-                                                    timestamp=timestamp,
-                                                    symbol=symbol,  # Already in BTCUSDT format
-                                                    wallet_address='BINANCE',  # Marker for Binance source
-                                                    liquidated_size=quantity,
-                                                    liquidation_price=price,
-                                                    side=liq_side,
-                                                    value=price * quantity,
-                                                    event_type='BINANCE_LIQUIDATION',
-                                                    exchange='BINANCE'
-                                                )
-                                                self._node_bridge.on_liquidation(liq_event)
-                                            except Exception:
-                                                pass  # Fail silently
+                                                from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
+                                                liq_value = price * quantity
+                                                record_liquidation_event(symbol, side, liq_value, timestamp)
+                                            except ImportError:
+                                                pass  # Module not available
                                 except:
                                     pass
                             elif 'kline' in stream:

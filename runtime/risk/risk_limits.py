@@ -32,7 +32,7 @@ class RiskLimitsConfig:
     max_aggregate_exposure_pct: float = 0.10  # 10% total
     max_correlated_exposure_pct: float = 0.07  # 7% correlated
     max_leverage: float = 1.0  # No leverage
-    max_concurrent_positions: int = 1
+    max_concurrent_positions: int = 3
 
     # Correlation threshold
     correlation_threshold: float = 0.7  # Above this = correlated

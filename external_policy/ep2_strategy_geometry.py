@@ -225,7 +225,7 @@ def restore_entry_context_from_positions(open_positions: list, persisted_context
     """Restore entry context from persisted positions.
 
     Called on startup to reconstruct internal state from position database.
-    This enables EXIT signals to trigger for positions opened in previous sessions.
+    This enables EXIT proposals to trigger for positions opened in previous sessions.
 
     Args:
         open_positions: List of dicts with keys: symbol, direction, entry_price, state
@@ -352,6 +352,41 @@ def _is_zone_confirmed(
         return False
 
     return True
+
+
+def _is_price_at_zone(
+    zone: 'SupplyDemandZonePrimitive',
+    current_price: Optional[float],
+    config: SupplyDemandZoneConfig = DEFAULT_ZONE_CONFIG
+) -> bool:
+    """
+    Check if current price is at the zone for entry.
+
+    Entry should only occur when price is at/near the zone:
+    - Supply zone (SHORT): price must be AT or ABOVE zone_low (at resistance)
+    - Demand zone (LONG): price must be AT or BELOW zone_high (at support)
+
+    Allows a tolerance buffer (zone_width * entry_tolerance) to avoid
+    missing entries by a few ticks.
+
+    Returns:
+        True if price is positioned correctly for entry, False otherwise
+    """
+    if current_price is None:
+        return False
+
+    zone_width = zone.zone_high - zone.zone_low
+    # Allow entry within 1x zone width tolerance from the zone boundary
+    entry_tolerance = zone_width * 1.0
+
+    if zone.zone_type == "supply":
+        # For SHORT: price must be at or above zone_low (at/in resistance zone)
+        return current_price >= zone.zone_low - entry_tolerance
+    elif zone.zone_type == "demand":
+        # For LONG: price must be at or below zone_high (at/in support zone)
+        return current_price <= zone.zone_high + entry_tolerance
+    else:
+        return False
 
 
 def _is_zone_invalidated(
@@ -529,7 +564,8 @@ def generate_geometry_proposal(
     # Rule 3: Position FLAT -> check for ENTRY
     if position_state == PositionState.FLAT or position_state is None:
         # Priority 1: Pattern-based entry (preferred, no oscillation risk)
-        if has_pattern_primitive and _is_zone_confirmed(supply_demand_zone, config):
+        # Must check: 1) zone confirmed, 2) price at zone (not below supply / not above demand)
+        if has_pattern_primitive and _is_zone_confirmed(supply_demand_zone, config) and _is_price_at_zone(supply_demand_zone, context.current_price, config):
             _record_entry_zone(symbol, supply_demand_zone)
             _entry_method[symbol] = "PATTERN"
             # Derive direction from zone type: demand=LONG (buy support), supply=SHORT (sell resistance)

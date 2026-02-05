@@ -5,6 +5,9 @@ Tracks simulated positions, account balance, and trade outcomes.
 Mechanical state tracking only. No interpretation.
 
 Authority: Ghost Trading Extension v1.0
+
+Persistence: Open positions are persisted to sqlite DB and restored on startup.
+This enables external queries for P&L and state reconciliation.
 """
 
 from dataclasses import dataclass, field
@@ -12,6 +15,8 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime
 import json
+import sqlite3
+import os
 
 from execution.ep4_ghost_adapter import (
     GhostExchangeAdapter,
@@ -19,6 +24,68 @@ from execution.ep4_ghost_adapter import (
     FillEstimate,
     ExecutionMode
 )
+
+# Structured diagnostics for silent paths
+from runtime.diagnostics import diag, ReasonCode
+
+
+# ==============================================================================
+# Position Persistence
+# ==============================================================================
+
+DEFAULT_DB_PATH = "/tmp/ghost_trades.db"
+
+
+def _init_position_table(conn: sqlite3.Connection) -> None:
+    """Create ghost_positions table if not exists."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ghost_positions (
+            trade_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            qty REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_time REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            entry_reason TEXT,
+            strategy_id TEXT,
+            exit_price REAL,
+            exit_time REAL,
+            pnl REAL,
+            UNIQUE(symbol, status) ON CONFLICT REPLACE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_status ON ghost_positions(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_symbol ON ghost_positions(symbol)")
+    conn.commit()
+
+
+def _load_open_positions(conn: sqlite3.Connection) -> Dict[str, dict]:
+    """Load all OPEN positions from DB. Returns dict keyed by symbol."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM ghost_positions WHERE status = 'OPEN'"
+    ).fetchall()
+    return {row['symbol']: dict(row) for row in rows}
+
+
+def _insert_position(conn: sqlite3.Connection, pos: dict) -> None:
+    """Insert new position with status=OPEN."""
+    conn.execute("""
+        INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id)
+        VALUES (:trade_id, :symbol, :side, :qty, :entry_price, :entry_time, 'OPEN', :entry_reason, :strategy_id)
+    """, pos)
+    conn.commit()
+
+
+def _update_position_closed(conn: sqlite3.Connection, symbol: str, exit_price: float, exit_time: float, pnl: float) -> None:
+    """Update position to CLOSED with exit data."""
+    conn.execute("""
+        UPDATE ghost_positions
+        SET status = 'CLOSED', exit_price = ?, exit_time = ?, pnl = ?
+        WHERE symbol = ? AND status = 'OPEN'
+    """, (exit_price, exit_time, pnl, symbol))
+    conn.commit()
 
 
 # ==============================================================================
@@ -116,7 +183,8 @@ class GhostPositionTracker:
         position_size_pct: float = 0.05,  # 5%
         symbols: List[str] = None,  # Support multiple symbols
         api_key: Optional[str] = None,
-        db_conn = None  # Optional database connection for logging
+        db_conn = None,  # Optional database connection for logging trades
+        db_path: str = DEFAULT_DB_PATH  # Path to position persistence DB
     ):
         """
         Initialize ghost position tracker.
@@ -127,6 +195,7 @@ class GhostPositionTracker:
             symbols: List of trading symbols to support
             api_key: Optional Binance API key for live data
             db_conn: Optional sqlite3 connection for logging trades
+            db_path: Path to sqlite DB for position persistence (default: /tmp/ghost_trades.db)
         """
         self._state = GhostAccountState(
             initial_balance=initial_balance,
@@ -135,6 +204,11 @@ class GhostPositionTracker:
         self._position_size_pct = position_size_pct
         self._db_conn = db_conn
         self._api_key = api_key
+        self._db_path = db_path
+
+        # Position persistence connection (separate from trade logging)
+        self._pos_conn: Optional[sqlite3.Connection] = None
+        self._init_persistence()
 
         # Ghost adapters per symbol (created on-demand)
         self._adapters: Dict[str, GhostExchangeAdapter] = {}
@@ -148,8 +222,79 @@ class GhostPositionTracker:
                     execution_mode=ExecutionMode.GHOST_LIVE
                 )
 
-        # Trade ID counter
-        self._next_trade_id = 1
+        # Trade ID counter - load from DB if positions exist
+        self._next_trade_id = self._get_next_trade_id()
+
+    def _init_persistence(self) -> None:
+        """Initialize position persistence DB and restore state."""
+        try:
+            self._pos_conn = sqlite3.connect(self._db_path)
+            _init_position_table(self._pos_conn)
+
+            # Load existing OPEN positions
+            saved_positions = _load_open_positions(self._pos_conn)
+            for symbol, row in saved_positions.items():
+                # Reconstruct GhostPosition from DB row
+                position = GhostPosition(
+                    symbol=row['symbol'],
+                    side=row['side'],
+                    quantity=row['qty'],
+                    entry_price=row['entry_price'],
+                    entry_timestamp=row['entry_time'],
+                    entry_order_id="",  # Not persisted
+                    entry_trade_id=row['trade_id'],
+                    entry_policy=row.get('strategy_id'),
+                    entry_primitives=None
+                )
+                self._state.open_positions[symbol] = position
+
+            if saved_positions:
+                print(f"[GHOST] Restored {len(saved_positions)} open positions from DB", flush=True)
+
+        except Exception as e:
+            print(f"[GHOST] Position persistence init failed: {e}", flush=True)
+            self._pos_conn = None
+
+    def _get_next_trade_id(self) -> int:
+        """Get next trade ID from DB or start at 1."""
+        if not self._pos_conn:
+            return 1
+        try:
+            row = self._pos_conn.execute(
+                "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_positions"
+            ).fetchone()
+            if row[0] is not None:
+                return row[0] + 1
+        except:
+            pass
+        return 1
+
+    def _persist_open_position(self, position: GhostPosition, strategy_id: Optional[str] = None) -> None:
+        """Persist new position to DB with status=OPEN."""
+        if not self._pos_conn:
+            return
+        try:
+            _insert_position(self._pos_conn, {
+                'trade_id': position.entry_trade_id,
+                'symbol': position.symbol,
+                'side': position.side,
+                'qty': position.quantity,
+                'entry_price': position.entry_price,
+                'entry_time': position.entry_timestamp,
+                'entry_reason': position.entry_policy,
+                'strategy_id': strategy_id or position.entry_policy,
+            })
+        except Exception as e:
+            print(f"[GHOST] Failed to persist position: {e}", flush=True)
+
+    def _persist_position_closed(self, symbol: str, exit_price: float, exit_time: float, pnl: float) -> None:
+        """Update position in DB to status=CLOSED with exit data."""
+        if not self._pos_conn:
+            return
+        try:
+            _update_position_closed(self._pos_conn, symbol, exit_price, exit_time, pnl)
+        except Exception as e:
+            print(f"[GHOST] Failed to update closed position: {e}", flush=True)
 
     def _get_adapter(self, symbol: str) -> GhostExchangeAdapter:
         """Get or create adapter for symbol."""
@@ -301,6 +446,9 @@ class GhostPositionTracker:
         # Update state
         self._state.open_positions[symbol] = position
 
+        # Persist position to DB
+        self._persist_open_position(position, policy_name)
+
         # Create trade record
         trade = GhostTrade(
             trade_id=trade_id,
@@ -443,10 +591,11 @@ class GhostPositionTracker:
 
         # Remove or reduce position
         if quantity >= position.quantity:
-            # Full close
+            # Full close - persist to DB as CLOSED
+            self._persist_position_closed(symbol, exit_price, result.timestamp, pnl)
             del self._state.open_positions[symbol]
         else:
-            # Partial close - update position
+            # Partial close - update position (keep as OPEN in DB, qty not updated for simplicity)
             updated_position = GhostPosition(
                 symbol=position.symbol,
                 side=position.side,
@@ -516,6 +665,92 @@ class GhostPositionTracker:
         """Get all open positions."""
         return self._state.open_positions.copy()
 
+    def get_positions_with_pnl(self, price_getter=None) -> List[Dict]:
+        """
+        Get open positions with computed unrealized P&L.
+
+        External P&L is computed on read from current mark price.
+        Does not persist per-tick values.
+
+        Args:
+            price_getter: Optional callable(symbol) -> float for current price.
+                          If None, uses adapter to get live price.
+
+        Returns:
+            List of dicts with position data + unrealized_pnl field
+        """
+        results = []
+        for symbol, pos in self._state.open_positions.items():
+            # Get current price
+            current_price = None
+            if price_getter:
+                try:
+                    current_price = price_getter(symbol)
+                except:
+                    pass
+
+            if current_price is None:
+                try:
+                    adapter = self._get_adapter(symbol)
+                    snapshot = adapter.capture_snapshot()
+                    current_price = (snapshot.best_bid + snapshot.best_ask) / 2
+                except:
+                    current_price = pos.entry_price  # Fallback
+
+            # Compute unrealized P&L
+            if pos.side == "LONG":
+                unrealized_pnl = (current_price - pos.entry_price) * pos.quantity
+            else:
+                unrealized_pnl = (pos.entry_price - current_price) * pos.quantity
+
+            pnl_pct = (unrealized_pnl / (pos.entry_price * pos.quantity)) * 100 if pos.entry_price > 0 else 0
+
+            results.append({
+                'trade_id': pos.entry_trade_id,
+                'symbol': symbol,
+                'side': pos.side,
+                'qty': pos.quantity,
+                'entry_price': pos.entry_price,
+                'entry_time': pos.entry_timestamp,
+                'current_price': current_price,
+                'unrealized_pnl': unrealized_pnl,
+                'unrealized_pnl_pct': pnl_pct,
+                'strategy_id': pos.entry_policy,
+            })
+
+        return results
+
+    @staticmethod
+    def query_positions_from_db(db_path: str = DEFAULT_DB_PATH, status: str = None) -> List[Dict]:
+        """
+        Query positions directly from DB without creating tracker instance.
+
+        For external tools that need position state without running the tracker.
+
+        Args:
+            db_path: Path to ghost trades DB
+            status: Filter by status ('OPEN', 'CLOSED', or None for all)
+
+        Returns:
+            List of position dicts from DB
+        """
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM ghost_positions WHERE status = ? ORDER BY entry_time DESC",
+                    (status,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM ghost_positions ORDER BY entry_time DESC"
+                ).fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            return []
+
     def _generate_trade_id(self) -> str:
         """Generate sequential trade ID."""
         trade_id = f"GHOST_{self._next_trade_id:06d}"
@@ -525,6 +760,14 @@ class GhostPositionTracker:
     def _log_trade_to_db(self, trade: GhostTrade) -> None:
         """Log trade to database if connection available."""
         if not self._db_conn:
+            # DIAGNOSTIC: No DB connection - trade not persisted
+            diag.record_skip(
+                component="GhostTracker",
+                function="_log_trade_to_db",
+                reason_code=ReasonCode.GT_NO_DB_CONNECTION,
+                symbol=trade.symbol,
+                context={"trade_id": trade.trade_id}
+            )
             return
 
         try:
@@ -584,8 +827,14 @@ class GhostPositionTracker:
 
             self._db_conn.commit()
         except Exception as e:
-            # Silently fail - don't break execution if logging fails
-            pass
+            # DIAGNOSTIC: DB write failed - trade not persisted
+            diag.record_skip(
+                component="GhostTracker",
+                function="_log_trade_to_db",
+                reason_code=ReasonCode.GT_DB_WRITE_FAILED,
+                symbol=trade.symbol,
+                context={"trade_id": trade.trade_id, "error": str(e)}
+            )
 
     def log_rejection(
         self,

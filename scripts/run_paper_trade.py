@@ -179,13 +179,17 @@ async def run_paper_trade():
     # Replaces BinanceTradeStream - now uses native HL fill data
     trade_stream = None  # Only used if node bridge unavailable
     if service._node_bridge:
-        def on_hl_fill(symbol: str, side: str, value: float, timestamp: float):
+        def on_hl_fill(symbol: str, side: str, price: float, size: float, timestamp: float):
             """Feed organic fills from HL node to the cascade sniper's absorption detector."""
             # HL symbols don't have USDT suffix - add it for consistency
             normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
+            # Calculate value from price * size
+            value = price * size
+            # Map side: "B" -> "BUY", "A" -> "SELL"
+            order_side = "BUY" if side == "B" else "SELL"
             record_organic_trade(
                 symbol=normalized_symbol,
-                side=side,  # Already "BUY" or "SELL"
+                side=order_side,
                 value=value,
                 timestamp=timestamp
             )
@@ -194,13 +198,15 @@ async def run_paper_trade():
         logger.info('Wired HL node fills to absorption detector (via gRPC adapter)')
 
         # Wire HL liquidations for cascade detector AND burst aggregator
-        def on_hl_liquidation(symbol: str, side: str, value: float, timestamp: float):
+        def on_hl_liquidation(symbol: str, side: str, price: float, size: float, timestamp: float):
             """Feed liquidations from HL node to the cascade sniper's detector."""
             # HL symbols don't have USDT suffix - add it for consistency
             normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
             # Convert position side (LONG/SHORT) to order side (BUY/SELL)
             # LONG liquidation = forced SELL, SHORT liquidation = forced BUY
             order_side = "SELL" if side == "LONG" else "BUY"
+            # Calculate value from price * size
+            value = price * size
 
             # Feed to OrganicFlowDetector (for absorption ratio)
             record_liquidation_event(
@@ -214,14 +220,12 @@ async def run_paper_trade():
             # This is critical - without it, cascade states never transition
             # because the state machine uses liquidation_burst from the aggregator
             if hasattr(service, '_liquidation_burst_aggregator'):
-                # Estimate price from value (value = price * quantity)
-                # For burst aggregator, we need quantity - use value as proxy
                 service._liquidation_burst_aggregator.add_event(
                     timestamp=timestamp,
                     symbol=normalized_symbol,
                     side=order_side,
-                    price=1.0,  # Placeholder - aggregator uses value anyway
-                    quantity=value  # Value as quantity (price=1 -> value=quantity)
+                    price=price,
+                    quantity=size
                 )
 
         service._node_bridge.on_hl_liquidation(on_hl_liquidation)

@@ -12,7 +12,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional, List, Tuple
 
@@ -166,9 +166,12 @@ class PriceReader:
             block_time_str = abci.get('time', '')
             block_height = abci.get('round', 0)
 
-            # Parse timestamp
+            # Parse timestamp (HL node timestamps are always UTC)
             try:
                 dt = datetime.fromisoformat(block_time_str.replace('Z', '+00:00'))
+                # Ensure UTC timezone for naive datetimes (no Z suffix)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
                 timestamp_ns = int(dt.timestamp() * 1_000_000_000)
             except (ValueError, AttributeError):
                 timestamp_ns = int(time.time() * 1_000_000_000)

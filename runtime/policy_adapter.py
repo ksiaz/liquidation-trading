@@ -65,6 +65,9 @@ from runtime.liquidations import LiquidationBurst
 # Directional context for kill-switch (via observation layer)
 from observation.types import TrendRegimeContext
 
+# Structured diagnostics for silent paths
+from runtime.diagnostics import diag, ReasonCode
+
 
 @dataclass(frozen=True)
 class AdapterConfig:
@@ -131,7 +134,8 @@ class PolicyAdapter:
         hl_proximity: Optional[ProximityData] = None,  # Hyperliquid proximity data
         liquidation_burst: Optional[LiquidationBurst] = None,  # Recent Binance liquidations
         absorption: Optional[AbsorptionAnalysis] = None,  # Order book absorption analysis
-        trend_context: Optional[TrendRegimeContext] = None  # Trend regime for kill-switch
+        trend_context: Optional[TrendRegimeContext] = None,  # Trend regime for kill-switch
+        price_returns: Optional[Dict[str, Optional[float]]] = None  # Gate B: {ret_1m, ret_3m}
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -289,6 +293,23 @@ class PolicyAdapter:
 
         # Phase 5: SLBRS/EFFCS strategies with regime gating
         if regime_state is None or regime_metrics is None:
+            # DIAGNOSTIC: Regime data missing - SLBRS/EFFCS strategies will be skipped
+            if regime_state is None:
+                diag.record_skip(
+                    component="PolicyAdapter",
+                    function="generate_mandates",
+                    reason_code=ReasonCode.PA_REGIME_STATE_MISSING,
+                    symbol=symbol,
+                    context={}
+                )
+            if regime_metrics is None:
+                diag.record_skip(
+                    component="PolicyAdapter",
+                    function="generate_mandates",
+                    reason_code=ReasonCode.PA_REGIME_METRICS_MISSING,
+                    symbol=symbol,
+                    context={}
+                )
             if _DIAG_ENABLED:
                 print(f"  [SLBRS/EFFCS] SKIPPED - regime_state={regime_state is not None}, regime_metrics={regime_metrics is not None}")
         if regime_state is not None and regime_metrics is not None:
@@ -302,6 +323,14 @@ class PolicyAdapter:
 
             # Use current price from collector (if not available, skip strategy calls)
             if current_price is None:
+                # DIAGNOSTIC: Missing price - SLBRS/EFFCS strategies cannot generate mandates
+                diag.record_skip(
+                    component="PolicyAdapter",
+                    function="generate_mandates",
+                    reason_code=ReasonCode.PA_MISSING_PRICE,
+                    symbol=symbol,
+                    context={"regime_state": regime_state.name if regime_state else None}
+                )
                 return mandates
 
             if self.config.enable_slbrs:
@@ -364,7 +393,8 @@ class PolicyAdapter:
                 position_state=position_state,
                 entry_mode=entry_mode,
                 absorption=absorption,  # Pass orderbook absorption analysis
-                trend_context=trend_context  # Pass trend context for kill-switch
+                trend_context=trend_context,  # Pass trend context for kill-switch
+                price_returns=price_returns  # Gate B: Short-term price returns
             )
             if _DIAG_ENABLED:
                 if proposal:
@@ -375,8 +405,17 @@ class PolicyAdapter:
                     print(f"  [cascade] → None (proximity_pos={prox_count}, burst_vol={burst_vol:.0f})")
             if proposal:
                 proposals.append(proposal)
-        elif self.config.enable_cascade_sniper and _DIAG_ENABLED:
-            print(f"  [cascade] SKIPPED - no proximity or burst data")
+        elif self.config.enable_cascade_sniper:
+            # DIAGNOSTIC: Cascade sniper enabled but no data - strategy skipped
+            diag.record_skip(
+                component="PolicyAdapter",
+                function="generate_mandates",
+                reason_code=ReasonCode.PA_CASCADE_DATA_MISSING,
+                symbol=symbol,
+                context={"proximity": hl_proximity is not None, "burst": liquidation_burst is not None}
+            )
+            if _DIAG_ENABLED:
+                print(f"  [cascade] SKIPPED - no proximity or burst data")
 
         # Convert proposals to mandates (pure normalization)
         # F5: Pass current_price for quantity calculation
@@ -414,10 +453,21 @@ class PolicyAdapter:
             Dictionary of primitive name -> primitive object
         """
         # Get pre-computed bundle for symbol
+        # Try exact match first, then base symbol (HL uses BTC, Binance uses BTCUSDT)
         bundle = observation_snapshot.primitives.get(symbol)
+        if bundle is None:
+            base_symbol = symbol.replace('USDT', '').replace('USD', '')
+            bundle = observation_snapshot.primitives.get(base_symbol)
 
         if bundle is None:
-            # Symbol not in snapshot (should not happen if symbol in symbols_active)
+            # DIAGNOSTIC: Symbol not in snapshot - all primitives will be None
+            diag.record_skip(
+                component="PolicyAdapter",
+                function="_extract_primitives",
+                reason_code=ReasonCode.PA_SYMBOL_NOT_IN_SNAPSHOT,
+                symbol=symbol,
+                context={"symbols_in_snapshot": list(observation_snapshot.primitives.keys())[:10]}
+            )
             # Return empty dict with all None primitives
             return {
                 "zone_penetration": None,

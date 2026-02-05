@@ -494,6 +494,68 @@ class M1IngestionEngine:
             self.counters['errors'] += 1
             return None
 
+    def normalize_hl_fill(self, symbol: str, payload: Dict) -> Optional[Dict]:
+        """
+        Normalize Hyperliquid fill event for M2 node creation.
+
+        Converts HL fill format to standard trade format compatible with
+        _associate_trade_with_nodes(). Skips liquidation fills to avoid
+        double-counting (liquidations create nodes via HL_LIQUIDATION).
+
+        Args:
+            symbol: Trading symbol (e.g., "BTC")
+            payload: Fill data with keys:
+                - side: "B" (buy) or "A" (sell)
+                - price: Fill price
+                - size: Fill size
+                - value_usd: USD value
+                - timestamp_ms: Timestamp in milliseconds
+                - is_liquidation: True if this fill is a liquidation
+
+        Returns:
+            Normalized event dict or None if skipped/error
+        """
+        try:
+            # Skip liquidation fills - they create nodes via HL_LIQUIDATION
+            if payload.get('is_liquidation'):
+                return None
+
+            price = float(payload.get('price', 0))
+            size = float(payload.get('size', 0))
+            value_usd = float(payload.get('value_usd', 0))
+
+            # Skip if no meaningful data
+            if price <= 0 or size <= 0:
+                return None
+
+            # Calculate quote_qty (USD value) - use provided or compute
+            quote_qty = value_usd if value_usd > 0 else price * size
+
+            # Map side: "B" = BUY (taker lifted asks), "A" = SELL (taker hit bids)
+            side = 'BUY' if payload.get('side') == 'B' else 'SELL'
+
+            # Timestamp: convert ms to seconds, fallback to current time
+            timestamp_ms = payload.get('timestamp_ms', 0)
+            timestamp = timestamp_ms / 1000.0 if timestamp_ms > 0 else payload.get('timestamp', 0)
+
+            event = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'price': price,
+                'quantity': size,
+                'quote_qty': quote_qty,
+                'side': side,
+                'event_type': 'HL_FILL',
+                'exchange': 'HYPERLIQUID',
+            }
+
+            self.counters['hl_fills'] = self.counters.get('hl_fills', 0) + 1
+            return event
+
+        except Exception:
+            self.counters['errors'] += 1
+            return None
+
     def get_latest_hl_price(self, symbol: str) -> Optional[float]:
         """
         Get latest Hyperliquid oracle price for a symbol.
@@ -513,3 +575,67 @@ class M1IngestionEngine:
             symbol: data['oracle_price']
             for symbol, data in self.latest_hl_prices.items()
         }
+
+    def get_hl_price_at_offset(self, symbol: str, offset_sec: float, current_time: float) -> Optional[float]:
+        """
+        Get HL price from approximately offset_sec ago.
+
+        Used by trend gate to calculate short-term returns.
+
+        Args:
+            symbol: Symbol to query (e.g., "BTC")
+            offset_sec: Seconds in the past to look (e.g., 60 for 1 minute ago)
+            current_time: Current timestamp for reference
+
+        Returns:
+            Price at offset time, or None if no data available
+        """
+        if symbol not in self.hl_prices:
+            return None
+
+        target_time = current_time - offset_sec
+        price_history = self.hl_prices[symbol]
+
+        if not price_history:
+            return None
+
+        # Find closest price to target time (binary search would be better but deque is small)
+        best_price = None
+        best_diff = float('inf')
+
+        for event in price_history:
+            diff = abs(event['timestamp'] - target_time)
+            if diff < best_diff:
+                best_diff = diff
+                best_price = event['oracle_price']
+
+        # Only return if we found something reasonably close (within 30s tolerance)
+        if best_diff <= 30.0 and best_price is not None:
+            return best_price
+
+        return None
+
+    def get_hl_price_returns(self, symbol: str, current_time: float) -> Dict[str, Optional[float]]:
+        """
+        Get price returns for trend gate calculations.
+
+        Returns:
+            Dict with ret_1m and ret_3m (as decimals, e.g., -0.001 = -0.1%)
+        """
+        current_price = self.get_latest_hl_price(symbol)
+        if current_price is None:
+            return {'ret_1m': None, 'ret_3m': None}
+
+        price_1m = self.get_hl_price_at_offset(symbol, 60.0, current_time)
+        price_3m = self.get_hl_price_at_offset(symbol, 180.0, current_time)
+
+        ret_1m = None
+        ret_3m = None
+
+        if price_1m is not None and price_1m > 0:
+            ret_1m = (current_price - price_1m) / price_1m
+
+        if price_3m is not None and price_3m > 0:
+            ret_3m = (current_price - price_3m) / price_3m
+
+        return {'ret_1m': ret_1m, 'ret_3m': ret_3m}

@@ -113,7 +113,8 @@ class ObservationSystem:
 
     def __init__(self, allowed_symbols: Optional[List[str]] = None):
         # None means allow ALL symbols dynamically
-        self._allowed_symbols: Optional[Set[str]] = set(allowed_symbols) if allowed_symbols else None
+        # Empty list means allow NO symbols (whitelist with zero entries)
+        self._allowed_symbols: Optional[Set[str]] = set(allowed_symbols) if allowed_symbols is not None else None
         self._system_time = 0.0
         self._status = ObservationStatus.UNINITIALIZED
         self._failure_reason = ""
@@ -145,6 +146,7 @@ class ObservationSystem:
         self._m2_diag_trades = 0
         self._m2_diag_nodes_created = 0
         self._m2_diag_last_report = 0
+        self._cycle_count = 0  # For periodic diagnostic output
         
     def set_hyperliquid_source(self, hl_collector: 'HyperliquidCollector') -> None:
         """
@@ -251,6 +253,20 @@ class ObservationSystem:
         """
         return self._m1.get_all_hl_prices()
 
+    def get_hl_price_returns(self, symbol: str) -> Dict[str, Optional[float]]:
+        """
+        Get price returns for trend gate calculations.
+
+        Used by Gate B (trend gate) to calculate short-term momentum.
+
+        Args:
+            symbol: Symbol to query (e.g., "BTC")
+
+        Returns:
+            Dict with ret_1m and ret_3m (as decimals, e.g., -0.001 = -0.1%)
+        """
+        return self._m1.get_hl_price_returns(symbol, self._system_time)
+
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
         Push external fact into memory.
@@ -295,6 +311,9 @@ class ObservationSystem:
                 normalized_event = self._m1.normalize_hl_position(symbol, payload)
             elif event_type == 'HL_ORDER':
                 normalized_event = self._m1.normalize_hl_order(symbol, payload)
+            elif event_type == 'HL_FILL':
+                # Normalize HL fill for M2 node creation (skips liquidation fills)
+                normalized_event = self._m1.normalize_hl_fill(symbol, payload)
 
             # Dispatch to M3 (Temporal & Pressure) if it's a trade
             if normalized_event and event_type == 'TRADE':
@@ -307,6 +326,11 @@ class ObservationSystem:
                 )
 
                 # M2 Population: Associate trade with nearby nodes
+                self._associate_trade_with_nodes(normalized_event)
+
+            # M2 Population: Associate HL fills with nodes (same as TRADE)
+            # Note: Liquidation fills are filtered out in normalize_hl_fill()
+            if normalized_event and event_type == 'HL_FILL':
                 self._associate_trade_with_nodes(normalized_event)
 
             # M2 Population: Create/update nodes from liquidations
@@ -569,6 +593,9 @@ class ObservationSystem:
 
         Authority: ANNEX_M4_PRIMITIVE_FLOW.md
         """
+        # Increment cycle counter for periodic diagnostics
+        self._cycle_count += 1
+
         # Initialize all primitives to None
         resting_size_primitive = None
         consumption_primitive = None
@@ -758,12 +785,15 @@ class ObservationSystem:
             )
 
             # Get M2 nodes for this symbol
-            active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+            # Normalize symbol: HL uses base symbols (BTC), Binance uses BTCUSDT
+            base_symbol = symbol.replace('USDT', '').replace('USD', '')
+            active_nodes = self._m2_store.get_active_nodes_for_symbol(base_symbol)
 
-            # DIAG: Log M2 node counts
-            if _DIAG_M2 and self._cycle_count % 10 == 1:
+            # DIAG: Log M2 node counts (always log for debug)
+            if _DIAG_M2:
                 total_nodes = len(self._m2_store._active_nodes)
-                print(f"[M2-DIAG] {symbol}: {len(active_nodes)} active nodes (total store: {total_nodes})", flush=True)
+                if self._cycle_count % 100 == 1:  # Less frequent but always fires
+                    print(f"[M2-DIAG] {symbol} (base={base_symbol}): {len(active_nodes)} nodes (store: {total_nodes})", flush=True)
 
             if active_nodes:
                 # Detect order blocks from individual nodes
@@ -808,11 +838,15 @@ class ObservationSystem:
                             if zone:
                                 zones.append(zone)
 
-                        # DIAG: Log zone detection
-                        if _DIAG_M2 and zones and self._cycle_count % 10 == 1:
-                            for z in zones:
-                                print(f"[M2-DIAG] {symbol}: ZONE {z.zone_type} @ {z.zone_center:.2f} "
-                                      f"(disp={z.displacement_detected}, retest={z.retest_detected})", flush=True)
+                        # DIAG: Log zone detection (always log result for visibility)
+                        if _DIAG_M2 and self._cycle_count % 10 == 1:
+                            if zones:
+                                for z in zones:
+                                    print(f"[M2-DIAG] {symbol}: ZONE {z.zone_type} @ {z.zone_center:.2f} "
+                                          f"(disp={z.displacement_detected}, retest={z.retest_detected}, "
+                                          f"rt_count={z.retest_count}, nodes={z.node_count}, str={z.avg_node_strength:.2f})", flush=True)
+                            else:
+                                print(f"[M2-DIAG] {symbol}: {len(clusters)} clusters but 0 zones (thresholds not met)", flush=True)
 
                         # Return strongest zone (highest total volume)
                         if zones:
@@ -820,6 +854,9 @@ class ObservationSystem:
                                 zones,
                                 key=lambda z: z.total_volume
                             )
+                    else:
+                        if _DIAG_M2 and self._cycle_count % 10 == 1:
+                            print(f"[M2-DIAG] {symbol}: {len(active_nodes)} nodes but no current_price", flush=True)
                 elif _DIAG_M2 and self._cycle_count % 10 == 1:
                     print(f"[M2-DIAG] {symbol}: {len(active_nodes)} nodes (need >=3 for zone)", flush=True)
 

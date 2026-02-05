@@ -1106,8 +1106,8 @@ class CollectorService:
                         active_primitives.append("open_interest_directional_bias")
 
                 # Try to extract policy name from result (if available)
-                if hasattr(result.action, 'strategy_id') and result.action.strategy_id:
-                    policy_name = result.action.strategy_id
+                if hasattr(result, 'strategy_id') and result.strategy_id:
+                    policy_name = result.strategy_id
 
                 # Handle ENTRY actions
                 if result.action.name == "ENTRY":

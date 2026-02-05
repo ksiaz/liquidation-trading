@@ -371,8 +371,9 @@ class ExecutionController:
                 state_after=new_position.state,
                 timestamp=timestamp,
                 error=None,
+                strategy_id=action.strategy_id,
             )
-            
+
         except InvariantViolation as e:
             return ExecutionResult(
                 symbol=symbol,

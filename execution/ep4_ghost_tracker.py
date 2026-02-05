@@ -22,7 +22,8 @@ from execution.ep4_ghost_adapter import (
     GhostExchangeAdapter,
     GhostExecutionResult,
     FillEstimate,
-    ExecutionMode
+    ExecutionMode,
+    NormalizedOrderbook
 )
 
 # Structured diagnostics for silent paths
@@ -52,11 +53,19 @@ def _init_position_table(conn: sqlite3.Connection) -> None:
             exit_price REAL,
             exit_time REAL,
             pnl REAL,
+            zone_context TEXT,
             UNIQUE(symbol, status) ON CONFLICT REPLACE
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_status ON ghost_positions(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_symbol ON ghost_positions(symbol)")
+
+    # Migration: add zone_context column if missing (for existing DBs)
+    try:
+        conn.execute("ALTER TABLE ghost_positions ADD COLUMN zone_context TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
 
 
@@ -72,8 +81,8 @@ def _load_open_positions(conn: sqlite3.Connection) -> Dict[str, dict]:
 def _insert_position(conn: sqlite3.Connection, pos: dict) -> None:
     """Insert new position with status=OPEN."""
     conn.execute("""
-        INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id)
-        VALUES (:trade_id, :symbol, :side, :qty, :entry_price, :entry_time, 'OPEN', :entry_reason, :strategy_id)
+        INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id, zone_context)
+        VALUES (:trade_id, :symbol, :side, :qty, :entry_price, :entry_time, 'OPEN', :entry_reason, :strategy_id, :zone_context)
     """, pos)
     conn.commit()
 
@@ -233,6 +242,8 @@ class GhostPositionTracker:
 
             # Load existing OPEN positions
             saved_positions = _load_open_positions(self._pos_conn)
+            persisted_contexts = {}
+
             for symbol, row in saved_positions.items():
                 # Reconstruct GhostPosition from DB row
                 position = GhostPosition(
@@ -248,8 +259,45 @@ class GhostPositionTracker:
                 )
                 self._state.open_positions[symbol] = position
 
+                # Collect zone context for geometry restoration
+                zone_ctx_json = row.get('zone_context')
+                if zone_ctx_json:
+                    try:
+                        persisted_contexts[symbol] = json.loads(zone_ctx_json)
+                    except json.JSONDecodeError:
+                        pass
+
             if saved_positions:
                 print(f"[GHOST] Restored {len(saved_positions)} open positions from DB", flush=True)
+
+                # Restore geometry strategy zone contexts for proper exit detection
+                # NOTE: Geometry stores context by BASE symbol (BTC), DB stores by FULL symbol (BTCUSDT)
+                if persisted_contexts:
+                    try:
+                        from external_policy.ep2_strategy_geometry import restore_entry_context_from_positions
+
+                        # Helper to normalize symbol
+                        def to_base(s: str) -> str:
+                            return s.replace('USDT', '').replace('USD', '')
+
+                        # Convert positions list to base symbols for geometry
+                        positions_list = [
+                            {
+                                "symbol": to_base(sym),
+                                "direction": "LONG" if row['side'] == "LONG" else "SHORT",
+                                "entry_price": row['entry_price'],
+                                "state": "OPEN"
+                            }
+                            for sym, row in saved_positions.items()
+                        ]
+
+                        # Convert persisted_contexts keys to base symbols
+                        base_contexts = {to_base(k): v for k, v in persisted_contexts.items()}
+
+                        restore_entry_context_from_positions(positions_list, base_contexts)
+                        print(f"[GHOST] Restored zone contexts for {len(persisted_contexts)} positions", flush=True)
+                    except Exception as e:
+                        print(f"[GHOST] Zone context restoration failed: {e}", flush=True)
 
         except Exception as e:
             print(f"[GHOST] Position persistence init failed: {e}", flush=True)
@@ -269,11 +317,31 @@ class GhostPositionTracker:
             pass
         return 1
 
+    def _normalize_to_base_symbol(self, symbol: str) -> str:
+        """Normalize symbol to base format (BTCUSDT -> BTC).
+
+        Geometry strategy stores context keyed by base symbol (from HL primitives),
+        but ghost tracker uses full Binance symbols. This ensures lookup works.
+        """
+        return symbol.replace('USDT', '').replace('USD', '')
+
     def _persist_open_position(self, position: GhostPosition, strategy_id: Optional[str] = None) -> None:
-        """Persist new position to DB with status=OPEN."""
+        """Persist new position to DB with status=OPEN, including zone context."""
         if not self._pos_conn:
             return
         try:
+            # Get zone context from geometry strategy for proper exit detection on restart
+            # Normalize symbol: geometry stores by base symbol (BTC), we use full symbol (BTCUSDT)
+            zone_context_json = None
+            try:
+                from external_policy.ep2_strategy_geometry import get_entry_context_for_persistence
+                base_symbol = self._normalize_to_base_symbol(position.symbol)
+                zone_ctx = get_entry_context_for_persistence(base_symbol)
+                if zone_ctx:
+                    zone_context_json = json.dumps(zone_ctx)
+            except Exception:
+                pass  # Geometry module may not be available
+
             _insert_position(self._pos_conn, {
                 'trade_id': position.entry_trade_id,
                 'symbol': position.symbol,
@@ -283,6 +351,7 @@ class GhostPositionTracker:
                 'entry_time': position.entry_timestamp,
                 'entry_reason': position.entry_policy,
                 'strategy_id': strategy_id or position.entry_policy,
+                'zone_context': zone_context_json,
             })
         except Exception as e:
             print(f"[GHOST] Failed to persist position: {e}", flush=True)
@@ -367,7 +436,8 @@ class GhostPositionTracker:
         quantity: Optional[float] = None,
         cycle_id: Optional[int] = None,
         policy_name: Optional[str] = None,
-        active_primitives: Optional[List[str]] = None
+        active_primitives: Optional[List[str]] = None,
+        orderbook: Optional[NormalizedOrderbook] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Open new position (simulated).
@@ -379,6 +449,8 @@ class GhostPositionTracker:
             cycle_id: Optional execution cycle ID
             policy_name: Optional policy that triggered entry
             active_primitives: Optional list of active primitive names
+            orderbook: Optional normalized orderbook (from HL or other source).
+                      If provided, uses this for price/spread instead of Binance.
 
         Returns:
             (success, error_reason, trade_record)
@@ -393,8 +465,8 @@ class GhostPositionTracker:
         # Execute ghost order
         order_side = "BUY" if side == "LONG" else "SELL"
 
-        # Capture snapshot to get current price
-        snapshot = adapter.capture_snapshot()
+        # Capture snapshot to get current price (uses HL orderbook if provided)
+        snapshot = adapter.capture_snapshot(orderbook=orderbook)
         entry_price = snapshot.best_ask if order_side == "BUY" else snapshot.best_bid
 
         # Calculate quantity if not provided
@@ -405,11 +477,12 @@ class GhostPositionTracker:
         filters = adapter.get_filters()
         quantity = round(quantity / filters['step_size']) * filters['step_size']
 
-        # Execute ghost order
+        # Execute ghost order (uses HL orderbook if provided)
         result = adapter.execute_ghost_order(
             side=order_side,
             order_type="MARKET",
-            quantity=quantity
+            quantity=quantity,
+            orderbook=orderbook
         )
 
         # Check execution result
@@ -483,7 +556,8 @@ class GhostPositionTracker:
         symbol: str,
         quantity: Optional[float] = None,
         cycle_id: Optional[int] = None,
-        exit_reason: str = "FULL_EXIT"
+        exit_reason: str = "FULL_EXIT",
+        orderbook: Optional[NormalizedOrderbook] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Close position (simulated).
@@ -493,6 +567,8 @@ class GhostPositionTracker:
             quantity: Quantity to close (None = full position)
             cycle_id: Optional execution cycle ID
             exit_reason: Reason for exit (FULL_EXIT, PARTIAL_REDUCE, STOP, MANDATE_EXIT)
+            orderbook: Optional normalized orderbook (from HL or other source).
+                      If provided, uses this for price/spread instead of Binance.
 
         Returns:
             (success, error_reason, trade_record)
@@ -516,15 +592,16 @@ class GhostPositionTracker:
         # Execute ghost order (opposite side)
         order_side = "SELL" if position.side == "LONG" else "BUY"
 
-        # Capture snapshot for exit price
-        snapshot = adapter.capture_snapshot()
+        # Capture snapshot for exit price (uses HL orderbook if provided)
+        snapshot = adapter.capture_snapshot(orderbook=orderbook)
         exit_price = snapshot.best_bid if order_side == "SELL" else snapshot.best_ask
 
-        # Execute ghost order
+        # Execute ghost order (uses HL orderbook if provided)
         result = adapter.execute_ghost_order(
             side=order_side,
             order_type="MARKET",
-            quantity=quantity
+            quantity=quantity,
+            orderbook=orderbook
         )
 
         # Check execution result

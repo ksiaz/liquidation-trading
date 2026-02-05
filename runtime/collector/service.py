@@ -14,7 +14,7 @@ import asyncio
 import json
 import time
 import logging
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Optional
 from collections import deque
 from decimal import Decimal
 # Import sealed Observation System
@@ -31,6 +31,7 @@ from runtime.logging.buffered_db import BufferedResearchDatabase
 
 # Import Ghost Tracker
 from execution.ep4_ghost_tracker import GhostPositionTracker
+from execution.ep4_ghost_adapter import NormalizedOrderbook
 import os
 
 # Import Regime Classification (Phase 5)
@@ -1120,12 +1121,16 @@ class CollectorService:
                     except Exception:
                         pass
 
+                    # Get HL orderbook for execution (falls back to Binance if unavailable)
+                    hl_orderbook = self._get_hl_orderbook(result.symbol)
+
                     success, error, trade = self.ghost_tracker.open_position(
                         symbol=result.symbol,
                         side=side,
                         cycle_id=cycle_id,
                         policy_name=policy_name,
-                        active_primitives=active_primitives
+                        active_primitives=active_primitives,
+                        orderbook=hl_orderbook
                     )
 
                     if success and trade:
@@ -1147,10 +1152,14 @@ class CollectorService:
                 # Handle EXIT actions
                 elif result.action.name == "EXIT":
                     if self.ghost_tracker.has_open_position(result.symbol):
+                        # Get HL orderbook for execution (falls back to Binance if unavailable)
+                        hl_orderbook = self._get_hl_orderbook(result.symbol)
+
                         success, error, trade = self.ghost_tracker.close_position(
                             symbol=result.symbol,
                             cycle_id=cycle_id,
-                            exit_reason="MANDATE_EXIT"
+                            exit_reason="MANDATE_EXIT",
+                            orderbook=hl_orderbook
                         )
 
                         if success and trade:
@@ -1166,11 +1175,15 @@ class CollectorService:
                         if position:
                             reduce_qty = position.quantity * 0.5
 
+                            # Get HL orderbook for execution (falls back to Binance if unavailable)
+                            hl_orderbook = self._get_hl_orderbook(result.symbol)
+
                             success, error, trade = self.ghost_tracker.close_position(
                                 symbol=result.symbol,
                                 quantity=reduce_qty,
                                 cycle_id=cycle_id,
-                                exit_reason="PARTIAL_REDUCE"
+                                exit_reason="PARTIAL_REDUCE",
+                                orderbook=hl_orderbook
                             )
 
                             if success and trade:
@@ -1231,6 +1244,33 @@ class CollectorService:
                 active_primitives.append(name)
 
         return active_primitives
+
+    def _get_hl_orderbook(self, symbol: str) -> Optional[NormalizedOrderbook]:
+        """Get normalized orderbook from Hyperliquid for ghost execution.
+
+        Args:
+            symbol: Full symbol (e.g., "BTCUSDT")
+
+        Returns:
+            NormalizedOrderbook if available, None otherwise (falls back to Binance)
+        """
+        if not self._hyperliquid_collector:
+            return None
+
+        try:
+            # Convert symbol format: BTCUSDT -> BTC for HL
+            coin = symbol.replace('USDT', '').replace('USD', '')
+
+            # Get cached orderbook from HL WebSocket client
+            hl_book = self._hyperliquid_collector._client.get_orderbook(coin)
+            if hl_book is None:
+                return None
+
+            # Convert to normalized format
+            return NormalizedOrderbook.from_hl_book(hl_book, coin)
+
+        except Exception:
+            return None  # Fallback to Binance
 
     def _log_cycle_to_db(self, snapshot: ObservationSnapshot, mandates: list, timestamp: float) -> int:
         """Log comprehensive execution cycle data to research database.

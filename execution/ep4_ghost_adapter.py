@@ -34,6 +34,91 @@ class FillEstimate(Enum):
     NONE = "NONE"
 
 
+# ==============================================================================
+# Normalized Orderbook Schema (Exchange-Agnostic)
+# ==============================================================================
+
+@dataclass(frozen=True)
+class NormalizedOrderbook:
+    """
+    Exchange-agnostic orderbook representation.
+
+    Can be populated from:
+    - Hyperliquid L2 book (preferred)
+    - Binance depth endpoint (fallback)
+    - Any other exchange
+
+    Levels are (price, quantity) tuples sorted by price.
+    """
+    symbol: str               # Base symbol (e.g., "BTC")
+    timestamp: float          # Unix timestamp
+    bids: tuple               # ((price, qty), ...) descending by price
+    asks: tuple               # ((price, qty), ...) ascending by price
+    source: str = "UNKNOWN"   # "HL_NODE", "HL_WS", "BINANCE", etc.
+
+    @property
+    def best_bid(self) -> float:
+        return self.bids[0][0] if self.bids else 0.0
+
+    @property
+    def best_ask(self) -> float:
+        return self.asks[0][0] if self.asks else 0.0
+
+    @property
+    def spread(self) -> float:
+        if self.best_bid and self.best_ask:
+            return self.best_ask - self.best_bid
+        return 0.0
+
+    @property
+    def mid_price(self) -> float:
+        if self.best_bid and self.best_ask:
+            return (self.best_bid + self.best_ask) / 2
+        return self.best_bid or self.best_ask or 0.0
+
+    @classmethod
+    def from_hl_book(cls, hl_book: Dict, symbol: str) -> 'NormalizedOrderbook':
+        """Convert HL client orderbook to normalized format.
+
+        HL book format from runtime/hyperliquid/client.py:
+        {
+            'timestamp': float,
+            'coin': str,
+            'mid_price': float,
+            'bids': [{'price': float, 'size': float, ...}, ...],
+            'asks': [{'price': float, 'size': float, ...}, ...],
+        }
+        """
+        bids = tuple(
+            (level['price'], level['size'])
+            for level in hl_book.get('bids', [])
+        )
+        asks = tuple(
+            (level['price'], level['size'])
+            for level in hl_book.get('asks', [])
+        )
+        return cls(
+            symbol=symbol,
+            timestamp=hl_book.get('timestamp', time.time()),
+            bids=bids,
+            asks=asks,
+            source="HL_WS"
+        )
+
+    @classmethod
+    def from_binance_depth(cls, depth: Dict, symbol: str) -> 'NormalizedOrderbook':
+        """Convert Binance depth response to normalized format."""
+        bids = tuple((float(p), float(q)) for p, q in depth.get('bids', []))
+        asks = tuple((float(p), float(q)) for p, q in depth.get('asks', []))
+        return cls(
+            symbol=symbol,
+            timestamp=time.time(),
+            bids=bids,
+            asks=asks,
+            source="BINANCE"
+        )
+
+
 @dataclass(frozen=True)
 class OrderBookSnapshot:
     """
@@ -227,23 +312,39 @@ class GhostExchangeAdapter:
         
         return filters
     
-    def capture_snapshot(self) -> OrderBookSnapshot:
+    def capture_snapshot(
+        self,
+        orderbook: Optional[NormalizedOrderbook] = None
+    ) -> OrderBookSnapshot:
         """
         Capture current order book snapshot.
-        
+
+        Args:
+            orderbook: Optional normalized orderbook (from HL or other source).
+                      If provided, uses this instead of fetching from Binance.
+
         Returns:
             OrderBookSnapshot
         """
         timestamp = time.time()
-        ob_data = self._api_client.get_order_book(symbol=self._symbol, limit=20)
-        
-        bids = tuple((float(p), float(q)) for p, q in ob_data["bids"])
-        asks = tuple((float(p), float(q)) for p, q in ob_data["asks"])
-        
-        best_bid = bids[0][0] if bids else 0.0
-        best_ask = asks[0][0] if asks else 0.0
-        spread = best_ask - best_bid if (best_bid and best_ask) else 0.0
-        
+
+        if orderbook is not None:
+            # Use injected orderbook (preferred path - no Binance call)
+            bids = orderbook.bids
+            asks = orderbook.asks
+            best_bid = orderbook.best_bid
+            best_ask = orderbook.best_ask
+            spread = orderbook.spread
+            timestamp = orderbook.timestamp
+        else:
+            # Fallback: fetch from Binance (backward compatibility)
+            ob_data = self._api_client.get_order_book(symbol=self._symbol, limit=20)
+            bids = tuple((float(p), float(q)) for p, q in ob_data["bids"])
+            asks = tuple((float(p), float(q)) for p, q in ob_data["asks"])
+            best_bid = bids[0][0] if bids else 0.0
+            best_ask = asks[0][0] if asks else 0.0
+            spread = best_ask - best_bid if (best_bid and best_ask) else 0.0
+
         snapshot = OrderBookSnapshot(
             snapshot_id=f"{self._symbol}_{int(timestamp * 1000)}",
             timestamp=timestamp,
@@ -254,10 +355,10 @@ class GhostExchangeAdapter:
             best_ask=best_ask,
             spread=spread
         )
-        
+
         if self._execution_mode == ExecutionMode.GHOST_SNAPSHOT:
             self._current_snapshot = snapshot
-        
+
         return snapshot
     
     def execute_ghost_order(
@@ -266,23 +367,26 @@ class GhostExchangeAdapter:
         side: str,
         order_type: str,
         quantity: float,
-        price: Optional[float] = None
+        price: Optional[float] = None,
+        orderbook: Optional[NormalizedOrderbook] = None
     ) -> GhostExecutionResult:
         """
         Execute ghost order (simulated).
-        
+
         Args:
             side: BUY or SELL
             order_type: MARKET or LIMIT
             quantity: Order quantity
             price: Limit price (required for LIMIT orders)
-        
+            orderbook: Optional normalized orderbook (from HL or other source).
+                      If provided, uses this instead of fetching from Binance.
+
         Returns:
             GhostExecutionResult with simulation outcome
         """
         # Get current snapshot
         if self._execution_mode == ExecutionMode.GHOST_LIVE:
-            snapshot = self.capture_snapshot()
+            snapshot = self.capture_snapshot(orderbook=orderbook)
         elif self._current_snapshot is not None:
             snapshot = self._current_snapshot
         else:

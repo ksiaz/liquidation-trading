@@ -407,7 +407,8 @@ class HyperliquidClient:
         Changes in open interest indicate liquidations occurred.
         """
         # Major coins to track for liquidation cascade detection
-        major_coins = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB", "OP", "SUI"]
+        # Synced with TOP_10_SYMBOLS from collector service (BTCUSDT -> BTC)
+        major_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "TRX", "DOT"]
 
         for coin in major_coins:
             subscription = {
@@ -426,7 +427,8 @@ class HyperliquidClient:
         - Thick book = cascade absorbed, reversal likely
         """
         # Subscribe to books for all major coins (matches activeAssetCtx)
-        orderbook_coins = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "LINK", "ARB", "OP", "SUI"]
+        # Synced with TOP_10_SYMBOLS from collector service (BTCUSDT -> BTC)
+        orderbook_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "TRX", "DOT"]
 
         for coin in orderbook_coins:
             subscription = {

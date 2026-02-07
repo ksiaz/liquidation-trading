@@ -34,6 +34,10 @@ from execution.ep4_ghost_tracker import GhostPositionTracker
 from execution.ep4_ghost_adapter import NormalizedOrderbook
 import os
 
+# Import Trailing Stop Manager for profit protection
+from runtime.exchange.trailing_stop_manager import TrailingStopManager, TrailingStopConfig, TrailingMode
+from runtime.persistence.execution_state_repository import ExecutionStateRepository
+
 # Import Regime Classification (Phase 5)
 from runtime.regime import RegimeState, RegimeMetrics, classify_regime
 from runtime.indicators import VWAPCalculator, MultiTimeframeATR
@@ -76,11 +80,11 @@ from runtime.validation import (
     LiquidityType
 )
 
-# Constants
+# Constants - Trading symbols (must match run_paper_trade.py)
 TOP_10_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
-    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
-    "TRXUSDT", "DOTUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "AVAXUSDT", "LINKUSDT", "HYPEUSDT", "SUIUSDT", "NEARUSDT",
+    "LTCUSDT", "ATOMUSDT", "AAVEUSDT", "APTUSDT", "ARBUSDT",
 ]
 
 class CollectorService:
@@ -154,8 +158,36 @@ class CollectorService:
             db_conn=self._execution_db.conn  # Pass database connection for logging
         )
 
+        # Trailing Stop Manager for profit protection
+        # Config: ATR_PROGRESSIVE - MFE-based with continuous tightening
+        # - Uses 5m ATR for volatility-adaptive stops
+        # - Starts at 2.5× ATR, tightens to 1.0× ATR as profit grows
+        # - Break-even at 0.5% profit as floor (not override)
+        # - Floor at 0.5% distance for low volatility protection
+        self._trailing_stop_config = TrailingStopConfig(
+            mode=TrailingMode.ATR_PROGRESSIVE,
+            # ATR progressive settings
+            atr_prog_start_mult=2.5,        # Wide at entry (2.5× ATR)
+            atr_prog_end_mult=1.0,          # Tight at 3% profit (1.0× ATR)
+            atr_prog_profit_range=0.03,     # Full tightening over 3% MFE profit
+            atr_prog_min_pct=0.005,         # Floor: at least 0.5% distance
+            # Break-even as minimum floor - lock in meaningful profit
+            break_even_trigger_pct=0.007,   # Trigger break-even after 0.7% profit
+            break_even_offset_pct=0.003,    # Lock in 0.3% profit at break-even
+            min_move_to_update_pct=0.001,   # Update stop if 0.1% improvement
+        )
+        # Create execution state repository for trailing stop persistence
+        self._execution_state_repo = ExecutionStateRepository(db_path="logs/execution_state.db")
+        self._trailing_stop_manager = TrailingStopManager(
+            logger=self._logger,
+            repository=self._execution_state_repo
+        )
+
         # Track execution log index to process new results
         self._last_execution_index = 0
+
+        # Reconcile ghost tracker with positions.db on startup
+        self._reconcile_positions_on_startup()
 
         # Store latest cycle context for ghost tracker
         self._latest_cycle_id = None
@@ -415,6 +447,74 @@ class CollectorService:
             restore_entry_context_from_positions(positions_list, persisted_contexts)
             self._logger.info(f"Strategy contexts restored for {len(positions_list)} positions")
 
+            # Register trailing stops for recovered positions (only if not already loaded from persistence)
+            existing_stops = self._trailing_stop_manager.get_all_stops()
+            existing_symbols = {s.symbol for s in existing_stops.values()}
+
+            for pos in open_positions.values():
+                if pos.state.value == "OPEN" and pos.entry_price and pos.direction:
+                    # Skip if trailing stop already exists for this symbol (from persistence)
+                    if pos.symbol in existing_symbols:
+                        self._logger.info(f"  {pos.symbol}: trailing stop already loaded from persistence")
+                        continue
+
+                    entry_price = float(pos.entry_price)
+                    direction = pos.direction.value if hasattr(pos.direction, 'value') else str(pos.direction)
+
+                    # Set initial stop at 2% from entry
+                    if direction == "LONG":
+                        initial_stop = entry_price * 0.98
+                    else:
+                        initial_stop = entry_price * 1.02
+
+                    # Use symbol as trade_id for recovered positions
+                    self._trailing_stop_manager.register_trailing_stop(
+                        entry_order_id=f"RECOVERED_{pos.symbol}",
+                        symbol=pos.symbol,
+                        direction=direction,
+                        entry_price=entry_price,
+                        initial_stop_price=initial_stop,
+                        config=self._trailing_stop_config
+                    )
+                    self._logger.info(f"  {pos.symbol}: registered trailing stop @ ${initial_stop:,.2f}")
+
+            # Also register trailing stops from ghost_positions (may have additional positions)
+            try:
+                import sqlite3
+                ghost_db = "/tmp/ghost_trades.db"
+                if os.path.exists(ghost_db):
+                    conn = sqlite3.connect(ghost_db)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT symbol, side, entry_price FROM ghost_positions WHERE status = 'OPEN'")
+                    for row in cursor.fetchall():
+                        symbol, side, entry_price = row
+                        # Skip if already registered
+                        if f"RECOVERED_{symbol}" in [s.entry_order_id for s in self._trailing_stop_manager.get_all_stops().values()]:
+                            continue
+
+                        direction = side  # ghost_positions uses LONG/SHORT directly
+                        entry = float(entry_price) if entry_price else 0
+                        if entry <= 0:
+                            continue
+
+                        if direction == "LONG":
+                            initial_stop = entry * 0.98
+                        else:
+                            initial_stop = entry * 1.02
+
+                        self._trailing_stop_manager.register_trailing_stop(
+                            entry_order_id=f"RECOVERED_{symbol}",
+                            symbol=symbol,
+                            direction=direction,
+                            entry_price=entry,
+                            initial_stop_price=initial_stop,
+                            config=self._trailing_stop_config
+                        )
+                        self._logger.info(f"  {symbol}: registered ghost trailing stop @ ${initial_stop:,.2f}")
+                    conn.close()
+            except Exception as ghost_err:
+                self._logger.debug(f"Ghost position recovery: {ghost_err}")
+
         except Exception as e:
             self._logger.warning(f"Position context recovery failed: {e}")
 
@@ -514,7 +614,8 @@ class CollectorService:
                         self._node_bridge.on_hl_liquidation(self._handle_hl_liquidation)
                         self._logger.info("HL liquidation callback registered (zscore + burst aggregator)")
 
-                        # Check initial status
+                        # Verify adapter is responding (STALE is OK during warmup)
+                        await asyncio.sleep(2)  # Give adapter time to send status
                         status = self._node_bridge.get_status()
                         if status:
                             self._logger.info(
@@ -522,9 +623,24 @@ class CollectorService:
                                 f"block={status.latest_block_height}, "
                                 f"prices={status.prices_emitted}, liqs={status.liquidations_emitted}"
                             )
+                            if status.status.name == 'ERROR':
+                                raise RuntimeError(
+                                    f"HL adapter ERROR: {status.last_error}. "
+                                    "Start adapter with: cd hl-adapter && python server.py"
+                                )
+                        else:
+                            raise RuntimeError(
+                                "HL adapter not responding (no status received). "
+                                "Start adapter with: cd hl-adapter && python server.py"
+                            )
+
+                        # Start periodic health check
+                        asyncio.create_task(self._monitor_node_bridge_health())
                     else:
-                        self._logger.warning("Node bridge failed to connect, falling back to WebSocket mode")
-                        self._use_node_mode = False
+                        raise RuntimeError(
+                            "Node bridge failed to connect. "
+                            "Start adapter with: cd hl-adapter && python server.py"
+                        )
                 except Exception as e:
                     self._logger.warning(f"Node bridge start failed: {e}")
 
@@ -545,6 +661,56 @@ class CollectorService:
 
         # Wait for Binance task (it runs forever, reconnecting as needed)
         await binance_task
+
+    async def _monitor_node_bridge_health(self):
+        """Periodic health check for HL adapter connection.
+
+        Logs ERROR loudly if adapter becomes unhealthy or disconnected.
+        This prevents silent failures where fills/liqs stop flowing.
+        """
+        check_interval = 30  # Check every 30 seconds
+        last_fills = 0
+        stale_count = 0
+
+        while self._running and self._node_bridge:
+            await asyncio.sleep(check_interval)
+
+            try:
+                if not self._node_bridge.is_connected:
+                    self._logger.error(
+                        "🚨 HL ADAPTER DISCONNECTED - fills/liqs NOT flowing! "
+                        "Restart adapter: cd hl-adapter && python server.py"
+                    )
+                    print(
+                        "\n🚨🚨🚨 HL ADAPTER DISCONNECTED 🚨🚨🚨\n"
+                        "Fills and liquidations are NOT being received!\n"
+                        "Restart adapter: cd hl-adapter && python server.py\n",
+                        flush=True
+                    )
+                    continue
+
+                if not self._node_bridge.is_healthy:
+                    status = self._node_bridge.get_status()
+                    self._logger.error(
+                        f"🚨 HL ADAPTER UNHEALTHY: {status.status.name if status else 'unknown'}"
+                    )
+                    continue
+
+                # Check if fills are flowing (should increase over time)
+                metrics = self._node_bridge.get_metrics()
+                current_fills = metrics.get('fills_ingested', 0)
+                if current_fills == last_fills:
+                    stale_count += 1
+                    if stale_count >= 3:  # 3 checks = 90 seconds of no fills
+                        self._logger.warning(
+                            f"⚠️ HL adapter stale: no new fills in {stale_count * check_interval}s"
+                        )
+                else:
+                    stale_count = 0
+                last_fills = current_fills
+
+            except Exception as e:
+                self._logger.error(f"Health check failed: {e}")
 
     async def _drive_clock(self):
         """Push Wall Clock time to System every 1s and drive M6 execution cycle.
@@ -912,7 +1078,90 @@ class CollectorService:
                 account=self._account,
                 mark_prices=mark_prices
             )
-            
+
+            # Process new execution results: register entries with ghost tracker,
+            # handle exits and reduces. Single unified path.
+            existing_stop_symbols = set(
+                s.symbol for s in self._trailing_stop_manager._stops.values()
+            )
+            for result in self.executor.get_execution_log()[self._last_execution_index:]:
+                if not result.success:
+                    continue
+
+                # --- ENTRY: register with ghost tracker + trailing stop ---
+                if (result.action.name == "ENTRY"
+                        and result.state_after.name == "OPEN"
+                        and result.symbol not in existing_stop_symbols):
+                    pos = self.executor.state_machine.get_position(result.symbol)
+                    if pos and pos.direction and pos.entry_price:
+                        side = pos.direction.value
+                        entry_px = float(pos.entry_price)
+                        qty = float(pos.quantity) if pos.quantity else 0.0
+
+                        success, error, trade = self.ghost_tracker.open_position(
+                            symbol=result.symbol,
+                            side=side,
+                            quantity=qty,
+                            entry_price=entry_px,
+                            timestamp=result.timestamp,
+                            cycle_id=getattr(result, 'cycle_id', None),
+                            policy_name=result.strategy_id
+                        )
+                        if success and trade:
+                            initial_stop = entry_px * (0.98 if side == "LONG" else 1.02)
+                            self._trailing_stop_manager.register_trailing_stop(
+                                entry_order_id=trade.trade_id,
+                                symbol=result.symbol,
+                                direction=side,
+                                entry_price=entry_px,
+                                initial_stop_price=initial_stop,
+                                config=self._trailing_stop_config
+                            )
+                            existing_stop_symbols.add(result.symbol)
+                            print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
+                        else:
+                            print(f"ENTRY_REJECTED: {result.symbol} - {error}")
+
+                # --- EXIT: close ghost position (must stay in sync with controller) ---
+                elif result.action.name == "EXIT":
+                    if self.ghost_tracker.has_open_position(result.symbol):
+                        current_price = self._get_current_price(result.symbol)
+                        ok, err, trade = self.ghost_tracker.close_position(
+                            symbol=result.symbol,
+                            cycle_id=getattr(result, 'cycle_id', None),
+                            exit_reason="MANDATE_EXIT",
+                            exit_price=current_price,
+                            timestamp=time.time()
+                        )
+                        if ok and trade:
+                            hold = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
+                            print(f"EXIT: MANDATE {result.symbol} @ ${trade.price:,.2f} PNL=${trade.pnl:+.2f} Hold={hold}")
+                            self._force_position_flat(result.symbol)
+                            for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
+                                if stop_state.symbol == result.symbol:
+                                    self._trailing_stop_manager.unregister_stop(stop_id)
+                                    break
+
+                # --- REDUCE: partial close ---
+                elif result.action.name == "REDUCE":
+                    if self.ghost_tracker.has_open_position(result.symbol):
+                        position = self.ghost_tracker.get_open_position(result.symbol)
+                        if position:
+                            reduce_qty = position.quantity * 0.5
+                            hl_orderbook = self._get_hl_orderbook(result.symbol)
+                            ok, err, trade = self.ghost_tracker.close_position(
+                                symbol=result.symbol,
+                                quantity=reduce_qty,
+                                cycle_id=getattr(result, 'cycle_id', None),
+                                exit_reason="PARTIAL_REDUCE",
+                                orderbook=hl_orderbook
+                            )
+                            if ok and trade:
+                                print(f"REDUCE: {result.symbol} {trade.quantity:.4f} @ ${trade.price:,.2f} PNL=${trade.pnl:+.2f}")
+
+            # Advance execution log index (was in _process_ghost_trades)
+            self._last_execution_index = len(self.executor.get_execution_log())
+
             # Log mandates and arbitration (linked to cycle)
             if hasattr(self, '_execution_db') and cycle_id is not None:
                 # Log mandates
@@ -1095,6 +1344,9 @@ class CollectorService:
             # 8. Track current price
             self._current_prices[normalized_symbol] = price
 
+            # 9. Update trailing stops and check for triggers
+            self._update_trailing_stops(normalized_symbol, price)
+
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL fill callback error: {e}")
@@ -1150,169 +1402,9 @@ class CollectorService:
             self._logger.debug(f"HL liquidation callback error: {e}")
 
     def _process_ghost_trades(self):
-        """Process ghost trades based on new execution results.
-
-        Checks execution log for new successful ENTRY/EXIT actions
-        and executes corresponding ghost trades.
-        """
-        try:
-            execution_log = self.executor.get_execution_log()
-
-            # Process new execution results since last check
-            new_results = execution_log[self._last_execution_index:]
-
-            for idx, result in enumerate(new_results):
-                # Only process successful actions for symbols in TOP_10
-                if not result.success or result.symbol not in TOP_10_SYMBOLS:
-                    continue
-
-                # Get cycle context from result (captured at execution time)
-                cycle_id = result.cycle_id if hasattr(result, 'cycle_id') else None
-                snapshot = self._latest_snapshot
-
-                # Extract active primitives for this symbol
-                active_primitives = None
-                policy_name = None
-
-                if snapshot and result.symbol in snapshot.primitives:
-                    bundle = snapshot.primitives[result.symbol]
-                    active_primitives = []
-
-                    # List all non-None primitives
-                    if bundle.zone_penetration is not None:
-                        active_primitives.append("zone_penetration")
-                    if bundle.displacement_origin_anchor is not None:
-                        active_primitives.append("displacement_origin_anchor")
-                    if bundle.price_traversal_velocity is not None:
-                        active_primitives.append("price_traversal_velocity")
-                    if bundle.traversal_compactness is not None:
-                        active_primitives.append("traversal_compactness")
-                    if bundle.price_acceptance_ratio is not None:
-                        active_primitives.append("price_acceptance_ratio")
-                    if bundle.central_tendency_deviation is not None:
-                        active_primitives.append("central_tendency_deviation")
-                    if bundle.structural_absence_duration is not None:
-                        active_primitives.append("structural_absence_duration")
-                    if bundle.structural_persistence_duration is not None:
-                        active_primitives.append("structural_persistence_duration")
-                    if bundle.traversal_void_span is not None:
-                        active_primitives.append("traversal_void_span")
-                    if bundle.event_non_occurrence_counter is not None:
-                        active_primitives.append("event_non_occurrence_counter")
-                    if bundle.resting_size is not None:
-                        active_primitives.append("resting_size")
-                    if bundle.order_consumption is not None:
-                        active_primitives.append("order_consumption")
-                    if bundle.absorption_event is not None:
-                        active_primitives.append("absorption_event")
-                    if bundle.refill_event is not None:
-                        active_primitives.append("refill_event")
-                    if bundle.liquidation_density is not None:
-                        active_primitives.append("liquidation_density")
-                    if bundle.directional_continuity is not None:
-                        active_primitives.append("directional_continuity")
-                    if bundle.trade_burst is not None:
-                        active_primitives.append("trade_burst")
-                    # Tier B-6: Cascade observation primitives
-                    if bundle.liquidation_cascade_proximity is not None:
-                        active_primitives.append("liquidation_cascade_proximity")
-                    if bundle.cascade_state is not None:
-                        active_primitives.append("cascade_state")
-                    if bundle.leverage_concentration_ratio is not None:
-                        active_primitives.append("leverage_concentration_ratio")
-                    if bundle.open_interest_directional_bias is not None:
-                        active_primitives.append("open_interest_directional_bias")
-
-                # Try to extract policy name from result (if available)
-                if hasattr(result, 'strategy_id') and result.strategy_id:
-                    policy_name = result.strategy_id
-
-                # Handle ENTRY actions
-                if result.action.name == "ENTRY":
-                    # Query position state machine to get actual direction
-                    side = "LONG"
-                    try:
-                        position = self.executor.state_machine.get_position(result.symbol)
-                        if position and hasattr(position, 'direction') and position.direction:
-                            side = position.direction.value if hasattr(position.direction, 'value') else str(position.direction)
-                    except Exception:
-                        pass
-
-                    # Get HL orderbook for execution (falls back to Binance if unavailable)
-                    hl_orderbook = self._get_hl_orderbook(result.symbol)
-
-                    success, error, trade = self.ghost_tracker.open_position(
-                        symbol=result.symbol,
-                        side=side,
-                        cycle_id=cycle_id,
-                        policy_name=policy_name,
-                        active_primitives=active_primitives,
-                        orderbook=hl_orderbook
-                    )
-
-                    if success and trade:
-                        print(f"GHOST: ENTRY {result.symbol} {side} {trade.quantity:.4f} @ ${trade.price:,.2f} [{len(active_primitives or [])} primitives]")
-                    else:
-                        print(f"GHOST: ENTRY_REJECTED {result.symbol} - {error}")
-                        if snapshot:
-                            self.ghost_tracker.log_rejection(
-                                cycle_id=cycle_id or 0,
-                                timestamp=result.timestamp,
-                                symbol=result.symbol,
-                                attempted_action="ENTRY",
-                                attempted_side=side,
-                                rejection_reason=error,
-                                policy_name=policy_name,
-                                triggering_primitives=active_primitives
-                            )
-
-                # Handle EXIT actions
-                elif result.action.name == "EXIT":
-                    if self.ghost_tracker.has_open_position(result.symbol):
-                        # Get HL orderbook for execution (falls back to Binance if unavailable)
-                        hl_orderbook = self._get_hl_orderbook(result.symbol)
-
-                        success, error, trade = self.ghost_tracker.close_position(
-                            symbol=result.symbol,
-                            cycle_id=cycle_id,
-                            exit_reason="MANDATE_EXIT",
-                            orderbook=hl_orderbook
-                        )
-
-                        if success and trade:
-                            print(f"GHOST: EXIT {result.symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: ${trade.pnl:+.2f}, Hold: {trade.holding_duration_sec:.0f}s")
-                        else:
-                            print(f"GHOST: EXIT_REJECTED {result.symbol} - {error}")
-
-                # Handle REDUCE actions (partial close)
-                elif result.action.name == "REDUCE":
-                    if self.ghost_tracker.has_open_position(result.symbol):
-                        # Reduce by 50% for now (in full implementation, use actual quantity)
-                        position = self.ghost_tracker.get_open_position(result.symbol)
-                        if position:
-                            reduce_qty = position.quantity * 0.5
-
-                            # Get HL orderbook for execution (falls back to Binance if unavailable)
-                            hl_orderbook = self._get_hl_orderbook(result.symbol)
-
-                            success, error, trade = self.ghost_tracker.close_position(
-                                symbol=result.symbol,
-                                quantity=reduce_qty,
-                                cycle_id=cycle_id,
-                                exit_reason="PARTIAL_REDUCE",
-                                orderbook=hl_orderbook
-                            )
-
-                            if success and trade:
-                                print(f"GHOST: REDUCE {result.symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: ${trade.pnl:+.2f}")
-
-            # Update last processed index
-            self._last_execution_index = len(execution_log)
-
-        except Exception as e:
-            print(f"ERROR in ghost trade processing: {e}")
-            import traceback
-            traceback.print_exc()  # Print full traceback for debugging
+        """Deprecated: entry/exit now handled in unified path after process_cycle().
+        Kept as empty method to avoid changing main loop call sites."""
+        pass
 
     def _extract_active_primitive_names(self, symbol: str, snapshot: ObservationSnapshot) -> List[str]:
         """Extract names of non-None primitives for a symbol.
@@ -1361,6 +1453,251 @@ class CollectorService:
                 active_primitives.append(name)
 
         return active_primitives
+
+    def _get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price for symbol from cache.
+
+        Returns None if no price available.
+        """
+        return self._current_prices.get(symbol)
+
+    def _reconcile_positions_on_startup(self):
+        """Reconcile ghost tracker with positions.db on startup.
+
+        Handles two mismatch cases:
+        1. Ghost OPEN + Controller FLAT → force-close stale ghost position
+        2. Controller OPEN + Ghost empty → register in ghost tracker + trailing stop
+        """
+        try:
+            import sqlite3
+            pos_db = 'logs/positions.db'
+            if not os.path.exists(pos_db):
+                return
+
+            conn = sqlite3.connect(pos_db, timeout=10)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT symbol, state, direction, quantity, entry_price, strategy_id "
+                "FROM positions"
+            ).fetchall()
+            conn.close()
+
+            controller_open = {}
+            for row in rows:
+                if row['state'] == 'OPEN' and row['entry_price']:
+                    controller_open[row['symbol']] = row
+
+            ghost_open = self.ghost_tracker.get_open_positions()
+
+            # Case 1: Ghost has position but controller is FLAT → stale ghost, close it
+            for symbol in list(ghost_open.keys()):
+                if symbol not in controller_open:
+                    print(f"RECONCILE: Ghost position for {symbol} but controller is FLAT — closing stale ghost")
+                    self.ghost_tracker.close_position(
+                        symbol=symbol,
+                        exit_reason="RECONCILE_STALE",
+                        exit_price=ghost_open[symbol].entry_price,  # flat PnL
+                        timestamp=time.time()
+                    )
+
+            # Case 2: Controller has OPEN position but ghost tracker empty → register
+            for symbol, row in controller_open.items():
+                if symbol not in ghost_open:
+                    side = row['direction']
+                    qty = float(row['quantity']) if row['quantity'] else 0.0
+                    entry_px = float(row['entry_price'])
+                    if qty <= 0 or not side:
+                        continue
+
+                    print(f"RECONCILE: Controller OPEN for {symbol} but ghost empty — registering")
+                    success, error, trade = self.ghost_tracker.open_position(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        entry_price=entry_px,
+                        timestamp=time.time(),  # Use current time since we don't know original
+                        policy_name=row['strategy_id']
+                    )
+                    if success and trade:
+                        # Register trailing stop
+                        self._trailing_stop_manager.register_trailing_stop(
+                            entry_order_id=trade.trade_id,
+                            symbol=symbol,
+                            direction=side,
+                            entry_price=entry_px,
+                            config=self._trailing_stop_config
+                        )
+                        print(f"RECONCILE: Registered {symbol} {side} @ ${entry_px:,.2f} id={trade.trade_id}")
+                    else:
+                        print(f"RECONCILE: Failed to register {symbol}: {error}")
+
+            # Case 3: Stale trailing stops for positions that no longer exist
+            all_open_symbols = set(controller_open.keys()) | set(ghost_open.keys())
+            stale_stops = []
+            for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
+                if state.symbol not in all_open_symbols:
+                    stale_stops.append(entry_id)
+            for entry_id in stale_stops:
+                print(f"RECONCILE: Removing stale trailing stop {entry_id}")
+                self._trailing_stop_manager.unregister_stop(entry_id)
+
+        except Exception as e:
+            print(f"RECONCILE: Error during startup reconciliation: {e}")
+
+    def _force_position_flat(self, symbol: str):
+        """Set position to FLAT in positions.db."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect('logs/positions.db', timeout=10)
+            conn.execute(
+                "UPDATE positions SET state = 'FLAT', direction = NULL, quantity = '0', "
+                "entry_price = NULL, strategy_id = NULL, entry_context = NULL "
+                "WHERE symbol = ?",
+                (symbol,)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"WARN: _force_position_flat({symbol}) failed: {e}")
+
+    def _recovered_exit(self, symbol: str, price: float, entry_id: str,
+                        direction: str, entry_price: float, exit_reason: str):
+        """Crash-recovery exit for positions in positions.db but not in ghost tracker.
+
+        Used when ghost_tracker.close_position() fails because position was
+        opened before the unified path (or after a restart without reconciliation).
+        """
+        try:
+            import sqlite3
+            conn = sqlite3.connect('logs/positions.db', timeout=10)
+            row = conn.execute(
+                "SELECT quantity FROM positions WHERE symbol = ?",
+                (symbol,)
+            ).fetchone()
+            qty = float(row[0]) if row and row[0] else 0.0
+            conn.close()
+
+            # Set FLAT
+            self._force_position_flat(symbol)
+
+            # Calculate PnL
+            if direction == "LONG":
+                pnl = (price - entry_price) * qty
+            else:
+                pnl = (entry_price - price) * qty
+
+            # Record exit to ghost_trades table
+            try:
+                exit_side = "SELL" if direction == "LONG" else "BUY"
+                now = time.time()
+                db = self.ghost_tracker._db_conn
+                if db:
+                    # Look up entry timestamp for holding duration
+                    holding_dur = None
+                    entry_row = db.execute(
+                        'SELECT timestamp FROM ghost_trades WHERE trade_id = ? AND is_entry = 1',
+                        (entry_id,)
+                    ).fetchone()
+                    if entry_row:
+                        holding_dur = now - float(entry_row[0])
+
+                    row = db.execute(
+                        'SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1'
+                    ).fetchone()
+                    last_bal = float(row[0]) if row and row[0] else 1000.0
+                    new_bal = last_bal + pnl
+                    db.execute('''
+                        INSERT INTO ghost_trades
+                        (trade_id, symbol, side, quantity, price, timestamp,
+                         position_side, is_entry, pnl, account_balance_after,
+                         exit_reason, holding_duration_sec)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    ''', (
+                        f"recovered_exit_{symbol}_{now:.0f}",
+                        symbol, exit_side, qty, price, now,
+                        direction, pnl, new_bal, exit_reason,
+                        holding_dur
+                    ))
+                    db.commit()
+            except Exception as db_err:
+                print(f"TRAILING: DB_WRITE_FAILED {symbol} - {db_err}")
+
+            print(f"RECOVERED: EXIT {symbol} qty={qty:.4f} @ ${price:,.2f}, PNL: ${pnl:+.2f}, Reason: {exit_reason}")
+            return True
+        except Exception as e:
+            print(f"TRAILING: RECOVERED_EXIT_FAILED {symbol} - {e}")
+            return False
+
+    def _update_trailing_stops(self, symbol: str, price: float):
+        """Update trailing stops for symbol and check for triggers.
+
+        Called on each price update. If a trailing stop is hit, closes the ghost position.
+        """
+        try:
+            # Get 5m ATR for this symbol (used by ATR_PROGRESSIVE mode)
+            atr_value = None
+            atr_calc = self._atr_calculators.get(symbol)
+            if atr_calc:
+                atr_value = atr_calc.get_atr_5m()
+
+            # Update trailing stop manager with new price and ATR
+            self._trailing_stop_manager.update_price(symbol, price, atr=atr_value)
+
+            # Check if any stops are triggered (price crossed stop level)
+            for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
+                if state.symbol != symbol:
+                    continue
+
+                # Check if stop is triggered
+                stop_triggered = False
+                if state.direction == "LONG" and price <= state.current_stop_price:
+                    stop_triggered = True
+                elif state.direction == "SHORT" and price >= state.current_stop_price:
+                    stop_triggered = True
+
+                if stop_triggered:
+                    # Determine exit reason
+                    if state.break_even_triggered:
+                        exit_reason = "TRAILING_STOP_BE"
+                    else:
+                        exit_reason = "TRAILING_STOP_LOSS"
+
+                    print(f"TRAILING: STOP HIT {symbol} @ ${price:,.2f} (stop was ${state.current_stop_price:,.2f})")
+
+                    # Primary path: close via ghost tracker (position is in memory)
+                    success, error, trade = self.ghost_tracker.close_position(
+                        symbol=symbol,
+                        exit_reason=exit_reason,
+                        exit_price=price,
+                        timestamp=time.time()
+                    )
+
+                    if success and trade:
+                        pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+                        hold_str = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
+                        print(f"EXIT: {symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: {pnl_str}, Hold: {hold_str}, Reason: {exit_reason}")
+                        self._force_position_flat(symbol)
+                        self._trailing_stop_manager.unregister_stop(entry_id)
+                    else:
+                        # Fallback: position in positions.db but not ghost tracker
+                        # (legacy entries from before unified path, or after restart)
+                        recovered = self._recovered_exit(
+                            symbol=symbol,
+                            price=price,
+                            entry_id=entry_id,
+                            direction=state.direction,
+                            entry_price=state.entry_price,
+                            exit_reason=exit_reason
+                        )
+                        if recovered:
+                            self._trailing_stop_manager.unregister_stop(entry_id)
+                        else:
+                            print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
+
+        except Exception as e:
+            import traceback
+            print(f"TRAILING: EXCEPTION in _update_trailing_stops: {e}")
+            traceback.print_exc()
 
     def _get_hl_orderbook(self, symbol: str) -> Optional[NormalizedOrderbook]:
         """Get normalized orderbook from Hyperliquid for ghost execution.
@@ -1753,6 +2090,9 @@ class CollectorService:
 
                                         # Track current price
                                         self._current_prices[symbol] = price
+
+                                        # Update trailing stops
+                                        self._update_trailing_stops(symbol, price)
                                     except:
                                         pass
                             elif 'forceorder' in stream.lower():

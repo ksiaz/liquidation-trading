@@ -102,6 +102,8 @@ class AdapterServer:
 
         self._grpc_server.servicer.push_liquidation(proto_event)
         self._liquidations_emitted += 1
+        if event.timestamp_ms:
+            self._last_block_time_ns = max(self._last_block_time_ns, int(event.timestamp_ms * 1_000_000))
 
     def _emit_fill(self, event):
         """Convert fill event to proto and broadcast."""
@@ -124,6 +126,10 @@ class AdapterServer:
 
         self._grpc_server.servicer.push_fill(proto_event)
         self._fills_emitted += 1
+        if event.block_height:
+            self._last_block_height = max(self._last_block_height, event.block_height)
+        if event.timestamp_ms:
+            self._last_block_time_ns = max(self._last_block_time_ns, int(event.timestamp_ms * 1_000_000))
 
     def _emit_status(self):
         """Emit current status to subscribers."""

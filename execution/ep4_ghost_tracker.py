@@ -727,7 +727,15 @@ class GhostPositionTracker:
         self._state.trade_count += 1
 
         # Log to database if connected
-        self._log_trade_to_db(trade)
+        db_ok = self._log_trade_to_db(trade)
+        if not db_ok and not trade.is_entry:
+            # Exit trade not persisted — log enough data for manual recovery
+            print(
+                f"[GHOST] EXIT_DB_ORPHAN: {trade.trade_id} {trade.symbol} "
+                f"entry={trade.entry_trade_id} pnl={trade.pnl:+.2f} "
+                f"reason={trade.exit_reason} — exit row NOT in execution.db",
+                flush=True
+            )
 
         # Remove or reduce position
         if quantity >= position.quantity:
@@ -897,8 +905,12 @@ class GhostPositionTracker:
         self._next_trade_id += 1
         return trade_id
 
-    def _log_trade_to_db(self, trade: GhostTrade) -> None:
-        """Log trade to database if connection available."""
+    def _log_trade_to_db(self, trade: GhostTrade) -> bool:
+        """Log trade to database if connection available.
+
+        Returns:
+            True if write succeeded, False if failed or no connection.
+        """
         if not self._db_conn:
             # DIAGNOSTIC: No DB connection - trade not persisted
             diag.record_skip(
@@ -908,7 +920,7 @@ class GhostPositionTracker:
                 symbol=trade.symbol,
                 context={"trade_id": trade.trade_id}
             )
-            return
+            return False
 
         import time as _time
 
@@ -973,7 +985,7 @@ class GhostPositionTracker:
                     ))
 
                 self._db_conn.commit()
-                return  # Success
+                return True  # Success
             except Exception as e:
                 is_locked = "database is locked" in str(e).lower()
                 if is_locked and attempt < max_attempts - 1:
@@ -991,7 +1003,7 @@ class GhostPositionTracker:
                     symbol=trade.symbol,
                     context={"trade_id": trade.trade_id, "error": str(e), "attempts": attempt + 1}
                 )
-                return  # Give up
+                return False  # Give up
 
     def log_rejection(
         self,

@@ -149,13 +149,26 @@ class CollectorService:
         self._last_stream_time = None
 
         # Ghost Trading Tracker ($1000 initial, 5% position size, all 10 symbols)
+        # CRITICAL: Ghost tracker gets its OWN db connection, NOT the buffered DB's conn.
+        # BufferedResearchDatabase has a background flush thread that uses _db_lock + conn.commit().
+        # Sharing the same connection caused race conditions (deadlock/crash on trailing stop exit).
+        import sqlite3 as _sqlite3
+        _ghost_db_conn = _sqlite3.connect("logs/execution.db", timeout=30, check_same_thread=False)
+        _ghost_db_conn.row_factory = _sqlite3.Row
+        _ghost_db_conn.execute("PRAGMA journal_mode=WAL")
+        # Migration: add entry_trade_id column for deterministic entry/exit linkage
+        try:
+            _ghost_db_conn.execute("ALTER TABLE ghost_trades ADD COLUMN entry_trade_id TEXT")
+            _ghost_db_conn.commit()
+        except _sqlite3.OperationalError:
+            pass  # Column already exists
         api_key = os.environ.get("BINANCE_API_KEY")
         self.ghost_tracker = GhostPositionTracker(
             initial_balance=1000.0,
             position_size_pct=0.05,
             symbols=TOP_10_SYMBOLS,  # All 10 symbols for testing
             api_key=api_key,
-            db_conn=self._execution_db.conn  # Pass database connection for logging
+            db_conn=_ghost_db_conn
         )
 
         # Trailing Stop Manager for profit protection
@@ -801,6 +814,12 @@ class CollectorService:
                 print(f"[HL_DEBUG] cycle={cycle_id} node_prices has {len(node_prices)} symbols: {list(node_prices.keys())[:5]}", flush=True)
 
             for symbol in snapshot.symbols_active:
+                # Skip HL-format duplicates (e.g., "BTC") - only process USDT symbols
+                # run_paper_trade.py adds both "BTCUSDT" and "BTC" to allowed_symbols;
+                # calculators are keyed by USDT format from HL fill handler.
+                if not symbol.endswith('USDT'):
+                    continue
+
                 try:
                     # Get current price - prefer HL node, fallback to Binance
                     # Convert symbol format: BTCUSDT -> BTC for HL node
@@ -810,6 +829,10 @@ class CollectorService:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
                         continue  # No price data yet
+
+                    # Update trailing stops with oracle price every cycle
+                    # (HL fills are sparse — oracle price ensures stops trail on moves)
+                    self._update_trailing_stops(symbol, price)
 
                     # Log when HL oracle price is used (activation proof)
                     # Log first 5 cycles then every 50th to reduce noise
@@ -838,7 +861,12 @@ class CollectorService:
                     vwap_distance = vwap_calc.get_distance(price)
                     atr_5m = atr_calc.get_atr_5m()
                     atr_30m = atr_calc.get_atr_30m()
-                    orderflow_imbalance = orderflow_calc.get_imbalance_30s()
+                    # Use 60s window in node mode (HL fills sparser than Binance)
+                    orderflow_imbalance = (
+                        orderflow_calc.get_imbalance_60s()
+                        if self._use_node_mode
+                        else orderflow_calc.get_imbalance_30s()
+                    )
                     liquidation_zscore = liquidation_calc.get_zscore(timestamp)
 
                     # Check if all metrics available
@@ -865,6 +893,13 @@ class CollectorService:
 
                     # Classify regime
                     regime_state = classify_regime(regime_metrics)
+
+                    # Diagnostic: show why DISABLED (temporary)
+                    if _diag_regime and regime_state.name == "DISABLED" and cycle_id and cycle_id % 50 == 1:
+                        atr_ratio = atr_5m / atr_30m if atr_30m else 0
+                        print(f"[REGIME] {symbol}: DISABLED - vwap_d={vwap_distance:.1f} atr5={atr_5m:.1f} "
+                              f"atr30={atr_30m:.1f} ratio={atr_ratio:.2f} of={orderflow_imbalance:.3f} "
+                              f"liq_z={liquidation_zscore:.2f}", flush=True)
 
                     # Phase 6: Log regime transitions
                     prev_regime = self._prev_regime_states.get(symbol)
@@ -1349,7 +1384,9 @@ class CollectorService:
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
-            self._logger.debug(f"HL fill callback error: {e}")
+            import traceback
+            print(f"HL_FILL_ERROR: {e}", flush=True)
+            traceback.print_exc()
 
     def _handle_hl_liquidation(
         self,
@@ -1610,13 +1647,13 @@ class CollectorService:
                         INSERT INTO ghost_trades
                         (trade_id, symbol, side, quantity, price, timestamp,
                          position_side, is_entry, pnl, account_balance_after,
-                         exit_reason, holding_duration_sec)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                         exit_reason, holding_duration_sec, entry_trade_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                     ''', (
                         f"recovered_exit_{symbol}_{now:.0f}",
                         symbol, exit_side, qty, price, now,
                         direction, pnl, new_bal, exit_reason,
-                        holding_dur
+                        holding_dur, entry_id
                     ))
                     db.commit()
             except Exception as db_err:

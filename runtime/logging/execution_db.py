@@ -33,9 +33,10 @@ class ResearchDatabase:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        
+        self.conn.execute("PRAGMA journal_mode=WAL")
+
         self._create_schema()
     
     def _create_schema(self):
@@ -325,7 +326,58 @@ class ResearchDatabase:
             )
         """)
 
-        # Table 8.6: Policy Outcomes (Primitive Performance Attribution)
+        # Table 8.6: Ghost Trades (Paper Trading Record)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ghost_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT NOT NULL,
+                cycle_id INTEGER,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                timestamp REAL NOT NULL,
+                position_side TEXT NOT NULL,
+                is_entry BOOLEAN NOT NULL,
+                pnl REAL,
+                account_balance_after REAL NOT NULL,
+                entry_cycle_id INTEGER,
+                exit_cycle_id INTEGER,
+                winning_policy_name TEXT,
+                active_primitives TEXT,
+                spread_bps REAL,
+                concurrent_positions INTEGER,
+                holding_duration_sec REAL,
+                exit_reason TEXT,
+                entry_trade_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
+            )
+        """)
+
+        # Table 8.7: Ghost Trade Rejections (Tracking Failed Trade Attempts)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ghost_trade_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+                attempted_action TEXT NOT NULL,
+                attempted_side TEXT,
+                rejection_reason TEXT NOT NULL,
+                mandate_id INTEGER,
+                policy_name TEXT,
+                account_balance REAL,
+                account_equity REAL,
+                open_positions_count INTEGER,
+                current_price REAL,
+                spread_bps REAL,
+                triggering_primitives TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Table 8.8: Policy Outcomes (Primitive Performance Attribution)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS policy_outcomes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -408,6 +460,11 @@ class ResearchDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_cycle ON policy_outcomes(cycle_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_symbol_ts ON policy_outcomes(symbol, timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_trade ON policy_outcomes(ghost_trade_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol ON ghost_trades(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_timestamp ON ghost_trades(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_cycle ON ghost_trades(cycle_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_rejections_symbol ON ghost_trade_rejections(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_rejections_cycle ON ghost_trade_rejections(cycle_id)")
 
         # =====================================================================
         # Hyperliquid Integration Tables

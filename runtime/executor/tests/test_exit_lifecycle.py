@@ -208,10 +208,11 @@ class TestEXITMandateGeneration:
     """Verify policies generate EXIT when conditions invalidate."""
 
     def test_geometry_generates_exit_when_open_and_zone_invalidated(self):
-        """Geometry policy generates EXIT when position OPEN and zone invalidated."""
+        """Geometry policy generates EXIT when price hard-breaks through frozen entry zone."""
         reset_entry_context()
 
         # Setup: First do an entry to populate entry context
+        # Entry zone: demand zone_low=49500, zone_high=50500, width=1000
         zone = _create_confirmed_zone()
         entry_context = StrategyContext(
             context_id="test_001_entry",
@@ -225,7 +226,7 @@ class TestEXITMandateGeneration:
             reason_code="TEST",
             timestamp=90.0
         )
-        # Entry first (populates entry context)
+        # Entry first (populates frozen entry context)
         entry_proposal = generate_geometry_proposal(
             supply_demand_zone=zone,
             context=entry_context,
@@ -234,41 +235,41 @@ class TestEXITMandateGeneration:
         )
         assert entry_proposal is not None, "Entry proposal should be emitted to populate context"
 
-        # Now check EXIT: zone changed (different zone_id, different geometry)
-        # This simulates the original zone being invalidated
-        changed_zone = SupplyDemandZonePrimitive(
-            zone_id="zone_999",  # Different zone ID
-            symbol="BTCUSDT",
-            zone_type="demand",
-            zone_low=45000.0,  # Significantly shifted geometry
-            zone_high=46000.0,
-            zone_center=45500.0,
-            zone_width=1000.0,
-            node_count=5,
-            total_interactions=50,
-            total_volume=200000.0,
-            avg_node_strength=0.6,
-            displacement_detected=True,
-            displacement_direction="up",
-            displacement_magnitude=2000.0,
-            retest_detected=True,
-            retest_count=2,
-            timestamp=200.0
-        )
+        # Now check EXIT: price breaks below frozen zone bounds
+        # Frozen geometry: demand zone_low=49500, width=1000, break_threshold=1.0
+        # Invalidation price: < 49500 - (1000 * 1.0) = 48500
+        # Need 3 consecutive cycles of breakage (MIN_BREAK_CONFIRMATION_CYCLES)
+        break_price = 48000.0  # Well below invalidation threshold of 48500
+
+        # Cycles 1 and 2: price broken but not yet confirmed
+        for cycle in range(2):
+            ctx = StrategyContext(
+                context_id=f"test_001_break_{cycle}",
+                timestamp=200.0 + cycle,
+                current_price=break_price
+            )
+            proposal = generate_geometry_proposal(
+                supply_demand_zone=zone,
+                context=ctx,
+                permission=permission,
+                position_state=PolicyPositionState.OPEN
+            )
+            assert proposal is None, f"Cycle {cycle}: should not exit yet (need 3 consecutive breaks)"
+
+        # Cycle 3: 3rd consecutive break -> EXIT
         exit_context = StrategyContext(
             context_id="test_001_exit",
-            timestamp=200.0,  # Well past grace period
-            current_price=50000.0
+            timestamp=203.0,
+            current_price=break_price
         )
-
         proposal = generate_geometry_proposal(
-            supply_demand_zone=changed_zone,  # Different zone = invalidated
+            supply_demand_zone=zone,
             context=exit_context,
             permission=permission,
             position_state=PolicyPositionState.OPEN
         )
 
-        # Assert: Returns EXIT proposal
+        # Assert: Returns EXIT proposal after 3 consecutive break cycles
         assert proposal is not None
         assert proposal.action_type == "EXIT"
         assert proposal.confidence == "ZONE_INVALIDATED"

@@ -38,25 +38,59 @@ DEFAULT_DB_PATH = "/tmp/ghost_trades.db"
 
 
 def _init_position_table(conn: sqlite3.Connection) -> None:
-    """Create ghost_positions table if not exists."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS ghost_positions (
-            trade_id TEXT PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            qty REAL NOT NULL,
-            entry_price REAL NOT NULL,
-            entry_time REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'OPEN',
-            entry_reason TEXT,
-            strategy_id TEXT,
-            exit_price REAL,
-            exit_time REAL,
-            pnl REAL,
-            zone_context TEXT,
-            UNIQUE(symbol, status) ON CONFLICT REPLACE
-        )
-    """)
+    """Create ghost_positions table if not exists. Migrates old schema if needed."""
+    # Check if table exists with old UNIQUE(symbol, status) ON CONFLICT REPLACE constraint
+    # SQLite can't ALTER TABLE DROP CONSTRAINT, so we recreate the table
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ghost_positions'"
+    ).fetchone()
+    if row and "ON CONFLICT REPLACE" in (row[0] or ""):
+        print("[GHOST] Migrating ghost_positions: removing ON CONFLICT REPLACE constraint", flush=True)
+        conn.execute("ALTER TABLE ghost_positions RENAME TO ghost_positions_old")
+        conn.execute("""
+            CREATE TABLE ghost_positions (
+                trade_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                entry_time REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                entry_reason TEXT,
+                strategy_id TEXT,
+                exit_price REAL,
+                exit_time REAL,
+                pnl REAL,
+                zone_context TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO ghost_positions
+            SELECT trade_id, symbol, side, qty, entry_price, entry_time,
+                   status, entry_reason, strategy_id, exit_price, exit_time, pnl, zone_context
+            FROM ghost_positions_old
+        """)
+        conn.execute("DROP TABLE ghost_positions_old")
+        print("[GHOST] Migration complete: ghost_positions recreated without UNIQUE constraint", flush=True)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ghost_positions (
+                trade_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                entry_time REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                entry_reason TEXT,
+                strategy_id TEXT,
+                exit_price REAL,
+                exit_time REAL,
+                pnl REAL,
+                zone_context TEXT
+            )
+        """)
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_status ON ghost_positions(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_symbol ON ghost_positions(symbol)")
 
@@ -138,8 +172,9 @@ class GhostTrade:
 
     # Enhanced context fields
     cycle_id: Optional[int] = None
-    entry_cycle_id: Optional[int] = None  # For exits, link to entry
+    entry_cycle_id: Optional[int] = None  # For exits, link to entry cycle
     exit_cycle_id: Optional[int] = None  # For exits
+    entry_trade_id: Optional[str] = None  # For exits: trade_id of the entry row (deterministic linkage)
     winning_policy: Optional[str] = None
     active_primitives: Optional[str] = None  # JSON array
     spread_bps: Optional[float] = None
@@ -237,7 +272,7 @@ class GhostPositionTracker:
     def _init_persistence(self) -> None:
         """Initialize position persistence DB and restore state."""
         try:
-            self._pos_conn = sqlite3.connect(self._db_path)
+            self._pos_conn = sqlite3.connect(self._db_path, check_same_thread=False)
             _init_position_table(self._pos_conn)
 
             # Load existing OPEN positions
@@ -437,7 +472,9 @@ class GhostPositionTracker:
         cycle_id: Optional[int] = None,
         policy_name: Optional[str] = None,
         active_primitives: Optional[List[str]] = None,
-        orderbook: Optional[NormalizedOrderbook] = None
+        orderbook: Optional[NormalizedOrderbook] = None,
+        entry_price: Optional[float] = None,
+        timestamp: Optional[float] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Open new position (simulated).
@@ -451,47 +488,63 @@ class GhostPositionTracker:
             active_primitives: Optional list of active primitive names
             orderbook: Optional normalized orderbook (from HL or other source).
                       If provided, uses this for price/spread instead of Binance.
+            entry_price: Optional externally-determined entry price.
+                        When provided with quantity, skips adapter execution.
+            timestamp: Optional entry timestamp (used with entry_price).
 
         Returns:
             (success, error_reason, trade_record)
         """
-        # Check if position already exists
+        # Close existing position on same symbol before opening new one
+        # Prevents orphaned entries from ON CONFLICT REPLACE or state desync
         if self.has_open_position(symbol):
-            return (False, f"Position already exists for {symbol}", None)
+            existing = self.get_open_position(symbol)
+            if existing:
+                print(f"[GHOST] Closing existing {symbol} {existing.side} position before new open", flush=True)
+                self.close_position(
+                    symbol=symbol,
+                    exit_reason="REPLACED_BY_NEW_ENTRY",
+                    exit_price=existing.entry_price,  # Flat PnL
+                    timestamp=timestamp or __import__('time').time()
+                )
 
-        # Get adapter for this symbol
-        adapter = self._get_adapter(symbol)
-
-        # Execute ghost order
         order_side = "BUY" if side == "LONG" else "SELL"
+        spread_bps = None
 
-        # Capture snapshot to get current price (uses HL orderbook if provided)
-        snapshot = adapter.capture_snapshot(orderbook=orderbook)
-        entry_price = snapshot.best_ask if order_side == "BUY" else snapshot.best_bid
+        if entry_price is not None and quantity is not None:
+            # External fill from controller — skip adapter execution
+            fill_price = entry_price
+            fill_timestamp = timestamp or time.time()
+        else:
+            # Original adapter path — fetch price and execute ghost order
+            adapter = self._get_adapter(symbol)
 
-        # Calculate quantity if not provided
-        if quantity is None:
-            quantity = self.get_position_size_quantity(entry_price)
+            snapshot = adapter.capture_snapshot(orderbook=orderbook)
+            fill_price = snapshot.best_ask if order_side == "BUY" else snapshot.best_bid
 
-        # Round quantity to exchange filters
-        filters = adapter.get_filters()
-        quantity = round(quantity / filters['step_size']) * filters['step_size']
+            if quantity is None:
+                quantity = self.get_position_size_quantity(fill_price)
 
-        # Execute ghost order (uses HL orderbook if provided)
-        result = adapter.execute_ghost_order(
-            side=order_side,
-            order_type="MARKET",
-            quantity=quantity,
-            orderbook=orderbook
-        )
+            filters = adapter.get_filters()
+            quantity = round(quantity / filters['step_size']) * filters['step_size']
 
-        # Check execution result
-        if not result.would_execute:
-            reason = result.reject_reason or "Execution failed"
-            return (False, reason, None)
+            result = adapter.execute_ghost_order(
+                side=order_side,
+                order_type="MARKET",
+                quantity=quantity,
+                orderbook=orderbook
+            )
 
-        if result.fill_estimate == FillEstimate.NONE:
-            return (False, "No fill", None)
+            if not result.would_execute:
+                reason = result.reject_reason or "Execution failed"
+                return (False, reason, None)
+
+            if result.fill_estimate == FillEstimate.NONE:
+                return (False, "No fill", None)
+
+            fill_timestamp = result.timestamp
+            if result.best_bid > 0:
+                spread_bps = ((result.best_ask - result.best_bid) / result.best_bid * 10000)
 
         # Generate trade ID
         trade_id = self._generate_trade_id()
@@ -499,17 +552,14 @@ class GhostPositionTracker:
         # Serialize active primitives
         primitives_json = json.dumps(active_primitives) if active_primitives else None
 
-        # Calculate spread in BPS
-        spread_bps = ((result.best_ask - result.best_bid) / result.best_bid * 10000) if result.best_bid > 0 else None
-
         # Create position
         position = GhostPosition(
             symbol=symbol,
             side=side,
             quantity=quantity,
-            entry_price=entry_price,
-            entry_timestamp=result.timestamp,
-            entry_order_id=result.orderbook_snapshot_id,
+            entry_price=fill_price,
+            entry_timestamp=fill_timestamp,
+            entry_order_id="external" if entry_price is not None else result.orderbook_snapshot_id,
             entry_trade_id=trade_id,
             entry_cycle_id=cycle_id,
             entry_policy=policy_name,
@@ -528,8 +578,8 @@ class GhostPositionTracker:
             symbol=symbol,
             side=order_side,
             quantity=quantity,
-            price=entry_price,
-            timestamp=result.timestamp,
+            price=fill_price,
+            timestamp=fill_timestamp,
             position_side=side,
             is_entry=True,
             pnl=None,
@@ -557,7 +607,9 @@ class GhostPositionTracker:
         quantity: Optional[float] = None,
         cycle_id: Optional[int] = None,
         exit_reason: str = "FULL_EXIT",
-        orderbook: Optional[NormalizedOrderbook] = None
+        orderbook: Optional[NormalizedOrderbook] = None,
+        exit_price: Optional[float] = None,
+        timestamp: Optional[float] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Close position (simulated).
@@ -569,6 +621,9 @@ class GhostPositionTracker:
             exit_reason: Reason for exit (FULL_EXIT, PARTIAL_REDUCE, STOP, MANDATE_EXIT)
             orderbook: Optional normalized orderbook (from HL or other source).
                       If provided, uses this for price/spread instead of Binance.
+            exit_price: Optional exit price (from trailing stop trigger).
+                       If provided, skips adapter snapshot + ghost order.
+            timestamp: Optional exit timestamp. Defaults to current time.
 
         Returns:
             (success, error_reason, trade_record)
@@ -586,37 +641,47 @@ class GhostPositionTracker:
         if quantity > position.quantity:
             return (False, f"Quantity {quantity} exceeds position size {position.quantity}", None)
 
-        # Get adapter for this symbol
-        adapter = self._get_adapter(symbol)
-
         # Execute ghost order (opposite side)
         order_side = "SELL" if position.side == "LONG" else "BUY"
 
-        # Capture snapshot for exit price (uses HL orderbook if provided)
-        snapshot = adapter.capture_snapshot(orderbook=orderbook)
-        exit_price = snapshot.best_bid if order_side == "SELL" else snapshot.best_ask
+        spread_bps = None
+        if exit_price is not None:
+            # External fill (trailing stop trigger) — use provided price directly
+            fill_price = exit_price
+            fill_timestamp = timestamp or time.time()
+        else:
+            # Original adapter path — simulate ghost order execution
+            adapter = self._get_adapter(symbol)
 
-        # Execute ghost order (uses HL orderbook if provided)
-        result = adapter.execute_ghost_order(
-            side=order_side,
-            order_type="MARKET",
-            quantity=quantity,
-            orderbook=orderbook
-        )
+            # Capture snapshot for exit price (uses HL orderbook if provided)
+            snapshot = adapter.capture_snapshot(orderbook=orderbook)
+            fill_price = snapshot.best_bid if order_side == "SELL" else snapshot.best_ask
 
-        # Check execution result
-        if not result.would_execute:
-            reason = result.reject_reason or "Execution failed"
-            return (False, reason, None)
+            # Execute ghost order (uses HL orderbook if provided)
+            result = adapter.execute_ghost_order(
+                side=order_side,
+                order_type="MARKET",
+                quantity=quantity,
+                orderbook=orderbook
+            )
 
-        if result.fill_estimate == FillEstimate.NONE:
-            return (False, "No fill", None)
+            # Check execution result
+            if not result.would_execute:
+                reason = result.reject_reason or "Execution failed"
+                return (False, reason, None)
+
+            if result.fill_estimate == FillEstimate.NONE:
+                return (False, "No fill", None)
+
+            fill_timestamp = result.timestamp
+            if result.best_bid > 0:
+                spread_bps = ((result.best_ask - result.best_bid) / result.best_bid * 10000)
 
         # Calculate PNL
         if position.side == "LONG":
-            pnl = (exit_price - position.entry_price) * quantity
+            pnl = (fill_price - position.entry_price) * quantity
         else:  # SHORT
-            pnl = (position.entry_price - exit_price) * quantity
+            pnl = (position.entry_price - fill_price) * quantity
 
         # Update account balance
         self._state.current_balance += pnl
@@ -629,22 +694,19 @@ class GhostPositionTracker:
             self._state.losing_trades += 1
 
         # Calculate holding duration
-        holding_duration = result.timestamp - position.entry_timestamp if position.entry_timestamp else None
-
-        # Calculate spread in BPS
-        spread_bps = ((result.best_ask - result.best_bid) / result.best_bid * 10000) if result.best_bid > 0 else None
+        holding_duration = fill_timestamp - position.entry_timestamp if position.entry_timestamp else None
 
         # Is this a partial close?
         is_partial = quantity < position.quantity
 
-        # Create trade record
+        # Create trade record with deterministic entry linkage
         trade = GhostTrade(
             trade_id=self._generate_trade_id(),
             symbol=symbol,
             side=order_side,
             quantity=quantity,
-            price=exit_price,
-            timestamp=result.timestamp,
+            price=fill_price,
+            timestamp=fill_timestamp,
             position_side=position.side,
             is_entry=False,
             pnl=pnl,
@@ -652,6 +714,7 @@ class GhostPositionTracker:
             cycle_id=cycle_id,
             entry_cycle_id=position.entry_cycle_id,
             exit_cycle_id=cycle_id,
+            entry_trade_id=position.entry_trade_id,  # Links exit to entry row
             winning_policy=position.entry_policy,
             active_primitives=position.entry_primitives,
             spread_bps=spread_bps,
@@ -669,7 +732,7 @@ class GhostPositionTracker:
         # Remove or reduce position
         if quantity >= position.quantity:
             # Full close - persist to DB as CLOSED
-            self._persist_position_closed(symbol, exit_price, result.timestamp, pnl)
+            self._persist_position_closed(symbol, fill_price, fill_timestamp, pnl)
             del self._state.open_positions[symbol]
         else:
             # Partial close - update position (keep as OPEN in DB, qty not updated for simplicity)
@@ -847,71 +910,88 @@ class GhostPositionTracker:
             )
             return
 
-        try:
-            cursor = self._db_conn.cursor()
-            cursor.execute('''
-                INSERT INTO ghost_trades (
-                    trade_id, cycle_id, symbol, side, quantity, price,
-                    timestamp, position_side, is_entry, pnl, account_balance_after,
-                    entry_cycle_id, exit_cycle_id, winning_policy_name,
-                    active_primitives, spread_bps, concurrent_positions,
-                    holding_duration_sec, exit_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                trade.trade_id,
-                trade.cycle_id,
-                trade.symbol,
-                trade.side,
-                trade.quantity,
-                trade.price,
-                trade.timestamp,
-                trade.position_side,
-                trade.is_entry,
-                trade.pnl,
-                trade.account_balance_after,
-                trade.entry_cycle_id,
-                trade.exit_cycle_id,
-                trade.winning_policy,
-                trade.active_primitives,
-                trade.spread_bps,
-                trade.concurrent_positions,
-                trade.holding_duration_sec,
-                trade.exit_reason
-            ))
+        import time as _time
 
-            # Update policy_outcomes with ghost trade results (only for exits)
-            if not trade.is_entry and trade.entry_cycle_id is not None:
-                # Find policy_outcome for the entry cycle and update with exit data
+        max_attempts = 4
+        retry_delays = [0.1, 0.5, 1.0]
+
+        for attempt in range(max_attempts):
+            try:
+                cursor = self._db_conn.cursor()
                 cursor.execute('''
-                    UPDATE policy_outcomes
-                    SET ghost_trade_id = ?,
-                        realized_pnl = ?,
-                        holding_duration_sec = ?,
-                        exit_reason = ?
-                    WHERE cycle_id = ?
-                      AND symbol = ?
-                      AND executed_action = 'ENTRY'
-                      AND ghost_trade_id IS NULL
-                    LIMIT 1
+                    INSERT INTO ghost_trades (
+                        trade_id, cycle_id, symbol, side, quantity, price,
+                        timestamp, position_side, is_entry, pnl, account_balance_after,
+                        entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
+                        active_primitives, spread_bps, concurrent_positions,
+                        holding_duration_sec, exit_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    int(trade.trade_id.split('_')[1]),  # Extract numeric ID from GHOST_000123
+                    trade.trade_id,
+                    trade.cycle_id,
+                    trade.symbol,
+                    trade.side,
+                    trade.quantity,
+                    trade.price,
+                    trade.timestamp,
+                    trade.position_side,
+                    trade.is_entry,
                     trade.pnl,
-                    trade.holding_duration_sec,
-                    trade.exit_reason,
+                    trade.account_balance_after,
                     trade.entry_cycle_id,
-                    trade.symbol
+                    trade.exit_cycle_id,
+                    trade.entry_trade_id,
+                    trade.winning_policy,
+                    trade.active_primitives,
+                    trade.spread_bps,
+                    trade.concurrent_positions,
+                    trade.holding_duration_sec,
+                    trade.exit_reason
                 ))
 
-            self._db_conn.commit()
-        except Exception as e:
-            # DIAGNOSTIC: DB write failed - trade not persisted
-            diag.record_skip(
-                component="GhostTracker",
-                function="_log_trade_to_db",
-                reason_code=ReasonCode.GT_DB_WRITE_FAILED,
-                symbol=trade.symbol,
-                context={"trade_id": trade.trade_id, "error": str(e)}
-            )
+                # Update policy_outcomes with ghost trade results (only for exits)
+                if not trade.is_entry and trade.entry_cycle_id is not None:
+                    # Find policy_outcome for the entry cycle and update with exit data
+                    cursor.execute('''
+                        UPDATE policy_outcomes
+                        SET ghost_trade_id = ?,
+                            realized_pnl = ?,
+                            holding_duration_sec = ?,
+                            exit_reason = ?
+                        WHERE cycle_id = ?
+                          AND symbol = ?
+                          AND executed_action = 'ENTRY'
+                          AND ghost_trade_id IS NULL
+                        LIMIT 1
+                    ''', (
+                        int(trade.trade_id.split('_')[1]),  # Extract numeric ID from GHOST_000123
+                        trade.pnl,
+                        trade.holding_duration_sec,
+                        trade.exit_reason,
+                        trade.entry_cycle_id,
+                        trade.symbol
+                    ))
+
+                self._db_conn.commit()
+                return  # Success
+            except Exception as e:
+                is_locked = "database is locked" in str(e).lower()
+                if is_locked and attempt < max_attempts - 1:
+                    delay = retry_delays[attempt]
+                    print(f"[GHOST] DB locked writing {trade.trade_id}, retry {attempt + 1}/{len(retry_delays)} in {delay}s", flush=True)
+                    _time.sleep(delay)
+                    continue
+
+                # Final failure or non-lock error
+                print(f"[GHOST] Failed to log trade to DB: {e}", flush=True)
+                diag.record_skip(
+                    component="GhostTracker",
+                    function="_log_trade_to_db",
+                    reason_code=ReasonCode.GT_DB_WRITE_FAILED,
+                    symbol=trade.symbol,
+                    context={"trade_id": trade.trade_id, "error": str(e), "attempts": attempt + 1}
+                )
+                return  # Give up
 
     def log_rejection(
         self,

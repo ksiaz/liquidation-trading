@@ -1175,7 +1175,6 @@ class CollectorService:
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
-                                    break
 
                 # --- REDUCE: partial close ---
                 elif result.action.name == "REDUCE":
@@ -1556,12 +1555,14 @@ class CollectorService:
                         policy_name=row['strategy_id']
                     )
                     if success and trade:
-                        # Register trailing stop
+                        # Register trailing stop (2% initial stop like normal entries)
+                        initial_stop = entry_px * (0.98 if side == "LONG" else 1.02)
                         self._trailing_stop_manager.register_trailing_stop(
                             entry_order_id=trade.trade_id,
                             symbol=symbol,
                             direction=side,
                             entry_price=entry_px,
+                            initial_stop_price=initial_stop,
                             config=self._trailing_stop_config
                         )
                         print(f"RECONCILE: Registered {symbol} {side} @ ${entry_px:,.2f} id={trade.trade_id}")

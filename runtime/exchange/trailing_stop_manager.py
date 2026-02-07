@@ -31,6 +31,7 @@ class TrailingMode(Enum):
     ATR_MULTIPLE = "ATR_MULTIPLE"          # ATR-based distance
     BREAK_EVEN_ONLY = "BREAK_EVEN_ONLY"    # Move to break-even, then fixed
     STEPPED = "STEPPED"                     # Step-based trailing (e.g., every 1%)
+    ATR_PROGRESSIVE = "ATR_PROGRESSIVE"    # ATR-based with MFE-progressive tightening
 
 
 @dataclass
@@ -48,6 +49,15 @@ class TrailingStopConfig:
     # Step settings (STEPPED mode)
     step_size_pct: float = 0.01            # Trail every 1% move
     step_trail_pct: float = 0.005          # Trail stop by 0.5% each step
+
+    # ATR_PROGRESSIVE settings - MFE-based continuous tightening
+    # Formula: atr_mult = clamp(start - k * mfe_profit_pct, end, start)
+    # where k = (start - end) / profit_range
+    atr_prog_start_mult: float = 2.5       # Wide at entry (2.5× ATR)
+    atr_prog_end_mult: float = 1.0         # Tight at max profit (1.0× ATR)
+    atr_prog_profit_range: float = 0.03    # Full tightening over 3% MFE profit
+    atr_prog_min_pct: float = 0.005        # Floor: at least 0.5% distance (low vol protection)
+    atr_prog_min_lock_ratio: float = 0.4   # Profit floor: lock at least 40% of MFE profit
 
     # Update settings
     min_move_to_update_pct: float = 0.002  # Only update stop if new level is 0.2% better
@@ -139,6 +149,12 @@ class TrailingStopManager:
                     break_even_offset_pct=config_dict.get('break_even_offset_pct', 0.001),
                     step_size_pct=config_dict.get('step_size_pct', 0.01),
                     step_trail_pct=config_dict.get('step_trail_pct', 0.005),
+                    # ATR_PROGRESSIVE settings
+                    atr_prog_start_mult=config_dict.get('atr_prog_start_mult', 2.5),
+                    atr_prog_end_mult=config_dict.get('atr_prog_end_mult', 1.0),
+                    atr_prog_profit_range=config_dict.get('atr_prog_profit_range', 0.03),
+                    atr_prog_min_pct=config_dict.get('atr_prog_min_pct', 0.005),
+                    atr_prog_min_lock_ratio=config_dict.get('atr_prog_min_lock_ratio', 0.4),
                     min_move_to_update_pct=config_dict.get('min_move_to_update_pct', 0.002),
                 )
 
@@ -179,6 +195,12 @@ class TrailingStopManager:
                 'break_even_offset_pct': state.config.break_even_offset_pct,
                 'step_size_pct': state.config.step_size_pct,
                 'step_trail_pct': state.config.step_trail_pct,
+                # ATR_PROGRESSIVE settings
+                'atr_prog_start_mult': state.config.atr_prog_start_mult,
+                'atr_prog_end_mult': state.config.atr_prog_end_mult,
+                'atr_prog_profit_range': state.config.atr_prog_profit_range,
+                'atr_prog_min_pct': state.config.atr_prog_min_pct,
+                'atr_prog_min_lock_ratio': state.config.atr_prog_min_lock_ratio,
                 'min_move_to_update_pct': state.config.min_move_to_update_pct,
             }
 
@@ -238,13 +260,28 @@ class TrailingStopManager:
             entry_price=entry_price,
             current_stop_price=initial_stop_price,
             initial_stop_price=initial_stop_price,
-            highest_price=entry_price if direction == "LONG" else 0.0,
-            lowest_price=entry_price if direction == "SHORT" else float('inf'),
+            highest_price=entry_price,  # Always start at entry for MFE tracking
+            lowest_price=entry_price,   # Always start at entry for MFE tracking
             last_update_ns=self._now_ns(),
             config=config
         )
 
         with self._lock:
+            # Remove any existing stop for the same symbol (enforce 1 stop per symbol)
+            existing_ids = [
+                eid for eid, s in self._stops.items()
+                if s.symbol == symbol and eid != entry_order_id
+            ]
+            for eid in existing_ids:
+                self._logger.info(f"X4-A: Replacing existing stop {eid} for {symbol} with {entry_order_id}")
+                del self._stops[eid]
+                # Clean up persistence for old stop
+                if self._repository:
+                    try:
+                        self._repository.delete_trailing_stop(eid)
+                    except Exception:
+                        pass
+
             self._stops[entry_order_id] = state
 
         # P2: Persist new trailing stop
@@ -292,17 +329,23 @@ class TrailingStopManager:
                         improvement = (old_stop - new_stop) / state.entry_price
 
                     if improvement >= state.config.min_move_to_update_pct:
-                        # AUDIT-P0-9: Track pending state before exchange ACK
-                        state.pending_stop_price = new_stop
-                        state.pending_update_ns = self._now_ns()
+                        # Update stop immediately (ghost mode - no exchange ACK needed)
+                        state.current_stop_price = new_stop
+                        state.last_update_ns = self._now_ns()
+                        state.updates_count += 1
 
+                        # Format with appropriate precision for small values
+                        def fmt(v): return f"{v:.5f}" if v < 1 else f"{v:.2f}"
                         self._logger.info(
-                            f"X4-A: Trailing stop update requested for {entry_id}: "
-                            f"{old_stop:.2f} -> {new_stop:.2f} "
-                            f"(price={price:.2f}, high/low={state.highest_price:.2f}/{state.lowest_price:.2f})"
+                            f"X4-A: Trailing stop updated for {entry_id}: "
+                            f"{fmt(old_stop)} -> {fmt(new_stop)} "
+                            f"(price={fmt(price)}, high/low={fmt(state.highest_price)}/{fmt(state.lowest_price)})"
                         )
 
-                        # Notify callback - caller should confirm_stop_update on exchange ACK
+                        # Persist updated state
+                        self._persist_state(state)
+
+                        # Notify callback
                         if self._on_stop_update:
                             self._on_stop_update(entry_id, old_stop, new_stop)
 
@@ -375,6 +418,78 @@ class TrailingStopManager:
                 if steps > 0:
                     new_stop = entry * (1 - (steps * config.step_trail_pct))
                     return new_stop if new_stop < current_stop else None
+
+        elif config.mode == TrailingMode.ATR_PROGRESSIVE:
+            # MFE-based ATR trailing with continuous tightening + profit-locking floor
+            # Uses highest/lowest price (MFE), not current price
+            # Avoids oscillation and step discontinuities
+
+            # Calculate MFE profit % (based on best price, not current)
+            if state.direction == "LONG":
+                mfe_profit_pct = (state.highest_price - entry) / entry
+                mfe_profit_abs = state.highest_price - entry
+            else:  # SHORT
+                mfe_profit_pct = (entry - state.lowest_price) / entry
+                mfe_profit_abs = entry - state.lowest_price
+
+            if state.current_atr is None:
+                # Fallback: use profit-locking only (no ATR data)
+                # Only lock profit after meaningful MFE (prevents stop at entry)
+                if mfe_profit_pct < config.break_even_trigger_pct:
+                    return None  # No ATR data and no meaningful profit — keep current stop
+                locked_profit = mfe_profit_abs * config.atr_prog_min_lock_ratio
+                if state.direction == "LONG":
+                    new_stop = entry + locked_profit
+                    return new_stop if new_stop > current_stop else None
+                else:
+                    new_stop = entry - locked_profit
+                    return new_stop if new_stop < current_stop else None
+
+            # Continuous multiplier: linear interpolation from start to end
+            # k = (start - end) / range, then mult = start - k * mfe
+            k = (config.atr_prog_start_mult - config.atr_prog_end_mult) / config.atr_prog_profit_range
+            raw_mult = config.atr_prog_start_mult - (k * mfe_profit_pct)
+            atr_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, raw_mult))
+
+            # Calculate ATR-based distance with floor protection
+            atr_distance = state.current_atr * atr_mult
+            min_distance = entry * config.atr_prog_min_pct
+            distance = max(atr_distance, min_distance)
+
+            # Calculate stop from MFE (highest/lowest), not current price
+            if state.direction == "LONG":
+                atr_stop = state.highest_price - distance
+
+                # Only engage profit-lock after meaningful MFE
+                # Without this, profit_lock at MFE=0 equals entry price, killing the position
+                new_stop = atr_stop
+                if mfe_profit_pct >= config.break_even_trigger_pct:
+                    locked_profit = mfe_profit_abs * config.atr_prog_min_lock_ratio
+                    profit_lock_stop = entry + locked_profit
+                    new_stop = max(atr_stop, profit_lock_stop)
+
+                # Break-even as additional floor
+                if state.break_even_triggered:
+                    be_stop = entry * (1 + config.break_even_offset_pct)
+                    new_stop = max(new_stop, be_stop)
+
+                return new_stop if new_stop > current_stop else None
+            else:  # SHORT
+                atr_stop = state.lowest_price + distance
+
+                # Only engage profit-lock after meaningful MFE
+                new_stop = atr_stop
+                if mfe_profit_pct >= config.break_even_trigger_pct:
+                    locked_profit = mfe_profit_abs * config.atr_prog_min_lock_ratio
+                    profit_lock_stop = entry - locked_profit
+                    new_stop = min(atr_stop, profit_lock_stop)
+
+                # Break-even as additional floor
+                if state.break_even_triggered:
+                    be_stop = entry * (1 - config.break_even_offset_pct)
+                    new_stop = min(new_stop, be_stop)
+
+                return new_stop if new_stop < current_stop else None
 
         return None
 

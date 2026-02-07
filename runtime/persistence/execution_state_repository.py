@@ -439,6 +439,7 @@ class ExecutionStateRepository:
                     break_even_triggered = excluded.break_even_triggered,
                     updates_count = excluded.updates_count,
                     current_atr = excluded.current_atr,
+                    config_json = excluded.config_json,
                     updated_at = excluded.updated_at
             """, (
                 stop.entry_order_id,

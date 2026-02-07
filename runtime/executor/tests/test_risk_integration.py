@@ -43,15 +43,18 @@ class TestRiskIntegration:
                 symbol="BTCUSDT",
                 type=MandateType.ENTRY,
                 authority=1.0,
-                timestamp=100.0
+                timestamp=100.0,
+                direction="LONG",
+                quantity=Decimal("0.1"),  # 0.1 BTC = $5000 exposure
+                entry_price=Decimal("50000")
             )
         ]
-        
+
         stats = controller.process_cycle(mandates, account, mark_prices)
-        
+
         assert stats.actions_executed == 0, "Action should be rejected"
         assert stats.actions_rejected == 1, "Action should be counted as rejected"
-        
+
         # Verify log reason
         log = controller.get_execution_log()
         assert len(log) == 1
@@ -105,5 +108,5 @@ class TestRiskIntegration:
         
         assert stats.actions_executed == 1, "Should execute risk mandate"
         assert "BTCUSDT" in controller.state_machine._positions
-        # State should be CLOSING (EXIT executed, awaiting fill)
-        assert controller.state_machine.get_position("BTCUSDT").state == PositionState.CLOSING
+        # State should be FLAT (EXIT auto-confirmed)
+        assert controller.state_machine.get_position("BTCUSDT").state == PositionState.FLAT

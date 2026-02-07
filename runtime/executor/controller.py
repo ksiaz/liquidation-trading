@@ -295,17 +295,20 @@ class ExecutionController:
 
                     # Save strategy context for restart recovery
                     if self._repository and action.strategy_id:
+                        entry_context = None
                         try:
                             from external_policy.ep2_strategy_geometry import get_entry_context_for_persistence
                             entry_context = get_entry_context_for_persistence(symbol)
-                            if entry_context:
-                                self._repository.save(
-                                    new_position,
-                                    strategy_id=action.strategy_id,
-                                    entry_context=entry_context
-                                )
                         except ImportError:
-                            pass  # Geometry module not available
+                            pass
+                        print(f"[STRATEGY_PERSIST] {symbol}: saving strategy_id={action.strategy_id}, context={'yes' if entry_context else 'no'}")
+                        self._repository.save(
+                            new_position,
+                            strategy_id=action.strategy_id,
+                            entry_context=entry_context
+                        )
+                    elif self._repository:
+                        print(f"[STRATEGY_PERSIST] {symbol}: NO strategy_id on action (action.strategy_id={action.strategy_id})")
             elif state_action == StateAction.EXIT:
                 new_position = self.state_machine.transition(symbol, state_action)
 
@@ -345,7 +348,7 @@ class ExecutionController:
                     if remaining_qty > 0:
                         # Partial reduction → back to OPEN with remaining
                         new_position = self.state_machine.transition(symbol, "PARTIAL",
-                            quantity=remaining_qty  # F5: Real remaining quantity
+                            new_quantity=remaining_qty  # F5: Real remaining quantity
                         )
                     else:
                         # Full reduction → FLAT

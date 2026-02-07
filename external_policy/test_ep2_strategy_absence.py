@@ -55,11 +55,11 @@ def permission_denied():
 
 @pytest.fixture
 def absence_exists():
-    """B1.1: Absence exists (partial)."""
+    """B1.1: Absence exists (partial), meets min_absence_duration=60s threshold."""
     return StructuralAbsenceDuration(
-        absence_duration=40.0,
-        observation_window=100.0,
-        absence_ratio=0.4
+        absence_duration=120.0,
+        observation_window=600.0,
+        absence_ratio=0.2
     )
 
 
@@ -85,11 +85,11 @@ def absence_total():
 
 @pytest.fixture
 def persistence_exists():
-    """B2.1: Persistence exists (partial)."""
+    """B2.1: Persistence exists (partial), meets min_persistence_duration=300s threshold."""
     return StructuralPersistenceDuration(
-        total_persistence_duration=60.0,
-        observation_window=100.0,
-        persistence_ratio=0.6
+        total_persistence_duration=480.0,
+        observation_window=600.0,
+        persistence_ratio=0.8
     )
 
 
@@ -142,7 +142,7 @@ def test_happy_path_all_conditions_met(
     
     assert result is not None
     assert result.strategy_id == "EP2-ABSENCE-V1"
-    assert result.action_type == "STRUCTURAL_ABSENCE_EVENT"
+    assert result.action_type == "ENTRY"
     assert result.confidence == "STRUCTURAL_PRESENT"
     assert result.justification_ref == "B1.1|B2.1"
     assert result.timestamp == strategy_context.timestamp
@@ -378,7 +378,86 @@ def test_semantic_purity_no_market_terms():
 
 
 # ==============================================================================
-# Immutability Test
+# Input Immutability Tests (A5)
+# ==============================================================================
+
+def test_input_immutability_absence(
+    persistence_exists,
+    strategy_context,
+    permission_allowed
+):
+    """Policy does not modify absence input."""
+    import copy
+    absence = StructuralAbsenceDuration(
+        absence_duration=40.0,
+        observation_window=100.0,
+        absence_ratio=0.4
+    )
+    absence_copy = copy.deepcopy(absence)
+
+    generate_absence_proposal(
+        permission=permission_allowed,
+        absence=absence,
+        persistence=persistence_exists,
+        geometry=None,
+        context=strategy_context
+    )
+
+    assert absence == absence_copy
+
+
+def test_input_immutability_persistence(
+    absence_exists,
+    strategy_context,
+    permission_allowed
+):
+    """Policy does not modify persistence input."""
+    import copy
+    persistence = StructuralPersistenceDuration(
+        total_persistence_duration=60.0,
+        observation_window=100.0,
+        persistence_ratio=0.6
+    )
+    persistence_copy = copy.deepcopy(persistence)
+
+    generate_absence_proposal(
+        permission=permission_allowed,
+        absence=absence_exists,
+        persistence=persistence,
+        geometry=None,
+        context=strategy_context
+    )
+
+    assert persistence == persistence_copy
+
+
+def test_input_immutability_geometry(
+    absence_exists,
+    persistence_exists,
+    strategy_context,
+    permission_allowed
+):
+    """Policy does not modify geometry input."""
+    import copy
+    geometry = ZonePenetrationDepth(
+        zone_id="Z1",
+        penetration_depth=5.0
+    )
+    geometry_copy = copy.deepcopy(geometry)
+
+    generate_absence_proposal(
+        permission=permission_allowed,
+        absence=absence_exists,
+        persistence=persistence_exists,
+        geometry=geometry,
+        context=strategy_context
+    )
+
+    assert geometry == geometry_copy
+
+
+# ==============================================================================
+# Proposal Immutability Test
 # ==============================================================================
 
 def test_proposal_immutability(

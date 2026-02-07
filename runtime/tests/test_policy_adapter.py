@@ -29,26 +29,7 @@ def make_empty_primitive_bundle(symbol: str) -> M4PrimitiveBundle:
 
     Used for testing when primitives are not relevant to test scenario.
     """
-    return M4PrimitiveBundle(
-        symbol=symbol,
-        zone_penetration=None,
-        displacement_origin_anchor=None,
-        price_traversal_velocity=None,
-        traversal_compactness=None,
-        price_acceptance_ratio=None,  # NEW: Added for Kinematics policy
-        central_tendency_deviation=None,
-        structural_absence_duration=None,
-        structural_persistence_duration=None,  # NEW: Added for Absence policy
-        traversal_void_span=None,
-        event_non_occurrence_counter=None,
-        resting_size=None,
-        order_consumption=None,
-        absorption_event=None,
-        refill_event=None,
-        liquidation_density=None,
-        directional_continuity=None,
-        trade_burst=None
-    )
+    return M4PrimitiveBundle.empty(symbol)
 
 
 class TestPolicyAdapterObservationStatus:

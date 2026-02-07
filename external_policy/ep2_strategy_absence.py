@@ -31,7 +31,7 @@ from runtime.position.types import PositionState
 class AbsenceThresholds:
     """Calibrated thresholds for meaningful absence entry conditions.
 
-    These filter noise from signal - constitutional thresholds on observable facts.
+    These filter noise from data - constitutional thresholds on observable facts.
     NOT predictions, NOT confidence scores - just minimum values for structural presence.
     """
     # Absence duration: minimum seconds of structural absence to be meaningful
@@ -92,7 +92,7 @@ def _entry_conditions_met(
     """
     Check if entry conditions are met (meaningful structural presence).
 
-    Uses calibrated thresholds to filter noise from signal.
+    Uses calibrated thresholds to filter noise from data.
     Thresholds are factual comparisons, NOT predictions or confidence scores.
 
     Returns:

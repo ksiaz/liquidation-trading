@@ -13,6 +13,8 @@ from external_policy.ep2_strategy_kinematics import (
 )
 from memory.m4_traversal_kinematics import PriceTraversalVelocity, TraversalCompactness
 from memory.m4_price_distribution import PriceAcceptanceRatio
+from memory.m4_node_patterns import OrderBlockPrimitive
+from runtime.position.types import PositionState
 
 
 # ==============================================================================
@@ -116,32 +118,54 @@ def acceptance_zero():
     )
 
 
+@pytest.fixture
+def order_block_confirmed():
+    """B5: Confirmed order block meeting all thresholds."""
+    return OrderBlockPrimitive(
+        node_id="OB_001",
+        symbol="BTC",
+        price_center=50000.0,
+        price_band=100.0,
+        side="bid",
+        interaction_count=15,  # >= min_interactions (10)
+        interactions_per_hour=30.0,
+        burstiness_coefficient=0.5,  # >= min_burstiness (0.3)
+        last_interaction_ts=1990.0,
+        time_since_interaction_sec=10.0,  # < max_idle_sec (300)
+        longest_idle_period_sec=60.0,
+        total_volume=100000.0,
+        buyer_initiated_volume=70000.0,
+        seller_initiated_volume=30000.0,
+        node_strength=0.6,  # >= min_node_strength (0.4)
+        liquidations_within_band=2,
+        timestamp=2000.0
+    )
+
+
 # ==============================================================================
 # Happy Path Test
 # ==============================================================================
 
 def test_happy_path_all_conditions_met(
-    velocity_nonzero,
-    compactness_nonzero,
-    acceptance_nonzero,
+    order_block_confirmed,
     strategy_context,
     permission_allowed
 ):
-    """Happy Path: All three primitives valid -> proposal emitted."""
+    """Happy Path: Confirmed order block -> proposal emitted."""
     result = generate_kinematics_proposal(
-        velocity=velocity_nonzero,
-        compactness=compactness_nonzero,
-        acceptance=acceptance_nonzero,
+        order_block=order_block_confirmed,
         permission=permission_allowed,
-        context=strategy_context
+        context=strategy_context,
+        position_state=PositionState.FLAT
     )
-    
+
     assert result is not None
-    assert result.strategy_id == "EP2-KINEMATICS-V1"
-    assert result.action_type == "STRUCTURAL_KINEMATIC_EVENT"
-    assert result.confidence == "STRUCTURAL_PRESENT"
-    assert result.justification_ref == "A3|A4|A5"
+    assert result.strategy_id == "EP2-KINEMATICS-V2"
+    assert result.action_type == "ENTRY"
+    assert result.confidence == "ORDERBLOCK_CONFIRMED"
+    assert "B5_OB" in result.justification_ref
     assert result.timestamp == strategy_context.timestamp
+    assert result.direction == "LONG"  # bid-side order block -> LONG
 
 
 # ==============================================================================
@@ -337,25 +361,107 @@ def test_semantic_purity_no_market_terms():
 
 
 # ==============================================================================
-# Immutability Test
+# Input Immutability Tests (A5)
 # ==============================================================================
 
-def test_proposal_immutability(
-    velocity_nonzero,
+def test_input_immutability_velocity(
     compactness_nonzero,
     acceptance_nonzero,
     strategy_context,
     permission_allowed
 ):
-    """Proposal must be immutable (frozen dataclass)."""
-    result = generate_kinematics_proposal(
-        velocity=velocity_nonzero,
+    """Policy does not modify velocity input."""
+    import copy
+    velocity = PriceTraversalVelocity(
+        traversal_id="T1",
+        price_delta=10.0,
+        time_delta=5.0,
+        velocity=2.0
+    )
+    velocity_copy = copy.deepcopy(velocity)
+
+    generate_kinematics_proposal(
+        velocity=velocity,
         compactness=compactness_nonzero,
         acceptance=acceptance_nonzero,
         permission=permission_allowed,
         context=strategy_context
     )
-    
+
+    assert velocity == velocity_copy
+
+
+def test_input_immutability_compactness(
+    velocity_nonzero,
+    acceptance_nonzero,
+    strategy_context,
+    permission_allowed
+):
+    """Policy does not modify compactness input."""
+    import copy
+    compactness = TraversalCompactness(
+        traversal_id="T1",
+        net_displacement=15.0,
+        total_path_length=20.0,
+        compactness_ratio=0.75
+    )
+    compactness_copy = copy.deepcopy(compactness)
+
+    generate_kinematics_proposal(
+        velocity=velocity_nonzero,
+        compactness=compactness,
+        acceptance=acceptance_nonzero,
+        permission=permission_allowed,
+        context=strategy_context
+    )
+
+    assert compactness == compactness_copy
+
+
+def test_input_immutability_acceptance(
+    velocity_nonzero,
+    compactness_nonzero,
+    strategy_context,
+    permission_allowed
+):
+    """Policy does not modify acceptance input."""
+    import copy
+    acceptance = PriceAcceptanceRatio(
+        accepted_range=8.0,
+        rejected_range=2.0,
+        acceptance_ratio=0.8
+    )
+    acceptance_copy = copy.deepcopy(acceptance)
+
+    generate_kinematics_proposal(
+        velocity=velocity_nonzero,
+        compactness=compactness_nonzero,
+        acceptance=acceptance,
+        permission=permission_allowed,
+        context=strategy_context
+    )
+
+    assert acceptance == acceptance_copy
+
+
+# ==============================================================================
+# Proposal Immutability Test
+# ==============================================================================
+
+def test_proposal_immutability(
+    order_block_confirmed,
+    strategy_context,
+    permission_allowed
+):
+    """Proposal must be immutable (frozen dataclass)."""
+    result = generate_kinematics_proposal(
+        order_block=order_block_confirmed,
+        permission=permission_allowed,
+        context=strategy_context,
+        position_state=PositionState.FLAT
+    )
+
+    assert result is not None
     # Attempt mutation should fail
     with pytest.raises(Exception):  # FrozenInstanceError
         result.strategy_id = "MODIFIED"

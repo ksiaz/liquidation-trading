@@ -1182,6 +1182,13 @@ class CollectorService:
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
+                        elif not ok:
+                            # Fallback: force position flat even if ghost tracker write failed
+                            print(f"EXIT_FAILED: {result.symbol} ghost close error: {err}")
+                            self._force_position_flat(result.symbol)
+                            for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
+                                if stop_state.symbol == result.symbol:
+                                    self._trailing_stop_manager.unregister_stop(stop_id)
 
                 # --- REDUCE: partial close ---
                 elif result.action.name == "REDUCE":
@@ -1396,6 +1403,15 @@ class CollectorService:
             # 10. Update trailing stops and check for triggers
             self._update_trailing_stops(normalized_symbol, price)
 
+            # 11. Feed cascade sniper organic flow detector (non-liquidation fills)
+            try:
+                from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
+                trade_side = "BUY" if side == "B" else "SELL"
+                trade_value = price * size  # USD value
+                record_organic_trade(normalized_symbol, trade_side, trade_value, timestamp)
+            except ImportError:
+                pass
+
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
             import traceback
@@ -1447,6 +1463,14 @@ class CollectorService:
 
             # 6. Track activity for calculator pruning
             self._calculator_last_activity[normalized_symbol] = timestamp
+
+            # 7. Feed cascade sniper organic flow detector
+            try:
+                from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
+                liq_value = price * size
+                record_liquidation_event(normalized_symbol, order_side, liq_value, timestamp)
+            except ImportError:
+                pass
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt

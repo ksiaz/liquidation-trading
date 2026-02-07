@@ -1486,20 +1486,21 @@ class ResearchDatabase:
         symbol: str,
         mandate_type: str,
         authority: float,
-        timestamp: float
+        timestamp: float,
+        source_policy: str = None
     ):
         """Log generated mandate."""
         if cycle_id is None: return
         cursor = self.conn.cursor()
-        
+
         cursor.execute("""
             INSERT INTO mandates (
-                cycle_id, symbol, mandate_type, authority, timestamp
-            ) VALUES (?, ?, ?, ?, ?)
+                cycle_id, symbol, mandate_type, authority, timestamp, source_policy
+            ) VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            cycle_id, symbol, mandate_type, authority, timestamp
+            cycle_id, symbol, mandate_type, authority, timestamp, source_policy
         ))
-        
+
         self.conn.commit()
 
     def log_arbitration_round(

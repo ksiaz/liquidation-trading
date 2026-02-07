@@ -43,6 +43,7 @@ class MockRestingSize:
 class MockOrderConsumption:
     """Mock order consumption primitive."""
     consumed_size: float
+    initial_size: float = 500.0  # Default: consumed_size/initial_size >= 10% for entry
 
 
 @dataclass
@@ -58,6 +59,8 @@ class TestSLBRSStrategy:
         """Reset strategy state before each test."""
         # Reset global strategy state
         _slbrs_strategy.reset_state("BTCUSDT")
+        # Clear sideways streak so each test starts clean
+        _slbrs_strategy._sideways_streak["BTCUSDT"] = 0
 
         self.context = StrategyContext(
             context_id="test_context",
@@ -70,6 +73,29 @@ class TestSLBRSStrategy:
             reason_code="TEST",
             timestamp=1000.0
         )
+
+        self.regime_sideways = RegimeState(
+            regime="SIDEWAYS_ACTIVE",
+            vwap_distance=60.0,
+            atr_5m=50.0,
+            atr_30m=70.0
+        )
+
+    def _warm_sideways_streak(self, symbol="BTCUSDT", cycles=2):
+        """Warm up SIDEWAYS streak to pass regime stability gate (>= 2 cycles)."""
+        for i in range(cycles):
+            generate_slbrs_proposal(
+                symbol=symbol,
+                regime_state=self.regime_sideways,
+                zone_penetration=None,  # No block — just builds streak
+                resting_size=None,
+                order_consumption=None,
+                structural_persistence=None,
+                price=50000.0,
+                context=StrategyContext(f"warmup_{i}", 900.0 + i),
+                permission=self.permission,
+                position_state=PositionState.FLAT
+            )
 
     def test_regime_gate_disabled_when_not_sideways(self):
         """Test SLBRS disabled when regime is not SIDEWAYS_ACTIVE."""
@@ -96,12 +122,12 @@ class TestSLBRSStrategy:
         # SLBRS should not generate proposal when regime is not SIDEWAYS
         assert proposal is None
 
-    def test_regime_gate_exit_when_regime_changes(self):
-        """Test SLBRS exits position when regime changes from SIDEWAYS."""
-        # First, establish position in SIDEWAYS regime would require
-        # simulating entry first, but for this test we can directly test
-        # the exit logic when regime changes
+    def test_regime_gate_blocks_when_regime_changes(self):
+        """Test SLBRS blocks (returns None) when regime changes from SIDEWAYS.
 
+        Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT.
+        Strategy cannot exit positions based solely on regime change.
+        """
         regime_changed = RegimeState(
             regime="EXPANSION_ACTIVE",
             vwap_distance=200.0,
@@ -122,24 +148,19 @@ class TestSLBRSStrategy:
             position_state=PositionState.OPEN  # Position exists
         )
 
-        # Should generate EXIT due to regime change
-        assert proposal is not None
-        assert proposal.action_type == "EXIT"
-        assert "REGIME_CHANGE" in proposal.justification_ref
+        # Should return None (BLOCK) - not EXIT
+        # Per §110.2.5: Regime mismatch blocks new evaluations, doesn't exit
+        assert proposal is None
 
     def test_first_test_detection(self):
         """Test SLBRS detects and records first test."""
-        regime_sideways = RegimeState(
-            regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
-        )
+        # Warm sideways streak (2+ cycles required for regime stability)
+        self._warm_sideways_streak()
 
-        # First call - should detect block and record first test
+        # Call with block present - should detect and record first test
         proposal1 = generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
+            regime_state=self.regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=10.0),
             resting_size=None,
             order_consumption=None,
@@ -158,17 +179,13 @@ class TestSLBRSStrategy:
 
     def test_retest_entry_conditions_met(self):
         """Test SLBRS generates ENTRY on valid retest."""
-        regime_sideways = RegimeState(
-            regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
-        )
+        # Warm sideways streak
+        self._warm_sideways_streak()
 
         # First call - record first test
         generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
+            regime_state=self.regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=10.0),
             resting_size=None,
             order_consumption=None,
@@ -179,7 +196,7 @@ class TestSLBRSStrategy:
             position_state=PositionState.FLAT
         )
 
-        # Second call - retest with absorption
+        # Second call - retest with absorption (consumed_size/initial_size >= 10%)
         context_retest = StrategyContext(
             context_id="test_context_retest",
             timestamp=1100.0
@@ -187,12 +204,12 @@ class TestSLBRSStrategy:
 
         proposal_retest = generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
+            regime_state=self.regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=8.0),  # Still near block
             resting_size=None,
-            order_consumption=MockOrderConsumption(consumed_size=100.0),  # Absorption present
+            order_consumption=MockOrderConsumption(consumed_size=100.0, initial_size=500.0),
             structural_persistence=MockStructuralPersistence(total_persistence_duration=40.0),
-            price=50005.0,  # Near first test price (within 30% of block width)
+            price=50005.0,  # Near first test price (within 50% of block width=50)
             context=context_retest,
             permission=self.permission,
             position_state=PositionState.FLAT
@@ -207,18 +224,14 @@ class TestSLBRSStrategy:
         assert "BLOCK_PERSISTENCE" in proposal_retest.justification_ref
 
     def test_retest_entry_no_absorption(self):
-        """Test SLBRS does not enter without absorption."""
-        regime_sideways = RegimeState(
-            regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
-        )
+        """Test SLBRS does not enter without absorption or meaningful penetration."""
+        # Warm sideways streak
+        self._warm_sideways_streak()
 
         # First call - record first test
         generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
+            regime_state=self.regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=10.0),
             resting_size=None,
             order_consumption=None,
@@ -229,7 +242,7 @@ class TestSLBRSStrategy:
             position_state=PositionState.FLAT
         )
 
-        # Second call - retest WITHOUT absorption
+        # Second call - retest WITHOUT absorption AND tiny penetration (< 20% of block width)
         context_retest = StrategyContext(
             context_id="test_context_retest",
             timestamp=1100.0
@@ -237,8 +250,8 @@ class TestSLBRSStrategy:
 
         proposal_retest = generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
-            zone_penetration=MockZonePenetration(penetration_depth=8.0),
+            regime_state=self.regime_sideways,
+            zone_penetration=MockZonePenetration(penetration_depth=1.0),  # < 20% of block_width=50
             resting_size=None,
             order_consumption=None,  # No absorption
             structural_persistence=MockStructuralPersistence(total_persistence_duration=40.0),
@@ -248,26 +261,23 @@ class TestSLBRSStrategy:
             position_state=PositionState.FLAT
         )
 
-        # Should NOT generate ENTRY without absorption
+        # Should NOT generate ENTRY without absorption or meaningful penetration
         assert proposal_retest is None
 
-    def test_invalidation_volatility_expansion(self):
-        """Test SLBRS exits on volatility expansion."""
+    def test_invalidation_returns_none_trailing_stop_handles_exit(self):
+        """Test SLBRS does not emit EXIT — trailing stop handles all exits.
+
+        Strategy-level invalidation (volatility expansion, price acceptance)
+        was removed. Exits are now handled by:
+        1. Trailing stop (ATR-progressive, registered on entry)
+        2. Regime change (SLBRS stops proposing, trailing stop still active)
+        """
         regime_expanding = RegimeState(
-            regime="SIDEWAYS_ACTIVE",  # Still in sideways but volatility expanding
+            regime="SIDEWAYS_ACTIVE",
             vwap_distance=60.0,
-            atr_5m=80.0,  # ATR ratio = 80/70 = 1.14 ≥ 1.0 → expansion
+            atr_5m=80.0,  # High ATR ratio (was volatility expansion trigger)
             atr_30m=70.0
         )
-
-        # Simulate position open
-        _slbrs_strategy._first_test["BTCUSDT"] = type('obj', (object,), {
-            'block_edge': 50000.0,
-            'block_width': 20.0,
-            'test_volume': 1000.0,
-            'test_price_impact': 10.0,
-            'timestamp': 1000.0
-        })()
 
         proposal = generate_slbrs_proposal(
             symbol="BTCUSDT",
@@ -282,46 +292,33 @@ class TestSLBRSStrategy:
             position_state=PositionState.OPEN
         )
 
-        # Should generate EXIT due to volatility expansion
-        assert proposal is not None
-        assert proposal.action_type == "EXIT"
-        assert "VOLATILITY_EXPANSION" in proposal.justification_ref
+        # Should return None (HOLD) — no strategy-level exit
+        assert proposal is None
 
-    def test_invalidation_price_acceptance(self):
-        """Test SLBRS exits when price accepts through block."""
-        regime_sideways = RegimeState(
-            regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
-        )
-
-        # Simulate position open with first test
-        _slbrs_strategy._first_test["BTCUSDT"] = type('obj', (object,), {
-            'block_edge': 50000.0,
-            'block_width': 20.0,
-            'test_volume': 1000.0,
-            'test_price_impact': 10.0,
-            'timestamp': 1000.0
-        })()
+    def test_retest_armed_resets_on_position_open(self):
+        """Test RETEST_ARMED state resets when position becomes OPEN."""
+        # Force state to RETEST_ARMED
+        _slbrs_strategy._state["BTCUSDT"] = SLBRSStrategy.__module__  # Won't work, use enum
+        from external_policy.ep2_slbrs_strategy import SLBRSState
+        _slbrs_strategy._state["BTCUSDT"] = SLBRSState.RETEST_ARMED
 
         proposal = generate_slbrs_proposal(
             symbol="BTCUSDT",
-            regime_state=regime_sideways,
-            zone_penetration=MockZonePenetration(penetration_depth=25.0),  # Beyond block width (20.0)
+            regime_state=self.regime_sideways,
+            zone_penetration=None,
             resting_size=None,
             order_consumption=None,
             structural_persistence=None,
-            price=50030.0,  # Price moved significantly beyond block
+            price=50000.0,
             context=self.context,
             permission=self.permission,
             position_state=PositionState.OPEN
         )
 
-        # Should generate EXIT due to price acceptance
-        assert proposal is not None
-        assert proposal.action_type == "EXIT"
-        assert "PRICE_ACCEPTANCE" in proposal.justification_ref
+        # Should return None (trailing stop handles exit)
+        assert proposal is None
+        # State should be reset to IDLE (ready for next cycle after exit)
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.IDLE
 
     def test_m6_denied_no_proposal(self):
         """Test SLBRS respects M6 permission denial."""

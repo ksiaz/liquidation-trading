@@ -135,7 +135,8 @@ class PolicyAdapter:
         liquidation_burst: Optional[LiquidationBurst] = None,  # Recent Binance liquidations
         absorption: Optional[AbsorptionAnalysis] = None,  # Order book absorption analysis
         trend_context: Optional[TrendRegimeContext] = None,  # Trend regime for kill-switch
-        price_returns: Optional[Dict[str, Optional[float]]] = None  # Gate B: {ret_1m, ret_3m}
+        price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
+        hl_order_consumption: Optional[Any] = None  # HL-derived order consumption (from taker fills)
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -177,6 +178,10 @@ class PolicyAdapter:
         # NOTE: This is a stub - actual implementation needs M5 query interface
         # For now, we simulate primitive extraction
         primitives = self._extract_primitives(observation_snapshot, symbol)
+
+        # Supplement with HL-derived order consumption when snapshot has None
+        if primitives.get("order_consumption") is None and hl_order_consumption is not None:
+            primitives["order_consumption"] = hl_order_consumption
 
         # Generate strategy context (neutral framing)
         context = StrategyContext(
@@ -331,7 +336,7 @@ class PolicyAdapter:
                     symbol=symbol,
                     context={"regime_state": regime_state.name if regime_state else None}
                 )
-                return mandates
+                return []
 
             if self.config.enable_slbrs:
                 # SLBRS strategy (SIDEWAYS regime)
@@ -348,10 +353,21 @@ class PolicyAdapter:
                     position_state=position_state
                 )
                 if _DIAG_ENABLED:
+                    from external_policy.ep2_slbrs_strategy import _slbrs_strategy
+                    sym_state = _slbrs_strategy._state.get(symbol, "?")
+                    streak = _slbrs_strategy._sideways_streak.get(symbol, 0)
                     if proposal:
-                        print(f"  [slbrs] → {proposal.action_type} ({proposal.confidence})")
+                        print(f"  [slbrs/{symbol}] → {proposal.action_type} dir={proposal.direction} ({proposal.confidence})")
+                    elif regime_state_obj.regime == "SIDEWAYS_ACTIVE":
+                        zp = primitives.get("zone_penetration")
+                        sp = primitives.get("structural_persistence_duration")
+                        oc = primitives.get("order_consumption")
+                        zp_d = f"pen={zp.penetration_depth:.4f}" if zp else "None"
+                        sp_d = f"dur={sp.total_persistence_duration:.1f}s" if sp else "None"
+                        oc_d = f"cons={oc.consumed_size:.1f}/{oc.initial_size:.1f}" if oc and hasattr(oc, 'consumed_size') and hasattr(oc, 'initial_size') else "None"
+                        print(f"  [slbrs/{symbol}] st={sym_state} sk={streak} zp={zp_d} sp={sp_d} oc={oc_d}")
                     else:
-                        print(f"  [slbrs] → None (regime={regime_state_obj.regime})")
+                        pass  # Don't spam non-SIDEWAYS regimes
                 if proposal:
                     proposals.append(proposal)
 
@@ -478,6 +494,7 @@ class PolicyAdapter:
                 "structural_absence_duration": None,
                 "traversal_void_span": None,
                 "event_non_occurrence_counter": None,
+                "structural_persistence_duration": None,
                 "resting_size": None,
                 "order_consumption": None,
                 "refill_event": None,
@@ -499,6 +516,7 @@ class PolicyAdapter:
             "structural_absence_duration": bundle.structural_absence_duration,
             "traversal_void_span": bundle.traversal_void_span,
             "event_non_occurrence_counter": bundle.event_non_occurrence_counter,
+            "structural_persistence_duration": bundle.structural_persistence_duration,
             "resting_size": bundle.resting_size,
             "order_consumption": bundle.order_consumption,
             "refill_event": bundle.refill_event,

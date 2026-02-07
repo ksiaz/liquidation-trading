@@ -43,6 +43,7 @@ class MockStructuralPersistence:
 class MockOrderConsumption:
     """Mock order consumption primitive."""
     consumed_size: float
+    initial_size: float = 500.0
 
 
 @dataclass
@@ -162,16 +163,12 @@ class TestRegimeMutualExclusion:
         assert proposal_slbrs is None
         assert proposal_effcs is None
 
-    def test_slbrs_exits_on_regime_transition_to_expansion(self):
-        """Test SLBRS exits position when regime transitions to EXPANSION."""
-        # Simulate SLBRS has open position
-        regime_sideways = RegimeState(
-            regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
-        )
+    def test_slbrs_blocks_on_regime_transition_to_expansion(self):
+        """Test SLBRS blocks (returns None) when regime transitions to EXPANSION.
 
+        Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT.
+        Strategies cannot exit positions based solely on regime change.
+        """
         # Regime transitions to EXPANSION
         regime_expansion = RegimeState(
             regime="EXPANSION_ACTIVE",
@@ -180,7 +177,7 @@ class TestRegimeMutualExclusion:
             atr_30m=70.0
         )
 
-        # SLBRS should generate EXIT on regime change
+        # SLBRS should BLOCK (return None) on regime mismatch
         proposal_slbrs = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_expansion,
@@ -194,20 +191,15 @@ class TestRegimeMutualExclusion:
             position_state=PositionState.OPEN  # Position exists
         )
 
-        assert proposal_slbrs is not None
-        assert proposal_slbrs.action_type == "EXIT"
-        assert "REGIME_CHANGE" in proposal_slbrs.justification_ref
+        # Per §110.2.5: Regime mismatch blocks new evaluations, doesn't exit
+        assert proposal_slbrs is None
 
-    def test_effcs_exits_on_regime_transition_to_sideways(self):
-        """Test EFFCS exits position when regime transitions to SIDEWAYS."""
-        # Simulate EFFCS has open position
-        regime_expansion = RegimeState(
-            regime="EXPANSION_ACTIVE",
-            vwap_distance=200.0,
-            atr_5m=80.0,
-            atr_30m=70.0
-        )
+    def test_effcs_blocks_on_regime_transition_to_sideways(self):
+        """Test EFFCS blocks (returns None) when regime transitions to SIDEWAYS.
 
+        Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT.
+        Strategies cannot exit positions based solely on regime change.
+        """
         # Regime transitions to SIDEWAYS
         regime_sideways = RegimeState(
             regime="SIDEWAYS_ACTIVE",
@@ -216,7 +208,7 @@ class TestRegimeMutualExclusion:
             atr_30m=70.0
         )
 
-        # EFFCS should generate EXIT on regime change
+        # EFFCS should BLOCK (return None) on regime mismatch
         proposal_effcs = effcs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
@@ -231,9 +223,8 @@ class TestRegimeMutualExclusion:
             position_state=PositionState.OPEN  # Position exists
         )
 
-        assert proposal_effcs is not None
-        assert proposal_effcs.action_type == "EXIT"
-        assert "REGIME_CHANGE" in proposal_effcs.justification_ref
+        # Per §110.2.5: Regime mismatch blocks new evaluations, doesn't exit
+        assert proposal_effcs is None
 
     def test_slbrs_can_enter_after_effcs_exits(self):
         """
@@ -278,8 +269,22 @@ class TestRegimeMutualExclusion:
 
         # Step 3: Simulate EFFCS exit (position now FLAT)
 
-        # Step 4: SLBRS can now evaluate
-        # First test detection
+        # Step 4: Warm sideways streak (2+ cycles required for regime stability)
+        for i in range(2):
+            slbrs_proposal(
+                symbol="BTCUSDT",
+                regime_state=regime_sideways,
+                zone_penetration=None,
+                resting_size=None,
+                order_consumption=None,
+                structural_persistence=None,
+                price=50000.0,
+                context=StrategyContext(f"warmup_{i}", 1050.0 + i),
+                permission=self.permission,
+                position_state=PositionState.FLAT
+            )
+
+        # Step 5: First test detection
         proposal_first_test = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
@@ -296,13 +301,13 @@ class TestRegimeMutualExclusion:
         # No entry on first test, but SLBRS evaluates (regime gate passed)
         assert proposal_first_test is None
 
-        # Retest with absorption
+        # Step 6: Retest with absorption (consumed/initial >= 10%)
         proposal_retest = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=8.0),
             resting_size=None,
-            order_consumption=MockOrderConsumption(consumed_size=100.0),
+            order_consumption=MockOrderConsumption(consumed_size=100.0, initial_size=500.0),
             structural_persistence=MockStructuralPersistence(total_persistence_duration=40.0),
             price=50005.0,
             context=StrategyContext("test2", 1200.0),

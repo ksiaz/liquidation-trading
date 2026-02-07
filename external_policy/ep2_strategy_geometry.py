@@ -20,13 +20,14 @@ Pattern Logic:
 4. Retest count >= 1 (CONFIRMATION - price returned to zone)
 
 EXIT Logic:
-Only exits when zone is INVALIDATED:
-- Zone disappeared (is None)
-- Zone broken through (price closes beyond zone bounds)
+Uses FROZEN entry-time geometry — ignores recomputed zones entirely.
+Only exits when price hard-breaks through frozen zone bounds (1× width beyond)
+for MIN_BREAK_CONFIRMATION_CYCLES consecutive cycles.
+Trailing stop handles all other exits.
 
 This eliminates oscillation because:
 - Entry requires CONFIRMATION (not instantaneous threshold)
-- Exit requires INVALIDATION (not threshold drop)
+- Exit requires sustained break through frozen geometry (not zone recomputation noise)
 
 CRITICAL: This module makes no decisions. It only proposes.
 """
@@ -131,6 +132,13 @@ _stability_counter: dict = {}
 # Track consecutive cycles where conditions are NOT met (for exit stability)
 _exit_stability_counter: dict = {}
 
+# Track consecutive cycles where price has broken entry-time zone bounds (per symbol)
+# Requires N consecutive cycles of breakage before invalidation — filters noise
+_break_confirmation_counter: dict = {}
+
+# Minimum consecutive cycles price must be beyond zone bounds before invalidation
+MIN_BREAK_CONFIRMATION_CYCLES = 3
+
 # Minimum consecutive cycles required for entry (stability requirement)
 # Keep low to allow trades while preventing rapid oscillation
 MIN_STABILITY_CYCLES = 3
@@ -184,11 +192,19 @@ def _record_entry_zone(symbol: str, zone: 'SupplyDemandZonePrimitive', entry_met
         "zone_high": zone.zone_high,
         "zone_center": zone.zone_center,
         "zone_width": zone.zone_high - zone.zone_low,  # Required for geometric tolerance check
+        "zone_type": zone.zone_type,  # "demand" or "supply" — frozen at entry time
         "retest_count_at_entry": zone.retest_count,
         "timestamp": zone.timestamp,
         "entry_method": entry_method
     }
     _entry_method[symbol] = entry_method
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize symbol to execution format (e.g., 'ETH' → 'ETHUSDT')."""
+    if symbol and not symbol.endswith("USDT") and not symbol.endswith("USD"):
+        return f"{symbol}USDT"
+    return symbol
 
 
 def get_entry_context_for_persistence(symbol: str) -> Optional[dict]:
@@ -199,26 +215,34 @@ def get_entry_context_for_persistence(symbol: str) -> Optional[dict]:
     Returns:
         Dict with zone context, or None if no context exists
     """
-    return _entry_zone_context.get(symbol)
+    ctx = _entry_zone_context.get(symbol)
+    if ctx is None:
+        ctx = _entry_zone_context.get(_normalize_symbol(symbol))
+    return ctx
 
 
 def _get_entry_zone(symbol: str) -> Optional[dict]:
     """Get the zone context that triggered entry."""
-    return _entry_zone_context.get(symbol)
+    ctx = _entry_zone_context.get(symbol)
+    if ctx is None:
+        ctx = _entry_zone_context.get(_normalize_symbol(symbol))
+    return ctx
 
 
 def _clear_entry_zone(symbol: str):
     """Clear entry zone context (on exit)."""
     _entry_zone_context.pop(symbol, None)
+    _entry_zone_context.pop(_normalize_symbol(symbol), None)
 
 
 def reset_entry_context():
     """Reset all entry context (for testing)."""
-    global _entry_zone_context, _entry_method, _stability_counter, _exit_stability_counter
+    global _entry_zone_context, _entry_method, _stability_counter, _exit_stability_counter, _break_confirmation_counter
     _entry_zone_context = {}
     _entry_method = {}
     _stability_counter = {}
     _exit_stability_counter = {}
+    _break_confirmation_counter = {}
 
 
 def restore_entry_context_from_positions(open_positions: list, persisted_contexts: dict = None):
@@ -262,12 +286,16 @@ def restore_entry_context_from_positions(open_positions: list, persisted_context
         # Since we don't have the original zone, use price-based pseudo-zone
         zone_width = entry_price * 0.01 if entry_price else 100  # 1% of entry price
 
+        # Derive zone_type from direction: LONG = demand (support), SHORT = supply (resistance)
+        zone_type = "demand" if direction == "LONG" else "supply"
+
         _entry_zone_context[symbol] = {
             "zone_id": f"restored_{symbol}",
             "zone_low": entry_price - zone_width / 2 if entry_price else 0,
             "zone_high": entry_price + zone_width / 2 if entry_price else 0,
             "zone_center": entry_price or 0,
             "zone_width": zone_width,
+            "zone_type": zone_type,
             "retest_count_at_entry": 1,
             "timestamp": 0,
             "restored": True  # Flag indicating this was restored, not from live zone
@@ -398,50 +426,52 @@ def _is_zone_invalidated(
     """
     Check if the entry zone has been INVALIDATED.
 
-    Invalidation occurs when:
-    1. Zone is None (disappeared completely)
-    2. Zone ID changed (different zone now)
-    3. Price broke through zone (closed beyond bounds)
+    Uses FROZEN entry-time geometry only — ignores recomputed zone objects entirely.
+    This prevents false exits from zone recomputation noise (zone=None, zone_id drift,
+    cluster center rounding, M2 node decay).
+
+    Invalidation occurs ONLY when:
+    - Price hard-breaks through entry-time zone bounds (1× zone width beyond)
+    - Break persists for MIN_BREAK_CONFIRMATION_CYCLES consecutive cycles
 
     Returns:
         True if zone is invalidated, False otherwise
     """
-    # Zone disappeared
-    if zone is None:
-        return True
+    global _break_confirmation_counter
 
-    # Zone ID changed - check if it's actually a different zone geometrically
-    if zone.zone_id != entry_context["zone_id"]:
-        # If geometry is similar (bounds shifted < 10% of zone width), treat as same zone
-        entry_width = entry_context.get("zone_width", 0)
-        if entry_width > 0:
-            low_shift = abs(zone.zone_low - entry_context.get("zone_low", 0))
-            high_shift = abs(zone.zone_high - entry_context.get("zone_high", 0))
-            max_shift = max(low_shift, high_shift)
-            if max_shift < entry_width * 0.1:
-                # Geometry similar, don't invalidate (zone_id just drifted)
-                pass
-            else:
-                # Geometry actually changed, invalidate
-                return True
-        else:
-            # No width info, fall back to ID comparison
+    if current_price is None:
+        return False
+
+    # Use frozen entry-time geometry — NOT recomputed zone
+    entry_low = entry_context.get("zone_low", 0)
+    entry_high = entry_context.get("zone_high", 0)
+    entry_width = entry_context.get("zone_width", 0)
+    zone_type = entry_context.get("zone_type", "demand")
+
+    if entry_width <= 0:
+        return False  # No geometry info — can't check break
+
+    break_distance = entry_width * config.zone_break_threshold
+    symbol = entry_context.get("zone_id", "").split("_")[0] if "_" in entry_context.get("zone_id", "") else "UNKNOWN"
+
+    # Check if price has broken through frozen zone bounds
+    price_broken = False
+    if zone_type == "demand":
+        # Demand zone (support): invalidated if price falls far below entry zone_low
+        price_broken = current_price < entry_low - break_distance
+    elif zone_type == "supply":
+        # Supply zone (resistance): invalidated if price rises far above entry zone_high
+        price_broken = current_price > entry_high + break_distance
+
+    # N-cycle confirmation: require persistent break, not single-tick noise
+    ctx_key = entry_context.get("zone_id", "UNKNOWN")
+    if price_broken:
+        _break_confirmation_counter[ctx_key] = _break_confirmation_counter.get(ctx_key, 0) + 1
+        if _break_confirmation_counter[ctx_key] >= MIN_BREAK_CONFIRMATION_CYCLES:
+            _break_confirmation_counter.pop(ctx_key, None)
             return True
-
-    # Check for zone break (price closed beyond bounds)
-    if current_price is not None:
-        zone_width = zone.zone_high - zone.zone_low
-        break_distance = zone_width * config.zone_break_threshold
-
-        # Demand zone (below price): invalidated if price closes far below
-        if zone.zone_type == "demand":
-            if current_price < zone.zone_low - break_distance:
-                return True
-
-        # Supply zone (above price): invalidated if price closes far above
-        elif zone.zone_type == "supply":
-            if current_price > zone.zone_high + break_distance:
-                return True
+    else:
+        _break_confirmation_counter[ctx_key] = 0
 
     return False
 
@@ -500,13 +530,15 @@ def generate_geometry_proposal(
     if permission.result == "DENIED":
         return None
 
-    # Determine symbol
+    # Determine symbol — normalize to execution format (e.g., "ETH" → "ETHUSDT")
     if supply_demand_zone is not None:
         symbol = supply_demand_zone.symbol
     elif zone_penetration is not None and hasattr(zone_penetration, 'symbol'):
         symbol = zone_penetration.symbol
     else:
         symbol = "UNKNOWN"
+    if symbol != "UNKNOWN" and not symbol.endswith("USDT") and not symbol.endswith("USD"):
+        symbol = f"{symbol}USDT"
 
     # Check which primitives are available
     has_pattern_primitive = supply_demand_zone is not None

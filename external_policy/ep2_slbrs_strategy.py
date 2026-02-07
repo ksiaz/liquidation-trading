@@ -81,8 +81,7 @@ class SLBRSState(Enum):
     """SLBRS state machine states."""
     IDLE = auto()  # No liquidity block detected
     FIRST_TEST_OBSERVED = auto()  # Block tested, rejection observed
-    RETEST_ARMED = auto()  # Ready for retest entry
-    IN_POSITION = auto()  # Position open
+    RETEST_ARMED = auto()  # Entry proposed, awaiting acceptance
 
 
 @dataclass
@@ -116,6 +115,8 @@ class SLBRSStrategy:
         """Initialize SLBRS strategy with empty state."""
         self._state: Dict[str, SLBRSState] = {}  # symbol -> state
         self._first_test: Dict[str, Optional[FirstTestObservation]] = {}  # symbol -> first test
+        self._sideways_streak: Dict[str, int] = {}  # symbol -> consecutive SIDEWAYS cycles
+        self._last_exit_ts: Dict[str, float] = {}  # symbol -> timestamp of last exit/reset
 
     def generate_proposal(
         self,
@@ -158,6 +159,8 @@ class SLBRSStrategy:
         if symbol not in self._state:
             self._state[symbol] = SLBRSState.IDLE
             self._first_test[symbol] = None
+            self._sideways_streak[symbol] = 0
+            self._last_exit_ts[symbol] = 0.0
 
         # Rule 1: M6 DENIED -> no proposal
         if permission.result == "DENIED":
@@ -165,16 +168,19 @@ class SLBRSStrategy:
 
         # Rule 2: Regime gate - SLBRS only active in SIDEWAYS regime
         if regime_state is None or regime_state.regime != "SIDEWAYS_ACTIVE":
-            # Regime not sideways -> SLBRS disabled
-            # Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT
-            # SLBRS cannot exit positions it didn't open (or even ones it did) based
-            # solely on regime change - that violates thesis invalidation principle.
-            # Return None to prevent new entries; let owning strategy handle exits.
+            self._sideways_streak[symbol] = 0
             return None
+
+        # Track consecutive SIDEWAYS cycles for regime stability
+        self._sideways_streak[symbol] = self._sideways_streak.get(symbol, 0) + 1
 
         # Rule 3: Check position state and generate appropriate action
         if position_state in (PositionState.ENTERING, PositionState.OPEN, PositionState.REDUCING):
-            # Position exists - check for invalidation
+            # Position accepted — reset SLBRS state so it's ready after exit
+            if self._state[symbol] == SLBRSState.RETEST_ARMED:
+                self._state[symbol] = SLBRSState.IDLE
+                self._first_test[symbol] = None
+            # Check for invalidation (currently returns None — trailing stop handles exits)
             return self._check_invalidation(
                 symbol=symbol,
                 regime_state=regime_state,
@@ -185,8 +191,16 @@ class SLBRSStrategy:
 
         # Rule 4: Position FLAT - check for entry opportunity
         if position_state == PositionState.FLAT or position_state is None:
+            # If we were RETEST_ARMED but position is now FLAT, entry was rejected
+            # or position already exited — reset with cooldown
+            if self._state[symbol] == SLBRSState.RETEST_ARMED:
+                self._state[symbol] = SLBRSState.IDLE
+                self._first_test[symbol] = None
+                self._last_exit_ts[symbol] = context.timestamp
+
             return self._check_entry(
                 symbol=symbol,
+                regime_state=regime_state,
                 zone_penetration=zone_penetration,
                 resting_size=resting_size,
                 order_consumption=order_consumption,
@@ -201,6 +215,7 @@ class SLBRSStrategy:
     def _check_entry(
         self,
         symbol: str,
+        regime_state: RegimeState,
         zone_penetration,
         resting_size,
         order_consumption,
@@ -212,12 +227,13 @@ class SLBRSStrategy:
         Check for SLBRS entry opportunity (retest logic).
 
         Entry conditions (from research):
-        1. Liquidity block detected (zone_liquidity ≥ 2.5× avg, persistence ≥ 30s)
+        1. Liquidity block detected (persistence ≥ 30s)
         2. First test observed (price entered, rejected)
         3. Retest conditions met:
-           - Distance to block ≤ 30% of block width
-           - Volume reduced (< first_test × 0.70)
-           - Absorption present (consumption_ratio ≥ 0.65)
+           - Distance to block ≤ 50% of block width
+           - Absorption present (consumed_size ≥ 10% of initial_size)
+        4. Regime stable (2+ consecutive SIDEWAYS cycles)
+        5. Not in post-exit cooldown (60s)
 
         Returns:
             ENTRY proposal if retest conditions met, None otherwise
@@ -226,64 +242,102 @@ class SLBRSStrategy:
         if zone_penetration is None:
             return None
 
-        # Check for liquidity block presence (using zone_penetration as proxy)
-        # Block exists if: penetration_depth > 0 AND persistence exists
+        # ATR-based block width (1 ATR = meaningful price range)
+        # Proximity for entry: 50% of this (0.5 ATR from block edge)
+        # Invalidation: penetration > this (price moved > 1 ATR through block)
+        atr_width = regime_state.atr_5m if regime_state.atr_5m > 0 else price * 0.005
+
+        # Check for liquidity block presence
         block_exists = (
             zone_penetration.penetration_depth > 0
             and structural_persistence is not None
             and structural_persistence.total_persistence_duration >= 30.0  # 30s threshold
         )
 
-        if not block_exists:
-            # No block detected
-            self._state[symbol] = SLBRSState.IDLE
-            return None
-
-        # Check if first test should be recorded
-        # (Simplified: assume first penetration is first test)
+        # State: IDLE → detect first block interaction
         if self._state[symbol] == SLBRSState.IDLE:
+            if not block_exists:
+                return None
+
+            # Gate: Regime must be stable (2+ consecutive SIDEWAYS cycles)
+            if self._sideways_streak.get(symbol, 0) < 2:
+                return None
+
+            # Gate: Post-exit cooldown (60s)
+            last_exit = self._last_exit_ts.get(symbol, 0.0)
+            if last_exit > 0 and context.timestamp - last_exit < 60.0:
+                return None
+
             # First time seeing block - record as first test
+            # Capture actual consumed volume if available for retest comparison
+            first_consumed = 0.0
+            if order_consumption is not None:
+                first_consumed = getattr(order_consumption, 'consumed_size', 0) or 0.0
             self._first_test[symbol] = FirstTestObservation(
-                block_edge=price,  # Simplified: use current price as block edge
-                block_width=zone_penetration.penetration_depth * 2,  # Estimate block width
-                test_volume=1.0,  # Placeholder (would need volume primitive)
+                block_edge=price,
+                block_width=atr_width,
+                test_volume=first_consumed,
                 test_price_impact=zone_penetration.penetration_depth,
                 timestamp=context.timestamp
             )
             self._state[symbol] = SLBRSState.FIRST_TEST_OBSERVED
             return None  # No entry on first test
 
-        # Check retest entry conditions
+        # State: FIRST_TEST_OBSERVED → check for retest entry
+        # Block was already validated on first test. Don't require full block_exists
+        # again (structural_persistence/order_consumption flicker between cycles).
         if self._state[symbol] == SLBRSState.FIRST_TEST_OBSERVED:
             first_test = self._first_test[symbol]
             if first_test is None:
+                self._state[symbol] = SLBRSState.IDLE
                 return None
 
-            # Retest Condition 1: Distance to block ≤ 30% of block width
+            # Timeout: reset if no retest within 120s of first test
+            if context.timestamp - first_test.timestamp > 120.0:
+                self._state[symbol] = SLBRSState.IDLE
+                self._first_test[symbol] = None
+                return None
+
+            # Retest Condition 1: Price near block edge
             distance_to_block = abs(price - first_test.block_edge)
-            proximity_threshold = 0.30 * first_test.block_width
+            proximity_threshold = 0.50 * first_test.block_width  # 50% of block width
 
             if distance_to_block > proximity_threshold:
-                # Too far from block
                 return None
 
-            # Retest Condition 2: Absorption present
-            # (Simplified: check if order_consumption exists and is significant)
-            absorption_present = (
-                order_consumption is not None
-                and order_consumption.consumed_size > 0
-                # Constitutional note: 0.65 threshold from liquidity mechanics
-                # Ideally would check: consumption_ratio ≥ 0.65
-                # For now, any consumption indicates absorption
-            )
+            # Retest Condition 2: Absorption evidence
+            # Prefer order consumption with meaningful ratio (Binance mode)
+            # Fall back to zone penetration as evidence of interaction (HL mode)
+            has_evidence = False
+            if order_consumption is not None:
+                initial = getattr(order_consumption, 'initial_size', 0) or 0
+                consumed = getattr(order_consumption, 'consumed_size', 0) or 0
+                # Require at least 10% absorption ratio (not just any contract)
+                if initial > 0 and consumed >= initial * 0.10:
+                    has_evidence = True
+            if not has_evidence and zone_penetration is not None:
+                # Zone penetration on retest = price interacting with block again
+                # Require penetration > 20% of block width (not just any tick)
+                if zone_penetration.penetration_depth > first_test.block_width * 0.20:
+                    has_evidence = True
 
-            if not absorption_present:
-                # No absorption observed
+            if not has_evidence:
                 return None
 
-            # Retest Condition 3: Reduced volume compared to first test
-            # (Simplified: assume condition met if we're here)
-            # Real implementation would compare current volume to first_test.test_volume
+            # Determine direction:
+            # 1. From orderbook depth if available (Binance mode)
+            # 2. From price vs block edge (HL mode):
+            #    Price below block_edge → approaching from below → LONG (expect bounce up)
+            #    Price above block_edge → approaching from above → SHORT (expect bounce down)
+            direction = "LONG"  # Default
+            if resting_size is not None:
+                if hasattr(resting_size, 'bid_size') and hasattr(resting_size, 'ask_size'):
+                    if resting_size.ask_size > resting_size.bid_size:
+                        direction = "SHORT"
+            else:
+                # No orderbook data — use price vs block edge
+                if price > first_test.block_edge:
+                    direction = "SHORT"
 
             # All retest conditions met -> propose ENTRY
             self._state[symbol] = SLBRSState.RETEST_ARMED
@@ -291,9 +345,10 @@ class SLBRSStrategy:
             return StrategyProposal(
                 strategy_id="EP2-SLBRS-V1",
                 action_type="ENTRY",
-                confidence="RETEST_CONDITIONS_MET",  # Structural observation, not confidence score
+                confidence="RETEST_CONDITIONS_MET",
                 justification_ref="BLOCK_PERSISTENCE|ORDER_ABSORPTION|PROXIMITY",
-                timestamp=context.timestamp
+                timestamp=context.timestamp,
+                direction=direction
             )
 
         # No entry conditions met
@@ -310,41 +365,19 @@ class SLBRSStrategy:
         """
         Check for SLBRS invalidation (exit logic).
 
-        Invalidation conditions (from research):
-        1. Volatility expands (ATR ratio ≥ 1.0)
-        2. Orderflow becomes one-sided (handled by regime classifier)
-        3. Price accepts through block (penetration increases significantly)
+        Currently returns None (HOLD) — all exits handled by trailing stop
+        and regime change. Kept as hook for future structural invalidation.
 
         Returns:
-            EXIT proposal if invalidation detected, None otherwise
+            None (HOLD) — no strategy-level exit conditions
         """
-        # Invalidation 1: Volatility expansion
-        # ATR ratio ≥ 1.0 indicates expansion (violates sideways regime)
-        if regime_state.atr_30m > 0:
-            atr_ratio = regime_state.atr_5m / regime_state.atr_30m
-            if atr_ratio >= 1.0:
-                # Volatility expanding
-                return self._generate_exit_proposal(
-                    reason="VOLATILITY_EXPANSION",
-                    context=context
-                )
-
-        # Invalidation 2: Price acceptance through block
-        # If penetration depth increases significantly beyond first test
-        first_test = self._first_test.get(symbol)
-        if first_test and zone_penetration:
-            current_penetration = zone_penetration.penetration_depth
-            # If price moved beyond block by more than block width -> accepted through
-            if current_penetration > first_test.block_width:
-                return self._generate_exit_proposal(
-                    reason="PRICE_ACCEPTANCE",
-                    context=context
-                )
-
-        # Invalidation 3: Orderflow one-sided
-        # (Handled by regime classifier - if regime changes, we exit via Rule 2)
-
-        # No invalidation detected -> HOLD
+        # No strategy-level invalidation — exits are handled by:
+        # 1. Trailing stop (registered on entry, follows price, PnL-based exit)
+        # 2. Regime change → SLBRS stops proposing → trailing stop still active
+        #
+        # Previous PRICE_ACCEPTANCE check was removed: zone_penetration_depth measures
+        # total depth in zone (always large at entry), not price movement since entry.
+        # ATR invalidation was removed: redundant with regime classifier.
         return None
 
     def _generate_exit_proposal(
@@ -375,11 +408,13 @@ class SLBRSStrategy:
             timestamp=context.timestamp
         )
 
-    def reset_state(self, symbol: str):
+    def reset_state(self, symbol: str, timestamp: float = 0.0):
         """Reset SLBRS state for symbol (after exit or failure)."""
         if symbol in self._state:
             self._state[symbol] = SLBRSState.IDLE
             self._first_test[symbol] = None
+            if timestamp > 0:
+                self._last_exit_ts[symbol] = timestamp
 
 
 # ==============================================================================

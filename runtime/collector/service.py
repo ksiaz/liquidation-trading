@@ -212,6 +212,9 @@ class CollectorService:
         self._atr_calculators: Dict[str, MultiTimeframeATR] = {}
         self._orderflow_calculators: Dict[str, MultiWindowOrderflow] = {}
         self._liquidation_calculators: Dict[str, LiquidationZScoreCalculator] = {}
+        # HL fill accumulator: aggregates taker fills per symbol per cycle
+        # Each entry: (side_consumed: "bid"|"ask", size: float, price: float, ts: float)
+        self._hl_fill_accumulator: Dict[str, list] = {}
 
         # Memory guard: track last calculator activity for pruning
         self._calculator_last_activity: Dict[str, float] = {}
@@ -1066,6 +1069,9 @@ class CollectorService:
                     coin_for_returns = symbol.replace('USDT', '').replace('USD', '')
                     price_returns = self._obs.get_hl_price_returns(coin_for_returns)
 
+                    # HL-derived order consumption (from taker fills)
+                    hl_oc = self._get_hl_order_consumption(symbol) if self._use_node_mode else None
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -1078,7 +1084,8 @@ class CollectorService:
                         hl_proximity=hl_proximity,  # Phase 6: Hyperliquid proximity
                         liquidation_burst=liquidation_burst,  # Phase 6: Liquidation burst
                         absorption=absorption,  # Phase 6: Order book absorption analysis
-                        price_returns=price_returns  # Gate B: Short-term price returns
+                        price_returns=price_returns,  # Gate B: Short-term price returns
+                        hl_order_consumption=hl_oc  # HL taker fills → order consumption
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1206,7 +1213,8 @@ class CollectorService:
                             symbol=mandate.symbol,
                             mandate_type=mandate.type.name,
                             authority=mandate.authority,
-                            timestamp=mandate.timestamp
+                            timestamp=mandate.timestamp,
+                            source_policy=mandate.strategy_id
                         )
                     except:
                         pass
@@ -1378,7 +1386,14 @@ class CollectorService:
             # 8. Track current price
             self._current_prices[normalized_symbol] = price
 
-            # 9. Update trailing stops and check for triggers
+            # 9. Accumulate fill for order consumption primitive
+            # HL side: "B" = buyer is taker (consumed asks), "A" = seller is taker (consumed bids)
+            side_consumed = "ask" if side == "B" else "bid"
+            if normalized_symbol not in self._hl_fill_accumulator:
+                self._hl_fill_accumulator[normalized_symbol] = []
+            self._hl_fill_accumulator[normalized_symbol].append((side_consumed, size, price, timestamp))
+
+            # 10. Update trailing stops and check for triggers
             self._update_trailing_stops(normalized_symbol, price)
 
         except Exception as e:
@@ -1665,6 +1680,65 @@ class CollectorService:
         except Exception as e:
             print(f"TRAILING: RECOVERED_EXIT_FAILED {symbol} - {e}")
             return False
+
+    def _get_hl_order_consumption(self, symbol: str, window_sec: float = 30.0):
+        """Build OrderConsumption from accumulated HL taker fills.
+
+        Each taker fill = size consumed from the resting book.
+        Aggregates fills within window into a single OrderConsumption primitive.
+
+        Returns:
+            OrderConsumption-compatible object or None if no fills
+        """
+        fills = self._hl_fill_accumulator.get(symbol)
+        if not fills:
+            return None
+
+        now = time.time()
+        # Filter to window and trim old fills to prevent unbounded growth
+        recent = [(s, sz, px, ts) for s, sz, px, ts in fills if now - ts <= window_sec]
+        self._hl_fill_accumulator[symbol] = recent
+        if not recent:
+            return None
+
+        # Aggregate by dominant side
+        bid_consumed = sum(sz for s, sz, px, ts in recent if s == "bid")
+        ask_consumed = sum(sz for s, sz, px, ts in recent if s == "ask")
+
+        # Use the side with more consumption
+        if bid_consumed >= ask_consumed:
+            consumed_size = bid_consumed
+            side = "bid"
+        else:
+            consumed_size = ask_consumed
+            side = "ask"
+
+        total_consumed = bid_consumed + ask_consumed
+        latest_price = recent[-1][2]
+        latest_ts = recent[-1][3]
+
+        # Return object compatible with OrderConsumption interface
+        # consumed_size = dominant side consumption, initial_size = total both sides
+        # (initial_size approximation: total volume gives SLBRS the ratio denominator)
+        from memory.m4_orderbook_primitives import OrderConsumption
+        # OrderConsumption is frozen and only has: consumed_size, side, price_level, timestamp
+        # SLBRS also checks initial_size via getattr — use a simple namespace
+        class _HLOrderConsumption:
+            __slots__ = ('consumed_size', 'initial_size', 'side', 'price_level', 'timestamp')
+            def __init__(self, consumed_size, initial_size, side, price_level, timestamp):
+                self.consumed_size = consumed_size
+                self.initial_size = initial_size
+                self.side = side
+                self.price_level = price_level
+                self.timestamp = timestamp
+
+        return _HLOrderConsumption(
+            consumed_size=consumed_size,
+            initial_size=total_consumed,
+            side=side,
+            price_level=latest_price,
+            timestamp=latest_ts
+        )
 
     def _update_trailing_stops(self, symbol: str, price: float):
         """Update trailing stops for symbol and check for triggers.

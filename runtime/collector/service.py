@@ -177,17 +177,21 @@ class CollectorService:
         # - Starts at 2.5× ATR, tightens to 1.0× ATR as profit grows
         # - Break-even at 0.5% profit as floor (not override)
         # - Floor at 0.5% distance for low volatility protection
+        # Tuning profile: BALANCED (2026-02-07)
+        # Wider initial stop, slower tightening, higher BE trigger
         self._trailing_stop_config = TrailingStopConfig(
             mode=TrailingMode.ATR_PROGRESSIVE,
             # ATR progressive settings
-            atr_prog_start_mult=2.5,        # Wide at entry (2.5× ATR)
-            atr_prog_end_mult=1.0,          # Tight at 3% profit (1.0× ATR)
-            atr_prog_profit_range=0.03,     # Full tightening over 3% MFE profit
-            atr_prog_min_pct=0.005,         # Floor: at least 0.5% distance
-            # Break-even as minimum floor - lock in meaningful profit
-            break_even_trigger_pct=0.007,   # Trigger break-even after 0.7% profit
-            break_even_offset_pct=0.003,    # Lock in 0.3% profit at break-even
-            min_move_to_update_pct=0.001,   # Update stop if 0.1% improvement
+            atr_prog_start_mult=2.8,        # Wide at entry (2.8× ATR)
+            atr_prog_end_mult=1.1,          # Moderate at target (1.1× ATR)
+            atr_prog_profit_range=0.04,     # Full tightening over 4% MFE profit
+            atr_prog_min_pct=0.006,         # Floor: at least 0.6% distance
+            # Break-even settings
+            break_even_trigger_pct=0.006,   # Trigger break-even after 0.6% profit
+            break_even_offset_pct=0.002,    # Lock in 0.2% profit at break-even
+            min_move_to_update_pct=0.0012,  # Update stop if 0.12% improvement
+            # Lock ratio: retain 45% of unrealized profit
+            atr_prog_min_lock_ratio=0.45,
         )
         # Create execution state repository for trailing stop persistence
         self._execution_state_repo = ExecutionStateRepository(db_path="logs/execution_state.db")
@@ -1150,7 +1154,7 @@ class CollectorService:
                             policy_name=result.strategy_id
                         )
                         if success and trade:
-                            initial_stop = entry_px * (0.98 if side == "LONG" else 1.02)
+                            initial_stop = entry_px * (0.975 if side == "LONG" else 1.025)
                             self._trailing_stop_manager.register_trailing_stop(
                                 entry_order_id=trade.trade_id,
                                 symbol=result.symbol,
@@ -1594,8 +1598,8 @@ class CollectorService:
                         policy_name=row['strategy_id']
                     )
                     if success and trade:
-                        # Register trailing stop (2% initial stop like normal entries)
-                        initial_stop = entry_px * (0.98 if side == "LONG" else 1.02)
+                        # Register trailing stop (2.5% initial stop matching balanced config)
+                        initial_stop = entry_px * (0.975 if side == "LONG" else 1.025)
                         self._trailing_stop_manager.register_trailing_stop(
                             entry_order_id=trade.trade_id,
                             symbol=symbol,
@@ -1792,8 +1796,16 @@ class CollectorService:
                     stop_triggered = True
 
                 if stop_triggered:
-                    # Determine exit reason
-                    if state.break_even_triggered:
+                    # Determine exit reason from actual PnL, not just BE flag
+                    # Calculate unrealized PnL to label correctly
+                    if state.direction == "LONG":
+                        pnl_pct = (price - state.entry_price) / state.entry_price
+                    else:
+                        pnl_pct = (state.entry_price - price) / state.entry_price
+
+                    if pnl_pct > 0.0005:  # > 0.05% profit
+                        exit_reason = "TRAILING_STOP_PROFIT"
+                    elif pnl_pct >= -0.0005:  # near break-even
                         exit_reason = "TRAILING_STOP_BE"
                     else:
                         exit_reason = "TRAILING_STOP_LOSS"

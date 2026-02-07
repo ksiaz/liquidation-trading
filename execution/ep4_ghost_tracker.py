@@ -339,18 +339,36 @@ class GhostPositionTracker:
             self._pos_conn = None
 
     def _get_next_trade_id(self) -> int:
-        """Get next trade ID from DB or start at 1."""
-        if not self._pos_conn:
-            return 1
-        try:
-            row = self._pos_conn.execute(
-                "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_positions"
-            ).fetchone()
-            if row[0] is not None:
-                return row[0] + 1
-        except:
-            pass
-        return 1
+        """Get next trade ID from DB or start at 1.
+
+        Queries both ghost_positions AND ghost_trades to find the true max,
+        preventing ID collisions when ghost_positions rows get cleaned up.
+        """
+        max_id = 0
+
+        # Check ghost_positions (pos_conn)
+        if self._pos_conn:
+            try:
+                row = self._pos_conn.execute(
+                    "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_positions"
+                ).fetchone()
+                if row[0] is not None:
+                    max_id = max(max_id, row[0])
+            except Exception:
+                pass
+
+        # Check ghost_trades in execution.db (db_conn) — the authoritative record
+        if self._db_conn:
+            try:
+                row = self._db_conn.execute(
+                    "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_trades"
+                ).fetchone()
+                if row[0] is not None:
+                    max_id = max(max_id, row[0])
+            except Exception:
+                pass
+
+        return max_id + 1 if max_id > 0 else 1
 
     def _normalize_to_base_symbol(self, symbol: str) -> str:
         """Normalize symbol to base format (BTCUSDT -> BTC).

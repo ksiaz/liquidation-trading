@@ -119,9 +119,7 @@ class TestPolicyAdapterWiring:
     def test_adapter_configuration_disables_policies(self):
         """Configuration correctly enables/disables policy invocation."""
         config = AdapterConfig(
-            enable_geometry=False,
-            enable_kinematics=False,
-            enable_absence=False
+            enable_geometry=False
         )
         adapter = PolicyAdapter(config)
 

@@ -120,9 +120,7 @@ def test_policy_activation_with_manual_nodes():
     print("6. Initializing PolicyAdapter...")
     config = AdapterConfig(
         default_authority=5.0,
-        enable_geometry=True,
-        enable_kinematics=True,
-        enable_absence=True
+        enable_geometry=True
     )
     adapter = PolicyAdapter(config=config)
     print("   ✓ PolicyAdapter initialized")

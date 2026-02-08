@@ -116,8 +116,6 @@ class CollectorService:
         # Phase 8: M6 Integration
         self.policy_adapter = PolicyAdapter(AdapterConfig(
             enable_geometry=True,        # TESTING: Enable for immediate mandate generation (no regime needed)
-            enable_kinematics=False,     # OLD: Baseline kinematics strategy (replaced by EFFCS)
-            enable_absence=False,        # Absence primitives not implemented
             enable_orderbook_test=False,  # Test policy (disabled)
             # Phase 5: Enable regime-gated strategies
             enable_slbrs=True,           # NEW: SLBRS strategy (SIDEWAYS regime)
@@ -1088,6 +1086,9 @@ class CollectorService:
                     # HL-derived order consumption (from taker fills)
                     hl_oc = self._get_hl_order_consumption(symbol) if self._use_node_mode else None
 
+                    # Trend context for cascade sniper kill-switch
+                    trend_context = self._obs.get_trend_context(symbol)
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -1100,6 +1101,7 @@ class CollectorService:
                         hl_proximity=hl_proximity,  # Phase 6: Hyperliquid proximity
                         liquidation_burst=liquidation_burst,  # Phase 6: Liquidation burst
                         absorption=absorption,  # Phase 6: Order book absorption analysis
+                        trend_context=trend_context,  # Trend kill-switch for cascade sniper
                         price_returns=price_returns,  # Gate B: Short-term price returns
                         hl_order_consumption=hl_oc,  # HL taker fills → order consumption
                         price_high=self._price_highs.get(symbol, current_price),
@@ -1502,6 +1504,8 @@ class CollectorService:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL liquidation callback error: {e}")
 
+    _hl_depth_logged_coins: set = set()  # Track which coins we've logged
+
     async def _handle_hl_orderbook(self, orderbook: Dict):
         """Feed HL L2 orderbook to observation layer as DEPTH event.
 
@@ -1537,8 +1541,8 @@ class CollectorService:
                 event_type='DEPTH',
                 payload=payload
             )
-        except Exception:
-            pass  # Fail silently per constitutional rules
+        except Exception as e:
+            self._logger.warning(f"HL orderbook ingestion error for {orderbook.get('coin', '?')}: {e}")
 
     def _process_ghost_trades(self):
         """Deprecated: entry/exit now handled in unified path after process_cycle().

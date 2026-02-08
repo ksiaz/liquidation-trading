@@ -29,8 +29,6 @@ The following components are **frozen** and may not be modified without explicit
 
 ### External Policy Stack
 - `external_policy/ep2_strategy_geometry.py` - Strategy #1
-- `external_policy/ep2_strategy_kinematics.py` - Strategy #2
-- `external_policy/ep2_strategy_absence.py` - Strategy #3
 - `external_policy/ep3_arbitration.py` - Arbitration
 - `execution/ep4_action_schemas.py` - Action grammar
 - `execution/ep4_risk_gates.py` - Risk gates

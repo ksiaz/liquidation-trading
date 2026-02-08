@@ -44,8 +44,6 @@ from external_policy.ep2_strategy_geometry import (
     PermissionOutput,
     StrategyProposal
 )
-from external_policy.ep2_strategy_kinematics import generate_kinematics_proposal
-from external_policy.ep2_strategy_absence import generate_absence_proposal
 # Test policy for order book primitives (verification only)
 from external_policy.ep2_strategy_orderbook_test import generate_orderbook_test_proposal
 
@@ -77,8 +75,6 @@ class AdapterConfig:
     """
     default_authority: float = 5.0  # Authority level for policy mandates
     enable_geometry: bool = True
-    enable_kinematics: bool = True
-    enable_absence: bool = True
     enable_orderbook_test: bool = False  # Test policy for verification
 
     # Phase 5: Regime-gated strategies (SLBRS/EFFCS)
@@ -212,7 +208,7 @@ class PolicyAdapter:
             print(f"  hl_proximity: {hl_proximity is not None}")
             print(f"  liquidation_burst: {liquidation_burst is not None}")
             print(f"  primitives ({len(active_primitives)}/{len(primitives)}): {active_primitives if active_primitives else 'NONE'}")
-            print(f"  policies enabled: geometry={self.config.enable_geometry}, kinematics={self.config.enable_kinematics}, "
+            print(f"  policies enabled: geometry={self.config.enable_geometry}, "
                   f"slbrs={self.config.enable_slbrs}, effcs={self.config.enable_effcs}, cascade={self.config.enable_cascade_sniper}")
 
         # Invoke frozen external policies
@@ -249,40 +245,6 @@ class PolicyAdapter:
                     else:
                         has_pen = primitives.get("zone_penetration") is not None
                         print(f"  [geometry] → None (zone=None, pen={has_pen})")
-            if proposal:
-                proposals.append(proposal)
-
-        if self.config.enable_kinematics:
-            proposal = generate_kinematics_proposal(
-                # Pattern primitive (B5) - order block with confirmation
-                order_block=primitives.get("order_block"),
-                permission=permission,
-                context=context,
-                position_state=position_state,
-                # Instantaneous primitives as fallback (with stability requirement)
-                velocity=primitives.get("price_traversal_velocity"),
-                compactness=primitives.get("traversal_compactness"),
-                acceptance=primitives.get("price_acceptance_ratio")
-            )
-            if _DIAG_ENABLED:
-                if proposal:
-                    print(f"  [kinematics] → {proposal.action_type} ({proposal.confidence})")
-                else:
-                    has_ob = primitives.get("order_block") is not None
-                    has_vel = primitives.get("price_traversal_velocity") is not None
-                    print(f"  [kinematics] → None (order_block={has_ob}, velocity={has_vel})")
-            if proposal:
-                proposals.append(proposal)
-
-        if self.config.enable_absence:
-            proposal = generate_absence_proposal(
-                permission=permission,
-                absence=primitives.get("structural_absence_duration"),
-                persistence=primitives.get("structural_persistence_duration"),
-                geometry=primitives.get("zone_penetration"),
-                context=context,
-                position_state=position_state
-            )
             if proposal:
                 proposals.append(proposal)
 
@@ -499,9 +461,14 @@ class PolicyAdapter:
                 "structural_persistence_duration": None,
                 "resting_size": None,
                 "order_consumption": None,
+                "absorption_event": None,
                 "refill_event": None,
+                "price_acceptance_ratio": None,
                 "order_block": None,
                 "supply_demand_zone": None,
+                "liquidation_density": None,
+                "directional_continuity": None,
+                "trade_burst": None,
                 "liquidation_cascade_proximity": None,
                 "cascade_state": None,
                 "leverage_concentration_ratio": None,
@@ -521,9 +488,14 @@ class PolicyAdapter:
             "structural_persistence_duration": bundle.structural_persistence_duration,
             "resting_size": bundle.resting_size,
             "order_consumption": bundle.order_consumption,
+            "absorption_event": bundle.absorption_event,
             "refill_event": bundle.refill_event,
+            "price_acceptance_ratio": bundle.price_acceptance_ratio,
             "order_block": bundle.order_block,
             "supply_demand_zone": bundle.supply_demand_zone,
+            "liquidation_density": bundle.liquidation_density,
+            "directional_continuity": bundle.directional_continuity,
+            "trade_burst": bundle.trade_burst,
             # Tier B-6 - Cascade observation primitives (from Hyperliquid)
             "liquidation_cascade_proximity": bundle.liquidation_cascade_proximity,
             "cascade_state": bundle.cascade_state,

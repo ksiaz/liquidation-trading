@@ -67,7 +67,6 @@ WORD_EXEMPTIONS = {
     ],
     'signal': [
         'm4_cascade_state',  # Documentation about what it cannot be
-        'ep2_strategy_absence',  # Documents what is not a signal
         'hyperliquid/',  # WebSocket signal (technical term)
         'ws_position_tracker',  # Technical signal term
         'liquidation_fade',  # Technical signal term

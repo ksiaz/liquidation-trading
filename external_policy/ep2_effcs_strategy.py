@@ -140,7 +140,9 @@ class EFFCSStrategy:
         price_low: float,  # Recent low
         context: StrategyContext,
         permission: PermissionOutput,
-        position_state: Optional[PositionState] = None
+        position_state: Optional[PositionState] = None,
+        trade_burst=None,  # TradeBurst | None (B4 - impulse intensity)
+        directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow direction)
     ) -> Optional[StrategyProposal]:
         """
         Generate EFFCS proposal based on current market structure.
@@ -207,7 +209,9 @@ class EFFCSStrategy:
                 price=price,
                 price_high=price_high,
                 price_low=price_low,
-                context=context
+                context=context,
+                trade_burst=trade_burst,
+                directional_continuity=directional_continuity
             )
 
         # No action
@@ -223,7 +227,9 @@ class EFFCSStrategy:
         price: float,
         price_high: float,
         price_low: float,
-        context: StrategyContext
+        context: StrategyContext,
+        trade_burst=None,
+        directional_continuity=None
     ) -> Optional[StrategyProposal]:
         """
         Check for EFFCS entry opportunity (impulse + pullback + continuation).
@@ -238,6 +244,12 @@ class EFFCSStrategy:
         """
         # Check if primitives available
         if price_velocity is None:
+            return None
+
+        # Full-context gate: price_high must differ from price_low
+        # When high == low, impulse direction is arbitrary and retracement
+        # is always 0% — zero-information entry. Block it.
+        if price_high <= price_low:
             return None
 
         # Calculate displacement magnitude
@@ -307,15 +319,31 @@ class EFFCSStrategy:
             # Check for continuation (pullback complete, price resuming impulse direction)
             # Simplified: if liquidations still elevated and displacement continues
             if liquidation_zscore >= 2.5 and retracement < 0.25:
+                # Directional continuity gate: trade flow must not contradict impulse
+                if directional_continuity is not None and directional_continuity.total_trades > 0:
+                    buy_ratio = directional_continuity.buy_trades / directional_continuity.total_trades
+                    if impulse_direction > 0 and buy_ratio < 0.4:
+                        return None  # Impulse UP but selling dominates — contradicted
+                    if impulse_direction < 0 and buy_ratio > 0.6:
+                        return None  # Impulse DOWN but buying dominates — contradicted
+
                 # Continuation conditions met -> propose ENTRY
                 self._state[symbol] = EFFCSState.CONTINUATION_ARMED
+
+                entry_direction = "LONG" if impulse_direction > 0 else "SHORT"
+
+                # Enrich justification with trade burst intensity
+                burst_ref = ""
+                if trade_burst is not None:
+                    burst_ref = f"|BURST:{trade_burst.trades_per_second:.1f}tps"
 
                 return StrategyProposal(
                     strategy_id="EP2-EFFCS-V1",
                     action_type="ENTRY",
                     confidence="CONTINUATION_CONDITIONS_MET",  # Structural observation
-                    justification_ref="IMPULSE_DISPLACEMENT|LIQUIDATION_SPIKE|PULLBACK_VALID",
-                    timestamp=context.timestamp
+                    justification_ref=f"IMPULSE_DISPLACEMENT|LIQUIDATION_SPIKE|PULLBACK_VALID{burst_ref}",
+                    timestamp=context.timestamp,
+                    direction=entry_direction
                 )
 
         # No entry conditions met
@@ -419,7 +447,9 @@ def generate_effcs_proposal(
     price_low: float,
     context: StrategyContext,
     permission: PermissionOutput,
-    position_state: Optional[PositionState] = None
+    position_state: Optional[PositionState] = None,
+    trade_burst=None,  # TradeBurst | None (B4 - impulse intensity)
+    directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow direction)
 ) -> Optional[StrategyProposal]:
     """
     Generate EFFCS proposal (function interface for policy adapter).
@@ -467,5 +497,7 @@ def generate_effcs_proposal(
         price_low=price_low,
         context=context,
         permission=permission,
-        position_state=position_state
+        position_state=position_state,
+        trade_burst=trade_burst,
+        directional_continuity=directional_continuity
     )

@@ -16,10 +16,11 @@ Strategy Logic (from OB-SLBRSorderblockstrat.md):
 
 Thresholds from Market Mechanics (NOT backtest optimization):
 - 2.5× liquidity concentration: Significant accumulation threshold
-- 30s persistence: Minimum block stability
-- 0.65 absorption ratio: Orderbook consumption threshold
+- 60s persistence: Minimum block stability
+- 0.15 absorption ratio: Orderbook consumption threshold
 - 0.30 block width: Proximity threshold for retest
-- 0.70 volume ratio: Reduced aggression threshold
+- 0.40 zone penetration: Minimum retest evidence (HL fallback)
+- Max 3 concurrent SLBRS positions
 
 CRITICAL: This strategy acknowledges outcome divergence (P12).
 Same structure may lead to different outcomes. No confidence scoring.
@@ -111,12 +112,16 @@ class SLBRSStrategy:
     - No certainty claims
     """
 
+    # Max concurrent SLBRS positions — level-retest strategy shouldn't be in 10 positions
+    MAX_CONCURRENT_POSITIONS = 3
+
     def __init__(self):
         """Initialize SLBRS strategy with empty state."""
         self._state: Dict[str, SLBRSState] = {}  # symbol -> state
         self._first_test: Dict[str, Optional[FirstTestObservation]] = {}  # symbol -> first test
         self._sideways_streak: Dict[str, int] = {}  # symbol -> consecutive SIDEWAYS cycles
         self._last_exit_ts: Dict[str, float] = {}  # symbol -> timestamp of last exit/reset
+        self._open_symbols: set = set()  # symbols with open SLBRS positions
 
     def generate_proposal(
         self,
@@ -130,7 +135,9 @@ class SLBRSStrategy:
         price: float,
         context: StrategyContext,
         permission: PermissionOutput,
-        position_state: Optional[PositionState] = None
+        position_state: Optional[PositionState] = None,
+        absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption)
+        directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow direction)
     ) -> Optional[StrategyProposal]:
         """
         Generate SLBRS proposal based on current market structure.
@@ -176,6 +183,7 @@ class SLBRSStrategy:
 
         # Rule 3: Check position state and generate appropriate action
         if position_state in (PositionState.ENTERING, PositionState.OPEN, PositionState.REDUCING):
+            self._open_symbols.add(symbol)  # Track open position
             # Position accepted — reset SLBRS state so it's ready after exit
             if self._state[symbol] == SLBRSState.RETEST_ARMED:
                 self._state[symbol] = SLBRSState.IDLE
@@ -191,6 +199,7 @@ class SLBRSStrategy:
 
         # Rule 4: Position FLAT - check for entry opportunity
         if position_state == PositionState.FLAT or position_state is None:
+            self._open_symbols.discard(symbol)  # No longer open
             # If we were RETEST_ARMED but position is now FLAT, entry was rejected
             # or position already exited — reset with cooldown
             if self._state[symbol] == SLBRSState.RETEST_ARMED:
@@ -206,7 +215,9 @@ class SLBRSStrategy:
                 order_consumption=order_consumption,
                 structural_persistence=structural_persistence,
                 price=price,
-                context=context
+                context=context,
+                absorption_event=absorption_event,
+                directional_continuity=directional_continuity
             )
 
         # No action
@@ -221,19 +232,20 @@ class SLBRSStrategy:
         order_consumption,
         structural_persistence,
         price: float,
-        context: StrategyContext
+        context: StrategyContext,
+        absorption_event=None,
+        directional_continuity=None
     ) -> Optional[StrategyProposal]:
         """
         Check for SLBRS entry opportunity (retest logic).
 
-        Entry conditions (from research):
-        1. Liquidity block detected (persistence ≥ 30s)
-        2. First test observed (price entered, rejected)
-        3. Retest conditions met:
-           - Distance to block ≤ 50% of block width
-           - Absorption present (consumed_size ≥ 10% of initial_size)
-        4. Regime stable (2+ consecutive SIDEWAYS cycles)
-        5. Not in post-exit cooldown (60s)
+        Entry requires ALL of (no fallbacks):
+        1. Liquidity block: zone_penetration + structural_persistence + resting_size
+        2. First test: block detected with orderbook confirmation
+        3. Retest: proximity + order_consumption (real absorption, not penetration depth)
+        4. Direction: from resting_size bid/ask ratio (not price heuristic)
+        5. Regime stable (4+ consecutive SIDEWAYS cycles)
+        6. Max 3 concurrent positions, 120s post-exit cooldown
 
         Returns:
             ENTRY proposal if retest conditions met, None otherwise
@@ -248,10 +260,13 @@ class SLBRSStrategy:
         atr_width = regime_state.atr_5m if regime_state.atr_5m > 0 else price * 0.005
 
         # Check for liquidity block presence
+        # Requires ALL of: zone interaction, structural persistence, AND orderbook depth.
+        # Without resting_size we can't confirm resting orders exist — no block.
         block_exists = (
             zone_penetration.penetration_depth > 0
             and structural_persistence is not None
-            and structural_persistence.total_persistence_duration >= 30.0  # 30s threshold
+            and structural_persistence.total_persistence_duration >= 60.0  # 60s block stability
+            and resting_size is not None  # Must see actual resting orders
         )
 
         # State: IDLE → detect first block interaction
@@ -259,13 +274,17 @@ class SLBRSStrategy:
             if not block_exists:
                 return None
 
-            # Gate: Regime must be stable (2+ consecutive SIDEWAYS cycles)
-            if self._sideways_streak.get(symbol, 0) < 2:
+            # Gate: Regime must be stable (4+ consecutive SIDEWAYS cycles)
+            if self._sideways_streak.get(symbol, 0) < 4:
                 return None
 
-            # Gate: Post-exit cooldown (60s)
+            # Gate: Max concurrent SLBRS positions
+            if len(self._open_symbols) >= self.MAX_CONCURRENT_POSITIONS:
+                return None
+
+            # Gate: Post-exit cooldown (120s)
             last_exit = self._last_exit_ts.get(symbol, 0.0)
-            if last_exit > 0 and context.timestamp - last_exit < 60.0:
+            if last_exit > 0 and context.timestamp - last_exit < 120.0:
                 return None
 
             # First time seeing block - record as first test
@@ -300,44 +319,50 @@ class SLBRSStrategy:
 
             # Retest Condition 1: Price near block edge
             distance_to_block = abs(price - first_test.block_edge)
-            proximity_threshold = 0.50 * first_test.block_width  # 50% of block width
+            proximity_threshold = 0.30 * first_test.block_width  # 30% of block width
 
             if distance_to_block > proximity_threshold:
                 return None
 
+            # Gate: Max concurrent SLBRS positions (check again at retest)
+            if len(self._open_symbols) >= self.MAX_CONCURRENT_POSITIONS:
+                return None
+
             # Retest Condition 2: Absorption evidence
-            # Prefer order consumption with meaningful ratio (Binance mode)
-            # Fall back to zone penetration as evidence of interaction (HL mode)
-            has_evidence = False
+            # Primary: order_consumption (consumed/initial >= 15%)
+            # Fallback: absorption_event (orderbook size consumed with minimal price movement)
+            absorption_confirmed = False
             if order_consumption is not None:
                 initial = getattr(order_consumption, 'initial_size', 0) or 0
                 consumed = getattr(order_consumption, 'consumed_size', 0) or 0
-                # Require at least 10% absorption ratio (not just any contract)
-                if initial > 0 and consumed >= initial * 0.10:
-                    has_evidence = True
-            if not has_evidence and zone_penetration is not None:
-                # Zone penetration on retest = price interacting with block again
-                # Require penetration > 20% of block width (not just any tick)
-                if zone_penetration.penetration_depth > first_test.block_width * 0.20:
-                    has_evidence = True
-
-            if not has_evidence:
+                if initial > 0 and consumed >= initial * 0.15:
+                    absorption_confirmed = True
+            if not absorption_confirmed and absorption_event is not None:
+                # Fallback: absorption_event means orders consumed with minimal price movement
+                if absorption_event.consumed_size > 0:
+                    absorption_confirmed = True
+            if not absorption_confirmed:
                 return None
 
-            # Determine direction:
-            # 1. From orderbook depth if available (Binance mode)
-            # 2. From price vs block edge (HL mode):
-            #    Price below block_edge → approaching from below → LONG (expect bounce up)
-            #    Price above block_edge → approaching from above → SHORT (expect bounce down)
-            direction = "LONG"  # Default
-            if resting_size is not None:
-                if hasattr(resting_size, 'bid_size') and hasattr(resting_size, 'ask_size'):
-                    if resting_size.ask_size > resting_size.bid_size:
-                        direction = "SHORT"
-            else:
-                # No orderbook data — use price vs block edge
-                if price > first_test.block_edge:
+            # Determine direction from orderbook depth (required)
+            # Without resting_size we can't know block nature → no entry
+            if resting_size is None:
+                return None
+
+            # More resting on bid side = buy wall = price supported = LONG
+            # More resting on ask side = sell wall = price capped = SHORT
+            direction = "LONG"
+            if hasattr(resting_size, 'bid_size') and hasattr(resting_size, 'ask_size'):
+                if resting_size.ask_size > resting_size.bid_size:
                     direction = "SHORT"
+
+            # Directional continuity gate: trade flow must not contradict resting_size direction
+            if directional_continuity is not None and directional_continuity.total_trades > 0:
+                buy_ratio = directional_continuity.buy_trades / directional_continuity.total_trades
+                if direction == "LONG" and buy_ratio < 0.4:
+                    return None  # Block says LONG but selling dominates — contradicted
+                if direction == "SHORT" and buy_ratio > 0.6:
+                    return None  # Block says SHORT but buying dominates — contradicted
 
             # All retest conditions met -> propose ENTRY
             self._state[symbol] = SLBRSState.RETEST_ARMED
@@ -436,7 +461,9 @@ def generate_slbrs_proposal(
     price: float,
     context: StrategyContext,
     permission: PermissionOutput,
-    position_state: Optional[PositionState] = None
+    position_state: Optional[PositionState] = None,
+    absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption fallback)
+    directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow validation)
 ) -> Optional[StrategyProposal]:
     """
     Generate SLBRS proposal (function interface for policy adapter).
@@ -482,5 +509,7 @@ def generate_slbrs_proposal(
         price=price,
         context=context,
         permission=permission,
-        position_state=position_state
+        position_state=position_state,
+        absorption_event=absorption_event,
+        directional_continuity=directional_continuity
     )

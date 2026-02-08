@@ -155,6 +155,78 @@ class CascadeSniperConfig:
     # Minimum organic ratio (|net|/total) for conviction
     organic_ratio_threshold: float = 0.3
 
+    # Warmup gate configuration (Gate A)
+    # Blocks entries until minimum flow data is collected
+    use_warmup_gate: bool = True
+
+    # Minimum fills tracked before allowing entry (per symbol)
+    # HL taker fills are sparser than Binance — 50 is sufficient for baseline flow
+    warmup_min_fills: int = 50
+
+    # Minimum liquidation events tracked before allowing entry (per symbol)
+    warmup_min_liqs: int = 3
+
+    # Minimum elapsed time since session start (seconds)
+    warmup_min_elapsed_sec: float = 120.0  # 2 minutes
+
+    # Warmup logic: elapsed >= T_min AND (fills >= N_min OR liqs >= L_min)
+    # This allows entry if we have time AND either sufficient fills or liquidations
+
+    # Trend gate configuration (Gate B)
+    # Blocks counter-trend entries during short-term moves
+    use_trend_gate: bool = True
+
+    # Return thresholds for blocking (as decimals, e.g., 0.0015 = 0.15%)
+    # LONG blocked if ret_1m <= -threshold OR ret_3m <= -threshold_3m
+    # SHORT blocked if ret_1m >= +threshold OR ret_3m >= +threshold_3m
+    trend_gate_ret_1m_threshold: float = 0.0015  # 0.15%
+    trend_gate_ret_3m_threshold: float = 0.0030  # 0.30%
+
+    # Allow counter-trend if absorption is dominant (escape hatch)
+    trend_gate_absorption_override: float = 0.65  # buy_ratio > 0.65 allows entry
+
+    # Strict block when price data unavailable (both ret_1m and ret_3m are None)
+    # Override requires BOTH high absorption AND extreme burst
+    trend_gate_no_data_absorption_override: float = 0.75  # Higher threshold for no-data
+    trend_gate_no_data_min_burst_value: float = 100_000.0  # Minimum cascade value for override
+
+    # Cascade confirmation gate (Gate C)
+    # Requires multiple bursts before triggering to avoid single-burst false positives
+    use_cascade_confirmation_gate: bool = True
+
+    # Minimum burst count to confirm cascade (within confirmation window)
+    cascade_min_burst_count: int = 2
+
+    # Time window for burst counting (seconds)
+    cascade_confirmation_window_sec: float = 60.0
+
+    # Refractory period between bursts (ignore bursts within this period)
+    # Prevents one continuous cascade from counting as multiple bursts
+    cascade_burst_refractory_sec: float = 10.0
+
+    # Override: Allow immediate entry if absorption ratio is very high
+    cascade_confirmation_absorption_override: float = 0.70  # buy_ratio > 0.70 allows entry
+
+    # ATR-based stops (Gate D) - DISABLED by default, requires backtest validation
+    # When enabled, replaces fixed % stop with ATR-scaled stop
+    use_atr_stop: bool = False  # Disabled by default - enable after backtest
+
+    # ATR multiplier for stop distance: stop = entry ± (k * ATR)
+    atr_stop_multiplier: float = 1.5  # 1.5x ATR
+
+    # Minimum stop distance as percentage (floor for very low ATR)
+    atr_stop_min_pct: float = 0.002  # 0.2% minimum
+
+    # Maximum stop distance as percentage (cap for tail loss protection)
+    atr_stop_max_pct: float = 0.01  # 1.0% maximum
+
+    # Grace period before stop activates (seconds)
+    # Avoids instant churn from noise at entry
+    atr_stop_grace_period_sec: float = 20.0
+
+    # Absorption-aware stop: exit quickly if absorption collapses
+    atr_stop_absorption_exit_threshold: float = 0.30  # Exit if buy_ratio < 0.30
+
 
 # ==============================================================================
 # Types
@@ -295,6 +367,10 @@ class CascadeStateMachine:
         self._triggered_at: Dict[str, float] = {}
         self._absorption_data: Dict[str, AbsorptionAnalysis] = {}
 
+        # Gate C: Burst history for cascade confirmation
+        # Per symbol: list of (timestamp, volume) tuples for each qualifying burst
+        self._burst_history: Dict[str, List[tuple]] = {}
+
         # Organic flow detector (research-backed absorption detection)
         self._organic_detector: Optional[OrganicFlowDetector] = None
         if config.use_organic_flow_detection:
@@ -342,10 +418,14 @@ class CascadeStateMachine:
             if not self._is_cluster_formed(proximity):
                 self._states[symbol] = CascadeState.NONE
                 self._primed_data.pop(symbol, None)
+                self._burst_history.pop(symbol, None)  # Gate C: Clear burst history
+                # Clear cascade direction to prevent stale data
+                if self._organic_detector:
+                    self._organic_detector.clear_cascade(symbol)
                 new_state = CascadeState.NONE
 
-            # Check for liquidation trigger
-            elif self._is_cascade_triggered(liquidations, symbol):
+            # Check for liquidation trigger (Gate C: cascade confirmation)
+            elif self._is_cascade_triggered(liquidations, symbol, timestamp):
                 self._states[symbol] = CascadeState.TRIGGERED
                 self._triggered_at[symbol] = timestamp
                 new_state = CascadeState.TRIGGERED
@@ -405,6 +485,10 @@ class CascadeStateMachine:
                 self._primed_data.pop(symbol, None)
                 self._triggered_at.pop(symbol, None)
                 self._absorption_data.pop(symbol, None)
+                self._burst_history.pop(symbol, None)  # Gate C: Clear burst history
+                # Clear cascade direction to prevent stale data
+                if self._organic_detector:
+                    self._organic_detector.clear_cascade(symbol)
                 new_state = CascadeState.NONE
 
         # Log state transitions
@@ -482,14 +566,27 @@ class CascadeStateMachine:
 
         return True
 
-    def _is_cascade_triggered(self, liquidations: Optional[LiquidationBurst], symbol: Optional[str] = None) -> bool:
+    def _is_cascade_triggered(
+        self,
+        liquidations: Optional[LiquidationBurst],
+        symbol: Optional[str] = None,
+        timestamp: Optional[float] = None
+    ) -> bool:
         """
         Check if liquidation activity indicates cascade start.
+
+        Gate C: Cascade Confirmation
+        - Requires burst_count >= min_burst_count within confirmation window
+        - Uses refractory period to avoid counting continuous cascade as multiple bursts
+        - Override: Allow immediate if absorption ratio > threshold
 
         Uses per-coin thresholds if enabled (research-backed P95 values).
         """
         if liquidations is None:
             return False
+
+        if symbol is None:
+            symbol = liquidations.symbol
 
         # Get per-coin threshold if enabled
         if self._config.use_per_coin_thresholds and symbol:
@@ -499,7 +596,71 @@ class CascadeStateMachine:
         else:
             threshold = self._config.liquidation_trigger_volume
 
-        return liquidations.total_volume >= threshold
+        # Check if current liquidation volume meets threshold
+        if liquidations.total_volume < threshold:
+            return False
+
+        # If cascade confirmation gate disabled, trigger immediately
+        if not self._config.use_cascade_confirmation_gate:
+            return True
+
+        # Get current timestamp (use window_end from burst if not provided)
+        if timestamp is None:
+            timestamp = liquidations.window_end
+
+        # Initialize burst history for symbol if needed
+        if symbol not in self._burst_history:
+            self._burst_history[symbol] = []
+
+        # Prune old bursts outside confirmation window
+        cutoff = timestamp - self._config.cascade_confirmation_window_sec
+        self._burst_history[symbol] = [
+            (ts, vol) for ts, vol in self._burst_history[symbol]
+            if ts > cutoff
+        ]
+
+        # Check refractory period - is this a new distinct burst?
+        is_new_burst = True
+        if self._burst_history[symbol]:
+            last_burst_time = self._burst_history[symbol][-1][0]
+            if timestamp - last_burst_time < self._config.cascade_burst_refractory_sec:
+                is_new_burst = False
+
+        # Record new burst
+        if is_new_burst:
+            self._burst_history[symbol].append((timestamp, liquidations.total_volume))
+            print(f"[CASCADE CONF] {symbol}: Burst recorded (#{len(self._burst_history[symbol])}, ${liquidations.total_volume:,.0f})")
+
+        # Check if we have enough bursts
+        burst_count = len(self._burst_history[symbol])
+        if burst_count >= self._config.cascade_min_burst_count:
+            print(f"[CASCADE CONF] {symbol}: Confirmed with {burst_count} bursts")
+            return True
+
+        # Check absorption override - high absorption allows immediate entry
+        # NOTE: cascade direction not set yet, so we use primed_data to determine direction
+        # and compute ratio directly from detector state
+        if self._organic_detector:
+            # Determine expected cascade direction from primed data
+            primed = self._primed_data.get(symbol)
+            if primed:
+                # Determine which side has more exposure (will be liquidated)
+                is_long_dominant = primed.long_positions_value > primed.short_positions_value
+                # Temporarily set cascade direction for absorption check
+                from runtime.cascade import CascadeDirection
+                temp_direction = CascadeDirection.DOWN if is_long_dominant else CascadeDirection.UP
+                # Set direction, check absorption, then clear
+                self._organic_detector.set_cascade_active(symbol, temp_direction, primed.total_value_at_risk)
+                signal = self._organic_detector.check_absorption(symbol, timestamp)
+                self._organic_detector.clear_cascade(symbol)  # Clear to avoid stale direction
+
+                if signal.buying_ratio > self._config.cascade_confirmation_absorption_override:
+                    print(f"[CASCADE CONF] {symbol}: Override - absorption ratio {signal.buying_ratio:.2f} > {self._config.cascade_confirmation_absorption_override}")
+                    return True
+
+        # Not enough bursts yet
+        print(f"[CASCADE CONF] {symbol}: Waiting for confirmation ({burst_count}/{self._config.cascade_min_burst_count} bursts)")
+        return False
 
     def _is_absorption_detected(
         self,
@@ -531,7 +692,7 @@ class CascadeStateMachine:
             if signal.is_absorbing:
                 print(f"[ORGANIC FLOW] {symbol}: Absorption detected!")
                 print(f"  liqs_stopped: {signal.liqs_stopped}, organic_net: ${signal.organic_net:,.0f}")
-                print(f"  organic_ratio: {signal.organic_ratio:.1%}, entry: {signal.entry_direction}")
+                print(f"  buying_ratio: {signal.buying_ratio:.1%}, entry: {signal.entry_direction}")
                 return True
 
         # FALLBACK 1: Check orderbook absorption if data available
@@ -548,10 +709,8 @@ class CascadeStateMachine:
                 if absorption.absorption_ratio_shorts >= self._config.min_absorption_ratio_for_reversal:
                     return True
 
-        # FALLBACK 2: Positions at risk decreased significantly
-        if proximity is not None:
-            if proximity.total_positions_at_risk < primed.total_positions_at_risk * 0.5:
-                return True
+        # No position-count-only fallback: position drop != absorption
+        # (could be voluntary exit, timeout, price moving away from cluster)
 
         return False
 
@@ -578,11 +737,11 @@ class CascadeStateMachine:
 
         absorption = self._absorption_data.get(symbol)
         if absorption is None:
-            return True  # No data, allow entry (conservative)
+            return False  # No absorption data → no evidence for thesis → block entry
 
         dominant_side = self.get_dominant_side(symbol)
         if dominant_side is None:
-            return True  # No dominant side, allow entry
+            return False  # No dominant side → can't determine absorption context → block
 
         # Get relevant absorption ratio
         if dominant_side == "LONG":
@@ -691,15 +850,282 @@ class CascadeStateMachine:
 _state_machine: Optional[CascadeStateMachine] = None
 _entry_quality_scorer: Optional[EntryQualityScorer] = None
 _config: Optional[CascadeSniperConfig] = None
+_session_start_time: Optional[float] = None  # Gate A: Session start for warmup
 
 
 def _get_state_machine() -> CascadeStateMachine:
     """Get or create the state machine singleton."""
-    global _state_machine, _config
+    global _state_machine, _config, _session_start_time
     if _state_machine is None:
         _config = CascadeSniperConfig()
         _state_machine = CascadeStateMachine(_config)
+        # Initialize session start time on first call
+        import time
+        _session_start_time = time.time()
     return _state_machine
+
+
+def _check_warmup_gate(symbol: str, timestamp: float) -> tuple[bool, str]:
+    """
+    Gate A: Check if warmup conditions are met for entry.
+
+    Warmup logic: elapsed >= T_min AND (fills >= N_min OR liqs >= L_min)
+    This allows entry if we have sufficient time AND either fills or liquidations.
+
+    Args:
+        symbol: Trading symbol (e.g., "BTCUSDT")
+        timestamp: Current timestamp
+
+    Returns:
+        (is_ready, reason) - True if warmup met, reason string for logging
+    """
+    global _config, _session_start_time
+
+    if _config is None or not _config.use_warmup_gate:
+        return True, "warmup_disabled"
+
+    if _session_start_time is None:
+        return False, "session_not_started"
+
+    sm = _get_state_machine()
+    if sm._organic_detector is None:
+        return True, "no_detector"  # Can't check warmup without detector
+
+    # Get warmup status for symbol
+    status = sm._organic_detector.get_warmup_status(symbol)
+
+    # Check elapsed time
+    elapsed = timestamp - _session_start_time
+    time_ok = elapsed >= _config.warmup_min_elapsed_sec
+
+    # Check data conditions (either fills OR liqs sufficient)
+    fills_ok = status['fill_count'] >= _config.warmup_min_fills
+    liqs_ok = status['liq_count'] >= _config.warmup_min_liqs
+    data_ok = fills_ok or liqs_ok
+
+    # Warmup met if time AND data conditions satisfied
+    if time_ok and data_ok:
+        return True, f"warmup_ok:elapsed={elapsed:.0f}s,fills={status['fill_count']},liqs={status['liq_count']}"
+
+    # Not ready - return detailed reason
+    reasons = []
+    if not time_ok:
+        reasons.append(f"elapsed={elapsed:.0f}s<{_config.warmup_min_elapsed_sec:.0f}s")
+    if not data_ok:
+        reasons.append(f"fills={status['fill_count']}<{_config.warmup_min_fills},liqs={status['liq_count']}<{_config.warmup_min_liqs}")
+
+    return False, f"warmup_not_met:{';'.join(reasons)}"
+
+
+def _check_trend_gate(
+    symbol: str,
+    entry_direction: str,
+    price_returns: Optional[Dict[str, Optional[float]]],
+    absorption_ratio: Optional[float] = None,
+    cascade_value: Optional[float] = None
+) -> tuple[bool, str]:
+    """
+    Gate B: Check if trend conditions allow entry.
+
+    Blocks counter-trend entries during short-term directional moves.
+    - LONG blocked if ret_1m <= -0.15% OR ret_3m <= -0.30%
+    - SHORT blocked if ret_1m >= +0.15% OR ret_3m >= +0.30%
+
+    Escape hatch: Allow if absorption_ratio > threshold (dominant absorption).
+
+    STRICT BLOCK: If both ret_1m and ret_3m are None (no price data), block entry
+    unless BOTH conditions are met:
+    - absorption_ratio > 0.75 (very high absorption)
+    - cascade_value > threshold (extreme burst magnitude)
+
+    Args:
+        symbol: Trading symbol
+        entry_direction: "LONG" or "SHORT"
+        price_returns: Dict with ret_1m and ret_3m (from observation.get_hl_price_returns)
+        absorption_ratio: Optional buy_ratio for escape hatch
+        cascade_value: Optional cascade value at risk for no-data override
+
+    Returns:
+        (is_allowed, reason) - True if entry allowed, reason string for logging
+    """
+    global _config
+
+    if _config is None or not _config.use_trend_gate:
+        return True, "trend_gate_disabled"
+
+    # Extract returns from dict (or None if dict is None)
+    ret_1m = price_returns.get('ret_1m') if price_returns else None
+    ret_3m = price_returns.get('ret_3m') if price_returns else None
+
+    # STRICT BLOCK: No price data available
+    # Block unless BOTH high absorption AND extreme burst
+    if ret_1m is None and ret_3m is None:
+        # Check override conditions
+        absorption_ok = (
+            absorption_ratio is not None and
+            absorption_ratio > _config.trend_gate_no_data_absorption_override
+        )
+        burst_ok = (
+            cascade_value is not None and
+            cascade_value >= _config.trend_gate_no_data_min_burst_value
+        )
+
+        if absorption_ok and burst_ok:
+            return True, (
+                f"no_data_override:absorption={absorption_ratio:.2f}>"
+                f"{_config.trend_gate_no_data_absorption_override},"
+                f"cascade=${cascade_value:,.0f}>=${_config.trend_gate_no_data_min_burst_value:,.0f}"
+            )
+
+        # Block - no data and override conditions not met
+        reasons = []
+        if not absorption_ok:
+            ratio_str = f"{absorption_ratio:.2f}" if absorption_ratio else "None"
+            reasons.append(f"absorption={ratio_str}<={_config.trend_gate_no_data_absorption_override}")
+        if not burst_ok:
+            value_str = f"${cascade_value:,.0f}" if cascade_value else "None"
+            reasons.append(f"cascade={value_str}<${_config.trend_gate_no_data_min_burst_value:,.0f}")
+
+        return False, f"no_price_data_blocked:{';'.join(reasons)}"
+
+    # Check escape hatch first - dominant absorption overrides trend block
+    if absorption_ratio is not None and absorption_ratio > _config.trend_gate_absorption_override:
+        return True, f"absorption_override:ratio={absorption_ratio:.2f}>{_config.trend_gate_absorption_override}"
+
+    # Check trend conditions based on entry direction
+    blocked = False
+    block_reason = ""
+
+    if entry_direction == "LONG":
+        # Block LONG if price dropping
+        if ret_1m is not None and ret_1m <= -_config.trend_gate_ret_1m_threshold:
+            blocked = True
+            block_reason = f"ret_1m={ret_1m*100:.2f}%<=-{_config.trend_gate_ret_1m_threshold*100:.2f}%"
+        elif ret_3m is not None and ret_3m <= -_config.trend_gate_ret_3m_threshold:
+            blocked = True
+            block_reason = f"ret_3m={ret_3m*100:.2f}%<=-{_config.trend_gate_ret_3m_threshold*100:.2f}%"
+
+    elif entry_direction == "SHORT":
+        # Block SHORT if price rising
+        if ret_1m is not None and ret_1m >= _config.trend_gate_ret_1m_threshold:
+            blocked = True
+            block_reason = f"ret_1m={ret_1m*100:.2f}%>={_config.trend_gate_ret_1m_threshold*100:.2f}%"
+        elif ret_3m is not None and ret_3m >= _config.trend_gate_ret_3m_threshold:
+            blocked = True
+            block_reason = f"ret_3m={ret_3m*100:.2f}%>={_config.trend_gate_ret_3m_threshold*100:.2f}%"
+
+    if blocked:
+        return False, f"trend_blocked:{block_reason}"
+
+    # Format return info for logging
+    ret_info = []
+    if ret_1m is not None:
+        ret_info.append(f"ret_1m={ret_1m*100:.2f}%")
+    if ret_3m is not None:
+        ret_info.append(f"ret_3m={ret_3m*100:.2f}%")
+
+    return True, f"trend_ok:{','.join(ret_info)}"
+
+
+def calculate_atr_stop_distance(
+    entry_price: float,
+    direction: str,
+    atr_value: Optional[float],
+) -> tuple[float, str]:
+    """
+    Gate D: Calculate ATR-based stop distance.
+
+    DISABLED BY DEFAULT - requires backtest validation before enabling.
+    Use use_atr_stop=True in config to enable.
+
+    Args:
+        entry_price: Entry price
+        direction: "LONG" or "SHORT"
+        atr_value: Current ATR value (1-minute timeframe recommended)
+
+    Returns:
+        (stop_price, reason) - Stop price and calculation details
+    """
+    global _config
+
+    if _config is None or not _config.use_atr_stop:
+        # Fallback to fixed 0.25% stop (current default behavior)
+        default_pct = 0.0025
+        if direction == "LONG":
+            stop_price = entry_price * (1 - default_pct)
+        else:
+            stop_price = entry_price * (1 + default_pct)
+        return stop_price, f"fixed_pct:{default_pct*100:.2f}%"
+
+    # Calculate ATR-based distance
+    if atr_value is None or atr_value <= 0:
+        # No ATR data - use minimum
+        distance_pct = _config.atr_stop_min_pct
+        reason = f"no_atr:using_min={distance_pct*100:.2f}%"
+    else:
+        # ATR-based distance: k * ATR / price
+        distance_pct = (_config.atr_stop_multiplier * atr_value) / entry_price
+
+        # Apply floor and ceiling
+        if distance_pct < _config.atr_stop_min_pct:
+            distance_pct = _config.atr_stop_min_pct
+            reason = f"atr_floor:{distance_pct*100:.2f}%"
+        elif distance_pct > _config.atr_stop_max_pct:
+            distance_pct = _config.atr_stop_max_pct
+            reason = f"atr_ceiling:{distance_pct*100:.2f}%"
+        else:
+            reason = f"atr_based:{distance_pct*100:.2f}% (atr={atr_value:.2f},k={_config.atr_stop_multiplier})"
+
+    # Calculate stop price
+    if direction == "LONG":
+        stop_price = entry_price * (1 - distance_pct)
+    else:
+        stop_price = entry_price * (1 + distance_pct)
+
+    return stop_price, reason
+
+
+def check_atr_stop_grace_period(entry_time: float, current_time: float) -> bool:
+    """
+    Check if stop should be active based on grace period.
+
+    Returns True if grace period has passed (stop should be active).
+    Returns False if still in grace period (stop should be ignored).
+    """
+    global _config
+
+    if _config is None or not _config.use_atr_stop:
+        return True  # Grace period only applies when ATR stops enabled
+
+    elapsed = current_time - entry_time
+    return elapsed >= _config.atr_stop_grace_period_sec
+
+
+def check_absorption_exit(symbol: str, timestamp: float) -> tuple[bool, str]:
+    """
+    Gate D: Check if absorption has collapsed and quick exit is needed.
+
+    When absorption ratio drops below threshold, exit quickly to limit losses.
+    This is an "absorption-aware stop" that reacts to flow conditions.
+
+    Returns:
+        (should_exit, reason) - True if exit triggered, reason for logging
+    """
+    global _config
+
+    if _config is None or not _config.use_atr_stop:
+        return False, "atr_stop_disabled"
+
+    sm = _get_state_machine()
+    if sm._organic_detector is None:
+        return False, "no_detector"
+
+    signal = sm._organic_detector.check_absorption(symbol, timestamp)
+
+    if signal.buying_ratio < _config.atr_stop_absorption_exit_threshold:
+        return True, f"absorption_collapsed:ratio={signal.buying_ratio:.2f}<{_config.atr_stop_absorption_exit_threshold}"
+
+    return False, f"absorption_ok:ratio={signal.buying_ratio:.2f}"
 
 
 def _get_entry_quality_scorer() -> EntryQualityScorer:
@@ -849,7 +1275,10 @@ def generate_cascade_sniper_proposal(
     position_state: Optional[PositionState] = None,
     entry_mode: EntryMode = EntryMode.ABSORPTION_REVERSAL,
     absorption: Optional[AbsorptionAnalysis] = None,
-    trend_context: Optional[TrendRegimeContext] = None
+    trend_context: Optional[TrendRegimeContext] = None,
+    price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
+    trade_burst=None,  # TradeBurst | None (B4 - cascade trading intensity)
+    liquidation_density=None  # LiquidationDensity | None (B3 - cluster quality)
 ) -> Optional[StrategyProposal]:
     """
     Generate cascade sniper entry proposal WITH TREND KILL-SWITCH.
@@ -914,6 +1343,12 @@ def generate_cascade_sniper_proposal(
     if symbol is None:
         return None
 
+    # Gate A: Warmup gate - block entries until sufficient data collected
+    warmup_ok, warmup_reason = _check_warmup_gate(symbol, context.timestamp)
+    if not warmup_ok:
+        print(f"[WARMUP GATE] {symbol}: Entry blocked - {warmup_reason}")
+        return None
+
     # Update state machine with absorption data
     state = sm.update(symbol, proximity, liquidations, context.timestamp, absorption)
 
@@ -946,6 +1381,19 @@ def generate_cascade_sniper_proposal(
                         print(f"[TREND KILL-SWITCH] {symbol}: {entry_direction} reversal blocked - {trend_context.direction.name}")
                         return None
 
+                # Gate B: Short-term trend gate (price returns)
+                # Get absorption ratio for escape hatch
+                absorption_signal = sm.get_absorption_signal(symbol)
+                absorption_ratio = absorption_signal.buying_ratio if absorption_signal else None
+                # Get cascade value for no-data override check
+                cascade_value = primed.total_value_at_risk if primed else None
+                trend_ok, trend_reason = _check_trend_gate(
+                    symbol, entry_direction, price_returns, absorption_ratio, cascade_value
+                )
+                if not trend_ok:
+                    print(f"[TREND GATE] {symbol}: {entry_direction} blocked - {trend_reason}")
+                    return None
+
                 # Rule 3b: Check entry quality based on liquidation exhaustion
                 # This uses the data-driven scoring from analysis of 759 trades
                 # Pass trend context for additional filtering
@@ -975,12 +1423,20 @@ def generate_cascade_sniper_proposal(
 
                 eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
 
+                # Enrich with trade burst intensity and liquidation cluster density
+                burst_str = ""
+                if trade_burst is not None:
+                    burst_str = f"|BURST:{trade_burst.trades_per_second:.1f}tps"
+                density_str = ""
+                if liquidation_density is not None:
+                    density_str = f"|LDENSITY:{liquidation_density.density_score:.2f}"
+
                 return StrategyProposal(
                     strategy_id="EP2-CASCADE-SNIPER-V1",
                     action_type="ENTRY",
                     direction=entry_direction,
                     confidence="ABSORPTION_REVERSAL",
-                    justification_ref=f"HL_PROX|ABSORB|{primed.total_positions_at_risk}pos|${primed.total_value_at_risk:.0f}{ratio_str}{eq_str}",
+                    justification_ref=f"HL_PROX|ABSORB|{primed.total_positions_at_risk}pos|${primed.total_value_at_risk:.0f}{ratio_str}{eq_str}{burst_str}{density_str}",
                     timestamp=context.timestamp
                 )
 
@@ -1042,12 +1498,20 @@ def generate_cascade_sniper_proposal(
 
                 eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
 
+                # Enrich with trade burst intensity and liquidation cluster density
+                burst_str = ""
+                if trade_burst is not None:
+                    burst_str = f"|BURST:{trade_burst.trades_per_second:.1f}tps"
+                density_str = ""
+                if liquidation_density is not None:
+                    density_str = f"|LDENSITY:{liquidation_density.density_score:.2f}"
+
                 return StrategyProposal(
                     strategy_id="EP2-CASCADE-SNIPER-V1",
                     action_type="ENTRY",
                     direction=entry_direction,
                     confidence="CASCADE_MOMENTUM",
-                    justification_ref=f"HL_PROX|TRIGGER|{primed.total_positions_at_risk}pos|${primed.total_value_at_risk:.0f}{ratio_str}{eq_str}",
+                    justification_ref=f"HL_PROX|TRIGGER|{primed.total_positions_at_risk}pos|${primed.total_value_at_risk:.0f}{ratio_str}{eq_str}{burst_str}{density_str}",
                     timestamp=context.timestamp
                 )
 
@@ -1126,7 +1590,8 @@ def generate_cascade_sniper_proposal_from_primitives(
     context: StrategyContext,
     position_state: Optional[PositionState] = None,
     entry_mode: EntryMode = EntryMode.ABSORPTION_REVERSAL,
-    trend_context: Optional[TrendRegimeContext] = None
+    trend_context: Optional[TrendRegimeContext] = None,
+    price_returns: Optional[Dict[str, Optional[float]]] = None  # Gate B: {ret_1m, ret_3m}
 ) -> Optional[StrategyProposal]:
     """
     Generate cascade sniper proposal from M4PrimitiveBundle WITH TREND KILL-SWITCH.
@@ -1137,6 +1602,9 @@ def generate_cascade_sniper_proposal_from_primitives(
     TREND KILL-SWITCH:
     - Reversal entries are blocked during strong directional moves
     - Momentum entries benefit from trend alignment (bonus applied)
+
+    TREND GATE (Gate B):
+    - Blocks counter-trend entries based on short-term price returns
 
     Args:
         permission: M6 permission result
@@ -1193,7 +1661,7 @@ def generate_cascade_sniper_proposal_from_primitives(
             window_end=cascade_state.timestamp
         )
 
-    # Delegate to existing function with trend context
+    # Delegate to existing function with trend context and price returns
     return generate_cascade_sniper_proposal(
         permission=permission,
         proximity=proximity,
@@ -1201,5 +1669,6 @@ def generate_cascade_sniper_proposal_from_primitives(
         context=context,
         position_state=position_state,
         entry_mode=entry_mode,
-        trend_context=trend_context
+        trend_context=trend_context,
+        price_returns=price_returns
     )

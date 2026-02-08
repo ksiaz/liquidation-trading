@@ -230,7 +230,8 @@ class PolicyAdapter:
                 # Instantaneous primitives as fallback (with stability requirement)
                 zone_penetration=primitives.get("zone_penetration"),
                 traversal_compactness=primitives.get("traversal_compactness"),
-                central_tendency_deviation=primitives.get("central_tendency_deviation")
+                central_tendency_deviation=primitives.get("central_tendency_deviation"),
+                absorption_event=primitives.get("absorption_event")
             )
             if _DIAG_ENABLED:
                 if proposal:
@@ -314,7 +315,9 @@ class PolicyAdapter:
                     price=current_price,
                     context=context,
                     permission=permission,
-                    position_state=position_state
+                    position_state=position_state,
+                    absorption_event=primitives.get("absorption_event"),
+                    directional_continuity=primitives.get("directional_continuity")
                 )
                 if _DIAG_ENABLED:
                     from external_policy.ep2_slbrs_strategy import _slbrs_strategy
@@ -348,7 +351,9 @@ class PolicyAdapter:
                     price_low=price_low if price_low is not None else current_price,
                     context=context,
                     permission=permission,
-                    position_state=position_state
+                    position_state=position_state,
+                    trade_burst=primitives.get("trade_burst"),
+                    directional_continuity=primitives.get("directional_continuity")
                 )
                 if _DIAG_ENABLED:
                     if proposal:
@@ -374,7 +379,9 @@ class PolicyAdapter:
                 entry_mode=entry_mode,
                 absorption=absorption,  # Pass orderbook absorption analysis
                 trend_context=trend_context,  # Pass trend context for kill-switch
-                price_returns=price_returns  # Gate B: Short-term price returns
+                price_returns=price_returns,  # Gate B: Short-term price returns
+                trade_burst=primitives.get("trade_burst"),
+                liquidation_density=primitives.get("liquidation_density")
             )
             if _DIAG_ENABLED:
                 if proposal:

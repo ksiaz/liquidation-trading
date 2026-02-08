@@ -491,7 +491,9 @@ def generate_geometry_proposal(
     zone_penetration=None,
     traversal_compactness=None,
     central_tendency_deviation=None,
-    instantaneous_config: InstantaneousFallbackConfig = DEFAULT_INSTANTANEOUS_CONFIG
+    instantaneous_config: InstantaneousFallbackConfig = DEFAULT_INSTANTANEOUS_CONFIG,
+    # Enrichment primitive: orderbook absorption at zone
+    absorption_event=None  # AbsorptionEvent | None (B2.1 - zone defense confirmation)
 ) -> Optional[StrategyProposal]:
     """
     Generate supply/demand zone pattern proposal.
@@ -602,11 +604,15 @@ def generate_geometry_proposal(
             _entry_method[symbol] = "PATTERN"
             # Derive direction from zone type: demand=LONG (buy support), supply=SHORT (sell resistance)
             entry_direction = "LONG" if supply_demand_zone.zone_type == "demand" else "SHORT"
+            # Enrich justification with absorption evidence (zone being defended)
+            absorption_ref = ""
+            if absorption_event is not None and absorption_event.consumed_size > 0:
+                absorption_ref = "|ABSORPTION"
             return StrategyProposal(
                 strategy_id="EP2-GEOMETRY-V2",
                 action_type="ENTRY",
                 confidence="ZONE_CONFIRMED",
-                justification_ref=f"B5_SDZ|{supply_demand_zone.zone_type.upper()}|RT{supply_demand_zone.retest_count}",
+                justification_ref=f"B5_SDZ|{supply_demand_zone.zone_type.upper()}|RT{supply_demand_zone.retest_count}{absorption_ref}",
                 timestamp=context.timestamp,
                 direction=entry_direction
             )

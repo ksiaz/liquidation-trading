@@ -219,6 +219,10 @@ class CollectorService:
         # HL fill accumulator: aggregates taker fills per symbol per cycle
         # Each entry: (side_consumed: "bid"|"ask", size: float, price: float, ts: float)
         self._hl_fill_accumulator: Dict[str, list] = {}
+        # Rolling price high/low tracker (5-min window) for EFFCS impulse detection
+        self._price_highs: Dict[str, float] = {}
+        self._price_lows: Dict[str, float] = {}
+        self._hl_reset_time: Dict[str, float] = {}
 
         # Memory guard: track last calculator activity for pruning
         self._calculator_last_activity: Dict[str, float] = {}
@@ -676,6 +680,14 @@ class CollectorService:
                     # This enables M4 cascade primitives to be computed from HL data
                     self._obs.set_hyperliquid_source(self._hyperliquid_collector)
                     self._logger.info("Hyperliquid collector wired to observation system")
+
+                    # Wire HL orderbook to observation layer for depth primitives
+                    # (resting_size, order_consumption, absorption)
+                    if hasattr(self._hyperliquid_collector, '_client'):
+                        self._hyperliquid_collector._client.set_orderbook_callback(
+                            self._handle_hl_orderbook
+                        )
+                        self._logger.info("HL orderbook callback registered (depth primitives)")
                 except Exception as e:
                     self._logger.warning(f"Hyperliquid collector start failed: {e}")
 
@@ -1089,7 +1101,9 @@ class CollectorService:
                         liquidation_burst=liquidation_burst,  # Phase 6: Liquidation burst
                         absorption=absorption,  # Phase 6: Order book absorption analysis
                         price_returns=price_returns,  # Gate B: Short-term price returns
-                        hl_order_consumption=hl_oc  # HL taker fills → order consumption
+                        hl_order_consumption=hl_oc,  # HL taker fills → order consumption
+                        price_high=self._price_highs.get(symbol, current_price),
+                        price_low=self._price_lows.get(symbol, current_price)
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1394,8 +1408,16 @@ class CollectorService:
             is_buyer_maker = (side == "A")
             self._orderflow_calculators[normalized_symbol].update(is_buyer_maker, size, timestamp)
 
-            # 8. Track current price
+            # 8. Track current price + rolling high/low (5-min window)
             self._current_prices[normalized_symbol] = price
+            now = time.time()
+            if normalized_symbol not in self._hl_reset_time or now - self._hl_reset_time[normalized_symbol] >= 300:
+                self._hl_reset_time[normalized_symbol] = now
+                self._price_highs[normalized_symbol] = price
+                self._price_lows[normalized_symbol] = price
+            else:
+                self._price_highs[normalized_symbol] = max(self._price_highs.get(normalized_symbol, price), price)
+                self._price_lows[normalized_symbol] = min(self._price_lows.get(normalized_symbol, price), price)
 
             # 9. Accumulate fill for order consumption primitive
             # HL side: "B" = buyer is taker (consumed asks), "A" = seller is taker (consumed bids)
@@ -1479,6 +1501,44 @@ class CollectorService:
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL liquidation callback error: {e}")
+
+    async def _handle_hl_orderbook(self, orderbook: Dict):
+        """Feed HL L2 orderbook to observation layer as DEPTH event.
+
+        Called by HyperliquidClient on every l2Book WebSocket update.
+        Converts HL format to M1 depth array format for primitive computation
+        (resting_size, order_consumption, absorption).
+        """
+        try:
+            coin = orderbook.get('coin')
+            if not coin:
+                return
+            symbol = f"{coin}USDT"
+
+            bids = orderbook.get('bids', [])
+            asks = orderbook.get('asks', [])
+            if not bids or not asks:
+                return
+
+            # Convert to M1 depth array format: [["price", "qty"], ...]
+            bid_levels = [[str(b['price']), str(b['size'])] for b in bids[:20]]
+            ask_levels = [[str(a['price']), str(a['size'])] for a in asks[:20]]
+
+            ts = orderbook.get('timestamp', time.time())
+            payload = {
+                'E': int(ts * 1000),
+                'b': bid_levels,
+                'a': ask_levels
+            }
+
+            self._obs.ingest_observation(
+                timestamp=ts,
+                symbol=symbol,
+                event_type='DEPTH',
+                payload=payload
+            )
+        except Exception:
+            pass  # Fail silently per constitutional rules
 
     def _process_ghost_trades(self):
         """Deprecated: entry/exit now handled in unified path after process_cycle().

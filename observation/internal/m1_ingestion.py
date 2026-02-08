@@ -538,16 +538,25 @@ class M1IngestionEngine:
             timestamp_ms = payload.get('timestamp_ms', 0)
             timestamp = timestamp_ms / 1000.0 if timestamp_ms > 0 else payload.get('timestamp', 0)
 
+            # Normalize symbol: HL uses "BTC", M1 buffers keyed by "BTCUSDT"
+            norm_symbol = f"{symbol}USDT" if not symbol.endswith("USDT") and not symbol.endswith("USD") else symbol
+
             event = {
                 'timestamp': timestamp,
-                'symbol': symbol,
+                'symbol': norm_symbol,
                 'price': price,
                 'quantity': size,
                 'quote_qty': quote_qty,
+                'base_qty': size,
                 'side': side,
                 'event_type': 'HL_FILL',
                 'exchange': 'HYPERLIQUID',
             }
+
+            # Populate raw_trades buffer (same as normalize_trade)
+            # Enables trade-based primitives (velocity, compactness, zone_penetration)
+            self.raw_trades[norm_symbol].append(event)
+            self.recent_prices[norm_symbol].append((timestamp, price))
 
             self.counters['hl_fills'] = self.counters.get('hl_fills', 0) + 1
             return event

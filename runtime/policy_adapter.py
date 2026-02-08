@@ -136,7 +136,9 @@ class PolicyAdapter:
         absorption: Optional[AbsorptionAnalysis] = None,  # Order book absorption analysis
         trend_context: Optional[TrendRegimeContext] = None,  # Trend regime for kill-switch
         price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
-        hl_order_consumption: Optional[Any] = None  # HL-derived order consumption (from taker fills)
+        hl_order_consumption: Optional[Any] = None,  # HL-derived order consumption (from taker fills)
+        price_high: Optional[float] = None,  # 5-min rolling high for EFFCS impulse direction
+        price_low: Optional[float] = None  # 5-min rolling low for EFFCS impulse direction
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -380,8 +382,8 @@ class PolicyAdapter:
                     displacement=primitives.get("displacement_origin_anchor"),
                     liquidation_zscore=regime_metrics.liquidation_zscore,
                     price=current_price,
-                    price_high=current_price,  # TODO: Track recent high separately
-                    price_low=current_price,  # TODO: Track recent low separately
+                    price_high=price_high if price_high is not None else current_price,
+                    price_low=price_low if price_low is not None else current_price,
                     context=context,
                     permission=permission,
                     position_state=position_state

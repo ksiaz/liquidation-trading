@@ -114,9 +114,14 @@ class PolicyAdapter:
     # Grace period (seconds) - no EXIT allowed within this time of ENTRY
     ENTRY_GRACE_PERIOD_SEC = 10.0
 
+    # Warmup: minimum seconds before ANY strategy can propose entries.
+    # Prevents garbage entries from unconverged primitives (ATR, VWAP, orderflow).
+    WARMUP_MIN_ELAPSED_SEC = 120.0
+
     def __init__(self, config: Optional[AdapterConfig] = None):
         """Initialize adapter with configuration."""
         self.config = config or AdapterConfig()
+        self._session_start_ts: Optional[float] = None
 
     def generate_mandates(
         self,
@@ -171,6 +176,14 @@ class PolicyAdapter:
                 timestamp=timestamp
             )]
 
+        # Warmup gate: block all strategy proposals until primitives have converged.
+        # Strategies are still called (to accumulate internal state like sideways_streak),
+        # but we discard any proposals during warmup.
+        if self._session_start_ts is None:
+            self._session_start_ts = timestamp
+        warmup_elapsed = timestamp - self._session_start_ts
+        warmup_passed = warmup_elapsed >= self.WARMUP_MIN_ELAPSED_SEC
+
         # Status is UNINITIALIZED (normal operation) - proceed with mandate generation
         # Extract M4 primitives from observation
         # NOTE: This is a stub - actual implementation needs M5 query interface
@@ -213,6 +226,11 @@ class PolicyAdapter:
 
         # Invoke frozen external policies
         proposals: List[StrategyProposal] = []
+
+        # Warmup gate: don't call strategies until primitives have converged.
+        # Strategies must NOT run during warmup (SLBRS accumulates sideways_streak).
+        if not warmup_passed:
+            return []
 
         if self.config.enable_geometry:
             # Create context with current_price for zone break detection
@@ -317,7 +335,9 @@ class PolicyAdapter:
                     permission=permission,
                     position_state=position_state,
                     absorption_event=primitives.get("absorption_event"),
-                    directional_continuity=primitives.get("directional_continuity")
+                    directional_continuity=primitives.get("directional_continuity"),
+                    orderflow_imbalance=regime_metrics.orderflow_imbalance,
+                    orderflow_fill_count=regime_metrics.orderflow_fill_count
                 )
                 if _DIAG_ENABLED:
                     from external_policy.ep2_slbrs_strategy import _slbrs_strategy
@@ -370,6 +390,8 @@ class PolicyAdapter:
             if self.config.cascade_sniper_entry_mode == "CASCADE_MOMENTUM":
                 entry_mode = CascadeSniperEntryMode.CASCADE_MOMENTUM
 
+            # Get liq_z from regime_metrics (if available) for cascade sniper override
+            cascade_liq_z = regime_metrics.liquidation_zscore if regime_metrics is not None else None
             proposal = generate_cascade_sniper_proposal(
                 permission=permission,
                 proximity=hl_proximity,
@@ -381,7 +403,8 @@ class PolicyAdapter:
                 trend_context=trend_context,  # Pass trend context for kill-switch
                 price_returns=price_returns,  # Gate B: Short-term price returns
                 trade_burst=primitives.get("trade_burst"),
-                liquidation_density=primitives.get("liquidation_density")
+                liquidation_density=primitives.get("liquidation_density"),
+                liquidation_zscore=cascade_liq_z  # Aggregate liq signal for override
             )
             if _DIAG_ENABLED:
                 if proposal:

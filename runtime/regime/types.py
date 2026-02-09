@@ -35,13 +35,15 @@ class RegimeMetrics:
         atr_5m: float,  # 5-minute ATR
         atr_30m: float,  # 30-minute ATR
         orderflow_imbalance: float,  # Taker buy ratio: buy / (buy + sell)
-        liquidation_zscore: float  # Z-score of liquidation rate
+        liquidation_zscore: float,  # Z-score of liquidation rate
+        orderflow_fill_count: int = 0  # Number of fills in orderflow window
     ):
         self.vwap_distance = vwap_distance
         self.atr_5m = atr_5m
         self.atr_30m = atr_30m
         self.orderflow_imbalance = orderflow_imbalance
         self.liquidation_zscore = liquidation_zscore
+        self.orderflow_fill_count = orderflow_fill_count
 
     def __repr__(self):
         return (

@@ -101,7 +101,18 @@ class LiquidationZScoreCalculator:
         stddev_rate = self._calculate_stddev(baseline_events, current_timestamp)
 
         if stddev_rate == 0:
-            # No variance - return 0 if current matches baseline, else large Z
+            # No variance in baseline. If current rate exceeds mean, return
+            # a fixed high z-score (activity above uniform baseline).
+            # If current matches or is below baseline, return 0.
+            current_cutoff = current_timestamp - self.current_window_seconds
+            current_total = sum(
+                qty for ts, qty in self._events if ts >= current_cutoff
+            )
+            current_rate_check = current_total / (self.current_window_seconds / 60.0)
+            if current_rate_check > mean_rate and mean_rate > 0:
+                return 3.0  # Activity above uniform baseline
+            if current_rate_check > 0 and mean_rate == 0:
+                return 5.0  # Activity where there was none
             return 0.0
 
         # Current rate: Liquidations in recent window
@@ -127,6 +138,8 @@ class LiquidationZScoreCalculator:
         Calculate standard deviation of liquidation rate.
 
         Divides baseline window into 1-minute buckets and calculates stddev.
+        Includes empty buckets (minutes with zero liquidations) to avoid
+        underestimating deviation when events are sparse.
 
         Args:
             events: List of (timestamp, quantity) events
@@ -138,7 +151,16 @@ class LiquidationZScoreCalculator:
         if not events:
             return 0.0
 
-        # Divide into 1-minute buckets
+        # Determine full range of 1-minute buckets across baseline window
+        baseline_start = current_timestamp - self.baseline_window_seconds
+        first_bucket = int(baseline_start) // 60
+        last_bucket = int(current_timestamp) // 60
+        total_buckets = last_bucket - first_bucket + 1
+
+        if total_buckets < 2:
+            return 0.0
+
+        # Populate buckets with event data
         buckets = {}
         for ts, qty in events:
             bucket_id = int(ts) // 60
@@ -146,12 +168,11 @@ class LiquidationZScoreCalculator:
                 buckets[bucket_id] = 0.0
             buckets[bucket_id] += qty
 
-        if len(buckets) < 2:
-            # Need at least 2 buckets for stddev
-            return 0.0
+        # Build full rate array including empty buckets (0.0 for minutes with no events)
+        rates = []
+        for bucket_id in range(first_bucket, last_bucket + 1):
+            rates.append(buckets.get(bucket_id, 0.0))
 
-        # Calculate mean and stddev
-        rates = list(buckets.values())
         mean = sum(rates) / len(rates)
         variance = sum((r - mean) ** 2 for r in rates) / len(rates)
         stddev = math.sqrt(variance)

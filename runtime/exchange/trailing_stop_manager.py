@@ -51,16 +51,22 @@ class TrailingStopConfig:
     step_trail_pct: float = 0.005          # Trail stop by 0.5% each step
 
     # ATR_PROGRESSIVE settings - MFE-based continuous tightening
-    # Formula: atr_mult = clamp(start - k * mfe_profit_pct, end, start)
-    # where k = (start - end) / profit_range
+    # Two-phase piecewise linear: fast initial tightening, gradual for runners
     atr_prog_start_mult: float = 2.5       # Wide at entry (2.5× ATR)
+    atr_prog_phase1_end_mult: float = 1.8  # End of phase 1 multiplier
+    atr_prog_phase1_range: float = 0.01    # Phase 1 covers 0-1% MFE (fast tightening)
     atr_prog_end_mult: float = 1.0         # Tight at max profit (1.0× ATR)
     atr_prog_profit_range: float = 0.03    # Full tightening over 3% MFE profit
     atr_prog_min_pct: float = 0.005        # Floor: at least 0.5% distance (low vol protection)
     atr_prog_min_lock_ratio: float = 0.4   # Profit floor: lock at least 40% of MFE profit
 
+    # Orderflow-aware tightening
+    orderflow_tighten_threshold: float = 0.38  # Adverse flow threshold (< this for LONG)
+    orderflow_tighten_mult: float = 0.6        # Multiply ATR distance by this when adverse
+
     # Update settings
     min_move_to_update_pct: float = 0.002  # Only update stop if new level is 0.2% better
+    min_move_atr_fraction: float = 0.05    # Update if move >= 5% of ATR (dynamic gate)
 
 
 @dataclass
@@ -82,6 +88,9 @@ class TrailingStopState:
 
     # ATR (if using ATR mode)
     current_atr: Optional[float] = None
+
+    # Orderflow imbalance (0-1, where 0.5 = balanced, <0.5 = selling, >0.5 = buying)
+    last_orderflow: Optional[float] = None
 
     # AUDIT-P0-9: Track confirmed exchange state separately from intended state
     # This allows detecting divergence when exchange ACK fails
@@ -149,13 +158,20 @@ class TrailingStopManager:
                     break_even_offset_pct=config_dict.get('break_even_offset_pct', 0.001),
                     step_size_pct=config_dict.get('step_size_pct', 0.01),
                     step_trail_pct=config_dict.get('step_trail_pct', 0.005),
-                    # ATR_PROGRESSIVE settings
+                    # ATR_PROGRESSIVE settings (two-phase)
                     atr_prog_start_mult=config_dict.get('atr_prog_start_mult', 2.5),
+                    atr_prog_phase1_end_mult=config_dict.get('atr_prog_phase1_end_mult', 1.8),
+                    atr_prog_phase1_range=config_dict.get('atr_prog_phase1_range', 0.01),
                     atr_prog_end_mult=config_dict.get('atr_prog_end_mult', 1.0),
                     atr_prog_profit_range=config_dict.get('atr_prog_profit_range', 0.03),
                     atr_prog_min_pct=config_dict.get('atr_prog_min_pct', 0.005),
                     atr_prog_min_lock_ratio=config_dict.get('atr_prog_min_lock_ratio', 0.4),
+                    # Orderflow tightening
+                    orderflow_tighten_threshold=config_dict.get('orderflow_tighten_threshold', 0.38),
+                    orderflow_tighten_mult=config_dict.get('orderflow_tighten_mult', 0.6),
+                    # Update settings
                     min_move_to_update_pct=config_dict.get('min_move_to_update_pct', 0.002),
+                    min_move_atr_fraction=config_dict.get('min_move_atr_fraction', 0.05),
                 )
 
                 state = TrailingStopState(
@@ -195,13 +211,20 @@ class TrailingStopManager:
                 'break_even_offset_pct': state.config.break_even_offset_pct,
                 'step_size_pct': state.config.step_size_pct,
                 'step_trail_pct': state.config.step_trail_pct,
-                # ATR_PROGRESSIVE settings
+                # ATR_PROGRESSIVE settings (two-phase)
                 'atr_prog_start_mult': state.config.atr_prog_start_mult,
+                'atr_prog_phase1_end_mult': state.config.atr_prog_phase1_end_mult,
+                'atr_prog_phase1_range': state.config.atr_prog_phase1_range,
                 'atr_prog_end_mult': state.config.atr_prog_end_mult,
                 'atr_prog_profit_range': state.config.atr_prog_profit_range,
                 'atr_prog_min_pct': state.config.atr_prog_min_pct,
                 'atr_prog_min_lock_ratio': state.config.atr_prog_min_lock_ratio,
+                # Orderflow tightening
+                'orderflow_tighten_threshold': state.config.orderflow_tighten_threshold,
+                'orderflow_tighten_mult': state.config.orderflow_tighten_mult,
+                # Update settings
                 'min_move_to_update_pct': state.config.min_move_to_update_pct,
+                'min_move_atr_fraction': state.config.min_move_atr_fraction,
             }
 
             persisted = PersistedTrailingStop(
@@ -293,13 +316,15 @@ class TrailingStopManager:
             f"mode={config.mode.value}"
         )
 
-    def update_price(self, symbol: str, price: float, atr: Optional[float] = None):
+    def update_price(self, symbol: str, price: float, atr: Optional[float] = None,
+                     orderflow_imbalance: Optional[float] = None):
         """Update price and potentially trail stops.
 
         Args:
             symbol: Trading symbol
             price: Current market price
             atr: Current ATR value (for ATR_MULTIPLE mode)
+            orderflow_imbalance: Buy/sell imbalance (0-1, <0.5 = selling pressure)
         """
         with self._lock:
             for entry_id, state in list(self._stops.items()):
@@ -309,6 +334,10 @@ class TrailingStopManager:
                 # Update ATR if provided
                 if atr is not None:
                     state.current_atr = atr
+
+                # Update orderflow if provided
+                if orderflow_imbalance is not None:
+                    state.last_orderflow = orderflow_imbalance
 
                 # Update high/low watermark
                 if state.direction == "LONG":
@@ -323,12 +352,20 @@ class TrailingStopManager:
                     old_stop = state.current_stop_price
 
                     # Check if move is significant enough
+                    # Dynamic update gate: use ATR-relative threshold when ATR available
+                    config = state.config
+                    if state.current_atr and state.current_atr > 0:
+                        min_move = state.current_atr * config.min_move_atr_fraction
+                        min_move_pct = min_move / state.entry_price
+                    else:
+                        min_move_pct = config.min_move_to_update_pct
+
                     if state.direction == "LONG":
                         improvement = (new_stop - old_stop) / state.entry_price
                     else:
                         improvement = (old_stop - new_stop) / state.entry_price
 
-                    if improvement >= state.config.min_move_to_update_pct:
+                    if improvement >= min_move_pct:
                         # Update stop immediately (ghost mode - no exchange ACK needed)
                         state.current_stop_price = new_stop
                         state.last_update_ns = self._now_ns()
@@ -445,11 +482,38 @@ class TrailingStopManager:
                     new_stop = entry - locked_profit
                     return new_stop if new_stop < current_stop else None
 
-            # Continuous multiplier: linear interpolation from start to end
-            # k = (start - end) / range, then mult = start - k * mfe
-            k = (config.atr_prog_start_mult - config.atr_prog_end_mult) / config.atr_prog_profit_range
-            raw_mult = config.atr_prog_start_mult - (k * mfe_profit_pct)
+            # Two-phase piecewise linear multiplier:
+            # Phase 1 (0 → phase1_range): fast tightening to protect new profit
+            # Phase 2 (phase1_range → profit_range): gradual tightening for runners
+            if mfe_profit_pct <= config.atr_prog_phase1_range:
+                # Phase 1: Fast tightening (entry protection)
+                if config.atr_prog_phase1_range > 0:
+                    k1 = (config.atr_prog_start_mult - config.atr_prog_phase1_end_mult) / config.atr_prog_phase1_range
+                    raw_mult = config.atr_prog_start_mult - (k1 * mfe_profit_pct)
+                else:
+                    raw_mult = config.atr_prog_start_mult
+            else:
+                # Phase 2: Gradual tightening (let winners run)
+                remaining_range = config.atr_prog_profit_range - config.atr_prog_phase1_range
+                if remaining_range > 0:
+                    progress = mfe_profit_pct - config.atr_prog_phase1_range
+                    k2 = (config.atr_prog_phase1_end_mult - config.atr_prog_end_mult) / remaining_range
+                    raw_mult = config.atr_prog_phase1_end_mult - (k2 * progress)
+                else:
+                    raw_mult = config.atr_prog_end_mult
             atr_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, raw_mult))
+
+            # Orderflow-aware tightening: adverse flow reduces multiplier
+            if state.last_orderflow is not None:
+                of = state.last_orderflow
+                if state.direction == "LONG" and of < config.orderflow_tighten_threshold:
+                    # Selling pressure against LONG — tighten stop
+                    atr_mult *= config.orderflow_tighten_mult
+                elif state.direction == "SHORT" and of > (1.0 - config.orderflow_tighten_threshold):
+                    # Buying pressure against SHORT — tighten stop
+                    atr_mult *= config.orderflow_tighten_mult
+                # Re-clamp after orderflow adjustment
+                atr_mult = max(config.atr_prog_end_mult, atr_mult)
 
             # Calculate ATR-based distance with floor protection
             atr_distance = state.current_atr * atr_mult

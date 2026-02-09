@@ -80,7 +80,10 @@ class OrderflowImbalanceCalculator:
         taker_buy_volume = 0.0
         taker_sell_volume = 0.0
 
-        for ts, is_buyer_maker, volume in self._trades:
+        # Snapshot to avoid "deque mutated during iteration" when
+        # gRPC fill callback appends while regime loop iterates.
+        trades_snapshot = list(self._trades)
+        for ts, is_buyer_maker, volume in trades_snapshot:
             if is_buyer_maker:
                 # Buyer was maker → taker was seller
                 taker_sell_volume += volume
@@ -93,6 +96,10 @@ class OrderflowImbalanceCalculator:
             return taker_buy_volume / total_volume
         else:
             return None
+
+    def get_trade_count(self) -> int:
+        """Return number of trades currently in the rolling window."""
+        return len(self._trades)
 
     def get_deviation_from_balance(self) -> Optional[float]:
         """
@@ -145,3 +152,11 @@ class MultiWindowOrderflow:
     def get_imbalance_60s(self) -> Optional[float]:
         """Get 60-second orderflow imbalance."""
         return self.window_60s.get_imbalance()
+
+    def get_trade_count_30s(self) -> int:
+        """Get number of trades in 30-second window."""
+        return self.window_30s.get_trade_count()
+
+    def get_trade_count_60s(self) -> int:
+        """Get number of trades in 60-second window."""
+        return self.window_60s.get_trade_count()

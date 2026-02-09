@@ -3,7 +3,7 @@ Runtime Collector Service
 
 The Driver of the Observation System.
 Responsibility:
-1. IO: Connect to Binance WebSockets.
+1. IO: Connect to HL node (gRPC adapter) and WebSockets.
 2. Clock: Drive System Time (advance_time).
 3. Ingest: Feed Raw Data to M5 (ingest_observation).
 4. Loop: Asyncio Main Loop.
@@ -69,7 +69,7 @@ from external_policy.ep2_strategy_geometry import restore_entry_context_from_pos
 # Phase E: StabilityObserver attachment (passive, read-only)
 from runtime.stability_observer import stability_observer
 
-# Import Binance Client for ATR warm-up
+# Binance client used only for initial ATR warm-up (historical klines)
 from runtime.binance.client import BinanceClient
 
 # Import Validation modules for data integrity and manipulation detection
@@ -85,6 +85,7 @@ TOP_10_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
     "AVAXUSDT", "LINKUSDT", "HYPEUSDT", "SUIUSDT", "NEARUSDT",
     "LTCUSDT", "ATOMUSDT", "AAVEUSDT", "APTUSDT", "ARBUSDT",
+    "BNBUSDT", "OPUSDT", "TRXUSDT", "WLDUSDT", "TONUSDT",
 ]
 
 class CollectorService:
@@ -133,7 +134,7 @@ class CollectorService:
         # This enables EXIT signals for positions opened in previous sessions
         self._restore_strategy_state()
 
-        # Track mark prices for execution (estimated from trade stream)
+        # Track mark prices for execution (updated from HL oracle in regime loop)
         self._mark_prices: Dict[str, Decimal] = {}
 
         # Mock account state (in production, this comes from exchange API)
@@ -179,15 +180,22 @@ class CollectorService:
         # Wider initial stop, slower tightening, higher BE trigger
         self._trailing_stop_config = TrailingStopConfig(
             mode=TrailingMode.ATR_PROGRESSIVE,
-            # ATR progressive settings
-            atr_prog_start_mult=2.8,        # Wide at entry (2.8× ATR)
-            atr_prog_end_mult=1.1,          # Moderate at target (1.1× ATR)
-            atr_prog_profit_range=0.04,     # Full tightening over 4% MFE profit
-            atr_prog_min_pct=0.006,         # Floor: at least 0.6% distance
+            # Two-phase ATR tightening
+            atr_prog_start_mult=2.5,        # Wide at entry (was 2.8)
+            atr_prog_phase1_end_mult=1.8,   # End of phase 1
+            atr_prog_phase1_range=0.01,     # Phase 1: 0-1% MFE (fast tightening)
+            atr_prog_end_mult=1.0,          # Tight at target (was 1.1)
+            atr_prog_profit_range=0.04,     # Full range unchanged
+            atr_prog_min_pct=0.005,         # Floor: 0.5% distance
+            # Orderflow tightening
+            orderflow_tighten_threshold=0.38,  # Adverse flow threshold
+            orderflow_tighten_mult=0.6,        # 40% tighter when adverse
             # Break-even settings
             break_even_trigger_pct=0.006,   # Trigger break-even after 0.6% profit
             break_even_offset_pct=0.002,    # Lock in 0.2% profit at break-even
-            min_move_to_update_pct=0.0012,  # Update stop if 0.12% improvement
+            # ATR-relative update gate
+            min_move_atr_fraction=0.05,     # Update if move >= 5% of ATR
+            min_move_to_update_pct=0.001,   # Lowered fallback (was 0.0012)
             # Lock ratio: retain 45% of unrealized profit
             atr_prog_min_lock_ratio=0.45,
         )
@@ -543,7 +551,7 @@ class CollectorService:
     async def _warm_up_atr_calculators(self, symbols: List[str]):
         """Pre-warm ATR calculators with historical klines.
 
-        Fetches 5m klines from Binance asynchronously to initialize ATR calculators,
+        Fetches historical 5m klines to initialize ATR calculators,
         avoiding the 90-minute warm-up delay for regime classification.
 
         Args:
@@ -596,7 +604,7 @@ class CollectorService:
         """Start all collectors."""
         self._running = True
         # Don't set _startup_time here - will be set on first stream data
-        # self._startup_time = time.time()  # REMOVED: causes clock skew with Binance time
+        # self._startup_time = time.time()  # REMOVED: causes clock skew
 
         # 0a. Recover persisted positions and strategy contexts (for restart recovery)
         await self._recover_position_contexts()
@@ -611,11 +619,10 @@ class CollectorService:
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
 
-        # 2. Start Binance WebSocket FIRST (before heavy node I/O to avoid timeout)
-        # Binance WebSocket handshake is sensitive to event loop blocking
+        # 2. Start Binance WebSocket (supplementary ATR warm-up source)
         binance_task = asyncio.create_task(self._run_binance_stream())
 
-        # Give Binance time to connect before starting heavy I/O
+        # Give WS time to connect before starting heavy I/O
         await asyncio.sleep(2.0)
 
         # 3. Start Hyperliquid Integration (Node Adapter or WebSocket Collector)
@@ -689,7 +696,7 @@ class CollectorService:
                 except Exception as e:
                     self._logger.warning(f"Hyperliquid collector start failed: {e}")
 
-        # Wait for Binance task (it runs forever, reconnecting as needed)
+        # Wait for supplementary WS task (runs forever, reconnecting as needed)
         await binance_task
 
     async def _monitor_node_bridge_health(self):
@@ -752,13 +759,13 @@ class CollectorService:
         while self._running:
             # Simple clock source selection:
             # - Node mode: use wall clock (node is synced, data is flowing)
-            # - WebSocket mode: use Binance stream time
+            # - WebSocket mode: use WS stream time
             if self._use_node_mode:
                 current_time = time.time()
             elif self._last_stream_time is not None:
                 current_time = self._last_stream_time
             else:
-                # Wait for first Binance stream event
+                # Wait for first WS stream event
                 await asyncio.sleep(0.5)
                 continue
 
@@ -838,14 +845,18 @@ class CollectorService:
                     continue
 
                 try:
-                    # Get current price - prefer HL node, fallback to Binance
-                    # Convert symbol format: BTCUSDT -> BTC for HL node
+                    # Get current price from HL node oracle
                     hl_symbol = symbol.replace('USDT', '')
                     price = node_prices.get(hl_symbol) or self._current_prices.get(symbol)
                     if price is None:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
                         continue  # No price data yet
+
+                    # Update price dicts from HL oracle so all paths use fresh data
+                    if node_prices.get(hl_symbol):
+                        self._mark_prices[symbol] = Decimal(str(price))
+                        self._current_prices[symbol] = price
 
                     # Update trailing stops with oracle price every cycle
                     # (HL fills are sparse — oracle price ensures stops trail on moves)
@@ -864,40 +875,42 @@ class CollectorService:
 
                     if not all([vwap_calc, atr_calc, orderflow_calc, liquidation_calc]):
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
-                            # DATA SOURCE CONTRACT: VWAP, ATR, Orderflow require Binance trades
-                            # See runtime/DATA_SOURCE_CONTRACT.py for authority map
                             missing = []
-                            if not vwap_calc: missing.append("VWAP (Binance trades required)")
-                            if not atr_calc: missing.append("ATR (Binance OHLC required)")
-                            if not orderflow_calc: missing.append("Orderflow (Binance direction required)")
+                            if not vwap_calc: missing.append("VWAP")
+                            if not atr_calc: missing.append("ATR")
+                            if not orderflow_calc: missing.append("Orderflow")
                             if not liquidation_calc: missing.append("Liquidation Z-score")
-                            print(f"[REGIME] {symbol}: SKIP - Binance-required data missing: {missing}", flush=True)
-                        continue  # Binance data not available for this symbol
+                            print(f"[REGIME] {symbol}: SKIP - calculators missing: {missing}", flush=True)
+                        continue  # Calculator not initialized for this symbol
 
                     # Compute regime metrics
                     vwap_distance = vwap_calc.get_distance(price)
                     atr_5m = atr_calc.get_atr_5m()
                     atr_30m = atr_calc.get_atr_30m()
-                    # Use 60s window in node mode (HL fills sparser than Binance)
+                    # Use 60s window in node mode (HL fills are sparser)
                     orderflow_imbalance = (
                         orderflow_calc.get_imbalance_60s()
                         if self._use_node_mode
                         else orderflow_calc.get_imbalance_30s()
                     )
                     liquidation_zscore = liquidation_calc.get_zscore(timestamp)
+                    orderflow_fill_count = (
+                        orderflow_calc.get_trade_count_60s()
+                        if self._use_node_mode
+                        else orderflow_calc.get_trade_count_30s()
+                    )
 
                     # Check if all metrics available
-                    # DATA SOURCE CONTRACT: All metrics except liq_z require Binance trade flow
                     if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             missing = []
-                            if vwap_distance is None: missing.append("VWAP (Binance)")
-                            if atr_5m is None: missing.append("ATR_5m (Binance)")
-                            if atr_30m is None: missing.append("ATR_30m (Binance warm-up)")
-                            if orderflow_imbalance is None: missing.append("Orderflow (Binance)")
-                            if liquidation_zscore is None: missing.append("Liq_Z (HL or Binance)")
+                            if vwap_distance is None: missing.append("VWAP")
+                            if atr_5m is None: missing.append("ATR_5m")
+                            if atr_30m is None: missing.append("ATR_30m")
+                            if orderflow_imbalance is None: missing.append("Orderflow")
+                            if liquidation_zscore is None: missing.append("Liq_Z")
                             print(f"[REGIME] {symbol}: SKIP - calculator warm-up incomplete: {missing}", flush=True)
-                        continue  # Binance calculator warm-up not complete
+                        continue  # Calculator warm-up not complete
 
                     # Create regime metrics object
                     regime_metrics = RegimeMetrics(
@@ -905,7 +918,8 @@ class CollectorService:
                         atr_5m=atr_5m,
                         atr_30m=atr_30m,
                         orderflow_imbalance=orderflow_imbalance,
-                        liquidation_zscore=liquidation_zscore
+                        liquidation_zscore=liquidation_zscore,
+                        orderflow_fill_count=orderflow_fill_count
                     )
 
                     # Classify regime
@@ -1059,7 +1073,7 @@ class CollectorService:
 
                     # Phase 6: Get liquidation burst data
                     # In node mode, use node bridge's aggregator (fed by node_trades liquidations)
-                    # Otherwise, use collector's aggregator (fed by Binance forceOrder stream)
+                    # Otherwise, use collector's aggregator (fed by WS forceOrder stream)
                     # Note: NodeBridge doesn't have get_burst (requires ObservationBridge)
                     liquidation_burst = None
                     if self._use_node_mode and self._node_bridge and hasattr(self._node_bridge, 'get_burst'):
@@ -1083,9 +1097,6 @@ class CollectorService:
                     coin_for_returns = symbol.replace('USDT', '').replace('USD', '')
                     price_returns = self._obs.get_hl_price_returns(coin_for_returns)
 
-                    # HL-derived order consumption (from taker fills)
-                    hl_oc = self._get_hl_order_consumption(symbol) if self._use_node_mode else None
-
                     # Trend context for cascade sniper kill-switch
                     trend_context = self._obs.get_trend_context(symbol)
 
@@ -1103,7 +1114,7 @@ class CollectorService:
                         absorption=absorption,  # Phase 6: Order book absorption analysis
                         trend_context=trend_context,  # Trend kill-switch for cascade sniper
                         price_returns=price_returns,  # Gate B: Short-term price returns
-                        hl_order_consumption=hl_oc,  # HL taker fills → order consumption
+                        hl_order_consumption=None,  # Canonical OC now has initial_size
                         price_high=self._price_highs.get(symbol, current_price),
                         price_low=self._price_lows.get(symbol, current_price)
                     )
@@ -1436,7 +1447,8 @@ class CollectorService:
                 from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
                 trade_side = "BUY" if side == "B" else "SELL"
                 trade_value = price * size  # USD value
-                record_organic_trade(normalized_symbol, trade_side, trade_value, timestamp)
+                record_organic_trade(normalized_symbol, trade_side, trade_value, timestamp,
+                                     price=price, size=size)
             except ImportError:
                 pass
 
@@ -1462,19 +1474,30 @@ class CollectorService:
         Mappings applied:
         - Symbol: coin -> f"{coin}USDT" (e.g., "BTC" -> "BTCUSDT")
         - Side: LONG -> SELL, SHORT -> BUY (position side -> order side)
-        - Quantity: size in base units (same as Binance forceOrder)
+        - Quantity: size in base units
         - Timestamp: already in seconds from NodeBridge
         """
         try:
             # 1. Symbol normalization: HL emits "BTC", calculators use "BTCUSDT"
             normalized_symbol = f"{symbol}USDT"
 
+            # Log liquidations for visibility
+            if not hasattr(self, '_hl_liq_count'):
+                self._hl_liq_count = 0
+            self._hl_liq_count += 1
+            liq_value = price * size
+            if self._hl_liq_count <= 5 or self._hl_liq_count % 100 == 0:
+                self._logger.info(f'[HL_LIQ #{self._hl_liq_count}] {symbol} {side} ${liq_value:.0f}')
+
             # 2. Initialize calculator for symbol if needed
             if normalized_symbol not in self._liquidation_calculators:
                 self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
 
-            # 3. Update liquidation Z-score calculator (uses quantity, not value)
-            self._liquidation_calculators[normalized_symbol].update(size, timestamp)
+            # 3. Update liquidation Z-score calculator (USD value, not base units)
+            # Base units (0.005 BTC) produce near-zero variance; USD ($480) gives
+            # meaningful magnitude differences between assets and time windows.
+            liq_usd = price * size
+            self._liquidation_calculators[normalized_symbol].update(liq_usd, timestamp)
 
             # 4. Side mapping for burst aggregator: LONG -> SELL, SHORT -> BUY
             # (HL side is position side, aggregator expects order side)
@@ -1541,6 +1564,13 @@ class CollectorService:
                 event_type='DEPTH',
                 payload=payload
             )
+
+            # Feed cascade sniper for structural absorption detection
+            try:
+                from external_policy.ep2_strategy_cascade_sniper import record_orderbook_update
+                record_orderbook_update(symbol, bids, asks, ts)
+            except ImportError:
+                pass
         except Exception as e:
             self._logger.warning(f"HL orderbook ingestion error for {orderbook.get('coin', '?')}: {e}")
 
@@ -1844,8 +1874,20 @@ class CollectorService:
             if atr_calc:
                 atr_value = atr_calc.get_atr_5m()
 
-            # Update trailing stop manager with new price and ATR
-            self._trailing_stop_manager.update_price(symbol, price, atr=atr_value)
+            # Orderflow for stop tightening (adverse flow = tighter stop)
+            orderflow = None
+            orderflow_calc = self._orderflow_calculators.get(symbol)
+            if orderflow_calc:
+                orderflow = (
+                    orderflow_calc.get_imbalance_60s()
+                    if self._use_node_mode
+                    else orderflow_calc.get_imbalance_30s()
+                )
+
+            # Update trailing stop manager with new price, ATR, and orderflow
+            self._trailing_stop_manager.update_price(
+                symbol, price, atr=atr_value, orderflow_imbalance=orderflow
+            )
 
             # Check if any stops are triggered (price crossed stop level)
             for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
@@ -1918,7 +1960,7 @@ class CollectorService:
             symbol: Full symbol (e.g., "BTCUSDT")
 
         Returns:
-            NormalizedOrderbook if available, None otherwise (falls back to Binance)
+            NormalizedOrderbook if available, None otherwise
         """
         if not self._hyperliquid_collector:
             return None
@@ -1936,7 +1978,7 @@ class CollectorService:
             return NormalizedOrderbook.from_hl_book(hl_book, coin)
 
         except Exception:
-            return None  # Fallback to Binance
+            return None
 
     def _log_cycle_to_db(self, snapshot: ObservationSnapshot, mandates: list, timestamp: float) -> int:
         """Log comprehensive execution cycle data to research database.
@@ -2246,8 +2288,8 @@ class CollectorService:
 
                             if 'aggtrade' in stream.lower():
                                 event_type = "TRADE"
-                                # Track mark price from trades
-                                if 'p' in payload:
+                                # Track mark price from trades (only in non-node mode)
+                                if 'p' in payload and not self._use_node_mode:
                                     self._mark_prices[symbol] = Decimal(str(payload['p']))
                                 # Log trade event for ground truth validation
                                 try:
@@ -2343,11 +2385,12 @@ class CollectorService:
                                             if symbol not in self._liquidation_calculators:
                                                 self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
 
-                                            # Update liquidation Z-score
-                                            self._liquidation_calculators[symbol].update(quantity, timestamp)
-
                                             # Phase 6: Update liquidation burst aggregator (for cascade sniper)
                                             price = float(order.get('p', 0))
+
+                                            # Update liquidation Z-score (USD value, not base units)
+                                            liq_usd = price * quantity
+                                            self._liquidation_calculators[symbol].update(liq_usd, timestamp)
                                             side = order.get('S', 'UNKNOWN')
                                             self._liquidation_burst_aggregator.add_event(
                                                 timestamp=timestamp,
@@ -2415,8 +2458,8 @@ class CollectorService:
                                             bids=bids,
                                             asks=asks
                                         )
-                                        # Update mark price from mid if available
-                                        if bids and asks:
+                                        # Update mark price from mid (only in non-node mode)
+                                        if bids and asks and not self._use_node_mode:
                                             mid = (float(bids[0][0]) + float(asks[0][0])) / 2
                                             self._mark_prices[symbol] = Decimal(str(mid))
                                 except:
@@ -2436,8 +2479,9 @@ class CollectorService:
                                             funding_rate=float(payload.get('r', 0)) if payload.get('r') else None,
                                             next_funding_time=float(payload.get('T', 0)) / 1000.0 if payload.get('T') else None
                                         )
-                                        # Update authoritative mark price
-                                        self._mark_prices[symbol] = Decimal(str(mark_price))
+                                        # Update mark price (only in non-node mode)
+                                        if not self._use_node_mode:
+                                            self._mark_prices[symbol] = Decimal(str(mark_price))
                                 except:
                                     pass
 
@@ -2455,8 +2499,9 @@ class CollectorService:
                             if self._last_stream_time is None or ts > self._last_stream_time:
                                 self._last_stream_time = ts
 
-                            # INGEST (P1: removed debug print from hot path)
-                            self._obs.ingest_observation(ts, symbol, event_type, payload)
+                            # Ingest to observation layer (skip in node mode to prevent mixed sources)
+                            if not self._use_node_mode:
+                                self._obs.ingest_observation(ts, symbol, event_type, payload)
 
                         except websockets.exceptions.ConnectionClosed:
                             # Let connection errors bubble up to trigger reconnect
@@ -2555,7 +2600,7 @@ async def main():
     collector = CollectorService(obs_system)
     
     print(f"[COLLECTOR] Starting with {len(TOP_10_SYMBOLS)} symbols: {TOP_10_SYMBOLS}")
-    print("[COLLECTOR] Connecting to Binance Futures WebSocket...")
+    print("[COLLECTOR] Connecting to HL node + WebSocket streams...")
     print("[COLLECTOR] M6 Execution Pipeline: ACTIVE")
     
     try:

@@ -15,11 +15,13 @@ Strategy Logic (from OB-SLBRSorderblockstrat.md):
 4. Exit on invalidation (volatility expands, orderflow one-sided, price accepts)
 
 Thresholds from Market Mechanics (NOT backtest optimization):
-- 2.5× liquidity concentration: Significant accumulation threshold
+- 0.75 resting imbalance: One side ≥ 75% of top-5 depth (directional wall, not MM noise)
 - 60s persistence: Minimum block stability
-- 0.15 absorption ratio: Orderbook consumption threshold
+- 0.65-0.95 absorption ratio: Orders consumed but block still standing (100% = broke through)
 - 0.30 block width: Proximity threshold for retest
-- 0.40 zone penetration: Minimum retest evidence (HL fallback)
+- 0.3% ATR floor: No entry when ATR < 0.3% of price (no volatility = no block)
+- ALL primitives required: zone_penetration, structural_persistence, resting_size, order_consumption
+- No fallbacks: missing any primitive → no entry
 - Max 3 concurrent SLBRS positions
 
 CRITICAL: This strategy acknowledges outcome divergence (P12).
@@ -115,6 +117,11 @@ class SLBRSStrategy:
     # Max concurrent SLBRS positions — level-retest strategy shouldn't be in 10 positions
     MAX_CONCURRENT_POSITIONS = 3
 
+    # Minimum cycles with valid order_consumption before allowing entry.
+    # Ensures L2 data has converged (not just 1-2 snapshots after startup).
+    # At ~3s regime cycle, 20 observations = ~60s of real L2 comparison data.
+    MIN_OC_OBSERVATIONS = 20
+
     def __init__(self):
         """Initialize SLBRS strategy with empty state."""
         self._state: Dict[str, SLBRSState] = {}  # symbol -> state
@@ -122,6 +129,7 @@ class SLBRSStrategy:
         self._sideways_streak: Dict[str, int] = {}  # symbol -> consecutive SIDEWAYS cycles
         self._last_exit_ts: Dict[str, float] = {}  # symbol -> timestamp of last exit/reset
         self._open_symbols: set = set()  # symbols with open SLBRS positions
+        self._oc_seen: Dict[str, int] = {}  # symbol -> count of valid order_consumption cycles
 
     def generate_proposal(
         self,
@@ -137,7 +145,9 @@ class SLBRSStrategy:
         permission: PermissionOutput,
         position_state: Optional[PositionState] = None,
         absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption)
-        directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow direction)
+        directional_continuity=None,  # DirectionalContinuity | None (B4 - trade flow direction)
+        orderflow_imbalance: Optional[float] = None,  # Taker buy ratio 0-1 (0=all selling, 1=all buying)
+        orderflow_fill_count: int = 0  # Number of fills in orderflow window
     ) -> Optional[StrategyProposal]:
         """
         Generate SLBRS proposal based on current market structure.
@@ -216,8 +226,9 @@ class SLBRSStrategy:
                 structural_persistence=structural_persistence,
                 price=price,
                 context=context,
-                absorption_event=absorption_event,
-                directional_continuity=directional_continuity
+                directional_continuity=directional_continuity,
+                orderflow_imbalance=orderflow_imbalance,
+                orderflow_fill_count=orderflow_fill_count
             )
 
         # No action
@@ -233,41 +244,98 @@ class SLBRSStrategy:
         structural_persistence,
         price: float,
         context: StrategyContext,
-        absorption_event=None,
-        directional_continuity=None
+        directional_continuity=None,
+        orderflow_imbalance: Optional[float] = None,
+        orderflow_fill_count: int = 0
     ) -> Optional[StrategyProposal]:
         """
         Check for SLBRS entry opportunity (retest logic).
 
-        Entry requires ALL of (no fallbacks):
-        1. Liquidity block: zone_penetration + structural_persistence + resting_size
-        2. First test: block detected with orderbook confirmation
-        3. Retest: proximity + order_consumption (real absorption, not penetration depth)
-        4. Direction: from resting_size bid/ask ratio (not price heuristic)
-        5. Regime stable (4+ consecutive SIDEWAYS cycles)
-        6. Max 3 concurrent positions, 120s post-exit cooldown
+        Entry requires ALL of (no fallbacks, no exceptions):
+        1. ALL primitives present: zone_penetration, structural_persistence,
+           resting_size, order_consumption (missing any → no entry)
+        2. ATR > 0.3% of price (real volatility required)
+        3. Zone penetration > 10% of ATR (meaningful interaction)
+        4. Structural persistence ≥ 60s (block stability)
+        5. Resting size imbalance ≥ 75/25 (directional wall, filters MM noise)
+        6. First test: block detected, no entry on first test
+        7. Retest: price near block edge (30% of ATR width)
+        8. Absorption: 65% ≤ order_consumption ≤ 95% (absorbed but block standing)
+        9. Directional continuity: trade flow not contradicting wall direction
+        10. Orderflow confirmation: taker flow must confirm direction
+        11. Regime stable (4+ consecutive SIDEWAYS cycles)
+        12. Max 3 concurrent positions, 120s post-exit cooldown
 
         Returns:
-            ENTRY proposal if retest conditions met, None otherwise
+            ENTRY proposal if ALL conditions met, None otherwise
         """
-        # Check if primitives available
+        # ======================================================================
+        # PRIMITIVE REQUIREMENTS: ALL must be present. No fallbacks.
+        # Missing any primitive = incomplete picture = no entry.
+        # ======================================================================
         if zone_penetration is None:
             return None
+        if structural_persistence is None:
+            return None
+        if resting_size is None:
+            return None
+        if order_consumption is None:
+            return None
 
-        # ATR-based block width (1 ATR = meaningful price range)
-        # Proximity for entry: 50% of this (0.5 ATR from block edge)
-        # Invalidation: penetration > this (price moved > 1 ATR through block)
-        atr_width = regime_state.atr_5m if regime_state.atr_5m > 0 else price * 0.005
+        # ======================================================================
+        # DATA QUALITY GATE: L2 data must have converged before trusting OC.
+        # After startup, first few order_consumption values are noise (1-2 snapshots).
+        # Require MIN_OC_OBSERVATIONS cycles with valid OC before allowing entry.
+        # ======================================================================
+        self._oc_seen[symbol] = self._oc_seen.get(symbol, 0) + 1
+        if self._oc_seen[symbol] < self.MIN_OC_OBSERVATIONS:
+            return None
 
-        # Check for liquidity block presence
-        # Requires ALL of: zone interaction, structural persistence, AND orderbook depth.
-        # Without resting_size we can't confirm resting orders exist — no block.
-        block_exists = (
-            zone_penetration.penetration_depth > 0
-            and structural_persistence is not None
-            and structural_persistence.total_persistence_duration >= 60.0  # 60s block stability
-            and resting_size is not None  # Must see actual resting orders
-        )
+        # ======================================================================
+        # ATR GATE: Require real measured volatility. No fallbacks.
+        # If ATR is zero or trivially small, there's no meaningful price action
+        # for a block retest strategy. Fallback to price*X defeats the gate.
+        # ======================================================================
+        atr_width = regime_state.atr_5m
+        min_meaningful_atr = price * 0.003  # 0.3% of price — real volatility required
+        if atr_width < min_meaningful_atr:
+            return None
+
+        # ======================================================================
+        # BLOCK DETECTION: All conditions from strategy spec.
+        # 1. Zone penetration must be meaningful (> 10% of ATR, not just > 0)
+        # 2. Structural persistence ≥ 60s (block stability)
+        # 3. Resting size shows significant depth imbalance (bid/ask ratio)
+        # ======================================================================
+        # Gate: penetration must be meaningful relative to ATR
+        if zone_penetration.penetration_depth < atr_width * 0.1:
+            return None
+
+        # Gate: block must have persisted at least 60s
+        if structural_persistence.total_persistence_duration < 60.0:
+            return None
+
+        # Gate: resting orders must show meaningful depth on at least one side
+        bid_sz = getattr(resting_size, 'bid_size', 0) or 0
+        ask_sz = getattr(resting_size, 'ask_size', 0) or 0
+        total_resting = bid_sz + ask_sz
+        if total_resting <= 0:
+            return None
+        # Imbalance: one side must dominate (directional wall).
+        # 0.75 = 75/25 split. Normal MM noise is 55-65%, so 0.75 filters it out.
+        resting_ratio = max(bid_sz, ask_sz) / total_resting if total_resting > 0 else 0
+        if resting_ratio < 0.75:  # 75/25 minimum — below this is normal book asymmetry
+            return None
+
+        # Gate: Minor side must have meaningful dollar value (not just thin book gap).
+        # A high ratio (0.96) with $640 minor side = book gap, not directional conviction.
+        # $5k minimum filters thin-book noise while allowing real walls on any asset.
+        MIN_MINOR_SIDE_USD = 5000.0
+        minor_side_usd = min(bid_sz, ask_sz) * price
+        if minor_side_usd < MIN_MINOR_SIDE_USD:
+            return None
+
+        block_exists = True
 
         # State: IDLE → detect first block interaction
         if self._state[symbol] == SLBRSState.IDLE:
@@ -328,33 +396,25 @@ class SLBRSStrategy:
             if len(self._open_symbols) >= self.MAX_CONCURRENT_POSITIONS:
                 return None
 
-            # Retest Condition 2: Absorption evidence
-            # Primary: order_consumption (consumed/initial >= 15%)
-            # Fallback: absorption_event (orderbook size consumed with minimal price movement)
-            absorption_confirmed = False
-            if order_consumption is not None:
-                initial = getattr(order_consumption, 'initial_size', 0) or 0
-                consumed = getattr(order_consumption, 'consumed_size', 0) or 0
-                if initial > 0 and consumed >= initial * 0.15:
-                    absorption_confirmed = True
-            if not absorption_confirmed and absorption_event is not None:
-                # Fallback: absorption_event means orders consumed with minimal price movement
-                if absorption_event.consumed_size > 0:
-                    absorption_confirmed = True
-            if not absorption_confirmed:
-                return None
+            # Retest Condition 2: Absorption evidence (order_consumption required)
+            # Absorption = orders consumed while block holds. NOT full consumption.
+            # - consumed/initial ≥ 0.65: meaningful absorption happening
+            # - consumed/initial ≤ 0.95: block still standing (100% = block broke through)
+            # No fallbacks — order_consumption was required at top of method.
+            initial = getattr(order_consumption, 'initial_size', 0) or 0
+            consumed = getattr(order_consumption, 'consumed_size', 0) or 0
+            if initial <= 0:
+                return None  # No initial orders to absorb
+            absorption_pct = consumed / initial
+            if absorption_pct < 0.65 or absorption_pct > 0.95:
+                return None  # Too little absorption OR block broken through
 
-            # Determine direction from orderbook depth (required)
-            # Without resting_size we can't know block nature → no entry
-            if resting_size is None:
-                return None
-
+            # Direction from orderbook depth imbalance (resting_size required at top)
             # More resting on bid side = buy wall = price supported = LONG
             # More resting on ask side = sell wall = price capped = SHORT
             direction = "LONG"
-            if hasattr(resting_size, 'bid_size') and hasattr(resting_size, 'ask_size'):
-                if resting_size.ask_size > resting_size.bid_size:
-                    direction = "SHORT"
+            if ask_sz > bid_sz:
+                direction = "SHORT"
 
             # Directional continuity gate: trade flow must not contradict resting_size direction
             if directional_continuity is not None and directional_continuity.total_trades > 0:
@@ -364,8 +424,41 @@ class SLBRSStrategy:
                 if direction == "SHORT" and buy_ratio > 0.6:
                     return None  # Block says SHORT but buying dominates — contradicted
 
+            # Orderflow data quality gate: require sufficient fills for reliable ratio.
+            # With sparse HL fills, a 60s window may have 10-15 fills for alts →
+            # extreme ratios like 0.06 (1 buy / 15 total) that look directional but
+            # are noise. 25 fills minimum ensures ratio has statistical meaning.
+            MIN_ORDERFLOW_FILLS = 25
+            if orderflow_fill_count < MIN_ORDERFLOW_FILLS:
+                return None  # Insufficient fills for reliable orderflow
+
+            # Orderflow extremity guard: near-0 or near-1 values are unreliable.
+            # of=0.06 with 15 fills = 1 buyer among 14 sellers — not conviction.
+            # Require ratio in [0.10, 0.90] to filter sparse-data extremes.
+            if orderflow_imbalance is not None:
+                if orderflow_imbalance < 0.10 or orderflow_imbalance > 0.90:
+                    return None  # Extreme reading = unreliable data
+
+            # Orderflow confirmation gate: taker flow must confirm entry direction.
+            # 75% win rate with confirming flow vs 12% against (12-trade sample, 2026-02-08).
+            # LONG requires buy ratio > 0.38 (at least 38% buying — not overwhelmed by sellers).
+            # SHORT requires buy ratio < 0.62 (at least 38% selling).
+            if orderflow_imbalance is not None:
+                if direction == "LONG" and orderflow_imbalance < 0.38:
+                    return None  # Dominant selling pressure contradicts LONG
+                if direction == "SHORT" and orderflow_imbalance > 0.62:
+                    return None  # Dominant buying pressure contradicts SHORT
+
             # All retest conditions met -> propose ENTRY
             self._state[symbol] = SLBRSState.RETEST_ARMED
+
+            # Diagnostic: log all gate values at entry time
+            of_str = f"{orderflow_imbalance:.3f}" if orderflow_imbalance is not None else "None"
+            print(f"[SLBRS-ENTRY-DIAG] {symbol}: atr={atr_width:.6f} min_atr={min_meaningful_atr:.6f} "
+                  f"pen={zone_penetration.penetration_depth:.6f} persist={structural_persistence.total_persistence_duration:.1f}s "
+                  f"bid=${bid_sz*price:,.0f} ask=${ask_sz*price:,.0f} minor=${minor_side_usd:,.0f} ratio={resting_ratio:.3f} "
+                  f"oc_init={initial:.2f} oc_cons={consumed:.2f} abs_pct={absorption_pct*100:.1f}% "
+                  f"of={of_str} fills={orderflow_fill_count} dir={direction} price={price:.4f}", flush=True)
 
             return StrategyProposal(
                 strategy_id="EP2-SLBRS-V1",
@@ -463,7 +556,9 @@ def generate_slbrs_proposal(
     permission: PermissionOutput,
     position_state: Optional[PositionState] = None,
     absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption fallback)
-    directional_continuity=None  # DirectionalContinuity | None (B4 - trade flow validation)
+    directional_continuity=None,  # DirectionalContinuity | None (B4 - trade flow validation)
+    orderflow_imbalance: Optional[float] = None,  # Taker buy ratio 0-1 (from regime metrics)
+    orderflow_fill_count: int = 0  # Number of fills in orderflow window
 ) -> Optional[StrategyProposal]:
     """
     Generate SLBRS proposal (function interface for policy adapter).
@@ -511,5 +606,7 @@ def generate_slbrs_proposal(
         permission=permission,
         position_state=position_state,
         absorption_event=absorption_event,
-        directional_continuity=directional_continuity
+        directional_continuity=directional_continuity,
+        orderflow_imbalance=orderflow_imbalance,
+        orderflow_fill_count=orderflow_fill_count
     )

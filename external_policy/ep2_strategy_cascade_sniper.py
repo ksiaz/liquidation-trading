@@ -23,7 +23,8 @@ Constitutional compliance:
 CRITICAL: This module makes no decisions. It only proposes.
 """
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional, Dict, List, TYPE_CHECKING
 from enum import Enum
 from runtime.position.types import PositionState
@@ -34,6 +35,7 @@ from runtime.validation.entry_quality import (
     EntryMode as EQEntryMode  # Alias to avoid conflict with local EntryMode
 )
 from memory.m4_absorption_confirmation import (
+    AbsorptionConfirmationTracker,
     TrendRegimeContext,
     TrendDirection,
 )
@@ -49,6 +51,101 @@ if TYPE_CHECKING:
     from observation.types import M4PrimitiveBundle
     from memory.m4_cascade_proximity import LiquidationCascadeProximity
     from memory.m4_cascade_state import CascadeStateObservation, CascadePhase
+
+
+# ==============================================================================
+# Running Pivot Detector (sub-second, per-fill)
+# ==============================================================================
+
+@dataclass
+class _RunningPivotState:
+    """Per-symbol running pivot state."""
+    trades: deque = field(default_factory=lambda: deque(maxlen=20))
+    prev_delta: float = 0.0
+    pivot_detected: bool = False
+    pivot_timestamp: float = 0.0
+
+
+class RunningPivotDetector:
+    """Sub-second pivot detection via running counters.
+
+    Called on EVERY fill. Fires when selling → buying transition detected.
+    Uses delta zero-cross as anchor signal + supporting confirmation.
+
+    During cascades at 10-20 fills/sec, 20 trades = 1-2s of history.
+    Detection fires within 1-2 trades of actual momentum shift.
+    """
+    MIN_TRADES = 8  # Need at least 8 trades to split into halves
+
+    def __init__(self):
+        self._state: Dict[str, _RunningPivotState] = {}
+
+    def on_trade(self, symbol: str, price: float, size: float,
+                 is_sell: bool, timestamp: float) -> bool:
+        """Process a fill. Returns True if pivot just detected."""
+        if symbol not in self._state:
+            self._state[symbol] = _RunningPivotState()
+        state = self._state[symbol]
+
+        state.trades.append((timestamp, price, size, is_sell))
+
+        if len(state.trades) < self.MIN_TRADES:
+            return False
+
+        trades = list(state.trades)
+        mid_idx = len(trades) // 2
+        first_half = trades[:mid_idx]
+        second_half = trades[mid_idx:]
+
+        # 1. Cumulative delta: buy_vol - sell_vol
+        delta = sum(s for _, _, s, sell in trades if not sell) - \
+                sum(s for _, _, s, sell in trades if sell)
+        delta_crossed = delta > 0 and state.prev_delta <= 0
+        state.prev_delta = delta
+
+        if not delta_crossed:
+            # No zero-cross = no new pivot
+            # BUT: don't reset existing pivot_detected flag —
+            # it must persist until consumed by regime cycle
+            return False
+
+        # 2. Buy acceleration: more buy volume in second half
+        first_buy = sum(s for _, _, s, sell in first_half if not sell) or 0.001
+        second_buy = sum(s for _, _, s, sell in second_half if not sell)
+        buy_accelerating = second_buy > first_buy * 1.2
+
+        # 3. Sell deceleration: less sell volume in second half
+        first_sell = sum(s for _, _, s, sell in first_half if sell) or 0.001
+        second_sell = sum(s for _, _, s, sell in second_half if sell)
+        sell_decelerating = second_sell < first_sell * 0.8
+
+        # 4. Price floor: second half low >= first half low
+        first_sell_prices = [p for _, p, _, sell in first_half if sell]
+        second_sell_prices = [p for _, p, _, sell in second_half if sell]
+        price_floor = False
+        if first_sell_prices and second_sell_prices:
+            price_floor = min(second_sell_prices) >= min(first_sell_prices)
+
+        # Pivot: delta crossed zero + at least 1 supporting signal
+        signals = sum([buy_accelerating, sell_decelerating, price_floor])
+        if signals >= 1:
+            state.pivot_detected = True
+            state.pivot_timestamp = timestamp
+            return True
+
+        return False
+
+    def consume_pivot(self, symbol: str) -> bool:
+        """Check and consume fast pivot flag. Called by regime cycle."""
+        state = self._state.get(symbol)
+        if state and state.pivot_detected:
+            state.pivot_detected = False  # Consume
+            return True
+        return False
+
+    def reset(self, symbol: str):
+        """Reset state for symbol (on cascade state reset)."""
+        self._state.pop(symbol, None)
 
 
 # ==============================================================================
@@ -160,8 +257,9 @@ class CascadeSniperConfig:
     use_warmup_gate: bool = True
 
     # Minimum fills tracked before allowing entry (per symbol)
-    # HL taker fills are sparser than Binance — 50 is sufficient for baseline flow
-    warmup_min_fills: int = 50
+    # HL taker fills are sparse for alts (~1/min). 15 fills in 60s window is enough
+    # for meaningful orderflow. Other gates (ATR, absorption) provide real filtering.
+    warmup_min_fills: int = 15
 
     # Minimum liquidation events tracked before allowing entry (per symbol)
     warmup_min_liqs: int = 3
@@ -371,6 +469,9 @@ class CascadeStateMachine:
         # Per symbol: list of (timestamp, volume) tuples for each qualifying burst
         self._burst_history: Dict[str, List[tuple]] = {}
 
+        # Per-symbol liq_z (set before update() by proposal generator)
+        self._liq_z: Dict[str, float] = {}
+
         # Organic flow detector (research-backed absorption detection)
         self._organic_detector: Optional[OrganicFlowDetector] = None
         if config.use_organic_flow_detection:
@@ -383,6 +484,15 @@ class CascadeStateMachine:
 
         # Last absorption signal per symbol (for diagnostics)
         self._last_absorption_signal: Dict[str, AbsorptionSignal] = {}
+
+        # Structural absorption tracker (8 signals, adaptive window)
+        self._absorption_tracker = AbsorptionConfirmationTracker()
+
+        # Running pivot detector (sub-second, per-fill)
+        self._fast_pivot = RunningPivotDetector()
+
+        # Gate B override flag: True when structural/fast pivot confirmed
+        self._structural_pivot: Dict[str, bool] = {}
 
     def update(
         self,
@@ -422,6 +532,8 @@ class CascadeStateMachine:
                 # Clear cascade direction to prevent stale data
                 if self._organic_detector:
                     self._organic_detector.clear_cascade(symbol)
+                self._fast_pivot.reset(symbol)
+                self._structural_pivot.pop(symbol, None)
                 new_state = CascadeState.NONE
 
             # Check for liquidation trigger (Gate C: cascade confirmation)
@@ -445,6 +557,12 @@ class CascadeStateMachine:
                         self._organic_detector.set_cascade_active(
                             symbol, CascadeDirection.UP, cluster_value
                         )
+
+                # FAST PATH: Check absorption immediately in the same cycle.
+                # Don't wait for next cycle — pivots are delay-sensitive.
+                if self._is_absorption_detected(symbol, liquidations, proximity, timestamp):
+                    self._states[symbol] = CascadeState.ABSORBING
+                    new_state = CascadeState.ABSORBING
             else:
                 # Update primed data
                 if proximity:
@@ -489,6 +607,9 @@ class CascadeStateMachine:
                 # Clear cascade direction to prevent stale data
                 if self._organic_detector:
                     self._organic_detector.clear_cascade(symbol)
+                # Clear pivot detection state
+                self._fast_pivot.reset(symbol)
+                self._structural_pivot.pop(symbol, None)
                 new_state = CascadeState.NONE
 
         # Log state transitions
@@ -604,6 +725,13 @@ class CascadeStateMachine:
         if not self._config.use_cascade_confirmation_gate:
             return True
 
+        # Fast path: liq_z >= 2.5 already proves statistically significant cascade.
+        # Skip the 2-burst requirement (10s+ delay) — the z-score IS the confirmation.
+        liq_z = self._liq_z.get(symbol, 0.0)
+        if liq_z >= 2.5:
+            print(f"[CASCADE CONF] {symbol}: liq_z={liq_z:.2f} confirms cascade (skipping burst count)")
+            return True
+
         # Get current timestamp (use window_end from burst if not provided)
         if timestamp is None:
             timestamp = liquidations.window_end
@@ -670,47 +798,79 @@ class CascadeStateMachine:
         timestamp: Optional[float] = None
     ) -> bool:
         """
-        Check if cascade is being absorbed.
+        Layered pivot detection for cascade absorption.
 
-        Detection methods (in priority order):
-        1. PRIMARY: Organic flow detection (research-backed)
-           - liqs_stopped AND organic_net opposes cascade
-        2. FALLBACK: Orderbook depth analysis
-           - absorption_ratio > threshold
-        3. FALLBACK: Position count drop
-           - positions at risk decreased >50%
+        Detection layers (fastest first):
+        1. FAST PIVOT: Running counters evaluated per-fill (~0.5s)
+        2. STRUCTURAL: AbsorptionConfirmationTracker (2-15s adaptive)
+        3. ORGANIC FLOW: OrganicFlowDetector ratio (10s window, existing)
+        4. ORDERBOOK: Static absorption ratio (existing fallback)
+
+        Layers 1-2 set structural_pivot flag → Gate B override.
+        Layers 3-4 preserve existing behavior (no Gate B override).
         """
         primed = self._primed_data.get(symbol)
         if primed is None:
             return False
 
-        # PRIMARY: Organic flow detection (research-backed)
-        if self._organic_detector and self._config.use_organic_flow_detection:
+        structural_pivot = False
+        detection_path = None
+
+        # === LAYER 1: Fast pivot (running counters, evaluated per-fill) ===
+        if self._fast_pivot.consume_pivot(symbol):
+            coin = symbol.replace('USDT', '').replace('USD', '')
+            combined = self._absorption_tracker.get_combined_observation(coin, timestamp)
+            total = combined.total_signals
+
+            if total >= 1:
+                structural_pivot = True
+                detection_path = f"FAST+STRUCTURAL:total_signals={total}"
+            else:
+                structural_pivot = True
+                detection_path = "FAST_PIVOT:no_structural_yet"
+
+        # === LAYER 2: Structural pivot (AbsorptionConfirmationTracker) ===
+        if not structural_pivot:
+            coin = symbol.replace('USDT', '').replace('USD', '')
+            combined = self._absorption_tracker.get_combined_observation(coin, timestamp)
+            abs_signals = combined.absorption.signals_confirmed
+            ctrl_signals = combined.control_shift.control_signals_confirmed
+
+            # Path A: Full structural (absorption + control shift confirmed)
+            if combined.base_exhaustion_confirmed:
+                structural_pivot = True
+                detection_path = f"STRUCTURAL:abs={abs_signals},ctrl={ctrl_signals}"
+
+            # Path B: Partial structural + organic flow supporting
+            elif abs_signals >= 1 and ctrl_signals >= 1:
+                if self._organic_detector:
+                    signal = self._organic_detector.check_absorption(symbol, timestamp)
+                    if signal.buying_ratio > 0.45:
+                        structural_pivot = True
+                        detection_path = f"PARTIAL+ORGANIC:abs={abs_signals},ctrl={ctrl_signals},ratio={signal.buying_ratio:.2f}"
+
+        # === LAYER 3: Organic flow (existing, 10s window) ===
+        if detection_path is None and self._organic_detector and self._config.use_organic_flow_detection:
             signal = self._organic_detector.check_absorption(symbol, timestamp)
             self._last_absorption_signal[symbol] = signal
-
             if signal.is_absorbing:
-                print(f"[ORGANIC FLOW] {symbol}: Absorption detected!")
-                print(f"  liqs_stopped: {signal.liqs_stopped}, organic_net: ${signal.organic_net:,.0f}")
-                print(f"  buying_ratio: {signal.buying_ratio:.1%}, entry: {signal.entry_direction}")
-                return True
+                detection_path = f"ORGANIC:ratio={signal.buying_ratio:.2f}"
+                # NO Gate B override for organic-only
 
-        # FALLBACK 1: Check orderbook absorption if data available
-        absorption = self._absorption_data.get(symbol)
-        if absorption is not None:
-            # Determine which side is being liquidated
-            dominant_side = self.get_dominant_side(symbol)
-            if dominant_side == "LONG":
-                # Longs liquidating → selling into bids → check bid absorption
-                if absorption.absorption_ratio_longs >= self._config.min_absorption_ratio_for_reversal:
-                    return True
-            elif dominant_side == "SHORT":
-                # Shorts liquidating → buying into asks → check ask absorption
-                if absorption.absorption_ratio_shorts >= self._config.min_absorption_ratio_for_reversal:
-                    return True
+        # === LAYER 4: Orderbook absorption fallback ===
+        if detection_path is None:
+            absorption = self._absorption_data.get(symbol)
+            if absorption is not None:
+                dominant = self.get_dominant_side(symbol)
+                if dominant == "LONG" and absorption.absorption_ratio_longs >= self._config.min_absorption_ratio_for_reversal:
+                    detection_path = f"ORDERBOOK:ratio={absorption.absorption_ratio_longs:.2f}"
+                elif dominant == "SHORT" and absorption.absorption_ratio_shorts >= self._config.min_absorption_ratio_for_reversal:
+                    detection_path = f"ORDERBOOK:ratio={absorption.absorption_ratio_shorts:.2f}"
 
-        # No position-count-only fallback: position drop != absorption
-        # (could be voluntary exit, timeout, price moving away from cluster)
+        if detection_path:
+            print(f"[PIVOT] {symbol}: {detection_path}")
+            self._structural_pivot[symbol] = structural_pivot
+            return True
 
         return False
 
@@ -807,29 +967,65 @@ class CascadeStateMachine:
         )
         self._organic_detector.add_liquidation(event)
 
+        # Feed structural tracker
+        coin = symbol.replace('USDT', '').replace('USD', '')
+        self._absorption_tracker.record_liquidation(coin, side, value, timestamp)
+
+    def feed_orderbook(
+        self,
+        symbol: str,
+        bids: List[Dict],
+        asks: List[Dict],
+        timestamp: float
+    ):
+        """
+        Feed L2 orderbook to structural absorption tracker for regime context.
+
+        Provides bid/ask depth, mid price, spread for adaptive threshold computation.
+        """
+        if not bids or not asks:
+            return
+        coin = symbol.replace('USDT', '').replace('USD', '')
+        total_bid = sum(b['size'] * b['price'] for b in bids[:10])
+        total_ask = sum(a['size'] * a['price'] for a in asks[:10])
+        mid = (bids[0]['price'] + asks[0]['price']) / 2
+        spread = asks[0]['price'] - bids[0]['price']
+        self._absorption_tracker.record_orderbook(coin, total_bid, total_ask, mid, spread, timestamp)
+
     def feed_organic_trade(
         self,
         symbol: str,
         side: str,  # "BUY" or "SELL"
         value: float,
         timestamp: float,
-        wallet_address: Optional[str] = None
+        wallet_address: Optional[str] = None,
+        price: Optional[float] = None,
+        size: Optional[float] = None
     ):
         """
-        Feed an organic (non-liquidation) trade to the detector.
+        Feed an organic (non-liquidation) trade to detectors.
 
-        Should be called for regular trades to track organic flow.
+        Routes to:
+        1. OrganicFlowDetector (existing, 10s window)
+        2. RunningPivotDetector (per-fill, sub-second)
+        3. AbsorptionConfirmationTracker (structural, 2-15s adaptive)
         """
-        if not self._organic_detector:
-            return
+        if self._organic_detector:
+            self._organic_detector.add_organic_trade(
+                symbol=symbol,
+                timestamp=timestamp,
+                side=side,
+                value=value,
+                wallet_address=wallet_address,
+            )
 
-        self._organic_detector.add_organic_trade(
-            symbol=symbol,
-            timestamp=timestamp,
-            side=side,
-            value=value,
-            wallet_address=wallet_address,
-        )
+        # Feed running pivot detector and structural tracker (need price/size)
+        if price is not None and size is not None:
+            is_sell = side.upper() == "SELL"
+            self._fast_pivot.on_trade(symbol, price, size, is_sell, timestamp)
+
+            coin = symbol.replace('USDT', '').replace('USD', '')
+            self._absorption_tracker.record_trade(coin, price, size, is_sell, timestamp)
 
     def get_absorption_signal(self, symbol: str) -> Optional[AbsorptionSignal]:
         """Get the last absorption signal for a symbol (for diagnostics)."""
@@ -1169,13 +1365,15 @@ def record_organic_trade(
     side: str,  # "BUY" or "SELL"
     value: float,
     timestamp: float,
-    wallet_address: Optional[str] = None
+    wallet_address: Optional[str] = None,
+    price: Optional[float] = None,
+    size: Optional[float] = None
 ):
     """
     Record an organic (non-liquidation) trade for absorption detection.
 
     Call this for regular trades to track organic flow.
-    The organic flow detector uses this to determine when absorption occurs.
+    Routes to OrganicFlowDetector, RunningPivotDetector, and AbsorptionConfirmationTracker.
 
     Args:
         symbol: Trading symbol (e.g., "BTCUSDT")
@@ -1183,9 +1381,27 @@ def record_organic_trade(
         value: USD value of trade
         timestamp: Event timestamp
         wallet_address: Optional wallet for liquidator filtering
+        price: Trade price (for structural pivot detection)
+        size: Trade size in base units (for structural pivot detection)
     """
     sm = _get_state_machine()
-    sm.feed_organic_trade(symbol, side, value, timestamp, wallet_address)
+    sm.feed_organic_trade(symbol, side, value, timestamp, wallet_address,
+                          price=price, size=size)
+
+
+def record_orderbook_update(
+    symbol: str,
+    bids: List[Dict],
+    asks: List[Dict],
+    timestamp: float
+):
+    """
+    Feed L2 orderbook to cascade sniper for structural absorption detection.
+
+    Provides regime context (bid/ask depth, spread) for adaptive thresholds.
+    """
+    sm = _get_state_machine()
+    sm.feed_orderbook(symbol, bids, asks, timestamp)
 
 
 def get_absorption_signal(symbol: str) -> Optional[AbsorptionSignal]:
@@ -1278,7 +1494,8 @@ def generate_cascade_sniper_proposal(
     trend_context: Optional[TrendRegimeContext] = None,
     price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
     trade_burst=None,  # TradeBurst | None (B4 - cascade trading intensity)
-    liquidation_density=None  # LiquidationDensity | None (B3 - cluster quality)
+    liquidation_density=None,  # LiquidationDensity | None (B3 - cluster quality)
+    liquidation_zscore: Optional[float] = None  # Z-score of liquidation rate (from regime metrics)
 ) -> Optional[StrategyProposal]:
     """
     Generate cascade sniper entry proposal WITH TREND KILL-SWITCH.
@@ -1349,6 +1566,10 @@ def generate_cascade_sniper_proposal(
         print(f"[WARMUP GATE] {symbol}: Entry blocked - {warmup_reason}")
         return None
 
+    # Set liq_z on state machine for Gate C fast-path
+    if liquidation_zscore is not None:
+        sm._liq_z[symbol] = liquidation_zscore
+
     # Update state machine with absorption data
     state = sm.update(symbol, proximity, liquidations, context.timestamp, absorption)
 
@@ -1357,6 +1578,18 @@ def generate_cascade_sniper_proposal(
 
     # Rule 3: Generate entry proposal based on state and mode
     if entry_mode == EntryMode.ABSORPTION_REVERSAL:
+        # FAST ENTRY: When liq_z confirms massive cascade AND pivot detected,
+        # enter from TRIGGERED state without waiting for ABSORBING.
+        # At pivots, the sharpest price move happens in the first 1-2 seconds.
+        if state == CascadeState.TRIGGERED:
+            liq_z_confirmed = (liquidation_zscore is not None and liquidation_zscore >= 2.5)
+            structural_pivot = sm._structural_pivot.get(symbol, False)
+            if liq_z_confirmed and structural_pivot:
+                # Promote to ABSORBING immediately and fall through
+                sm._states[symbol] = CascadeState.ABSORBING
+                state = CascadeState.ABSORBING
+                print(f"[FAST ENTRY] {symbol}: TRIGGERED → ABSORBING (liq_z={liquidation_zscore:.2f} + structural pivot)")
+
         # Enter on absorption (reversal play)
         if state == CascadeState.ABSORBING:
             dominant_side = sm.get_dominant_side(symbol)
@@ -1375,29 +1608,55 @@ def generate_cascade_sniper_proposal(
                 entry_direction = dominant_side  # Same as liquidated side = reversal
 
                 # Rule 3a-TREND: TREND KILL-SWITCH for reversal entries
-                # Reversal entries are DANGEROUS during strong trends
+                # Reversal entries are DANGEROUS during strong trends — UNLESS
+                # a statistically significant liquidation cascade is in progress.
+                # liq_z >= 2.5 means current liquidation rate is 2.5σ above baseline,
+                # which IS the catalyst that reverses the trend. Blocking here would
+                # defeat the entire purpose of cascade sniper.
                 if trend_context is not None:
                     if _is_reversal_blocked_by_trend(entry_direction, trend_context):
-                        print(f"[TREND KILL-SWITCH] {symbol}: {entry_direction} reversal blocked - {trend_context.direction.name}")
-                        return None
+                        structural_pivot = sm._structural_pivot.get(symbol, False)
+                        liq_z_override = (liquidation_zscore is not None and liquidation_zscore >= 2.5)
+                        if structural_pivot and liq_z_override:
+                            print(f"[TREND KILL-SWITCH] {symbol}: {entry_direction} OVERRIDDEN — "
+                                  f"liq_z={liquidation_zscore:.2f} + structural pivot during {trend_context.direction.name}")
+                        else:
+                            reasons = []
+                            if not structural_pivot:
+                                reasons.append("no_structural_pivot")
+                            if not liq_z_override:
+                                lz = f"{liquidation_zscore:.2f}" if liquidation_zscore is not None else "None"
+                                reasons.append(f"liq_z={lz}<2.5")
+                            print(f"[TREND KILL-SWITCH] {symbol}: {entry_direction} reversal blocked - "
+                                  f"{trend_context.direction.name} ({', '.join(reasons)})")
+                            return None
 
                 # Gate B: Short-term trend gate (price returns)
-                # Get absorption ratio for escape hatch
-                absorption_signal = sm.get_absorption_signal(symbol)
-                absorption_ratio = absorption_signal.buying_ratio if absorption_signal else None
-                # Get cascade value for no-data override check
-                cascade_value = primed.total_value_at_risk if primed else None
-                trend_ok, trend_reason = _check_trend_gate(
-                    symbol, entry_direction, price_returns, absorption_ratio, cascade_value
-                )
-                if not trend_ok:
-                    print(f"[TREND GATE] {symbol}: {entry_direction} blocked - {trend_reason}")
-                    return None
+                # OVERRIDE: Skip Gate B when structural/fast pivot confirmed
+                # (structural signals already validate the reversal is real)
+                structural_pivot = sm._structural_pivot.get(symbol, False)
+                if structural_pivot:
+                    print(f"[TREND GATE] {symbol}: OVERRIDDEN by structural pivot")
+                else:
+                    absorption_signal = sm.get_absorption_signal(symbol)
+                    absorption_ratio = absorption_signal.buying_ratio if absorption_signal else None
+                    cascade_value = primed.total_value_at_risk if primed else None
+                    trend_ok, trend_reason = _check_trend_gate(
+                        symbol, entry_direction, price_returns, absorption_ratio, cascade_value
+                    )
+                    if not trend_ok:
+                        print(f"[TREND GATE] {symbol}: {entry_direction} blocked - {trend_reason}")
+                        return None
 
                 # Rule 3b: Check entry quality based on liquidation exhaustion
                 # This uses the data-driven scoring from analysis of 759 trades
                 # Pass trend context for additional filtering
-                if _config and _config.use_entry_quality_filter:
+                #
+                # OVERRIDE: When liq_z >= 2.5, the aggregate liquidation signal proves
+                # "significant liquidation context" even if individual HL liqs are small
+                # (HL captures micro-liqs at $42-$7k that fail the $10k individual threshold)
+                liq_z_significant = (liquidation_zscore is not None and liquidation_zscore >= 2.5)
+                if _config and _config.use_entry_quality_filter and not liq_z_significant:
                     should_enter, eq_score = eq_scorer.get_entry_recommendation(
                         symbol=symbol,
                         intended_side=entry_direction,
@@ -1411,8 +1670,10 @@ def generate_cascade_sniper_proposal(
                         print(f"[EQ FILTER] {symbol}: {entry_direction} blocked - {eq_score.reason}")
                         return None
                 else:
-                    # No filter, get score for logging only (with trend context)
+                    # No filter OR liq_z override — get score for logging only
                     eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
+                    if liq_z_significant:
+                        print(f"[EQ FILTER] {symbol}: OVERRIDDEN — liq_z={liquidation_zscore:.2f} proves aggregate liquidation significance")
 
                 # Include absorption ratio and entry quality in justification
                 absorption_data = sm.get_absorption_data(symbol)

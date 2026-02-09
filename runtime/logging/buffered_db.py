@@ -117,17 +117,25 @@ class BufferedResearchDatabase:
         with self._db_lock:
             try:
                 for method_name, args, kwargs in writes:
-                    method = getattr(self._db, method_name, None)
-                    if method:
+                    if method_name == '__raw_sql__':
+                        # Raw SQL execution (ghost trades, rejections, etc.)
+                        sql, params = args
                         try:
-                            # Strip internal tracking kwargs before calling
-                            clean_kwargs = {k: v for k, v in kwargs.items()
-                                          if not k.startswith('_injected_')}
-                            # Call the underlying method
-                            method(*args, **clean_kwargs)
+                            self._db.conn.execute(sql, params)
                         except Exception as e:
-                            # Log but don't fail - some writes may be invalid
-                            pass
+                            print(f"[BRD] Raw SQL error: {e}", flush=True)
+                    else:
+                        method = getattr(self._db, method_name, None)
+                        if method:
+                            try:
+                                # Strip internal tracking kwargs before calling
+                                clean_kwargs = {k: v for k, v in kwargs.items()
+                                              if not k.startswith('_injected_')}
+                                # Call the underlying method
+                                method(*args, **clean_kwargs)
+                            except Exception as e:
+                                # Log but don't fail - some writes may be invalid
+                                pass
 
                 # Single commit for entire batch
                 self._db.conn.commit()
@@ -215,6 +223,27 @@ class BufferedResearchDatabase:
     def log_arbitration_round(self, *args, **kwargs):
         """Buffer arbitration round."""
         self._buffer_write('log_arbitration_round', *args, **kwargs)
+
+    # =========================================================================
+    # Raw SQL (for ghost trades, rejections, etc.)
+    # =========================================================================
+
+    def execute_sql(self, sql: str, params: tuple = ()):
+        """Buffer a raw SQL statement for batch execution.
+
+        Used by components that write to execution.db tables not managed
+        by ResearchDatabase (e.g., ghost_trades, ghost_trade_rejections).
+        """
+        self._buffer.put(('__raw_sql__', (sql, params), {}))
+        self._writes_buffered += 1
+
+    def read_sql(self, sql: str, params: tuple = ()):
+        """Execute a read query synchronously under the DB lock.
+
+        Call flush() first if you need to see recently buffered writes.
+        """
+        with self._db_lock:
+            return self._db.conn.execute(sql, params).fetchall()
 
     # =========================================================================
     # Pass-through for methods that need immediate execution

@@ -148,26 +148,14 @@ class CollectorService:
         self._last_stream_time = None
 
         # Ghost Trading Tracker ($1000 initial, 5% position size, all 10 symbols)
-        # CRITICAL: Ghost tracker gets its OWN db connection, NOT the buffered DB's conn.
-        # BufferedResearchDatabase has a background flush thread that uses _db_lock + conn.commit().
-        # Sharing the same connection caused race conditions (deadlock/crash on trailing stop exit).
-        import sqlite3 as _sqlite3
-        _ghost_db_conn = _sqlite3.connect("logs/execution.db", timeout=30, check_same_thread=False)
-        _ghost_db_conn.row_factory = _sqlite3.Row
-        _ghost_db_conn.execute("PRAGMA journal_mode=WAL")
-        # Migration: add entry_trade_id column for deterministic entry/exit linkage
-        try:
-            _ghost_db_conn.execute("ALTER TABLE ghost_trades ADD COLUMN entry_trade_id TEXT")
-            _ghost_db_conn.commit()
-        except _sqlite3.OperationalError:
-            pass  # Column already exists
+        # All execution.db writes go through BufferedResearchDatabase (single writer).
         api_key = os.environ.get("BINANCE_API_KEY")
         self.ghost_tracker = GhostPositionTracker(
             initial_balance=1000.0,
             position_size_pct=0.05,
-            symbols=TOP_10_SYMBOLS,  # All 10 symbols for testing
+            symbols=TOP_10_SYMBOLS,
             api_key=api_key,
-            db_conn=_ghost_db_conn
+            buffered_db=self._execution_db
         )
 
         # Trailing Stop Manager for profit protection
@@ -1761,39 +1749,43 @@ class CollectorService:
             else:
                 pnl = (entry_price - price) * qty
 
-            # Record exit to ghost_trades table
+            # Record exit to ghost_trades via BufferedResearchDatabase
             try:
                 exit_side = "SELL" if direction == "LONG" else "BUY"
                 now = time.time()
-                db = self.ghost_tracker._db_conn
-                if db:
-                    # Look up entry timestamp for holding duration
-                    holding_dur = None
-                    entry_row = db.execute(
-                        'SELECT timestamp FROM ghost_trades WHERE trade_id = ? AND is_entry = 1',
-                        (entry_id,)
-                    ).fetchone()
-                    if entry_row:
-                        holding_dur = now - float(entry_row[0])
 
-                    row = db.execute(
-                        'SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1'
-                    ).fetchone()
-                    last_bal = float(row[0]) if row and row[0] else 1000.0
-                    new_bal = last_bal + pnl
-                    db.execute('''
-                        INSERT INTO ghost_trades
-                        (trade_id, symbol, side, quantity, price, timestamp,
-                         position_side, is_entry, pnl, account_balance_after,
-                         exit_reason, holding_duration_sec, entry_trade_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-                    ''', (
-                        f"recovered_exit_{symbol}_{now:.0f}",
-                        symbol, exit_side, qty, price, now,
-                        direction, pnl, new_bal, exit_reason,
-                        holding_dur, entry_id
-                    ))
-                    db.commit()
+                # Flush pending writes so reads reflect latest state
+                self._execution_db.flush()
+
+                # Look up entry timestamp for holding duration
+                holding_dur = None
+                entry_rows = self._execution_db.read_sql(
+                    'SELECT timestamp FROM ghost_trades WHERE trade_id = ? AND is_entry = 1',
+                    (entry_id,)
+                )
+                if entry_rows:
+                    holding_dur = now - float(entry_rows[0][0])
+
+                # Get latest balance
+                bal_rows = self._execution_db.read_sql(
+                    'SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1'
+                )
+                last_bal = float(bal_rows[0][0]) if bal_rows and bal_rows[0][0] else 1000.0
+                new_bal = last_bal + pnl
+
+                # Write exit row via BRD buffer
+                self._execution_db.execute_sql('''
+                    INSERT INTO ghost_trades
+                    (trade_id, symbol, side, quantity, price, timestamp,
+                     position_side, is_entry, pnl, account_balance_after,
+                     exit_reason, holding_duration_sec, entry_trade_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                ''', (
+                    f"recovered_exit_{symbol}_{now:.0f}",
+                    symbol, exit_side, qty, price, now,
+                    direction, pnl, new_bal, exit_reason,
+                    holding_dur, entry_id
+                ))
             except Exception as db_err:
                 print(f"TRAILING: DB_WRITE_FAILED {symbol} - {db_err}")
 

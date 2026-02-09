@@ -17,7 +17,6 @@ from datetime import datetime
 import json
 import sqlite3
 import os
-
 from execution.ep4_ghost_adapter import (
     GhostExchangeAdapter,
     GhostExecutionResult,
@@ -227,7 +226,7 @@ class GhostPositionTracker:
         position_size_pct: float = 0.05,  # 5%
         symbols: List[str] = None,  # Support multiple symbols
         api_key: Optional[str] = None,
-        db_conn = None,  # Optional database connection for logging trades
+        buffered_db = None,  # BufferedResearchDatabase for execution.db writes
         db_path: str = DEFAULT_DB_PATH  # Path to position persistence DB
     ):
         """
@@ -238,7 +237,7 @@ class GhostPositionTracker:
             position_size_pct: Position size as fraction of account (0.05 = 5%)
             symbols: List of trading symbols to support
             api_key: Optional Binance API key for live data
-            db_conn: Optional sqlite3 connection for logging trades
+            buffered_db: BufferedResearchDatabase instance for execution.db writes
             db_path: Path to sqlite DB for position persistence (default: /tmp/ghost_trades.db)
         """
         self._state = GhostAccountState(
@@ -246,7 +245,7 @@ class GhostPositionTracker:
             current_balance=initial_balance
         )
         self._position_size_pct = position_size_pct
-        self._db_conn = db_conn
+        self._buffered_db = buffered_db
         self._api_key = api_key
         self._db_path = db_path
 
@@ -357,14 +356,15 @@ class GhostPositionTracker:
             except Exception:
                 pass
 
-        # Check ghost_trades in execution.db (db_conn) — the authoritative record
-        if self._db_conn:
+        # Check ghost_trades in execution.db via BufferedResearchDatabase
+        if self._buffered_db:
             try:
-                row = self._db_conn.execute(
+                self._buffered_db.flush()  # Ensure pending writes are persisted
+                rows = self._buffered_db.read_sql(
                     "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_trades"
-                ).fetchone()
-                if row[0] is not None:
-                    max_id = max(max_id, row[0])
+                )
+                if rows and rows[0][0] is not None:
+                    max_id = max(max_id, rows[0][0])
             except Exception:
                 pass
 
@@ -924,13 +924,12 @@ class GhostPositionTracker:
         return trade_id
 
     def _log_trade_to_db(self, trade: GhostTrade) -> bool:
-        """Log trade to database if connection available.
+        """Buffer trade write via BufferedResearchDatabase. Never blocks.
 
         Returns:
-            True if write succeeded, False if failed or no connection.
+            True if buffered successfully, False on error or no DB.
         """
-        if not self._db_conn:
-            # DIAGNOSTIC: No DB connection - trade not persisted
+        if not self._buffered_db:
             diag.record_skip(
                 component="GhostTracker",
                 function="_log_trade_to_db",
@@ -940,88 +939,79 @@ class GhostPositionTracker:
             )
             return False
 
-        import time as _time
+        try:
+            # INSERT ghost_trades row
+            self._buffered_db.execute_sql('''
+                INSERT INTO ghost_trades (
+                    trade_id, cycle_id, symbol, side, quantity, price,
+                    timestamp, position_side, is_entry, pnl, account_balance_after,
+                    entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
+                    active_primitives, spread_bps, concurrent_positions,
+                    holding_duration_sec, exit_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade.trade_id,
+                trade.cycle_id,
+                trade.symbol,
+                trade.side,
+                trade.quantity,
+                trade.price,
+                trade.timestamp,
+                trade.position_side,
+                trade.is_entry,
+                trade.pnl,
+                trade.account_balance_after,
+                trade.entry_cycle_id,
+                trade.exit_cycle_id,
+                trade.entry_trade_id,
+                trade.winning_policy,
+                trade.active_primitives,
+                trade.spread_bps,
+                trade.concurrent_positions,
+                trade.holding_duration_sec,
+                trade.exit_reason
+            ))
 
-        max_attempts = 4
-        retry_delays = [0.1, 0.5, 1.0]
-
-        for attempt in range(max_attempts):
-            try:
-                cursor = self._db_conn.cursor()
-                cursor.execute('''
-                    INSERT INTO ghost_trades (
-                        trade_id, cycle_id, symbol, side, quantity, price,
-                        timestamp, position_side, is_entry, pnl, account_balance_after,
-                        entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
-                        active_primitives, spread_bps, concurrent_positions,
-                        holding_duration_sec, exit_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            # UPDATE policy_outcomes with ghost trade results (only for exits)
+            if not trade.is_entry and trade.entry_cycle_id is not None:
+                self._buffered_db.execute_sql('''
+                    UPDATE policy_outcomes
+                    SET ghost_trade_id = ?,
+                        realized_pnl = ?,
+                        holding_duration_sec = ?,
+                        exit_reason = ?
+                    WHERE cycle_id = ?
+                      AND symbol = ?
+                      AND executed_action = 'ENTRY'
+                      AND ghost_trade_id IS NULL
+                    LIMIT 1
                 ''', (
-                    trade.trade_id,
-                    trade.cycle_id,
-                    trade.symbol,
-                    trade.side,
-                    trade.quantity,
-                    trade.price,
-                    trade.timestamp,
-                    trade.position_side,
-                    trade.is_entry,
+                    int(trade.trade_id.split('_')[1]),
                     trade.pnl,
-                    trade.account_balance_after,
-                    trade.entry_cycle_id,
-                    trade.exit_cycle_id,
-                    trade.entry_trade_id,
-                    trade.winning_policy,
-                    trade.active_primitives,
-                    trade.spread_bps,
-                    trade.concurrent_positions,
                     trade.holding_duration_sec,
-                    trade.exit_reason
+                    trade.exit_reason,
+                    trade.entry_cycle_id,
+                    trade.symbol
                 ))
 
-                # Update policy_outcomes with ghost trade results (only for exits)
-                if not trade.is_entry and trade.entry_cycle_id is not None:
-                    # Find policy_outcome for the entry cycle and update with exit data
-                    cursor.execute('''
-                        UPDATE policy_outcomes
-                        SET ghost_trade_id = ?,
-                            realized_pnl = ?,
-                            holding_duration_sec = ?,
-                            exit_reason = ?
-                        WHERE cycle_id = ?
-                          AND symbol = ?
-                          AND executed_action = 'ENTRY'
-                          AND ghost_trade_id IS NULL
-                        LIMIT 1
-                    ''', (
-                        int(trade.trade_id.split('_')[1]),  # Extract numeric ID from GHOST_000123
-                        trade.pnl,
-                        trade.holding_duration_sec,
-                        trade.exit_reason,
-                        trade.entry_cycle_id,
-                        trade.symbol
-                    ))
-
-                self._db_conn.commit()
-                return True  # Success
-            except Exception as e:
-                is_locked = "database is locked" in str(e).lower()
-                if is_locked and attempt < max_attempts - 1:
-                    delay = retry_delays[attempt]
-                    print(f"[GHOST] DB locked writing {trade.trade_id}, retry {attempt + 1}/{len(retry_delays)} in {delay}s", flush=True)
-                    _time.sleep(delay)
-                    continue
-
-                # Final failure or non-lock error
-                print(f"[GHOST] Failed to log trade to DB: {e}", flush=True)
-                diag.record_skip(
-                    component="GhostTracker",
-                    function="_log_trade_to_db",
-                    reason_code=ReasonCode.GT_DB_WRITE_FAILED,
-                    symbol=trade.symbol,
-                    context={"trade_id": trade.trade_id, "error": str(e), "attempts": attempt + 1}
+            if not trade.is_entry:
+                print(
+                    f"[GHOST-WRITER] Buffered exit {trade.trade_id} {trade.symbol} "
+                    f"pnl={trade.pnl:+.2f}",
+                    flush=True
                 )
-                return False  # Give up
+
+            return True
+        except Exception as e:
+            print(f"[GHOST] Failed to buffer trade {trade.trade_id}: {e}", flush=True)
+            diag.record_skip(
+                component="GhostTracker",
+                function="_log_trade_to_db",
+                reason_code=ReasonCode.GT_DB_WRITE_FAILED,
+                symbol=trade.symbol,
+                context={"trade_id": trade.trade_id, "error": str(e)}
+            )
+            return False
 
     def log_rejection(
         self,
@@ -1038,30 +1028,14 @@ class GhostPositionTracker:
         spread_bps: Optional[float] = None,
         triggering_primitives: Optional[List[str]] = None
     ) -> None:
-        """Log rejected trade attempt to database.
-
-        Args:
-            cycle_id: Execution cycle ID
-            timestamp: Rejection timestamp
-            symbol: Trading symbol
-            attempted_action: ENTRY, EXIT, or REDUCE
-            attempted_side: LONG or SHORT (if applicable)
-            rejection_reason: Why the trade was rejected
-            mandate_id: Optional mandate ID that triggered attempt
-            policy_name: Optional policy that generated mandate
-            current_price: Optional market price at rejection
-            spread_bps: Optional spread in basis points
-            triggering_primitives: Optional list of active primitives
-        """
-        if not self._db_conn:
+        """Log rejected trade attempt to database (buffered)."""
+        if not self._buffered_db:
             return
 
         try:
-            cursor = self._db_conn.cursor()
-
             primitives_json = json.dumps(triggering_primitives) if triggering_primitives else None
 
-            cursor.execute('''
+            self._buffered_db.execute_sql('''
                 INSERT INTO ghost_trade_rejections (
                     cycle_id, timestamp, symbol, attempted_action, attempted_side,
                     rejection_reason, mandate_id, policy_name,
@@ -1084,9 +1058,7 @@ class GhostPositionTracker:
                 spread_bps,
                 primitives_json
             ))
-            self._db_conn.commit()
-        except Exception as e:
-            # Silently fail - don't break execution if logging fails
+        except Exception:
             pass
 
     def print_summary(self) -> None:

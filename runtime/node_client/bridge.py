@@ -65,8 +65,14 @@ class NodeBridge:
         self._running = False
         self._last_status: Optional[SyncStatus] = None
 
+        # External price callbacks (for mark price + ATR updates)
+        self._price_callbacks: list = []
+
         # External fill callbacks (for organic flow detection)
         self._fill_callbacks: list = []
+
+        # Extended fill callbacks (for capitulation tracking - receives full FillEvent)
+        self._extended_fill_callbacks: list = []
 
         # External liquidation callbacks (for cascade detector)
         self._liquidation_callbacks: list = []
@@ -83,7 +89,7 @@ class NodeBridge:
         """Handle price event - feed to observation system."""
         try:
             # Use wall clock for governance freshness check
-            # (avoids dropping data due to node/Binance time domain mismatch)
+            # (avoids dropping data due to node time domain mismatch)
             now = time.time()
 
             self._obs.ingest_observation(
@@ -99,6 +105,15 @@ class NodeBridge:
                 },
             )
             self._prices_ingested += 1
+
+            # Forward to price callbacks (mark price + ATR updates)
+            if self._price_callbacks and event.oracle_float:
+                timestamp = event.timestamp_ns / 1_000_000_000
+                for callback in self._price_callbacks:
+                    try:
+                        callback(event.symbol, event.oracle_float, timestamp)
+                    except Exception as cb_err:
+                        print(f"[NodeBridge] Price callback error: {cb_err}", file=sys.stderr)
 
         except Exception as e:
             self._errors += 1
@@ -119,7 +134,7 @@ class NodeBridge:
             # LONG liquidation = forced SELL, SHORT liquidation = forced BUY
             canonical_side = 'SELL' if event.side == 'LONG' else 'BUY'
 
-            # Build Binance-compatible payload for normalize_liquidation
+            # Build canonical payload for normalize_liquidation
             # Format: {'E': timestamp_ms, 'o': {'p': price, 'q': quantity, 'S': side}}
             self._obs.ingest_observation(
                 timestamp=now,
@@ -128,7 +143,7 @@ class NodeBridge:
                 payload={
                     'E': event.timestamp_ms,  # Event timestamp (ms)
                     'o': {
-                        'p': str(event.price_float),   # Price as string (Binance format)
+                        'p': str(event.price_float),   # Price as string
                         'q': str(event.size_float),    # Quantity as string
                         'S': canonical_side,           # Order side (BUY/SELL)
                     },
@@ -220,9 +235,32 @@ class NodeBridge:
                     except Exception as cb_err:
                         print(f"[NodeBridge] Fill callback error: {cb_err}", file=sys.stderr)
 
+            # Forward ALL fills (including liquidation) with extended data
+            # Used for: CapitulationTracker (needs dir, closedPnl, startPosition)
+            if self._extended_fill_callbacks:
+                for callback in self._extended_fill_callbacks:
+                    try:
+                        callback(event)
+                    except Exception as cb_err:
+                        print(f"[NodeBridge] Extended fill callback error: {cb_err}", file=sys.stderr)
+
         except Exception as e:
             self._errors += 1
             print(f"[NodeBridge] Error handling fill: {e}", file=sys.stderr)
+
+    def on_price_update(self, callback: Callable[[str, float, float], None]):
+        """
+        Register callback for HL oracle price updates.
+
+        Callback signature: callback(symbol, price, timestamp)
+        - symbol: Asset symbol (e.g., "BTC")
+        - price: Oracle price
+        - timestamp: Unix timestamp in seconds
+
+        Use this to keep _mark_prices and ATR fresh from oracle prices
+        (arrives every ~1s vs sparse fills).
+        """
+        self._price_callbacks.append(callback)
 
     def on_organic_fill(self, callback: Callable[[str, str, float, float, float], None]):
         """
@@ -241,6 +279,16 @@ class NodeBridge:
         - Side for orderflow: "B" -> is_buyer_maker=False, "A" -> is_buyer_maker=True
         """
         self._fill_callbacks.append(callback)
+
+    def on_fill_extended(self, callback: Callable):
+        """
+        Register callback for ALL fills with extended data (full FillEvent).
+
+        Callback signature: callback(event: FillEvent)
+        Called for BOTH organic and liquidation fills.
+        FillEvent includes dir, start_position, closed_pnl for capitulation tracking.
+        """
+        self._extended_fill_callbacks.append(callback)
 
     def on_hl_liquidation(self, callback: Callable[[str, str, float, float, float], None]):
         """
@@ -313,8 +361,11 @@ class NodeBridge:
         return self._last_status.is_healthy
 
     def get_status(self) -> Optional[SyncStatus]:
-        """Get current adapter status."""
-        return self._subscriber.get_status()
+        """Get current adapter status (also updates cached status)."""
+        status = self._subscriber.get_status()
+        if status is not None:
+            self._last_status = status
+        return status
 
     def get_metrics(self) -> dict:
         """Get bridge metrics."""

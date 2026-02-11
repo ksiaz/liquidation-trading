@@ -22,14 +22,14 @@ class TestRegimeClassifier:
         # SIDEWAYS conditions:
         # - VWAP distance ≤ 1.25 × ATR_5m
         # - ATR_5m / ATR_30m < 0.80
-        # - Orderflow imbalance < 0.18
+        # - Orderflow balanced: |imbalance - 0.5| < 0.32
         # - Liquidation Z-score < 2.0
 
         metrics = RegimeMetrics(
             vwap_distance=60.0,  # Price near VWAP
             atr_5m=50.0,  # Distance = 60, 1.25 × ATR = 62.5 → contained ✓
             atr_30m=70.0,  # Ratio = 50/70 = 0.714 < 0.80 → compressed ✓
-            orderflow_imbalance=0.12,  # < 0.18 → balanced ✓
+            orderflow_imbalance=0.45,  # |0.45 - 0.5| = 0.05 < 0.32 → balanced ✓
             liquidation_zscore=1.5  # < 2.0 → subdued ✓
         )
 
@@ -41,14 +41,14 @@ class TestRegimeClassifier:
         # EXPANSION conditions:
         # - VWAP distance ≥ 1.5 × ATR_5m
         # - ATR_5m / ATR_30m ≥ 1.0
-        # - Orderflow imbalance ≥ 0.35
+        # - Orderflow dominant: |imbalance - 0.5| >= 0.15
         # - Liquidation Z-score ≥ 2.5
 
         metrics = RegimeMetrics(
             vwap_distance=150.0,  # Price far from VWAP
             atr_5m=80.0,  # Distance = 150, 1.5 × ATR = 120 → escaped ✓
             atr_30m=70.0,  # Ratio = 80/70 = 1.143 ≥ 1.0 → expanded ✓
-            orderflow_imbalance=0.42,  # ≥ 0.35 → dominant ✓
+            orderflow_imbalance=0.70,  # |0.70 - 0.5| = 0.20 ≥ 0.15 → dominant ✓
             liquidation_zscore=3.2  # ≥ 2.5 → elevated ✓
         )
 
@@ -63,7 +63,7 @@ class TestRegimeClassifier:
             vwap_distance=100.0,  # Between thresholds
             atr_5m=70.0,  # Distance = 100, 1.25×70=87.5 (not contained), 1.5×70=105 (not escaped)
             atr_30m=75.0,  # Ratio = 70/75 = 0.933 (not compressed, not expanded)
-            orderflow_imbalance=0.25,  # Between 0.18 and 0.35
+            orderflow_imbalance=0.45,  # |0.45-0.5|=0.05 → balanced (but VWAP not contained)
             liquidation_zscore=2.2  # Between 2.0 and 2.5
         )
 
@@ -72,13 +72,13 @@ class TestRegimeClassifier:
 
     def test_disabled_partial_sideways(self):
         """Test DISABLED when only some SIDEWAYS conditions met."""
-        # VWAP contained, but other conditions not met
+        # VWAP contained, but orderflow too imbalanced
 
         metrics = RegimeMetrics(
             vwap_distance=50.0,  # Contained ✓
             atr_5m=50.0,
             atr_30m=60.0,  # Compressed ✓
-            orderflow_imbalance=0.40,  # NOT balanced ✗ (> 0.18)
+            orderflow_imbalance=0.90,  # |0.90-0.5|=0.40 ≥ 0.32 → NOT balanced ✗
             liquidation_zscore=1.0  # Subdued ✓
         )
 
@@ -114,13 +114,13 @@ class TestRegimeClassifier:
             vwap_distance=60.0,  # Could satisfy SIDEWAYS (if 1.25×ATR ≥ 60)
             atr_5m=50.0,  # But SIDEWAYS needs compressed (< 0.80), EXPANSION needs expanded (≥ 1.0)
             atr_30m=70.0,  # This gives 0.714 → SIDEWAYS only
-            orderflow_imbalance=0.35,  # Boundary value (could be EXPANSION)
-            liquidation_zscore=2.0  # Boundary value (could be SIDEWAYS)
+            orderflow_imbalance=0.45,  # |0.45-0.5|=0.05 → balanced (SIDEWAYS), not dominant
+            liquidation_zscore=1.5  # < 2.0 → SIDEWAYS
         )
 
-        # With these values, should be SIDEWAYS (compressed volatility)
+        # With these values, should be SIDEWAYS (compressed volatility, balanced flow)
         regime = classify_regime(metrics)
-        assert regime in (RegimeState.SIDEWAYS_ACTIVE, RegimeState.DISABLED)
+        assert regime == RegimeState.SIDEWAYS_ACTIVE
 
     def test_determinism(self):
         """Test that same inputs always produce same output."""
@@ -128,7 +128,7 @@ class TestRegimeClassifier:
             vwap_distance=80.0,
             atr_5m=60.0,
             atr_30m=75.0,
-            orderflow_imbalance=0.15,
+            orderflow_imbalance=0.45,
             liquidation_zscore=1.8
         )
 
@@ -145,7 +145,7 @@ class TestRegimeClassifier:
             vwap_distance=62.5,  # Exactly 1.25 × 50
             atr_5m=50.0,
             atr_30m=70.0,
-            orderflow_imbalance=0.10,
+            orderflow_imbalance=0.50,  # Balanced
             liquidation_zscore=1.5
         )
 
@@ -154,7 +154,7 @@ class TestRegimeClassifier:
             vwap_distance=62.4,
             atr_5m=50.0,
             atr_30m=70.0,
-            orderflow_imbalance=0.10,
+            orderflow_imbalance=0.50,  # Balanced
             liquidation_zscore=1.5
         )
 
@@ -163,7 +163,7 @@ class TestRegimeClassifier:
             vwap_distance=62.6,
             atr_5m=50.0,
             atr_30m=70.0,
-            orderflow_imbalance=0.10,
+            orderflow_imbalance=0.50,  # Balanced
             liquidation_zscore=1.5
         )
 

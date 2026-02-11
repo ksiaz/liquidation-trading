@@ -70,8 +70,7 @@ from external_policy.ep2_strategy_geometry import restore_entry_context_from_pos
 # Phase E: StabilityObserver attachment (passive, read-only)
 from runtime.stability_observer import stability_observer
 
-# Binance client used only for initial ATR warm-up (historical klines)
-from runtime.binance.client import BinanceClient
+# Warmup uses HL candleSnapshot API for ATR/VWAP pre-loading
 
 # Import Validation modules for data integrity and manipulation detection
 from runtime.validation import (
@@ -150,12 +149,10 @@ class CollectorService:
 
         # Ghost Trading Tracker ($1000 initial, 5% position size, all 10 symbols)
         # All execution.db writes go through BufferedResearchDatabase (single writer).
-        api_key = os.environ.get("BINANCE_API_KEY")
         self.ghost_tracker = GhostPositionTracker(
             initial_balance=1000.0,
             position_size_pct=0.05,
             symbols=TOP_10_SYMBOLS,
-            api_key=api_key,
             buffered_db=self._execution_db
         )
 
@@ -548,57 +545,119 @@ class CollectorService:
         except Exception as e:
             self._logger.warning(f"Position context recovery failed: {e}")
 
-    async def _warm_up_atr_calculators(self, symbols: List[str]):
-        """Pre-warm ATR calculators with historical klines.
+    async def _warm_up_calculators(self, symbols: List[str]):
+        """Pre-warm ATR and VWAP from HL candleSnapshot API.
 
-        Fetches historical 5m klines to initialize ATR calculators,
-        avoiding the 90-minute warm-up delay for regime classification.
+        Fetches 5m candles from Hyperliquid to initialize ATR (needs OHLC)
+        and VWAP (needs close*volume). Without this, regime classification
+        is blocked for 10+ minutes after restart.
+
+        Also creates Orderflow and LiqZ calculators so they're ready when
+        fills arrive (moves from "calculators missing" to "warm-up incomplete").
 
         Args:
-            symbols: List of symbols to warm up (e.g., ['BTCUSDT', 'ETHUSDT'])
+            symbols: USDT-suffixed symbols (e.g., ['BTCUSDT', 'ETHUSDT'])
         """
+        import aiohttp
+
         try:
-            import asyncio
-            client = BinanceClient()
-            warmup_count = 0
+            atr_ready = 0
+            vwap_ready = 0
+            now_ms = int(time.time() * 1000)
+            # Fetch last 2.5h of 5m candles (30 candles)
+            start_ms = now_ms - 30 * 5 * 60 * 1000
 
-            # Fetch all klines concurrently
-            tasks = [client.get_klines_async(symbol, interval='5m', limit=30) for symbol in symbols]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            async with aiohttp.ClientSession() as session:
+                for symbol in symbols:
+                    hl_coin = symbol.replace('USDT', '')
 
-            for symbol, klines_5m in zip(symbols, results):
-                if isinstance(klines_5m, Exception):
-                    self._logger.warning(f"[ATR-WARMUP] {symbol}: Failed to fetch - {klines_5m}")
-                    continue
+                    try:
+                        resp = await session.post(
+                            'https://api.hyperliquid.xyz/info',
+                            json={
+                                'type': 'candleSnapshot',
+                                'req': {
+                                    'coin': hl_coin,
+                                    'interval': '5m',
+                                    'startTime': start_ms,
+                                    'endTime': now_ms,
+                                }
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        )
+                        candles = await resp.json()
+                    except Exception as e:
+                        self._logger.warning(f"[WARMUP] {symbol}: fetch failed - {e}")
+                        continue
 
-                if klines_5m and len(klines_5m) >= 6:
-                    # Initialize ATR calculator for this symbol
+                    if not candles or len(candles) < 6:
+                        self._logger.warning(
+                            f"[WARMUP] {symbol}: insufficient candles "
+                            f"({len(candles) if candles else 0})"
+                        )
+                        continue
+
+                    # Ensure all 4 calculators exist
                     if symbol not in self._atr_calculators:
                         self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
+                    if symbol not in self._vwap_calculators:
+                        self._vwap_calculators[symbol] = VWAPCalculator()
+                    if symbol not in self._orderflow_calculators:
+                        self._orderflow_calculators[symbol] = MultiWindowOrderflow()
+                    if symbol not in self._liquidation_calculators:
+                        self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
 
-                    # Warm up from historical data
-                    self._atr_calculators[symbol].warm_up_from_klines(klines_5m)
-                    warmup_count += 1
+                    # Convert HL candle format to ATR warmup format
+                    # HL: {t, T, s, i, o, c, h, l, v, n}
+                    klines = []
+                    for c in candles:
+                        try:
+                            klines.append({
+                                'high': float(c['h']),
+                                'low': float(c['l']),
+                                'close': float(c['c']),
+                                'open': float(c['o']),
+                                'volume': float(c['v']),
+                                'close_time': int(c['T']) / 1000.0,
+                            })
+                        except (KeyError, ValueError):
+                            continue
 
-                    # Check if ATR is now available
+                    if len(klines) < 6:
+                        continue
+
+                    # Warm up ATR from OHLC
+                    self._atr_calculators[symbol].warm_up_from_klines(klines)
+
+                    # Warm up VWAP from close*volume
+                    for k in klines:
+                        if k['close'] > 0 and k['volume'] > 0:
+                            self._vwap_calculators[symbol].update(
+                                k['close'], k['volume'], k['close_time']
+                            )
+
                     atr_5m = self._atr_calculators[symbol].get_atr_5m()
                     atr_30m = self._atr_calculators[symbol].get_atr_30m()
+                    vwap = self._vwap_calculators[symbol].get_vwap()
 
                     if atr_5m and atr_30m:
-                        self._logger.info(
-                            f"[ATR-WARMUP] {symbol}: ATR_5m={atr_5m:.2f}, ATR_30m={atr_30m:.2f} (ready)"
-                        )
-                    else:
-                        self._logger.warning(
-                            f"[ATR-WARMUP] {symbol}: Insufficient klines ({len(klines_5m)})"
-                        )
-                else:
-                    self._logger.warning(f"[ATR-WARMUP] {symbol}: No klines fetched")
+                        atr_ready += 1
+                    if vwap:
+                        vwap_ready += 1
 
-            self._logger.info(f"[ATR-WARMUP] Warmed up {warmup_count}/{len(symbols)} symbols")
+                    if atr_5m and atr_30m and vwap:
+                        self._logger.info(
+                            f"[WARMUP] {symbol}: ATR_5m={atr_5m:.4f}, "
+                            f"ATR_30m={atr_30m:.4f}, VWAP={vwap:.2f}"
+                        )
+
+            self._logger.info(
+                f"[WARMUP] Complete: ATR={atr_ready}/{len(symbols)}, "
+                f"VWAP={vwap_ready}/{len(symbols)}"
+            )
 
         except Exception as e:
-            self._logger.warning(f"[ATR-WARMUP] Failed: {e}")
+            self._logger.warning(f"[WARMUP] Failed: {e}")
 
     async def start(self):
         """Start all collectors."""
@@ -640,6 +699,13 @@ class CollectorService:
                         self._node_bridge.on_fill_extended(self._handle_hl_fill_extended)
                         self._logger.info("HL extended fill callback registered (capitulation tracker)")
 
+                        # Wire HL oracle prices to _mark_prices and ATR calculators
+                        # Breaks the staleness chain: oracle prices arrive every ~1s vs sparse fills
+                        # Ensures _mark_prices is always fresh (no Decimal("0") defaults)
+                        # and ATR reflects true price range (not just moments of fills)
+                        self._node_bridge.on_price_update(self._handle_hl_price)
+                        self._logger.info("HL price callback registered (mark prices + ATR)")
+
                         # Inject capitulation tracker into cascade sniper for absorption confidence
                         try:
                             from external_policy.ep2_strategy_cascade_sniper import set_capitulation_tracker
@@ -670,6 +736,10 @@ class CollectorService:
 
                         # Start periodic health check
                         asyncio.create_task(self._monitor_node_bridge_health())
+
+                        # Pre-warm ATR + VWAP from HL candles (avoids 10+ min warmup delay)
+                        # Also creates Orderflow/LiqZ calculators so they're ready for fills
+                        await self._warm_up_calculators(TOP_10_SYMBOLS)
                     else:
                         raise RuntimeError(
                             "Node bridge failed to connect. "
@@ -1399,6 +1469,37 @@ class CollectorService:
             absorption_ratio_shorts=absorption_ratio_shorts,
             timestamp=time.time()
         )
+
+    def _handle_hl_price(
+        self,
+        hl_symbol: str,   # Coin (e.g., "BTC")
+        price: float,     # Oracle price
+        timestamp: float  # Unix timestamp in seconds
+    ):
+        """Handle HL oracle price — keep _mark_prices and ATR fresh.
+
+        Oracle prices arrive every ~1s per symbol. This breaks the staleness
+        chain where _mark_prices was only updated in the regime loop (every 2s,
+        and only for symbols past the calculator warmup gate).
+
+        Also feeds ATR with continuous price data so it reflects true volatility
+        even when HL fills are sparse. ATR aggregates prices into 5m/30m candles
+        internally, so frequent updates just give more accurate high/low/close.
+        """
+        symbol = hl_symbol + 'USDT'
+
+        # Update price dicts immediately (no regime loop dependency)
+        self._mark_prices[symbol] = Decimal(str(price))
+        self._current_prices[symbol] = price
+
+        # Feed ATR calculator with oracle prices (keeps ATR fresh between sparse fills).
+        # Create ATR if it doesn't exist yet — symbols with zero fills would never
+        # get an ATR calculator from _handle_hl_fill alone.
+        atr_calc = self._atr_calculators.get(symbol)
+        if not atr_calc:
+            atr_calc = MultiTimeframeATR(period=3)
+            self._atr_calculators[symbol] = atr_calc
+        atr_calc.update_trade(price, timestamp)
 
     def _handle_hl_fill(
         self,
@@ -2391,312 +2492,6 @@ class CollectorService:
             import traceback
             traceback.print_exc()
             return None
-
-    async def _run_binance_stream(self):
-        """Connect to Binance WebSocket with dynamic subscription."""
-        import websockets
-
-        # Use all TOP_10_SYMBOLS for full liquidation coverage
-        test_symbols = TOP_10_SYMBOLS  # All 10 symbols for cascade detection
-
-        # Build stream list for subscription
-        streams = [
-            f"{s.lower()}@aggTrade" for s in test_symbols
-        ] + [
-            f"{s.lower()}@forceOrder" for s in test_symbols
-        ] + [
-            "!forceOrder@arr"  # Global liquidation stream for ALL symbols
-        ] + [
-            f"{s.lower()}@bookTicker" for s in test_symbols
-        ] + [
-            f"{s.lower()}@depth20@100ms" for s in test_symbols
-        ] + [
-            f"{s.lower()}@markPrice@1s" for s in test_symbols
-        ]  # 5 streams per symbol + 1 global liquidation
-
-        # Connect to /stream endpoint for combined format (stream/data wrapper)
-        base_url = "wss://fstream.binance.com/stream"
-
-        # Exponential backoff parameters
-        # WAF ban is typically 5 minutes - start high to let it expire
-        reconnect_delay = 30  # Start with 30 seconds
-        max_reconnect_delay = 300  # Cap at 5 minutes
-
-        while self._running:
-            try:
-                import websockets
-                self._logger.info(f"Connecting to Binance WebSocket...")
-                async with websockets.connect(
-                    base_url,
-                    open_timeout=30,     # 30s handshake timeout
-                    ping_interval=60,    # Send ping every 60 seconds (Binance sends every 3 min)
-                    ping_timeout=30,     # Detect dead connection within 30s
-                    close_timeout=10     # Clean connection close timeout
-                ) as ws:
-                    self._logger.info("Connected to Binance, subscribing to streams...")
-
-                    # Subscribe to streams in batches (max 10 messages/sec)
-                    # Send all streams in one SUBSCRIBE message (allowed up to 1024)
-                    subscribe_msg = {
-                        "method": "SUBSCRIBE",
-                        "params": streams,
-                        "id": 1
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-
-                    # Wait for subscription confirmation
-                    response = await asyncio.wait_for(ws.recv(), timeout=10)
-                    resp_data = json.loads(response)
-                    if resp_data.get("result") is None and resp_data.get("id") == 1:
-                        self._logger.info(f"Subscribed to {len(streams)} streams")
-                    else:
-                        self._logger.warning(f"Subscription response: {resp_data}")
-
-                    reconnect_delay = 5  # Reset backoff on successful connection
-                    while self._running:
-                        try:
-                            msg = await ws.recv()
-                            data = json.loads(msg)
-                            stream = data['stream']
-                            payload = data['data']
-
-                            # Parse Symbol & Type
-                            symbol = stream.split('@')[0].upper()
-                            event_type = "UNKNOWN"
-
-                            # P1: Removed DEBUG_STREAM print from hot path
-
-                            if 'aggtrade' in stream.lower():
-                                event_type = "TRADE"
-                                # Track mark price from trades (only in non-node mode)
-                                if 'p' in payload and not self._use_node_mode:
-                                    self._mark_prices[symbol] = Decimal(str(payload['p']))
-                                # Log trade event for ground truth validation
-                                try:
-                                    self._execution_db.log_trade_event(
-                                        symbol=symbol,
-                                        timestamp=int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time(),
-                                        price=float(payload.get('p', 0)),
-                                        volume=float(payload.get('q', 0)),
-                                        is_buyer_maker=payload.get('m', False)
-                                    )
-                                except:
-                                    pass
-
-                                # Phase 5: Update regime calculators with trade data
-                                # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), skip Binance
-                                # trades for VWAP/ATR/Orderflow. HL fills are wired via
-                                # _handle_hl_fill callback to avoid double counting.
-                                if not self._use_node_mode:
-                                    try:
-                                        price = float(payload.get('p', 0))
-                                        volume = float(payload.get('q', 0))
-                                        timestamp = int(payload.get('T', 0)) / 1000.0 if 'T' in payload else time.time()
-                                        is_buyer_maker = payload.get('m', False)
-
-                                        # Memory guard: check symbol limit before adding new
-                                        is_new_symbol = symbol not in self._vwap_calculators
-                                        if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
-                                            self.prune_stale_calculators()
-
-                                        # Initialize calculators for symbol if needed
-                                        if symbol not in self._vwap_calculators:
-                                            self._vwap_calculators[symbol] = VWAPCalculator()
-                                        if symbol not in self._atr_calculators:
-                                            # Use period=3 for testing (needs 15min for 5m, 90min for 30m instead of 70min/7hrs)
-                                            self._atr_calculators[symbol] = MultiTimeframeATR(period=3)
-                                        if symbol not in self._orderflow_calculators:
-                                            self._orderflow_calculators[symbol] = MultiWindowOrderflow()
-                                        if symbol not in self._liquidation_calculators:
-                                            self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
-
-                                        # Track last activity for pruning
-                                        self._calculator_last_activity[symbol] = timestamp
-
-                                        # Update VWAP
-                                        self._vwap_calculators[symbol].update(price, volume, timestamp)
-
-                                        # Update ATR
-                                        self._atr_calculators[symbol].update_trade(price, timestamp)
-
-                                        # Update orderflow imbalance
-                                        self._orderflow_calculators[symbol].update(is_buyer_maker, volume, timestamp)
-
-                                        # Track current price
-                                        self._current_prices[symbol] = price
-                                    except:
-                                        pass
-                            elif 'forceorder' in stream.lower():
-                                event_type = "LIQUIDATION"
-                                # P1: Removed DEBUG_STREAM print from hot path
-                                # Log raw liquidation event
-                                if 'o' in payload:
-                                    order = payload['o']
-                                    # For global !forceOrder@arr stream, get symbol from order data
-                                    symbol = order.get('s', symbol)
-                                    try:
-                                        # P1: Removed DEBUG prints from hot path
-                                        side_value = order.get('S', 'UNKNOWN')
-                                        self._execution_db.log_liquidation_event(
-                                            timestamp=ts if 'ts' in locals() else time.time(),
-                                            symbol=symbol,
-                                            side=side_value,
-                                            price=float(order.get('p', 0)),
-                                            volume=float(order.get('q', 0))
-                                        )
-                                    except Exception:
-                                        pass  # Fail silently per constitutional rules
-
-                                # Phase 5: Update liquidation Z-score calculator
-                                # VENUE CONSISTENCY: In node mode (USE_HL_NODE=true), skip Binance
-                                # liquidations for zscore/burst. HL liquidations are wired via
-                                # _handle_hl_liquidation callback to avoid double counting.
-                                if not self._use_node_mode:
-                                    try:
-                                        if 'o' in payload:
-                                            order = payload['o']
-                                            quantity = float(order.get('q', 0))
-                                            timestamp = ts if 'ts' in locals() else time.time()
-
-                                            # Initialize calculator for symbol if needed
-                                            if symbol not in self._liquidation_calculators:
-                                                self._liquidation_calculators[symbol] = LiquidationZScoreCalculator()
-
-                                            # Phase 6: Update liquidation burst aggregator (for cascade sniper)
-                                            price = float(order.get('p', 0))
-
-                                            # Update liquidation Z-score (USD value, not base units)
-                                            liq_usd = price * quantity
-                                            self._liquidation_calculators[symbol].update(liq_usd, timestamp)
-                                            side = order.get('S', 'UNKNOWN')
-                                            self._liquidation_burst_aggregator.add_event(
-                                                timestamp=timestamp,
-                                                symbol=symbol,
-                                                side=side,
-                                                price=price,
-                                                quantity=quantity
-                                            )
-
-                                            # Phase 7: Record to entry quality scorer for exhaustion detection
-                                            try:
-                                                from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
-                                                liq_value = price * quantity
-                                                record_liquidation_event(symbol, side, liq_value, timestamp)
-                                            except ImportError:
-                                                pass  # Module not available
-                                    except:
-                                        pass
-                            elif 'kline' in stream:
-                                event_type = "KLINE"
-                                # Log OHLC candle
-                                if 'k' in payload:
-                                    k = payload['k']
-                                    if k.get('x', False):  # Only closed candles
-                                        try:
-                                            self._execution_db.log_ohlc_candle(
-                                                symbol=symbol,
-                                                timestamp=int(k['t']) / 1000.0,
-                                                open_price=float(k['o']),
-                                                high=float(k['h']),
-                                                low=float(k['l']),
-                                                close=float(k['c']),
-                                                volume=float(k.get('v', 0)),
-                                                trade_count=int(k.get('n', 0))
-                                            )
-                                        except:
-                                            pass
-                            elif 'bookticker' in stream.lower():
-                                event_type = "DEPTH"
-                                # Log order book update for ground truth validation
-                                try:
-                                    if 'b' in payload and 'B' in payload and 'a' in payload and 'A' in payload:
-                                        ts_orderbook = int(payload.get('T', 0)) / 1000.0 if payload.get('T') else time.time()
-                                        self._execution_db.log_orderbook_event(
-                                            symbol=symbol,
-                                            timestamp=ts_orderbook,
-                                            best_bid_price=float(payload['b']),
-                                            best_bid_qty=float(payload['B']),
-                                            best_ask_price=float(payload['a']),
-                                            best_ask_qty=float(payload['A'])
-                                        )
-                                except:
-                                    pass
-                            elif 'depth20' in stream.lower():
-                                event_type = "DEPTH_L2"
-                                # Log L2 orderbook depth (20 levels)
-                                try:
-                                    ts_depth = int(payload.get('T', 0)) / 1000.0 if payload.get('T') else time.time()
-                                    bids = payload.get('b', [])
-                                    asks = payload.get('a', [])
-                                    if bids or asks:
-                                        self._execution_db.log_orderbook_depth(
-                                            symbol=symbol,
-                                            timestamp=ts_depth,
-                                            bids=bids,
-                                            asks=asks
-                                        )
-                                        # Update mark price from mid (only in non-node mode)
-                                        if bids and asks and not self._use_node_mode:
-                                            mid = (float(bids[0][0]) + float(asks[0][0])) / 2
-                                            self._mark_prices[symbol] = Decimal(str(mid))
-                                except:
-                                    pass
-                            elif 'markprice' in stream.lower():
-                                event_type = "MARK_PRICE"
-                                # Log official mark price with funding info
-                                try:
-                                    ts_mark = int(payload.get('E', 0)) / 1000.0 if payload.get('E') else time.time()
-                                    mark_price = float(payload.get('p', 0))
-                                    if mark_price > 0:
-                                        self._execution_db.log_mark_price(
-                                            symbol=symbol,
-                                            timestamp=ts_mark,
-                                            mark_price=mark_price,
-                                            index_price=float(payload.get('i', 0)) if payload.get('i') else None,
-                                            funding_rate=float(payload.get('r', 0)) if payload.get('r') else None,
-                                            next_funding_time=float(payload.get('T', 0)) / 1000.0 if payload.get('T') else None
-                                        )
-                                        # Update mark price (only in non-node mode)
-                                        if not self._use_node_mode:
-                                            self._mark_prices[symbol] = Decimal(str(mark_price))
-                                except:
-                                    pass
-
-                            # TIMESTAMP EXTRACTION
-                            # Note: 'E' is event time, 'T' varies by stream type
-                            # For markPrice, 'T' is next_funding_time (FUTURE!) - must use 'E'
-                            ts = time.time()
-                            if 'E' in payload:
-                                ts = int(payload['E']) / 1000.0
-                            elif 'T' in payload and 'markprice' not in stream.lower():
-                                # Only use 'T' for non-markPrice streams (trade timestamp)
-                                ts = int(payload['T']) / 1000.0
-
-                            # Update authoritative system clock
-                            if self._last_stream_time is None or ts > self._last_stream_time:
-                                self._last_stream_time = ts
-
-                            # Ingest to observation layer (skip in node mode to prevent mixed sources)
-                            if not self._use_node_mode:
-                                self._obs.ingest_observation(ts, symbol, event_type, payload)
-
-                        except websockets.exceptions.ConnectionClosed:
-                            # Let connection errors bubble up to trigger reconnect
-                            raise
-                        except Exception as e:
-                            print(f"Processing Error: {e}")
-                            import traceback
-                            traceback.print_exc()  # Print full stack trace
-                            await asyncio.sleep(1)
-
-            except Exception as e:
-                print(f"Connection Failed: {e}. Retrying in {reconnect_delay}s...")
-                import traceback
-                traceback.print_exc()  # Print full traceback
-                await asyncio.sleep(reconnect_delay)
-                # Exponential backoff: double the delay, capped at max
-                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-
 
     def get_execution_log(self):
         """Get execution trace from controller.

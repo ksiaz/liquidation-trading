@@ -87,8 +87,9 @@ def _check_sideways_conditions(metrics: RegimeMetrics) -> bool:
     # Condition 2: Volatility compression
     volatility_compressed = metrics.atr_5m / metrics.atr_30m < 0.80
 
-    # Condition 3: Orderflow balanced
-    orderflow_balanced = metrics.orderflow_imbalance < 0.18
+    # Condition 3: Orderflow balanced (near 0.5)
+    # Deviation from balance: |imbalance - 0.5| < 0.32 → between 0.18 and 0.82
+    orderflow_balanced = abs(metrics.orderflow_imbalance - 0.5) < 0.32
 
     # Condition 4: Liquidations subdued
     liquidations_low = metrics.liquidation_zscore < 2.0
@@ -129,8 +130,9 @@ def _check_expansion_conditions(metrics: RegimeMetrics) -> bool:
     # Condition 2: Volatility expansion
     volatility_expanded = metrics.atr_5m / metrics.atr_30m >= 1.0
 
-    # Condition 3: Orderflow dominant
-    orderflow_dominant = metrics.orderflow_imbalance >= 0.35
+    # Condition 3: Orderflow dominant (directional, either side)
+    # Deviation from balance: |imbalance - 0.5| >= 0.15 → below 0.35 or above 0.65
+    orderflow_dominant = abs(metrics.orderflow_imbalance - 0.5) >= 0.15
 
     # Condition 4: Liquidations elevated
     liquidations_high = metrics.liquidation_zscore >= 2.5

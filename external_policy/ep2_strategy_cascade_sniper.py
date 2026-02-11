@@ -6,7 +6,7 @@ and enter positions with sniper timing.
 
 Authority:
 - Hyperliquid Position Tracker (proximity data)
-- Binance Liquidation Stream (cascade confirmation)
+- Liquidation Stream (cascade confirmation)
 - M6 Scaffolding v1.0
 - EP-3 Arbitration & Risk Gate v1.0
 
@@ -45,6 +45,8 @@ from runtime.cascade import (
     OrganicFlowDetector,
     CascadeDirection,
     AbsorptionSignal,
+    CapitulationTracker,
+    CapitulationMetrics,
 )
 
 if TYPE_CHECKING:
@@ -404,7 +406,7 @@ class ProximityData:
 @dataclass(frozen=True)
 class LiquidationBurst:
     """
-    Recent liquidation activity from Binance.
+    Recent liquidation activity.
 
     Structural observation - no interpretation.
     """
@@ -849,6 +851,23 @@ class CascadeStateMachine:
                         structural_pivot = True
                         detection_path = f"PARTIAL+ORGANIC:abs={abs_signals},ctrl={ctrl_signals},ratio={signal.buying_ratio:.2f}"
 
+        # === LAYER 2.5: Capitulation boost ===
+        # When capitulation confidence >= 0.7 AND any structural signal exists,
+        # promote to structural_pivot (strongest confidence = gate bypass).
+        if not structural_pivot and _capitulation_tracker is not None:
+            coin = symbol.replace('USDT', '').replace('USD', '')
+            cap = _capitulation_tracker.get_metrics(coin, timestamp)
+            if cap.confidence >= 0.7 and cap.total_fills >= 10:
+                # Check if we have at least partial structural evidence
+                combined = self._absorption_tracker.get_combined_observation(coin, timestamp)
+                if combined.total_signals >= 1:
+                    structural_pivot = True
+                    detection_path = (
+                        f"CAPITULATION+STRUCTURAL:cap={cap.confidence:.2f},"
+                        f"close_ratio={cap.close_ratio:.2f},loss=${cap.cumulative_loss:.0f},"
+                        f"flips={cap.flip_count},signals={combined.total_signals}"
+                    )
+
         # === LAYER 3: Organic flow (existing, 10s window) ===
         if detection_path is None and self._organic_detector and self._config.use_organic_flow_detection:
             signal = self._organic_detector.check_absorption(symbol, timestamp)
@@ -1047,6 +1066,7 @@ _state_machine: Optional[CascadeStateMachine] = None
 _entry_quality_scorer: Optional[EntryQualityScorer] = None
 _config: Optional[CascadeSniperConfig] = None
 _session_start_time: Optional[float] = None  # Gate A: Session start for warmup
+_capitulation_tracker: Optional[CapitulationTracker] = None  # Capitulation detection
 
 
 def _get_state_machine() -> CascadeStateMachine:
@@ -1059,6 +1079,12 @@ def _get_state_machine() -> CascadeStateMachine:
         import time
         _session_start_time = time.time()
     return _state_machine
+
+
+def set_capitulation_tracker(tracker: CapitulationTracker):
+    """Inject capitulation tracker for absorption confidence boosting."""
+    global _capitulation_tracker
+    _capitulation_tracker = tracker
 
 
 def _check_warmup_gate(symbol: str, timestamp: float) -> tuple[bool, str]:
@@ -1341,7 +1367,7 @@ def record_liquidation_event(
     """
     Record a liquidation event for entry quality scoring.
 
-    MUST be called for each liquidation event from Binance forceOrder stream.
+    MUST be called for each liquidation event from the liquidation stream.
     This feeds the exhaustion reversal detection.
 
     Args:
@@ -1527,7 +1553,7 @@ def generate_cascade_sniper_proposal(
     Args:
         permission: M6 permission result
         proximity: Current Hyperliquid proximity data
-        liquidations: Recent Binance liquidation burst
+        liquidations: Recent liquidation burst
         context: Strategy execution context
         position_state: Current position state
         entry_mode: Entry timing mode
@@ -1797,9 +1823,10 @@ def get_primed_symbols() -> List[str]:
 
 def reset_state():
     """Reset state machine and entry quality scorer (for testing)."""
-    global _state_machine, _entry_quality_scorer
+    global _state_machine, _entry_quality_scorer, _capitulation_tracker
     _state_machine = None
     _entry_quality_scorer = None
+    _capitulation_tracker = None
 
 
 def get_entry_quality_score(symbol: str, direction: str) -> Optional[EntryScore]:
@@ -1907,7 +1934,7 @@ def generate_cascade_sniper_proposal_from_primitives(
     # DATA SOURCE CONTRACT NOTE: cascade_state comes from HL which has direct LONG/SHORT
     # side information. The 50/50 split here is a TEMPORARY APPROXIMATION pending proper
     # side tracking in cascade_state. This does NOT violate data contracts because we're
-    # not faking HL data from Binance - we're working within HL's data.
+    # working within HL's native data.
     # TODO: Add long_value/short_value to cascade_state when HL breakdown is available
     liquidations = None
     if cascade_state and cascade_state.liquidations_30s > 0:

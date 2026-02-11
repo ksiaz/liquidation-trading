@@ -176,8 +176,20 @@ class ExecutionController:
                     actions_rejected += 1
                     continue
 
-                # F5: Use real values from action
-                entry_price = action.entry_price or mark_prices.get(symbol, Decimal("0"))
+                # F5: Use real values from action — reject if no valid price
+                entry_price = action.entry_price or mark_prices.get(symbol)
+                if not entry_price or entry_price <= 0:
+                    self._execution_log.append(ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=self.state_machine.get_position(symbol).state,
+                        state_after=self.state_machine.get_position(symbol).state,
+                        timestamp=time.time(),
+                        error=f"ENTRY rejected - no valid mark price for {symbol} (stale data)"
+                    ))
+                    actions_rejected += 1
+                    continue
 
                 valid, error = self.risk_monitor.validate_entry(
                     symbol=symbol,
@@ -272,8 +284,18 @@ class ExecutionController:
                 # For ghost trading: immediately confirm entry (ENTERING → OPEN)
                 # In live trading, this would happen after exchange confirms fill
                 if new_position.state == PositionState.ENTERING:
-                    # F5: Use real quantity from action, fallback to mark price if no entry_price
-                    entry_price = action.entry_price or self._mark_prices.get(symbol, Decimal("1"))
+                    # F5: Use real quantity from action — reject if no valid price
+                    entry_price = action.entry_price or self._mark_prices.get(symbol)
+                    if not entry_price or entry_price <= 0:
+                        return ExecutionResult(
+                            symbol=symbol,
+                            action=action.type,
+                            success=False,
+                            state_before=state_before,
+                            state_after=new_position.state,
+                            timestamp=timestamp,
+                            error=f"ENTRY rejected - no valid mark price for {symbol} (stale data)",
+                        )
 
                     # F5: Reject if quantity is missing (no placeholders)
                     if action.quantity is None or action.quantity <= 0:

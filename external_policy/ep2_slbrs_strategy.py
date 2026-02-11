@@ -122,6 +122,22 @@ class SLBRSStrategy:
     # At ~3s regime cycle, 20 observations = ~60s of real L2 comparison data.
     MIN_OC_OBSERVATIONS = 20
 
+    # Diagnostic logging interval — log rejection reason every N cycles per symbol.
+    # At 5Hz (200ms cycle), 150 cycles = ~30s between diagnostics per symbol.
+    _DIAG_INTERVAL = 150
+
+    # Maximum age (seconds) for a cached order_consumption value.
+    # OC is inherently transient — only non-None when L2 book decreased between
+    # consecutive snapshots. Most cycles have no decrease (MM refill, stable book).
+    # Caching with 30s window lets a single consumption event satisfy the gate
+    # across multiple evaluation cycles without requiring real-time coincidence.
+    _OC_CACHE_MAX_AGE_SEC = 30.0
+
+    # Capitulation confidence threshold: below this, capitulation gate blocks entry.
+    # 0.5 is intentionally softer than cascade sniper's 0.7 — SLBRS uses it as
+    # additional confirmation rather than primary signal. Debated 2026-02-11.
+    CAPITULATION_MIN_CONFIDENCE = 0.5
+
     def __init__(self):
         """Initialize SLBRS strategy with empty state."""
         self._state: Dict[str, SLBRSState] = {}  # symbol -> state
@@ -130,6 +146,13 @@ class SLBRSStrategy:
         self._last_exit_ts: Dict[str, float] = {}  # symbol -> timestamp of last exit/reset
         self._open_symbols: set = set()  # symbols with open SLBRS positions
         self._oc_seen: Dict[str, int] = {}  # symbol -> count of valid order_consumption cycles
+        self._diag_counter: Dict[str, int] = {}  # symbol -> cycle counter for diagnostics
+        self._oc_cache: Dict[str, tuple] = {}  # symbol -> (order_consumption, timestamp)
+        self._sp_cache: Dict[str, tuple] = {}  # symbol -> (structural_persistence, timestamp)
+        # Gate rejection frequency: gate_name -> count (across all symbols)
+        self._gate_rejections: Dict[str, int] = {}
+        self._gate_rejections_total: int = 0
+        self._last_gate_log_ts: float = 0.0
 
     def generate_proposal(
         self,
@@ -147,7 +170,8 @@ class SLBRSStrategy:
         absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption)
         directional_continuity=None,  # DirectionalContinuity | None (B4 - trade flow direction)
         orderflow_imbalance: Optional[float] = None,  # Taker buy ratio 0-1 (0=all selling, 1=all buying)
-        orderflow_fill_count: int = 0  # Number of fills in orderflow window
+        orderflow_fill_count: int = 0,  # Number of fills in orderflow window
+        capitulation_confidence: float = 0.0  # CapitulationTracker confidence 0-1
     ) -> Optional[StrategyProposal]:
         """
         Generate SLBRS proposal based on current market structure.
@@ -178,6 +202,14 @@ class SLBRSStrategy:
             self._first_test[symbol] = None
             self._sideways_streak[symbol] = 0
             self._last_exit_ts[symbol] = 0.0
+
+        # Periodic gate rejection summary (every ~5 minutes)
+        if (self._gate_rejections_total > 0 and
+                context.timestamp - self._last_gate_log_ts >= 300.0):
+            self._last_gate_log_ts = context.timestamp
+            sorted_gates = sorted(self._gate_rejections.items(), key=lambda x: -x[1])
+            top = " ".join(f"{g}={c}" for g, c in sorted_gates[:8])
+            print(f"[SLBRS-GATES] total={self._gate_rejections_total} {top}", flush=True)
 
         # Rule 1: M6 DENIED -> no proposal
         if permission.result == "DENIED":
@@ -228,7 +260,8 @@ class SLBRSStrategy:
                 context=context,
                 directional_continuity=directional_continuity,
                 orderflow_imbalance=orderflow_imbalance,
-                orderflow_fill_count=orderflow_fill_count
+                orderflow_fill_count=orderflow_fill_count,
+                capitulation_confidence=capitulation_confidence
             )
 
         # No action
@@ -246,7 +279,8 @@ class SLBRSStrategy:
         context: StrategyContext,
         directional_continuity=None,
         orderflow_imbalance: Optional[float] = None,
-        orderflow_fill_count: int = 0
+        orderflow_fill_count: int = 0,
+        capitulation_confidence: float = 0.0
     ) -> Optional[StrategyProposal]:
         """
         Check for SLBRS entry opportunity (retest logic).
@@ -269,17 +303,67 @@ class SLBRSStrategy:
         Returns:
             ENTRY proposal if ALL conditions met, None otherwise
         """
+        # Diagnostic logging: track which gate blocks, log every N cycles
+        self._diag_counter[symbol] = self._diag_counter.get(symbol, 0) + 1
+        _diag = self._diag_counter[symbol] % self._DIAG_INTERVAL == 0
+        _reject = None  # Set to gate name if rejected
+
+        # Log capitulation confidence periodically (data collection, not a gate)
+        if _diag and capitulation_confidence > 0.0:
+            print(f"[SLBRS-DIAG] {symbol}: cap={capitulation_confidence:.2f}", flush=True)
+
+        def _count_reject(gate_name: str):
+            """Record gate rejection for frequency analysis."""
+            self._gate_rejections[gate_name] = self._gate_rejections.get(gate_name, 0) + 1
+            self._gate_rejections_total += 1
+
+        # ======================================================================
+        # TRANSIENT PRIMITIVE CACHE: OC and SP are computed from point-in-time
+        # state that flickers between cycles. OC requires L2 book to decrease;
+        # SP requires raw_trades window to overlap M2 node intervals. Both can
+        # be None in any given cycle despite the underlying condition persisting.
+        # Cache recent values (30s) to avoid blocking on timing coincidence.
+        # ======================================================================
+        if order_consumption is not None:
+            self._oc_cache[symbol] = (order_consumption, context.timestamp)
+        elif symbol in self._oc_cache:
+            cached_oc, cached_ts = self._oc_cache[symbol]
+            if context.timestamp - cached_ts <= self._OC_CACHE_MAX_AGE_SEC:
+                order_consumption = cached_oc
+            else:
+                del self._oc_cache[symbol]
+
+        if structural_persistence is not None:
+            self._sp_cache[symbol] = (structural_persistence, context.timestamp)
+        elif symbol in self._sp_cache:
+            cached_sp, cached_ts = self._sp_cache[symbol]
+            if context.timestamp - cached_ts <= self._OC_CACHE_MAX_AGE_SEC:
+                structural_persistence = cached_sp
+            else:
+                del self._sp_cache[symbol]
+
         # ======================================================================
         # PRIMITIVE REQUIREMENTS: ALL must be present. No fallbacks.
         # Missing any primitive = incomplete picture = no entry.
         # ======================================================================
         if zone_penetration is None:
-            return None
-        if structural_persistence is None:
-            return None
-        if resting_size is None:
-            return None
-        if order_consumption is None:
+            _reject = "zone_pen=None"
+        elif structural_persistence is None:
+            _reject = "struct_persist=None"
+        elif resting_size is None:
+            _reject = "resting_sz=None"
+        elif order_consumption is None:
+            _reject = "order_cons=None"
+
+        if _reject:
+            _count_reject("primitives_missing")
+            if _diag:
+                _missing = []
+                if zone_penetration is None: _missing.append("zp")
+                if structural_persistence is None: _missing.append("sp")
+                if resting_size is None: _missing.append("rs")
+                if order_consumption is None: _missing.append("oc")
+                print(f"[SLBRS-DIAG] {symbol}: primitives_missing={'+'.join(_missing)}")
             return None
 
         # ======================================================================
@@ -289,6 +373,9 @@ class SLBRSStrategy:
         # ======================================================================
         self._oc_seen[symbol] = self._oc_seen.get(symbol, 0) + 1
         if self._oc_seen[symbol] < self.MIN_OC_OBSERVATIONS:
+            _count_reject("oc_warmup")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: oc_warmup={self._oc_seen[symbol]}/{self.MIN_OC_OBSERVATIONS}")
             return None
 
         # ======================================================================
@@ -299,6 +386,9 @@ class SLBRSStrategy:
         atr_width = regime_state.atr_5m
         min_meaningful_atr = price * 0.003  # 0.3% of price — real volatility required
         if atr_width < min_meaningful_atr:
+            _count_reject("atr_low")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: atr_low={atr_width:.4f}<{min_meaningful_atr:.4f}")
             return None
 
         # ======================================================================
@@ -309,10 +399,16 @@ class SLBRSStrategy:
         # ======================================================================
         # Gate: penetration must be meaningful relative to ATR
         if zone_penetration.penetration_depth < atr_width * 0.1:
+            _count_reject("pen_depth")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: pen_depth={zone_penetration.penetration_depth:.4f}<{atr_width*0.1:.4f}")
             return None
 
         # Gate: block must have persisted at least 60s
         if structural_persistence.total_persistence_duration < 60.0:
+            _count_reject("persist_low")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: persist={structural_persistence.total_persistence_duration:.1f}s<60s")
             return None
 
         # Gate: resting orders must show meaningful depth on at least one side
@@ -320,11 +416,17 @@ class SLBRSStrategy:
         ask_sz = getattr(resting_size, 'ask_size', 0) or 0
         total_resting = bid_sz + ask_sz
         if total_resting <= 0:
+            _count_reject("resting_empty")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: resting_empty")
             return None
         # Imbalance: one side must dominate (directional wall).
         # 0.75 = 75/25 split. Normal MM noise is 55-65%, so 0.75 filters it out.
         resting_ratio = max(bid_sz, ask_sz) / total_resting if total_resting > 0 else 0
         if resting_ratio < 0.75:  # 75/25 minimum — below this is normal book asymmetry
+            _count_reject("resting_ratio")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: resting_ratio={resting_ratio:.2f}<0.75 bid={bid_sz:.1f} ask={ask_sz:.1f}")
             return None
 
         # Gate: Minor side must have meaningful dollar value (not just thin book gap).
@@ -333,6 +435,9 @@ class SLBRSStrategy:
         MIN_MINOR_SIDE_USD = 5000.0
         minor_side_usd = min(bid_sz, ask_sz) * price
         if minor_side_usd < MIN_MINOR_SIDE_USD:
+            _count_reject("minor_usd")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: minor_usd=${minor_side_usd:.0f}<${MIN_MINOR_SIDE_USD:.0f}")
             return None
 
         block_exists = True
@@ -344,15 +449,24 @@ class SLBRSStrategy:
 
             # Gate: Regime must be stable (4+ consecutive SIDEWAYS cycles)
             if self._sideways_streak.get(symbol, 0) < 4:
+                _count_reject("sideways_streak")
+                if _diag:
+                    print(f"[SLBRS-DIAG] {symbol}: sideways_streak={self._sideways_streak.get(symbol, 0)}<4")
                 return None
 
             # Gate: Max concurrent SLBRS positions
             if len(self._open_symbols) >= self.MAX_CONCURRENT_POSITIONS:
+                _count_reject("max_positions")
+                if _diag:
+                    print(f"[SLBRS-DIAG] {symbol}: max_positions={len(self._open_symbols)}>={self.MAX_CONCURRENT_POSITIONS}")
                 return None
 
             # Gate: Post-exit cooldown (120s)
             last_exit = self._last_exit_ts.get(symbol, 0.0)
             if last_exit > 0 and context.timestamp - last_exit < 120.0:
+                _count_reject("cooldown")
+                if _diag:
+                    print(f"[SLBRS-DIAG] {symbol}: cooldown={context.timestamp - last_exit:.0f}s<120s")
                 return None
 
             # First time seeing block - record as first test
@@ -390,10 +504,12 @@ class SLBRSStrategy:
             proximity_threshold = 0.30 * first_test.block_width  # 30% of block width
 
             if distance_to_block > proximity_threshold:
+                _count_reject("retest_proximity")
                 return None
 
             # Gate: Max concurrent SLBRS positions (check again at retest)
             if len(self._open_symbols) >= self.MAX_CONCURRENT_POSITIONS:
+                _count_reject("max_positions")
                 return None
 
             # Retest Condition 2: Absorption evidence (order_consumption required)
@@ -404,9 +520,11 @@ class SLBRSStrategy:
             initial = getattr(order_consumption, 'initial_size', 0) or 0
             consumed = getattr(order_consumption, 'consumed_size', 0) or 0
             if initial <= 0:
+                _count_reject("absorption_no_initial")
                 return None  # No initial orders to absorb
             absorption_pct = consumed / initial
             if absorption_pct < 0.65 or absorption_pct > 0.95:
+                _count_reject("absorption_range")
                 return None  # Too little absorption OR block broken through
 
             # Direction from orderbook depth imbalance (resting_size required at top)
@@ -420,8 +538,10 @@ class SLBRSStrategy:
             if directional_continuity is not None and directional_continuity.total_trades > 0:
                 buy_ratio = directional_continuity.buy_trades / directional_continuity.total_trades
                 if direction == "LONG" and buy_ratio < 0.4:
+                    _count_reject("dir_continuity")
                     return None  # Block says LONG but selling dominates — contradicted
                 if direction == "SHORT" and buy_ratio > 0.6:
+                    _count_reject("dir_continuity")
                     return None  # Block says SHORT but buying dominates — contradicted
 
             # Orderflow data quality gate: require sufficient fills for reliable ratio.
@@ -430,6 +550,7 @@ class SLBRSStrategy:
             # are noise. 25 fills minimum ensures ratio has statistical meaning.
             MIN_ORDERFLOW_FILLS = 25
             if orderflow_fill_count < MIN_ORDERFLOW_FILLS:
+                _count_reject("orderflow_fills")
                 return None  # Insufficient fills for reliable orderflow
 
             # Orderflow extremity guard: near-0 or near-1 values are unreliable.
@@ -437,6 +558,7 @@ class SLBRSStrategy:
             # Require ratio in [0.10, 0.90] to filter sparse-data extremes.
             if orderflow_imbalance is not None:
                 if orderflow_imbalance < 0.10 or orderflow_imbalance > 0.90:
+                    _count_reject("orderflow_extreme")
                     return None  # Extreme reading = unreliable data
 
             # Orderflow confirmation gate: taker flow must confirm entry direction.
@@ -445,9 +567,17 @@ class SLBRSStrategy:
             # SHORT requires buy ratio < 0.62 (at least 38% selling).
             if orderflow_imbalance is not None:
                 if direction == "LONG" and orderflow_imbalance < 0.38:
+                    _count_reject("orderflow_confirm")
                     return None  # Dominant selling pressure contradicts LONG
                 if direction == "SHORT" and orderflow_imbalance > 0.62:
+                    _count_reject("orderflow_confirm")
                     return None  # Dominant buying pressure contradicts SHORT
+
+            # Capitulation: logged at entry for data collection, NOT a blocking gate.
+            # Sideways regime has low close ratios by nature — 0.5 threshold would
+            # effectively disable SLBRS. Collect data first, gate later if warranted.
+            # Original threshold: CAPITULATION_MIN_CONFIDENCE = 0.5 (preserved in class).
+            # Debated 2026-02-11: pony-alpha + claude agreed — regime mismatch.
 
             # All retest conditions met -> propose ENTRY
             self._state[symbol] = SLBRSState.RETEST_ARMED
@@ -458,7 +588,8 @@ class SLBRSStrategy:
                   f"pen={zone_penetration.penetration_depth:.6f} persist={structural_persistence.total_persistence_duration:.1f}s "
                   f"bid=${bid_sz*price:,.0f} ask=${ask_sz*price:,.0f} minor=${minor_side_usd:,.0f} ratio={resting_ratio:.3f} "
                   f"oc_init={initial:.2f} oc_cons={consumed:.2f} abs_pct={absorption_pct*100:.1f}% "
-                  f"of={of_str} fills={orderflow_fill_count} dir={direction} price={price:.4f}", flush=True)
+                  f"of={of_str} fills={orderflow_fill_count} dir={direction} price={price:.4f} "
+                  f"cap={capitulation_confidence:.2f}", flush=True)
 
             return StrategyProposal(
                 strategy_id="EP2-SLBRS-V1",
@@ -558,7 +689,8 @@ def generate_slbrs_proposal(
     absorption_event=None,  # AbsorptionEvent | None (B2.1 - orderbook absorption fallback)
     directional_continuity=None,  # DirectionalContinuity | None (B4 - trade flow validation)
     orderflow_imbalance: Optional[float] = None,  # Taker buy ratio 0-1 (from regime metrics)
-    orderflow_fill_count: int = 0  # Number of fills in orderflow window
+    orderflow_fill_count: int = 0,  # Number of fills in orderflow window
+    capitulation_confidence: float = 0.0  # CapitulationTracker confidence 0-1
 ) -> Optional[StrategyProposal]:
     """
     Generate SLBRS proposal (function interface for policy adapter).
@@ -608,5 +740,6 @@ def generate_slbrs_proposal(
         absorption_event=absorption_event,
         directional_continuity=directional_continuity,
         orderflow_imbalance=orderflow_imbalance,
-        orderflow_fill_count=orderflow_fill_count
+        orderflow_fill_count=orderflow_fill_count,
+        capitulation_confidence=capitulation_confidence
     )

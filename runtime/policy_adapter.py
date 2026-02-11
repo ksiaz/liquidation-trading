@@ -139,7 +139,8 @@ class PolicyAdapter:
         price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
         hl_order_consumption: Optional[Any] = None,  # HL-derived order consumption (from taker fills)
         price_high: Optional[float] = None,  # 5-min rolling high for EFFCS impulse direction
-        price_low: Optional[float] = None  # 5-min rolling low for EFFCS impulse direction
+        price_low: Optional[float] = None,  # 5-min rolling low for EFFCS impulse direction
+        capitulation_confidence: float = 0.0  # CapitulationTracker confidence for SLBRS
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -337,7 +338,8 @@ class PolicyAdapter:
                     absorption_event=primitives.get("absorption_event"),
                     directional_continuity=primitives.get("directional_continuity"),
                     orderflow_imbalance=regime_metrics.orderflow_imbalance,
-                    orderflow_fill_count=regime_metrics.orderflow_fill_count
+                    orderflow_fill_count=regime_metrics.orderflow_fill_count,
+                    capitulation_confidence=capitulation_confidence
                 )
                 if _DIAG_ENABLED:
                     from external_policy.ep2_slbrs_strategy import _slbrs_strategy

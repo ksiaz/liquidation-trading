@@ -43,6 +43,7 @@ from runtime.regime import RegimeState, RegimeMetrics, classify_regime
 from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
+from runtime.cascade import CapitulationTracker
 
 # Import Hyperliquid Integration
 try:
@@ -200,6 +201,9 @@ class CollectorService:
         # Reconcile ghost tracker with positions.db on startup
         self._reconcile_positions_on_startup()
 
+        # Backfill missing exit rows in execution.db from ghost_positions DB
+        self._backfill_missing_exits()
+
         # Store latest cycle context for ghost tracker
         self._latest_cycle_id = None
         self._latest_snapshot = None
@@ -230,6 +234,9 @@ class CollectorService:
             max_events=1000
         )
 
+        # Capitulation tracker (detects forced position unwinding from HL fill metadata)
+        self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
+
         # Track current prices for regime calculation
         self._current_prices: Dict[str, float] = {}
 
@@ -241,6 +248,10 @@ class CollectorService:
 
         # Track previous regime state for transition logging (Phase 6)
         self._prev_regime_states: Dict[str, RegimeState] = {}
+        # Regime debounce: require N consecutive cycles of new state before transitioning
+        # Prevents orderflow noise from causing SIDEWAYS↔DISABLED chatter at 5Hz
+        self._regime_pending: Dict[str, tuple] = {}  # symbol → (pending_state, count)
+        self._REGIME_DEBOUNCE_CYCLES = 5  # 5 cycles × 200ms = 1 second
 
         # Hyperliquid Integration (optional)
         # Two modes: Node Adapter (direct node access) or WebSocket Collector
@@ -398,6 +409,7 @@ class CollectorService:
             self._regime_states.pop(symbol, None)
             self._regime_metrics.pop(symbol, None)
             self._prev_regime_states.pop(symbol, None)
+            self._regime_pending.pop(symbol, None)
             self._calculators_pruned += 1
 
         if to_remove:
@@ -599,16 +611,8 @@ class CollectorService:
 
         # self._logger.info(f"Warmup period duration: {self._warmup_duration_sec}s from startup")
 
-        # 0. Pre-warm ATR calculators with historical data (async - non-blocking)
-        # This avoids 90-minute warm-up delay for regime classification
-        self._logger.info("[ATR-WARMUP] Fetching historical klines for ATR initialization...")
-        await self._warm_up_atr_calculators(TOP_10_SYMBOLS)
-
         # 1. Start Clock Driver (Heartbeat)
         asyncio.create_task(self._drive_clock())
-
-        # 2. Start Binance WebSocket (supplementary ATR warm-up source)
-        binance_task = asyncio.create_task(self._run_binance_stream())
 
         # Give WS time to connect before starting heavy I/O
         await asyncio.sleep(2.0)
@@ -630,6 +634,19 @@ class CollectorService:
                         # This ensures liq_z and burst_vol reflect HL liquidations in node mode
                         self._node_bridge.on_hl_liquidation(self._handle_hl_liquidation)
                         self._logger.info("HL liquidation callback registered (zscore + burst aggregator)")
+
+                        # Wire ALL fills (including liquidation) for capitulation tracking
+                        # CapitulationTracker needs dir/startPosition/closedPnl from extended fill data
+                        self._node_bridge.on_fill_extended(self._handle_hl_fill_extended)
+                        self._logger.info("HL extended fill callback registered (capitulation tracker)")
+
+                        # Inject capitulation tracker into cascade sniper for absorption confidence
+                        try:
+                            from external_policy.ep2_strategy_cascade_sniper import set_capitulation_tracker
+                            set_capitulation_tracker(self._capitulation_tracker)
+                            self._logger.info("Capitulation tracker injected into cascade sniper")
+                        except ImportError:
+                            pass
 
                         # Verify adapter is responding (STALE is OK during warmup)
                         await asyncio.sleep(2)  # Give adapter time to send status
@@ -684,8 +701,9 @@ class CollectorService:
                 except Exception as e:
                     self._logger.warning(f"Hyperliquid collector start failed: {e}")
 
-        # Wait for supplementary WS task (runs forever, reconnecting as needed)
-        await binance_task
+        # Keep service alive (block forever until shutdown)
+        self._shutdown_event = asyncio.Event()
+        await self._shutdown_event.wait()
 
     async def _monitor_node_bridge_health(self):
         """Periodic health check for HL adapter connection.
@@ -920,20 +938,37 @@ class CollectorService:
                               f"atr30={atr_30m:.1f} ratio={atr_ratio:.2f} of={orderflow_imbalance:.3f} "
                               f"liq_z={liquidation_zscore:.2f}", flush=True)
 
-                    # Phase 6: Log regime transitions
+                    # Phase 6: Debounced regime transitions
+                    # Require N consecutive cycles of the new state before applying
                     prev_regime = self._prev_regime_states.get(symbol)
                     if prev_regime is not None and prev_regime != regime_state:
-                        # Regime transition detected
-                        self._logger.info(
-                            f"Regime transition: {symbol} {prev_regime.name} → {regime_state.name} "
-                            f"(VWAP dist={vwap_distance:.1f}, ATR 5m/30m={atr_5m:.1f}/{atr_30m:.1f}, "
-                            f"orderflow={orderflow_imbalance:.3f}, liq_z={liquidation_zscore:.2f})"
-                        )
+                        pending = self._regime_pending.get(symbol)
+                        if pending and pending[0] == regime_state:
+                            count = pending[1] + 1
+                        else:
+                            count = 1
+                        self._regime_pending[symbol] = (regime_state, count)
+
+                        if count >= self._REGIME_DEBOUNCE_CYCLES:
+                            # Confirmed transition
+                            self._logger.info(
+                                f"Regime transition: {symbol} {prev_regime.name} → {regime_state.name} "
+                                f"(VWAP dist={vwap_distance:.1f}, ATR 5m/30m={atr_5m:.1f}/{atr_30m:.1f}, "
+                                f"orderflow={orderflow_imbalance:.3f}, liq_z={liquidation_zscore:.2f})"
+                            )
+                            self._prev_regime_states[symbol] = regime_state
+                            self._regime_pending.pop(symbol, None)
+                        else:
+                            # Not confirmed yet — keep previous regime
+                            regime_state = prev_regime
+                    else:
+                        # Same state as before or first classification — reset pending
+                        self._regime_pending.pop(symbol, None)
+                        self._prev_regime_states[symbol] = regime_state
 
                     # Store regime state and metrics for this symbol
                     self._regime_states[symbol] = regime_state
                     self._regime_metrics[symbol] = regime_metrics
-                    self._prev_regime_states[symbol] = regime_state
 
                 except Exception as e:
                     # Don't fail cycle if regime classification fails
@@ -1088,6 +1123,14 @@ class CollectorService:
                     # Trend context for cascade sniper kill-switch
                     trend_context = self._obs.get_trend_context(symbol)
 
+                    # Capitulation confidence for SLBRS entry quality gate
+                    cap_confidence = 0.0
+                    if self._capitulation_tracker:
+                        cap_metrics = self._capitulation_tracker.get_metrics(
+                            coin_for_returns, timestamp
+                        )
+                        cap_confidence = cap_metrics.confidence
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -1104,7 +1147,8 @@ class CollectorService:
                         price_returns=price_returns,  # Gate B: Short-term price returns
                         hl_order_consumption=None,  # Canonical OC now has initial_size
                         price_high=self._price_highs.get(symbol, current_price),
-                        price_low=self._price_lows.get(symbol, current_price)
+                        price_low=self._price_lows.get(symbol, current_price),
+                        capitulation_confidence=cap_confidence
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1446,6 +1490,28 @@ class CollectorService:
             print(f"HL_FILL_ERROR: {e}", flush=True)
             traceback.print_exc()
 
+    def _handle_hl_fill_extended(self, event):
+        """Handle extended fill event with capitulation data.
+
+        Called for ALL fills (organic + liquidation) via on_fill_extended callback.
+        Feeds CapitulationTracker with dir/startPosition/closedPnl from HL node.
+        """
+        try:
+            if not event.dir:
+                return  # No direction data — skip
+
+            timestamp = event.timestamp_ms / 1000.0
+            self._capitulation_tracker.on_fill(
+                symbol=event.symbol,
+                dir_type=event.dir,
+                closed_pnl=event.closed_pnl_float,
+                start_position=event.start_position_float,
+                size=event.size_float,
+                timestamp=timestamp,
+            )
+        except Exception as e:
+            print(f"HL_FILL_EXTENDED_ERROR: {e}", flush=True)
+
     def _handle_hl_liquidation(
         self,
         symbol: str,      # Coin (e.g., "BTC")
@@ -1707,6 +1773,122 @@ class CollectorService:
         except Exception as e:
             print(f"RECONCILE: Error during startup reconciliation: {e}")
 
+    def _backfill_missing_exits(self):
+        """Backfill missing exit rows in execution.db from ghost_positions DB.
+
+        When the process is killed (kill -9), BRD buffer is lost. The position
+        DB (/tmp/ghost_trades.db) gets updated immediately (direct write), but
+        execution.db exit rows are lost. This method detects the mismatch and
+        writes the missing exit rows on startup.
+        """
+        try:
+            import sqlite3
+            pos_db_path = '/tmp/ghost_trades.db'
+            if not os.path.exists(pos_db_path):
+                return
+
+            pos_conn = sqlite3.connect(pos_db_path, timeout=10)
+            closed_positions = pos_conn.execute('''
+                SELECT trade_id, symbol, side, qty, entry_price, exit_price,
+                       entry_time, exit_time, pnl, strategy_id
+                FROM ghost_positions
+                WHERE status = 'CLOSED' AND exit_price IS NOT NULL
+            ''').fetchall()
+            pos_conn.close()
+
+            if not closed_positions:
+                return
+
+            # Flush BRD so reads reflect latest state
+            self._execution_db.flush()
+
+            # Get all entry trade_ids that have matching exit rows
+            exit_rows = self._execution_db.read_sql(
+                'SELECT entry_trade_id FROM ghost_trades WHERE is_entry = 0 AND entry_trade_id IS NOT NULL'
+            )
+            exited_entry_ids = {r[0] for r in exit_rows if r[0]}
+
+            # Also check for recovered exits by trade_id pattern
+            recovered_rows = self._execution_db.read_sql(
+                "SELECT trade_id FROM ghost_trades WHERE trade_id LIKE 'recovered_exit_%'"
+            )
+            recovered_symbols_ts = set()
+            for r in recovered_rows:
+                # recovered_exit_BTCUSDT_1770706169 format
+                parts = r[0].split('_')
+                if len(parts) >= 3:
+                    recovered_symbols_ts.add(parts[2])  # symbol
+
+            backfilled = 0
+            for row in closed_positions:
+                tid, sym, side, qty, entry_px, exit_px, entry_t, exit_t, pnl, strat = row
+
+                # Skip if exit already exists
+                if tid in exited_entry_ids:
+                    continue
+
+                # Skip if already recovered
+                # Check for exact exit row by looking for entry in execution.db
+                entry_exists = self._execution_db.read_sql(
+                    'SELECT 1 FROM ghost_trades WHERE trade_id = ? AND is_entry = 1',
+                    (tid,)
+                )
+                if not entry_exists:
+                    continue  # Entry not in execution.db either — very old position
+
+                # Check if ANY exit row already exists for this entry
+                has_exit = self._execution_db.read_sql(
+                    'SELECT 1 FROM ghost_trades WHERE entry_trade_id = ? AND is_entry = 0',
+                    (tid,)
+                )
+                if has_exit:
+                    continue
+
+                # Missing exit — backfill it
+                exit_side = "BUY" if side == "SHORT" else "SELL"
+                hold_dur = (exit_t - entry_t) if exit_t and entry_t else None
+
+                # Determine exit reason from PnL
+                if pnl and pnl > 0:
+                    exit_reason = "TRAILING_STOP_PROFIT"
+                elif pnl and pnl < 0:
+                    exit_reason = "TRAILING_STOP_LOSS"
+                else:
+                    exit_reason = "UNKNOWN_RECOVERED"
+
+                # Get latest balance for running total
+                bal_rows = self._execution_db.read_sql(
+                    'SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1'
+                )
+                last_bal = float(bal_rows[0][0]) if bal_rows and bal_rows[0][0] else 1000.0
+                new_bal = last_bal + (pnl or 0)
+
+                self._execution_db.execute_sql('''
+                    INSERT INTO ghost_trades
+                    (trade_id, symbol, side, quantity, price, timestamp,
+                     position_side, is_entry, pnl, account_balance_after,
+                     exit_reason, holding_duration_sec, entry_trade_id,
+                     winning_policy_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    f"backfill_{tid}",
+                    sym, exit_side, qty, exit_px, exit_t or time.time(),
+                    side, pnl, new_bal, exit_reason,
+                    hold_dur, tid, strat
+                ))
+                backfilled += 1
+                pnl_str = f"${pnl:+.2f}" if pnl else "$0.00"
+                print(f"BACKFILL: {tid} {sym} {side} exit@{exit_px:,.2f} pnl={pnl_str} hold={hold_dur:.0f}s")
+
+            if backfilled > 0:
+                self._execution_db.flush()
+                print(f"BACKFILL: Recovered {backfilled} missing exit rows in execution.db")
+
+        except Exception as e:
+            print(f"BACKFILL: Error during exit backfill: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _force_position_flat(self, symbol: str):
         """Set position to FLAT in positions.db."""
         try:
@@ -1882,8 +2064,15 @@ class CollectorService:
             )
 
             # Check if any stops are triggered (price crossed stop level)
+            # Use list() snapshot — we may unregister during iteration
             for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
                 if state.symbol != symbol:
+                    continue
+
+                # Guard: if position already closed (by a prior stop for same symbol), skip
+                if not self.ghost_tracker.has_open_position(symbol):
+                    # Stale stop — unregister and move on
+                    self._trailing_stop_manager.unregister_stop(entry_id)
                     continue
 
                 # Check if stop is triggered
@@ -1894,23 +2083,21 @@ class CollectorService:
                     stop_triggered = True
 
                 if stop_triggered:
-                    # Determine exit reason from actual PnL, not just BE flag
-                    # Calculate unrealized PnL to label correctly
+                    # Determine exit reason from actual PnL
                     if state.direction == "LONG":
                         pnl_pct = (price - state.entry_price) / state.entry_price
                     else:
                         pnl_pct = (state.entry_price - price) / state.entry_price
 
-                    if pnl_pct > 0.0005:  # > 0.05% profit
+                    if pnl_pct > 0.0005:
                         exit_reason = "TRAILING_STOP_PROFIT"
-                    elif pnl_pct >= -0.0005:  # near break-even
+                    elif pnl_pct >= -0.0005:
                         exit_reason = "TRAILING_STOP_BE"
                     else:
                         exit_reason = "TRAILING_STOP_LOSS"
 
                     print(f"TRAILING: STOP HIT {symbol} @ ${price:,.2f} (stop was ${state.current_stop_price:,.2f})")
 
-                    # Primary path: close via ghost tracker (position is in memory)
                     success, error, trade = self.ghost_tracker.close_position(
                         symbol=symbol,
                         exit_reason=exit_reason,
@@ -1923,10 +2110,7 @@ class CollectorService:
                         hold_str = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
                         print(f"EXIT: {symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: {pnl_str}, Hold: {hold_str}, Reason: {exit_reason}")
                         self._force_position_flat(symbol)
-                        self._trailing_stop_manager.unregister_stop(entry_id)
                     else:
-                        # Fallback: position in positions.db but not ghost tracker
-                        # (legacy entries from before unified path, or after restart)
                         recovered = self._recovered_exit(
                             symbol=symbol,
                             price=price,
@@ -1935,10 +2119,14 @@ class CollectorService:
                             entry_price=state.entry_price,
                             exit_reason=exit_reason
                         )
-                        if recovered:
-                            self._trailing_stop_manager.unregister_stop(entry_id)
-                        else:
+                        if not recovered:
                             print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
+
+                    # Unregister ALL stops for this symbol after exit (prevents duplicate exits)
+                    for sid, sstate in self._trailing_stop_manager.get_all_stops().items():
+                        if sstate.symbol == symbol:
+                            self._trailing_stop_manager.unregister_stop(sid)
+                    break  # Only one exit per symbol per call
 
         except Exception as e:
             import traceback
@@ -2336,9 +2524,6 @@ class CollectorService:
 
                                         # Track current price
                                         self._current_prices[symbol] = price
-
-                                        # Update trailing stops
-                                        self._update_trailing_stops(symbol, price)
                                     except:
                                         pass
                             elif 'forceorder' in stream.lower():

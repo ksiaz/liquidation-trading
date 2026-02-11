@@ -112,6 +112,7 @@ BINANCE_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
     'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'SUIUSDT', 'NEARUSDT',
     'LTCUSDT', 'ATOMUSDT', 'AAVEUSDT', 'APTUSDT', 'ARBUSDT',
+    'BNBUSDT', 'OPUSDT', 'TRXUSDT', 'WLDUSDT', 'TONUSDT',
 ]
 HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
 SYMBOLS = BINANCE_SYMBOLS + HL_SYMBOLS  # Both formats for observation whitelist
@@ -174,62 +175,18 @@ async def run_paper_trade():
     except Exception as e:
         logger.debug(f"Could not register cascade state machine: {e}")
 
-    # Wire HL node fills for organic flow detection
-    # This feeds taker buy/sell data to the absorption detector via gRPC
-    # Replaces BinanceTradeStream - now uses native HL fill data
+    # HL fills are already wired to cascade sniper's organic flow detector
+    # via service._handle_hl_fill (registered in CollectorService.__init__).
+    # That path passes price/size for RunningPivotDetector + AbsorptionConfirmationTracker.
+    # Do NOT register a duplicate callback here (causes double-counting).
+    # HL liquidations are already wired via service._handle_hl_liquidation
+    # (registered in CollectorService.__init__), which feeds:
+    # - Z-score calculator
+    # - Burst aggregator
+    # - record_liquidation_event (cascade sniper)
     trade_stream = None  # Only used if node bridge unavailable
     if service._node_bridge:
-        def on_hl_fill(symbol: str, side: str, price: float, size: float, timestamp: float):
-            """Feed organic fills from HL node to the cascade sniper's absorption detector."""
-            # HL symbols don't have USDT suffix - add it for consistency
-            normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
-            # Calculate value from price * size
-            value = price * size
-            # Map side: "B" -> "BUY", "A" -> "SELL"
-            order_side = "BUY" if side == "B" else "SELL"
-            record_organic_trade(
-                symbol=normalized_symbol,
-                side=order_side,
-                value=value,
-                timestamp=timestamp
-            )
-
-        service._node_bridge.on_organic_fill(on_hl_fill)
-        logger.info('Wired HL node fills to absorption detector (via gRPC adapter)')
-
-        # Wire HL liquidations for cascade detector AND burst aggregator
-        def on_hl_liquidation(symbol: str, side: str, price: float, size: float, timestamp: float):
-            """Feed liquidations from HL node to the cascade sniper's detector."""
-            # HL symbols don't have USDT suffix - add it for consistency
-            normalized_symbol = f"{symbol}USDT" if not symbol.endswith('USDT') else symbol
-            # Convert position side (LONG/SHORT) to order side (BUY/SELL)
-            # LONG liquidation = forced SELL, SHORT liquidation = forced BUY
-            order_side = "SELL" if side == "LONG" else "BUY"
-            # Calculate value from price * size
-            value = price * size
-
-            # Feed to OrganicFlowDetector (for absorption ratio)
-            record_liquidation_event(
-                symbol=normalized_symbol,
-                side=order_side,
-                value=value,
-                timestamp=timestamp
-            )
-
-            # Feed to burst aggregator (for cascade state machine triggering)
-            # This is critical - without it, cascade states never transition
-            # because the state machine uses liquidation_burst from the aggregator
-            if hasattr(service, '_liquidation_burst_aggregator'):
-                service._liquidation_burst_aggregator.add_event(
-                    timestamp=timestamp,
-                    symbol=normalized_symbol,
-                    side=order_side,
-                    price=price,
-                    quantity=size
-                )
-
-        service._node_bridge.on_hl_liquidation(on_hl_liquidation)
-        logger.info('Wired HL node liquidations to cascade detector AND burst aggregator')
+        logger.info('HL fills + liquidations wired via CollectorService._handle_hl_fill/liquidation')
     else:
         # Fallback to Binance trade stream if node bridge unavailable
         logger.warning('Node bridge not available, falling back to BinanceTradeStream')
@@ -266,6 +223,10 @@ async def run_paper_trade():
     if sm and hasattr(sm, '_organic_detector') and sm._organic_detector:
         cleanup.register_pruner('organic_flow_detector', lambda: sm._organic_detector.cleanup(time.time()))
 
+    # Register capitulation tracker pruning
+    if hasattr(service, '_capitulation_tracker'):
+        cleanup.register_pruner('capitulation_tracker', lambda: service._capitulation_tracker.cleanup(time.time()))
+
     # Register collector calculator pruning
     cleanup.register_pruner('collector_calculators', service.prune_stale_calculators)
 
@@ -282,11 +243,12 @@ async def run_paper_trade():
         cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
 
     # Register execution.db pruning (48h retention to prevent unbounded growth)
-    # Run every cleanup cycle - the prune method is fast when little to prune
-    if hasattr(service, '_execution_db') and hasattr(service._execution_db, '_db'):
+    # MUST use prune_safe() to go through BRD's lock. Direct _db access
+    # bypasses the lock and corrupts transaction state, losing ghost trades.
+    if hasattr(service, '_execution_db') and hasattr(service._execution_db, 'prune_safe'):
         cleanup.register_pruner(
             'execution_db',
-            lambda: service._execution_db._db.prune_old_data(max_age_hours=48).get('total_deleted', 0)
+            lambda: service._execution_db.prune_safe(max_age_hours=48)
         )
 
     # Register HL node data cleanup (keeps 24h of data, cleans diagnostics)
@@ -409,6 +371,16 @@ async def run_paper_trade():
         # Cleanup
         logger.info('Stopping...')
         service._running = False
+
+        # Flush BRD buffer FIRST — prevents exit row loss on graceful shutdown.
+        # kill -9 still loses buffer (handled by _backfill_missing_exits on restart).
+        if hasattr(service, '_execution_db'):
+            try:
+                service._execution_db.flush()
+                logger.info('Flushed execution.db buffer')
+            except Exception as e:
+                logger.warning(f'Failed to flush execution.db: {e}')
+
         if trade_stream:
             trade_stream.stop()
             logger.info('Trade stream stopped')

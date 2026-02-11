@@ -21,7 +21,7 @@ from typing import Optional
 import events_pb2
 from checkpoint import CheckpointManager
 from grpc_server import GRPCServer, SCHEMA_VERSION
-from readers import PriceReader, LiquidationReader, FillReader
+from readers import PriceReader, FillReader
 
 
 class AdapterServer:
@@ -45,7 +45,6 @@ class AdapterServer:
 
         # File readers
         self._price_reader = PriceReader(self._data_path)
-        self._liq_reader = LiquidationReader(self._data_path)
         self._fill_reader = FillReader(self._data_path)
 
         # gRPC server
@@ -62,7 +61,6 @@ class AdapterServer:
 
         # Threads
         self._price_thread: Optional[threading.Thread] = None
-        self._liq_thread: Optional[threading.Thread] = None
         self._fill_thread: Optional[threading.Thread] = None
         self._status_thread: Optional[threading.Thread] = None
         self._checkpoint_thread: Optional[threading.Thread] = None
@@ -106,7 +104,13 @@ class AdapterServer:
             self._last_block_time_ns = max(self._last_block_time_ns, int(event.timestamp_ms * 1_000_000))
 
     def _emit_fill(self, event):
-        """Convert fill event to proto and broadcast."""
+        """Convert fill event to proto and broadcast.
+
+        Also derives liquidation events from fills with liquidation metadata.
+        This replaced the separate LiquidationReader which was redundant
+        (both read the same node_fills/hourly files) and delayed
+        (it started from file beginning instead of real-time).
+        """
         proto_event = events_pb2.FillEvent(
             symbol=event.symbol,
             side=event.side,
@@ -122,6 +126,9 @@ class AdapterServer:
             mark_price=event.mark_price,
             fill_id=event.fill_id,
             tx_hash=event.tx_hash,
+            dir=event.dir,
+            start_position=event.start_position,
+            closed_pnl=event.closed_pnl,
         )
 
         self._grpc_server.servicer.push_fill(proto_event)
@@ -130,6 +137,30 @@ class AdapterServer:
             self._last_block_height = max(self._last_block_height, event.block_height)
         if event.timestamp_ms:
             self._last_block_time_ns = max(self._last_block_time_ns, int(event.timestamp_ms * 1_000_000))
+
+        # Derive liquidation event from fill with liquidation metadata.
+        # FillReader only emits taker fills (crossed=true). For liquidations,
+        # the taker is the liquidated user's forced order:
+        #   side "B" (buy) = SHORT position liquidated (forced buy to close)
+        #   side "A" (sell) = LONG position liquidated (forced sell to close)
+        if event.is_liquidation:
+            liq_side = 'SHORT' if event.side == 'B' else 'LONG'
+            proto_liq = events_pb2.LiquidationEvent(
+                symbol=event.symbol,
+                side=liq_side,
+                price=event.price,
+                size=event.size,
+                value_usd=event.value_usd,
+                liquidator_wallet='',  # Not available from taker fill
+                liquidated_wallet=event.liquidated_wallet,
+                mark_price=event.mark_price,
+                method=event.method,
+                timestamp_ms=event.timestamp_ms,
+                fill_id=event.fill_id,
+                tx_hash=event.tx_hash,
+            )
+            self._grpc_server.servicer.push_liquidation(proto_liq)
+            self._liquidations_emitted += 1
 
     def _emit_status(self):
         """Emit current status to subscribers."""
@@ -190,32 +221,6 @@ class AdapterServer:
 
         print("[SERVER] Price reader stopped", file=sys.stderr)
 
-    def _run_liq_reader(self):
-        """Liquidation reader thread."""
-        print("[SERVER] Liquidation reader starting...", file=sys.stderr)
-
-        try:
-            for event in self._liq_reader.read_liquidations():
-                if not self._running:
-                    break
-
-                self._emit_liquidation(event)
-
-                # Update checkpoint
-                state = self._liq_reader.get_state()
-                self._checkpoint_mgr.update_liq_state(
-                    date=state['date'],
-                    hour=state['hour'],
-                    position=state['position'],
-                    fill_id=state['last_fill_id'],
-                )
-                self._checkpoint_mgr.increment_liquidations()
-
-        except Exception as e:
-            print(f"[SERVER] Liquidation reader error: {e}", file=sys.stderr)
-
-        print("[SERVER] Liquidation reader stopped", file=sys.stderr)
-
     def _run_fill_reader(self):
         """Fill reader thread."""
         print("[SERVER] Fill reader starting...", file=sys.stderr)
@@ -263,12 +268,12 @@ class AdapterServer:
             position=checkpoint.price_file_position,
         )
 
-        self._liq_reader.initialize(
-            date=checkpoint.liq_date or None,
-            hour=checkpoint.liq_hour if checkpoint.liq_hour >= 0 else None,
-            position=checkpoint.liq_file_position,
-            last_fill_id=checkpoint.last_liq_fill_id,
-        )
+        # Initialize fill reader - start from end of current file (real-time only).
+        # Liquidation events are derived from fills (fills with liquidation metadata).
+        # This replaced the separate LiquidationReader — both were reading the same
+        # node_fills/hourly files, but LiquidationReader started from the beginning
+        # causing delayed liquidation data until it caught up.
+        self._fill_reader.initialize(skip_historical=True)
 
         # Restore counters
         self._prices_emitted = checkpoint.prices_emitted
@@ -279,35 +284,16 @@ class AdapterServer:
         print(f"[SERVER] Starting gRPC server on port {self._grpc_port}...", file=sys.stderr)
         self._grpc_server.start()
 
-        # Wait for at least one liquidation subscriber before starting historical replay
-        # This ensures paper trade doesn't miss the replay events
-        print("[SERVER] Waiting for liquidation subscriber before starting historical replay...",
-              file=sys.stderr)
-        wait_start = time.time()
-        max_wait = 30.0  # Maximum wait time
-        while self._running and (time.time() - wait_start) < max_wait:
-            metrics = self._grpc_server.servicer.get_metrics()
-            if metrics['liq_subscribers'] > 0:
-                print(f"[SERVER] Liquidation subscriber connected. Starting replay.",
-                      file=sys.stderr)
-                break
-            time.sleep(0.5)
-        else:
-            if self._running:
-                print(f"[SERVER] No subscriber after {max_wait}s. Starting anyway.",
-                      file=sys.stderr)
-
         # Start reader threads
+        # Liquidation events are derived from fills in _emit_fill() — no separate reader.
         print("[SERVER] Starting reader threads...", file=sys.stderr)
 
         self._price_thread = threading.Thread(target=self._run_price_reader, daemon=True)
-        self._liq_thread = threading.Thread(target=self._run_liq_reader, daemon=True)
         self._fill_thread = threading.Thread(target=self._run_fill_reader, daemon=True)
         self._status_thread = threading.Thread(target=self._run_status_loop, daemon=True)
         self._checkpoint_thread = threading.Thread(target=self._run_checkpoint_loop, daemon=True)
 
         self._price_thread.start()
-        self._liq_thread.start()
         self._fill_thread.start()
         self._status_thread.start()
         self._checkpoint_thread.start()
@@ -349,7 +335,6 @@ class AdapterServer:
 
         # Close readers
         self._price_reader.close()
-        self._liq_reader.close()
         self._fill_reader.close()
 
         # Save final checkpoint

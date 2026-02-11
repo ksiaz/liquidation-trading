@@ -429,6 +429,10 @@ async def run_paper_trade():
                     f'Critical: {service._node_psm.metrics.critical_positions}'
                 )
 
+            # Data freshness breaker status
+            if hasattr(service, '_data_breaker') and service._data_breaker and service._data_breaker.is_open:
+                logger.warning(f'DATA BREAKER OPEN: {service._data_breaker._trip_reason} — entries blocked')
+
             # Log proximity data
             if obs._hl_collector:
                 for coin in ['BTC', 'ETH', 'HYPE']:

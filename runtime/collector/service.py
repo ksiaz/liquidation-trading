@@ -24,9 +24,11 @@ from observation.types import ObservationSnapshot, ObservationStatus
 # Import M6 components (Phase 8)
 from runtime.policy_adapter import PolicyAdapter, AdapterConfig
 from runtime.arbitration.arbitrator import MandateArbitrator
+from runtime.arbitration.types import MandateType
 from runtime.executor.controller import ExecutionController
 from runtime.risk.types import RiskConfig, AccountState
 from runtime.logging.pg_buffered_db import PgBufferedResearchDatabase
+from runtime.risk.circuit_breaker import DataFreshnessBreaker
 
 # Import Ghost Tracker
 from execution.ep4_ghost_tracker import GhostPositionTracker
@@ -327,6 +329,9 @@ class CollectorService:
         self._manipulation_detector = ManipulationDetector()
         self._stop_hunt_detector = StopHuntDetector()
         self._logger.info("Validation and manipulation detection initialized")
+
+        # Data freshness circuit breaker — blocks entries when node/adapter stale
+        self._data_breaker = DataFreshnessBreaker() if self._node_bridge else None
 
         # Diagnostic logging configuration (P1: now opt-in via env)
         self._diag_enabled = os.environ.get('ENABLE_DIAG', '').lower() == 'true'
@@ -1064,6 +1069,13 @@ class CollectorService:
                     self._logger.warning(f"Regime classification error for {symbol}: {e}")
                     continue
 
+            # Data freshness gate — block new entries when node/adapter stale
+            # Trailing stops already updated in regime loop above (~line 951)
+            _data_breaker_open = False
+            if self._data_breaker:
+                self._data_breaker.evaluate(self._node_bridge)
+                _data_breaker_open = self._data_breaker.is_open
+
             # Collect mandates from all active symbols
             all_mandates = []
             mandate_primitives_map = {}  # Track primitives for each mandate
@@ -1253,6 +1265,17 @@ class CollectorService:
                     import traceback
                     traceback.print_exc()
                     # Continue to next symbol
+
+            # Data freshness gate: drop ENTRY mandates when breaker open
+            if _data_breaker_open and all_mandates:
+                before = len(all_mandates)
+                all_mandates = [m for m in all_mandates if m.type != MandateType.ENTRY]
+                dropped = before - len(all_mandates)
+                if dropped:
+                    self._logger.warning(
+                        f"Data breaker open: dropped {dropped} ENTRY mandate(s), "
+                        f"kept {len(all_mandates)} EXIT/REDUCE"
+                    )
 
             if all_mandates:
                 print(f"🎯 CYCLE {cycle_id}: {len(all_mandates)} TOTAL MANDATES from {len(set(m.symbol for m in all_mandates))} symbols")

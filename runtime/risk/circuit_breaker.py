@@ -164,6 +164,81 @@ class CircuitBreaker:
         return list(self._events)
 
 
+class DataFreshnessBreaker(CircuitBreaker):
+    """
+    Trips when node/adapter data becomes stale. Auto-resets when data resumes.
+
+    Staleness checks (evaluated every regime cycle ~2s):
+    1. gRPC disconnected: bridge.is_connected == False
+    2. Adapter stale: bridge.is_healthy == False (>30s no block)
+    3. Price stale: no prices for 60s
+    4. Fill stale: no fills for 300s
+
+    When tripped: blocks new entries, exits always permitted.
+    Anti-flap: requires N consecutive healthy evaluations to close.
+    Startup grace: skips evaluation for first 30s.
+    """
+
+    _RESET_THRESHOLD = 3       # consecutive healthy checks to close
+    _STARTUP_GRACE_SEC = 30.0  # skip checks for first 30s
+    _PRICE_STALE_SEC = 60.0    # no prices for 60s → trip
+    _FILL_STALE_SEC = 300.0    # no fills for 5 min → trip
+
+    def __init__(self, name: str = "data-freshness", logger: logging.Logger = None):
+        config = CircuitBreakerConfig(manual_reset_required=False)
+        super().__init__(name, config, logger)
+        self._created_at = time.time()
+        self._consecutive_healthy = 0
+
+    def evaluate(self, bridge) -> None:
+        """Evaluate data freshness from node bridge. Call every regime cycle."""
+        now = time.time()
+
+        # Startup grace — don't trip before first data arrives
+        if now - self._created_at < self._STARTUP_GRACE_SEC:
+            return
+
+        reason = self._check_staleness(bridge, now)
+        if reason:
+            self._consecutive_healthy = 0
+            if not self.is_open:
+                self.trip(reason)
+        else:
+            self._consecutive_healthy += 1
+            if self.is_open and self._consecutive_healthy >= self._RESET_THRESHOLD:
+                self._logger.info(
+                    f"Data freshness restored after {self._RESET_THRESHOLD} healthy checks"
+                )
+                self.reset(manual=True)  # manual=True bypasses the flag check
+                self._consecutive_healthy = 0
+
+    def _check_staleness(self, bridge, now: float) -> Optional[str]:
+        """Return trip reason string, or None if healthy."""
+        if not bridge.is_connected:
+            return "gRPC disconnected"
+
+        if not bridge.is_healthy:
+            return "adapter reports STALE (>30s no block)"
+
+        metrics = bridge.get_metrics()
+        last_price = metrics.get('last_price_time', 0)
+        last_fill = metrics.get('last_fill_time', 0)
+
+        if last_price > 0 and (now - last_price) > self._PRICE_STALE_SEC:
+            return f"no prices for {now - last_price:.0f}s"
+
+        if last_fill > 0 and (now - last_fill) > self._FILL_STALE_SEC:
+            return f"no fills for {now - last_fill:.0f}s"
+
+        return None
+
+    def allows_entry(self) -> bool:
+        return self.is_closed
+
+    def allows_exit(self) -> bool:
+        return True
+
+
 class RapidLossBreaker(CircuitBreaker):
     """
     Triggers when losses accumulate too quickly.

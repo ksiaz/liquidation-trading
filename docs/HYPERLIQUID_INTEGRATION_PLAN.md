@@ -834,10 +834,7 @@ ORDER BY aggregate_position_size DESC;
 python runtime/native_app/main.py
 
 # Query cascade detections
-python -c "
-import sqlite3
-conn = sqlite3.connect('logs/execution.db')
-c = conn.cursor()
+psql -U liqtrade -d liquidation_trading -c "
 
 # Check cascade proximity
 c.execute('SELECT COUNT(*) FROM cascade_proximity_values WHERE positions_at_risk_count > 0')

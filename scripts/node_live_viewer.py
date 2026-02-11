@@ -275,31 +275,33 @@ async def show_current_state():
 def get_positions_near_liq_sync():
     """Get positions close to liquidation from tracked wallets (sync version)."""
     import requests
-    import sqlite3
+    import psycopg2.extras
+    from runtime.logging.pg_pool import get_conn, put_conn, init_pool
+
+    init_pool()
 
     print("\033[92m" + "="*60 + "\033[0m")
     print("\033[92mPositions Near Liquidation\033[0m")
     print(f"\033[92mNode: {NODE_HOST} | Direct API - No limits!\033[0m")
     print("\033[92m" + "="*60 + "\033[0m\n")
 
-    # Load tracked wallets from indexed_wallets.db
+    # Load tracked wallets from PostgreSQL (table renamed: positions -> indexed_wallet_positions)
+    wallets = []
+    conn = get_conn()
     try:
-        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "indexed_wallets.db")
-        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        # Get wallets with positions
         cursor.execute("""
-            SELECT DISTINCT wallet_address FROM positions
+            SELECT DISTINCT wallet_address FROM indexed_wallet_positions
             WHERE position_value > 10000
             ORDER BY position_value DESC
             LIMIT 100
         """)
         wallets = [row[0] for row in cursor.fetchall()]
-        conn.close()
         print(f"Loaded {len(wallets)} wallets with large positions\n")
     except Exception as e:
         print(f"Could not load wallets from DB: {e}")
-        wallets = []
+    finally:
+        put_conn(conn)
 
     if not wallets:
         # Fallback to some known active wallets

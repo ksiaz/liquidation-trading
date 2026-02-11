@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import os
-import sqlite3
 import sys
 import time
 import threading
@@ -22,11 +21,19 @@ from typing import Dict, List, Optional
 
 import grpc
 
+# Add project root to path
+_project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(_project_root))
+
 # Add hl-adapter protos to path
-_hl_adapter_path = Path(__file__).parent.parent / 'hl-adapter'
+_hl_adapter_path = _project_root / 'hl-adapter'
 sys.path.insert(0, str(_hl_adapter_path))
 import events_pb2
 import events_pb2_grpc
+
+# Initialize PG pool
+from runtime.logging.pg_pool import init_pool, get_conn, put_conn
+init_pool()
 
 
 
@@ -201,123 +208,108 @@ def get_live_prices(symbols: List[str]) -> Dict[str, float]:
         return {s: _grpc_prices[s] for s in symbols if s in _grpc_prices}
 
 
-def get_open_positions(db_path: str = '/tmp/ghost_trades.db') -> List[dict]:
-    """Get open positions from ghost positions database or executor state.
+def get_open_positions() -> List[dict]:
+    """Get open positions from PostgreSQL.
 
-    Primary source: /tmp/ghost_trades.db (ghost_positions table)
-    Fallback: logs/positions.db (executor state machine)
+    Primary source: ghost_positions table
+    Fallback: positions table (executor state machine)
     """
     positions = []
 
-    # Try ghost_trades.db first
-    if os.path.exists(db_path):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        # Try ghost_positions first
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
+            cur.execute('''
                 SELECT symbol, side, qty, entry_price, entry_time, strategy_id, trade_id
                 FROM ghost_positions
                 WHERE status = 'OPEN'
             ''')
-            for row in cursor.fetchall():
-                symbol, side, qty, entry_price, entry_time, strategy_id, trade_id = row
-                direction = side
+            for row in cur.fetchall():
                 positions.append({
-                    'symbol': symbol,
-                    'direction': direction,
-                    'quantity': float(qty) if qty else 0,
-                    'entry_price': float(entry_price) if entry_price else 0,
-                    'entry_time': entry_time,
-                    'strategy': strategy_id,
-                    'trade_id': trade_id
+                    'symbol': row[0],
+                    'direction': row[1],
+                    'quantity': float(row[2]) if row[2] else 0,
+                    'entry_price': float(row[3]) if row[3] else 0,
+                    'entry_time': row[4],
+                    'strategy': row[5],
+                    'trade_id': row[6]
                 })
-            conn.close()
         except Exception:
-            pass
+            conn.rollback()
 
-    # Fallback to logs/positions.db if no open positions in ghost_trades
-    if not positions:
-        executor_db = 'logs/positions.db'
-        if os.path.exists(executor_db):
+        # Fallback to positions table
+        if not positions:
             try:
-                conn = sqlite3.connect(executor_db)
-                cursor = conn.cursor()
-                cursor.execute('''
+                cur = conn.cursor()
+                cur.execute('''
                     SELECT symbol, direction, quantity, entry_price, created_at, strategy_id
                     FROM positions
                     WHERE state = 'OPEN'
                 ''')
-                for row in cursor.fetchall():
-                    symbol, direction, qty, entry_price, created_at, strategy_id = row
+                for row in cur.fetchall():
                     positions.append({
-                        'symbol': symbol,
-                        'direction': direction,
-                        'quantity': float(qty) if qty else 0,
-                        'entry_price': float(entry_price) if entry_price else 0,
-                        'entry_time': created_at,
-                        'strategy': strategy_id,
-                        'trade_id': f'RECOVERED_{symbol}'  # Synthetic ID for recovered positions
+                        'symbol': row[0],
+                        'direction': row[1],
+                        'quantity': float(row[2]) if row[2] else 0,
+                        'entry_price': float(row[3]) if row[3] else 0,
+                        'entry_time': row[4],
+                        'strategy': row[5],
+                        'trade_id': f'RECOVERED_{row[0]}'
                     })
-                conn.close()
             except Exception:
-                pass
+                conn.rollback()
 
-    # Fallback: get strategy from ghost_trades if not in ghost_positions
-    try:
-        exec_db = 'logs/execution.db'
-        if os.path.exists(exec_db):
-            conn = sqlite3.connect(exec_db)
-            cursor = conn.cursor()
-            for pos in positions:
-                if not pos.get('strategy'):
-                    cursor.execute('''
+        # Fill in missing strategy from ghost_trades
+        for pos in positions:
+            if not pos.get('strategy'):
+                try:
+                    cur = conn.cursor()
+                    cur.execute('''
                         SELECT winning_policy_name FROM ghost_trades
-                        WHERE symbol = ? AND is_entry = 1
+                        WHERE symbol = %s AND is_entry = 1
                         ORDER BY id DESC LIMIT 1
                     ''', (pos['symbol'],))
-                    row = cursor.fetchone()
+                    row = cur.fetchone()
                     if row and row[0]:
                         pos['strategy'] = row[0]
-            conn.close()
-    except Exception:
-        pass
+                except Exception:
+                    conn.rollback()
+    finally:
+        put_conn(conn)
 
     return positions
 
 
 def get_trailing_stop_info(trade_id: str, symbol: str = None) -> Optional[dict]:
-    """Get trailing stop state from execution_state.db if available.
+    """Get trailing stop state from PostgreSQL.
 
     Tries trade_id first, then falls back to RECOVERED_{symbol} for recovered positions.
     """
-    db_path = 'logs/execution_state.db'
-    if not os.path.exists(db_path):
-        return None
-
+    conn = get_conn()
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        cur = conn.cursor()
 
         # Try original trade_id first
-        cursor.execute('''
+        cur.execute('''
             SELECT current_stop_price, initial_stop_price, highest_price, lowest_price,
                    break_even_triggered, entry_price, direction
             FROM trailing_stops
-            WHERE entry_order_id = ?
+            WHERE entry_order_id = %s
         ''', (trade_id,))
-        row = cursor.fetchone()
+        row = cur.fetchone()
 
         # If not found and symbol provided, try RECOVERED_{symbol}
         if not row and symbol:
-            cursor.execute('''
+            cur.execute('''
                 SELECT current_stop_price, initial_stop_price, highest_price, lowest_price,
                        break_even_triggered, entry_price, direction
                 FROM trailing_stops
-                WHERE entry_order_id = ?
+                WHERE entry_order_id = %s
             ''', (f"RECOVERED_{symbol}",))
-            row = cursor.fetchone()
-
-        conn.close()
+            row = cur.fetchone()
 
         if row:
             return {
@@ -330,21 +322,20 @@ def get_trailing_stop_info(trade_id: str, symbol: str = None) -> Optional[dict]:
                 'direction': row[6]
             }
     except Exception:
-        pass
+        conn.rollback()
+    finally:
+        put_conn(conn)
 
     return None
 
 
-def get_recent_exits(db_path: str = 'logs/execution.db', limit: int = 10) -> List[dict]:
-    """Get recent exit trades from execution database."""
+def get_recent_exits(limit: int = 10) -> List[dict]:
+    """Get recent exit trades from PostgreSQL."""
     exits = []
-    if not os.path.exists(db_path):
-        return exits
-
+    conn = get_conn()
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
+        cur = conn.cursor()
+        cur.execute('''
             SELECT e.symbol, e.side, e.quantity, e.price, e.timestamp, e.pnl,
                    e.holding_duration_sec, e.exit_reason,
                    (SELECT winning_policy_name FROM ghost_trades
@@ -353,11 +344,10 @@ def get_recent_exits(db_path: str = 'logs/execution.db', limit: int = 10) -> Lis
             FROM ghost_trades e
             WHERE e.is_entry = 0
             ORDER BY e.id DESC
-            LIMIT ?
+            LIMIT %s
         ''', (limit,))
-        for row in cursor.fetchall():
+        for row in cur.fetchall():
             symbol, side, qty, price, ts, pnl, hold, exit_reason, strategy = row
-            # Determine direction from exit side (opposite)
             direction = 'SHORT' if side == 'BUY' else 'LONG'
             exits.append({
                 'symbol': symbol,
@@ -370,32 +360,30 @@ def get_recent_exits(db_path: str = 'logs/execution.db', limit: int = 10) -> Lis
                 'exit_reason': exit_reason,
                 'strategy': strategy
             })
-        conn.close()
     except Exception:
-        pass
+        conn.rollback()
+    finally:
+        put_conn(conn)
 
     return exits
 
 
-def get_session_stats(db_path: str = 'logs/execution.db') -> dict:
+def get_session_stats() -> dict:
     """Get session statistics from today's trades."""
     stats = {'trades': 0, 'wins': 0, 'losses': 0, 'net_pnl': 0.0}
-    if not os.path.exists(db_path):
-        return stats
 
+    conn = get_conn()
     try:
-        # Get today's start timestamp (midnight UTC)
         today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         today_ts = today.timestamp()
 
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
+        cur = conn.cursor()
+        cur.execute('''
             SELECT pnl FROM ghost_trades
-            WHERE is_entry = 0 AND timestamp > ?
+            WHERE is_entry = 0 AND timestamp > %s
         ''', (today_ts,))
 
-        for (pnl,) in cursor.fetchall():
+        for (pnl,) in cur.fetchall():
             if pnl is not None:
                 stats['trades'] += 1
                 stats['net_pnl'] += pnl
@@ -403,28 +391,27 @@ def get_session_stats(db_path: str = 'logs/execution.db') -> dict:
                     stats['wins'] += 1
                 else:
                     stats['losses'] += 1
-        conn.close()
     except Exception:
-        pass
+        conn.rollback()
+    finally:
+        put_conn(conn)
 
     return stats
 
 
-def get_account_balance(db_path: str = 'logs/execution.db') -> float:
-    """Get current paper account balance."""
-    if not os.path.exists(db_path):
-        return 1000.0  # Default starting balance
-
+def get_account_balance() -> float:
+    """Get current paper account balance from PostgreSQL."""
+    conn = get_conn()
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1')
-        row = cursor.fetchone()
-        conn.close()
+        cur = conn.cursor()
+        cur.execute('SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1')
+        row = cur.fetchone()
         if row and row[0]:
             return float(row[0])
     except Exception:
-        pass
+        conn.rollback()
+    finally:
+        put_conn(conn)
 
     return 1000.0
 

@@ -50,6 +50,7 @@ GLOBAL_FORBIDDEN_OUTPUTS: List[str] = [
 FORBIDDEN_VALUE_PATTERNS: List[str] = [
     "STRONG_", "WEAK_", "GOOD_", "BAD_",
     "BULL_", "BEAR_",
+    "BULLISH", "BEARISH",  # Full directional sentiment words
     "ENTRY", "EXIT",
     "BUY", "SELL",  # Except as part of standard specific event types
     "POSITIVE", "NEGATIVE",

@@ -41,19 +41,15 @@ try:
 except: print('  API not available')
 "
 
-# 4. Database recent activity
+# 4. Database recent activity (PostgreSQL)
 echo ""
-echo "--- DATABASE (execution.db) ---"
-if [ -f /home/ksiaz/liquidation-trading/logs/execution.db ]; then
-    sqlite3 /home/ksiaz/liquidation-trading/logs/execution.db "
-        SELECT 'Cycles: ' || COUNT(*) FROM execution_cycles;
-        SELECT 'Mandates: ' || COUNT(*) FROM mandates;
-        SELECT 'M2 Nodes: ' || COUNT(*) FROM m2_nodes;
-        SELECT 'Last cycle: ' || datetime(timestamp, 'unixepoch', 'localtime') FROM execution_cycles ORDER BY id DESC LIMIT 1;
-    " 2>/dev/null
-else
-    echo "  execution.db not found"
-fi
+echo "--- DATABASE (PostgreSQL) ---"
+PGPASSWORD=liqtrade psql -U liqtrade -d liquidation_trading -t -A -c "
+    SELECT 'Cycles: ' || COUNT(*) FROM execution_cycles;
+    SELECT 'Mandates: ' || COUNT(*) FROM mandates;
+    SELECT 'M2 Nodes: ' || COUNT(*) FROM m2_nodes;
+    SELECT 'Last cycle: ' || to_char(to_timestamp(timestamp) AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD HH24:MI:SS') FROM execution_cycles ORDER BY id DESC LIMIT 1;
+" 2>/dev/null || echo "  PostgreSQL not available"
 
 # 5. Paper trade log tail
 echo ""

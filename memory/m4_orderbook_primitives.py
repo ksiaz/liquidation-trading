@@ -45,6 +45,7 @@ class OrderConsumption:
     side: str  # Which side consumed ("bid" or "ask")
     price_level: float  # Price where consumption occurred
     timestamp: float  # When observed
+    initial_size: float = 0.0  # Size before consumption (previous snapshot)
 
 
 # ==============================================================================
@@ -159,7 +160,8 @@ def detect_order_consumption(
             consumed_size=consumed,
             side=side,
             price_level=price_level,
-            timestamp=timestamp
+            timestamp=timestamp,
+            initial_size=previous_size
         )
 
     return None

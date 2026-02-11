@@ -245,6 +245,22 @@ class BufferedResearchDatabase:
         with self._db_lock:
             return self._db.conn.execute(sql, params).fetchall()
 
+    def prune_safe(self, max_age_hours: int = 48) -> int:
+        """Run prune_old_data under the DB lock (thread-safe).
+
+        MUST be used instead of accessing _db.prune_old_data() directly,
+        which bypasses the lock and corrupts BRD's transaction state.
+        """
+        # Flush pending writes first so prune sees latest data
+        self.flush()
+        with self._db_lock:
+            try:
+                result = self._db.prune_old_data(max_age_hours=max_age_hours)
+                return result.get('total_deleted', 0)
+            except Exception as e:
+                print(f"[BRD] Prune error: {e}", flush=True)
+                return 0
+
     # =========================================================================
     # Pass-through for methods that need immediate execution
     # =========================================================================

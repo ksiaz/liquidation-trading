@@ -18,7 +18,7 @@ from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-import sqlite3
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 
 NODE_URL = "http://64.176.65.252:8080"
 
@@ -59,57 +59,58 @@ class StopZone:
 class StopOrderCollector:
     """Collect stop orders from node for analysis."""
 
-    def __init__(self, db_path: str = "stop_research.db"):
-        self.db_path = db_path
+    def __init__(self):
         self.stops: List[StopOrder] = []
         self.prices: Dict[str, float] = {}
         self.price_history: Dict[str, List[PricePoint]] = defaultdict(list)
         self._init_db()
 
     def _init_db(self):
-        """Initialize SQLite database for persistent storage."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        """Initialize PostgreSQL tables for persistent storage."""
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS stop_orders (
-                id INTEGER PRIMARY KEY,
-                timestamp REAL,
-                coin TEXT,
-                trigger_price REAL,
-                size REAL,
-                side TEXT,
-                tpsl TEXT,
-                price_at_placement REAL
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stop_orders (
+                    id SERIAL PRIMARY KEY,
+                    timestamp DOUBLE PRECISION,
+                    coin TEXT,
+                    trigger_price DOUBLE PRECISION,
+                    size DOUBLE PRECISION,
+                    side TEXT,
+                    tpsl TEXT,
+                    price_at_placement DOUBLE PRECISION
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS price_history (
-                id INTEGER PRIMARY KEY,
-                timestamp REAL,
-                coin TEXT,
-                price REAL
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS price_history (
+                    id SERIAL PRIMARY KEY,
+                    timestamp DOUBLE PRECISION,
+                    coin TEXT,
+                    price DOUBLE PRECISION
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS stop_touches (
-                id INTEGER PRIMARY KEY,
-                coin TEXT,
-                stop_price REAL,
-                stop_size REAL,
-                tpsl TEXT,
-                touched_at REAL,
-                price_before REAL,
-                price_after_1m REAL,
-                price_after_5m REAL,
-                reversal_pct REAL
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stop_touches (
+                    id SERIAL PRIMARY KEY,
+                    coin TEXT,
+                    stop_price DOUBLE PRECISION,
+                    stop_size DOUBLE PRECISION,
+                    tpsl TEXT,
+                    touched_at DOUBLE PRECISION,
+                    price_before DOUBLE PRECISION,
+                    price_after_1m DOUBLE PRECISION,
+                    price_after_5m DOUBLE PRECISION,
+                    reversal_pct DOUBLE PRECISION
+                )
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def fetch_current_prices(self) -> Dict[str, float]:
         """Get current prices from node."""
@@ -172,19 +173,21 @@ class StopOrderCollector:
 
     def find_stop_zones(self, coin: str, price_tolerance_pct: float = 0.5) -> List[Dict]:
         """Find clusters of stops near similar price levels."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
 
-        # Get recent stops for this coin
-        cursor.execute("""
-            SELECT trigger_price, size, tpsl, timestamp
-            FROM stop_orders
-            WHERE coin = ? AND timestamp > ?
-            ORDER BY trigger_price
-        """, (coin, time.time() - 3600))  # Last hour
+            # Get recent stops for this coin
+            cursor.execute("""
+                SELECT trigger_price, size, tpsl, timestamp
+                FROM stop_orders
+                WHERE coin = %s AND timestamp > %s
+                ORDER BY trigger_price
+            """, (coin, time.time() - 3600))  # Last hour
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
+        finally:
+            put_conn(conn)
 
         if not rows:
             return []
@@ -231,53 +234,59 @@ class StopOrderCollector:
 
     def analyze_stop_touches(self, coin: str) -> Dict:
         """Analyze what happens when price reaches stop zones."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT
-                tpsl,
-                COUNT(*) as count,
-                AVG(reversal_pct) as avg_reversal,
-                SUM(CASE WHEN reversal_pct > 0.5 THEN 1 ELSE 0 END) as reversals
-            FROM stop_touches
-            WHERE coin = ?
-            GROUP BY tpsl
-        """, (coin,))
+            cursor.execute("""
+                SELECT
+                    tpsl,
+                    COUNT(*) as count,
+                    AVG(reversal_pct) as avg_reversal,
+                    SUM(CASE WHEN reversal_pct > 0.5 THEN 1 ELSE 0 END) as reversals
+                FROM stop_touches
+                WHERE coin = %s
+                GROUP BY tpsl
+            """, (coin,))
 
-        results = {}
-        for row in cursor.fetchall():
-            tpsl, count, avg_reversal, reversals = row
-            results[tpsl] = {
-                'touches': count,
-                'avg_reversal_pct': avg_reversal or 0,
-                'reversal_rate': (reversals or 0) / count if count > 0 else 0
-            }
+            results = {}
+            for row in cursor.fetchall():
+                tpsl, count, avg_reversal, reversals = row
+                results[tpsl] = {
+                    'touches': count,
+                    'avg_reversal_pct': avg_reversal or 0,
+                    'reversal_rate': (reversals or 0) / count if count > 0 else 0
+                }
+        finally:
+            put_conn(conn)
 
-        conn.close()
         return results
 
     def save_stop(self, stop: StopOrder, current_price: float):
         """Save a stop order to database."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO stop_orders (timestamp, coin, trigger_price, size, side, tpsl, price_at_placement)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (stop.timestamp, stop.coin, stop.trigger_price, stop.size, stop.side, stop.tpsl, current_price))
-        conn.commit()
-        conn.close()
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO stop_orders (timestamp, coin, trigger_price, size, side, tpsl, price_at_placement)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (stop.timestamp, stop.coin, stop.trigger_price, stop.size, stop.side, stop.tpsl, current_price))
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def save_price(self, coin: str, price: float):
         """Save price point to database."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO price_history (timestamp, coin, price)
-            VALUES (?, ?, ?)
-        """, (time.time(), coin, price))
-        conn.commit()
-        conn.close()
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO price_history (timestamp, coin, price)
+                VALUES (%s, %s, %s)
+            """, (time.time(), coin, price))
+            conn.commit()
+        finally:
+            put_conn(conn)
 
 
 def research_correlation():
@@ -352,6 +361,8 @@ def live_collection(duration_minutes: int = 60):
 
 if __name__ == "__main__":
     import sys
+
+    init_pool()
 
     if len(sys.argv) > 1 and sys.argv[1] == "collect":
         duration = int(sys.argv[2]) if len(sys.argv) > 2 else 60

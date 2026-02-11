@@ -292,8 +292,8 @@ class TestNoComputedFields:
     def test_position_snapshots_no_derived_columns(self, db):
         """Position snapshots table has no derived columns."""
         cursor = db.conn.cursor()
-        cursor.execute("PRAGMA table_info(hl_position_snapshots)")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'hl_position_snapshots'")
+        columns = [row[0] for row in cursor.fetchall()]
 
         # These would be computed/derived fields
         forbidden = [
@@ -316,8 +316,8 @@ class TestNoComputedFields:
     def test_liquidation_events_no_derived_columns(self, db):
         """Liquidation events table has no derived columns."""
         cursor = db.conn.cursor()
-        cursor.execute("PRAGMA table_info(hl_liquidation_events_raw)")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'hl_liquidation_events_raw'")
+        columns = [row[0] for row in cursor.fetchall()]
 
         forbidden = [
             'side',
@@ -332,8 +332,8 @@ class TestNoComputedFields:
     def test_oi_snapshots_no_derived_columns(self, db):
         """OI snapshots table has no derived columns."""
         cursor = db.conn.cursor()
-        cursor.execute("PRAGMA table_info(hl_oi_snapshots)")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'hl_oi_snapshots'")
+        columns = [row[0] for row in cursor.fetchall()]
 
         forbidden = [
             'oi_change',  # Derived from diff

@@ -540,7 +540,7 @@ Create `runtime/hyperliquid/whale_registry.py`:
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import time
-import sqlite3
+from runtime.logging.pg_pool import get_conn, put_conn
 
 @dataclass
 class WhaleProfile:
@@ -585,7 +585,7 @@ class WhaleTracker:
 
     def _init_db(self):
         """Initialize SQLite database."""
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS whale_positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,7 +654,7 @@ class WhaleTracker:
             del self._whale_positions[key]
 
         # Log to database
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
         conn.execute("""
             INSERT INTO whale_trades
             (wallet, coin, action, side, size_change, price, timestamp)
@@ -704,7 +704,7 @@ class WhaleTracker:
     def get_recent_whale_activity(self, coin: str = None, hours: int = 24) -> List[dict]:
         """Get recent whale trading activity."""
         cutoff = time.time() - hours * 3600
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
         cursor = conn.execute("""
             SELECT wallet, coin, action, side, size_change, price, timestamp
             FROM whale_trades

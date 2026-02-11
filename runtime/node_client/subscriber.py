@@ -231,6 +231,9 @@ class NodeSubscriber:
             method=proto.method,
             fill_id=proto.fill_id,
             tx_hash=proto.tx_hash,
+            dir=proto.dir,
+            start_position=proto.start_position,
+            closed_pnl=proto.closed_pnl,
         )
 
     def _convert_status(self, proto: events_pb2.SyncStatusEvent) -> SyncStatus:
@@ -285,7 +288,7 @@ class NodeSubscriber:
                     self._disconnect(str(e))
 
     def _run_liq_stream(self):
-        """Liquidation stream thread."""
+        """Liquidation stream thread with reconnect."""
         while self._running:
             if not self._connected:
                 time.sleep(self.RECONNECT_DELAY_SEC)
@@ -309,13 +312,25 @@ class NodeSubscriber:
                             print(f"[NODE_CLIENT] Liquidation callback error: {e}",
                                   file=sys.stderr)
 
+                # Stream ended normally - server closed it
+                if self._running:
+                    print("[NODE_CLIENT] Liq stream ended, will retry...",
+                          file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
+
             except grpc.RpcError as e:
                 if self._running:
-                    print(f"[NODE_CLIENT] Liquidation stream error: {e}",
+                    print(f"[NODE_CLIENT] Liq stream error: {e}",
                           file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
+            except Exception as e:
+                if self._running:
+                    print(f"[NODE_CLIENT] Liq stream FATAL: {e}",
+                          file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
 
     def _run_fill_stream(self):
-        """Fill stream thread."""
+        """Fill stream thread with reconnect."""
         while self._running:
             if not self._connected:
                 time.sleep(self.RECONNECT_DELAY_SEC)
@@ -323,6 +338,7 @@ class NodeSubscriber:
 
             try:
                 request = events_pb2.StreamRequest(symbols=self._symbols)
+                print("[NODE_CLIENT] Fill stream subscribing...", file=sys.stderr)
 
                 for proto in self._stub.StreamFills(request):
                     if not self._running:
@@ -339,10 +355,22 @@ class NodeSubscriber:
                             print(f"[NODE_CLIENT] Fill callback error: {e}",
                                   file=sys.stderr)
 
+                # Stream ended normally - server closed it
+                if self._running:
+                    print("[NODE_CLIENT] Fill stream ended, will retry...",
+                          file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
+
             except grpc.RpcError as e:
                 if self._running:
                     print(f"[NODE_CLIENT] Fill stream error: {e}",
                           file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
+            except Exception as e:
+                if self._running:
+                    print(f"[NODE_CLIENT] Fill stream FATAL: {e}",
+                          file=sys.stderr)
+                    time.sleep(self.RECONNECT_DELAY_SEC)
 
     def _run_status_stream(self):
         """Status stream thread."""

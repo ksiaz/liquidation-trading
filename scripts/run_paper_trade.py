@@ -5,19 +5,20 @@ Paper Trading Mode with Node Integration.
 Runs the full system with:
 - Node adapter for real-time liquidation data (USE_HL_NODE=true)
 - Cascade Sniper strategy enabled
-- Paper trade mode (no real orders, logged to paper_trades.db)
+- Paper trade mode (no real orders, logged to PostgreSQL)
 
 Usage:
     python scripts/run_paper_trade.py
 
 View results:
-    sqlite3 paper_trades.db "SELECT * FROM paper_trades ORDER BY entry_time DESC LIMIT 20"
+    psql -U liqtrade -d liquidation_trading -c "SELECT * FROM paper_trades ORDER BY entry_time DESC LIMIT 20"
 """
 
 import os
 import sys
 import asyncio
 import logging
+import logging.handlers
 import signal
 
 # Enable node mode
@@ -27,13 +28,17 @@ os.environ['ENABLE_DIAG'] = 'false'  # Reduce noise
 # Add project root to path early
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Setup logging
+# Setup logging — RotatingFileHandler caps disk usage at ~60MB (3 × 20MB)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(name)s %(levelname)s: %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('paper_trade.log')
+        logging.handlers.RotatingFileHandler(
+            'paper_trade.log',
+            maxBytes=20 * 1024 * 1024,  # 20MB per file
+            backupCount=3,               # Keep 3 rotated copies
+        ),
     ]
 )
 
@@ -45,6 +50,16 @@ logger = logging.getLogger('PaperTrade')
 
 from pathlib import Path
 import time
+
+# Initialize PostgreSQL connection pool BEFORE anything imports DB modules
+from runtime.logging.pg_pool import init_pool, get_conn, put_conn, close_pool
+from runtime.logging.pg_schema import ensure_schema
+
+init_pool()
+_schema_conn = get_conn()
+ensure_schema(_schema_conn)
+put_conn(_schema_conn)
+print("[PG] Schema initialized", flush=True)
 
 from observation.governance import ObservationSystem
 from runtime.collector.service import CollectorService
@@ -100,6 +115,78 @@ def cleanup_temp_databases(tmp_dir: str = None, max_age_days: int = 1) -> int:
         try:
             if shm_file.stat().st_mtime < cutoff:
                 shm_file.unlink()
+        except (OSError, PermissionError):
+            pass
+
+    return deleted
+
+
+def prune_stale_log_files(max_age_hours: int = 72) -> int:
+    """Remove stale log files older than max_age_hours.
+
+    Cleans up:
+    - Rotated paper_trade.log.N backups
+    - One-off test/debug logs (dry_run_*, test_*, *_test.log, *_output.log)
+    - Old logs in logs/ directory
+    - node.log truncation (keep last 50k lines ≈ 72h at normal rate)
+
+    Returns:
+        Number of files deleted
+    """
+    project_root = Path(__file__).parent.parent
+    cutoff = time.time() - (max_age_hours * 3600)
+    deleted = 0
+
+    # 1. Delete stale one-off log files in project root
+    stale_patterns = [
+        'dry_run_*.log', 'test_*.log', '*_test.log', '*_output.log',
+        'final_*.log', 'warmup_*.log', 'detailed_*.log', 'direct_*.log',
+        'console_*.log', 'error_capture_*.log', 'full_debug_*.log',
+        'reduced_*.log', 'dev_mode_*.log', 'monitor.log', 'adapter.log',
+        'mcp_debug.log', 'THREAD_ERRORS.log',
+    ]
+    for pattern in stale_patterns:
+        for log_file in project_root.glob(pattern):
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    deleted += 1
+            except (OSError, PermissionError):
+                pass
+
+    # 2. Delete stale logs in logs/ subdirectory
+    logs_dir = project_root / 'logs'
+    if logs_dir.exists():
+        for log_file in logs_dir.glob('*.log'):
+            try:
+                # Keep paper_trade.log (active), delete old ones
+                if log_file.name == 'paper_trade.log':
+                    continue
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    deleted += 1
+            except (OSError, PermissionError):
+                pass
+
+    # 3. Delete stale THREAD_ERRORS.log in subdirectories
+    for log_file in project_root.rglob('THREAD_ERRORS.log'):
+        try:
+            if log_file.stat().st_mtime < cutoff:
+                log_file.unlink()
+                deleted += 1
+        except (OSError, PermissionError):
+            pass
+
+    # 4. Truncate node.log if it exceeds 50k lines (~72h of normal output)
+    node_log = Path.home() / 'hl' / 'node.log'
+    if node_log.exists():
+        try:
+            line_count = sum(1 for _ in node_log.open('r', errors='replace'))
+            if line_count > 50_000:
+                # Keep last 50k lines
+                lines = node_log.read_text(errors='replace').splitlines()
+                node_log.write_text('\n'.join(lines[-50_000:]) + '\n')
+                logger.info(f'Truncated node.log from {line_count} to 50000 lines')
         except (OSError, PermissionError):
             pass
 
@@ -265,6 +352,9 @@ async def run_paper_trade():
         ).get('total_files', 0)
     )
 
+    # Register log file pruning (72h retention for stale logs, node.log truncation)
+    cleanup.register_pruner('log_files', lambda: prune_stale_log_files(max_age_hours=72))
+
     logger.info(f'Node mode active: {service._use_node_mode}')
     logger.info(f'HL enabled: {service._hyperliquid_enabled}')
 
@@ -424,6 +514,8 @@ async def run_paper_trade():
         except asyncio.CancelledError:
             pass
 
+    # Close PostgreSQL connection pool
+    close_pool()
     logger.info('Paper trade session ended.')
 
 

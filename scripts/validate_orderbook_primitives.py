@@ -5,16 +5,16 @@ Validates that order book primitives correspond to actual market data.
 Constitutional: Reports facts, not quality judgments.
 
 Usage:
-    python scripts/validate_orderbook_primitives.py logs/execution.db
+    python scripts/validate_orderbook_primitives.py
 """
 
-import sqlite3
 import sys
-from typing import Dict, List, Optional
 import time
+from typing import Dict, List, Optional
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 
 
-def validate_consumption_vs_trades(db_path: str, time_window_sec: float = 3600.0) -> Dict:
+def validate_consumption_vs_trades(time_window_sec: float = 3600.0) -> Dict:
     """
     Validate that OrderConsumption events correlate with actual trade flow.
 
@@ -25,84 +25,85 @@ def validate_consumption_vs_trades(db_path: str, time_window_sec: float = 3600.0
 
     Returns: Dict with validation statistics
     """
-    conn = sqlite3.connect(db_path)
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
 
-    # Get all cycles with consumption events
-    consumption_query = """
-        SELECT
-            pv.cycle_id,
-            pv.symbol,
-            pv.order_consumption_size,
-            ec.timestamp as cycle_timestamp,
-            mn.price_center
-        FROM primitive_values pv
-        JOIN execution_cycles ec ON pv.cycle_id = ec.id
-        JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
-        WHERE pv.order_consumption_size > 0
-          AND ec.timestamp > ?
-        ORDER BY ec.timestamp DESC
-    """
-
-    consumptions = conn.execute(
-        consumption_query,
-        (time.time() - time_window_sec,)
-    ).fetchall()
-
-    results = []
-
-    for cycle_id, symbol, consumed_size, cycle_ts, price_center in consumptions:
-        # Find trades near this price and time
-        price_tolerance = 100.0  # ±$100 (should match node price_band)
-        time_tolerance = 5.0     # ±5 seconds
-
-        trade_query = """
+        # Get all cycles with consumption events
+        consumption_query = """
             SELECT
-                COUNT(*) as trade_count,
-                SUM(volume) as total_trade_volume,
-                AVG(price) as avg_trade_price
-            FROM trade_events
-            WHERE symbol = ?
-              AND price BETWEEN ? AND ?
-              AND timestamp BETWEEN ? AND ?
+                pv.cycle_id,
+                pv.symbol,
+                pv.order_consumption_size,
+                ec.timestamp as cycle_timestamp,
+                mn.price_center
+            FROM primitive_values pv
+            JOIN execution_cycles ec ON pv.cycle_id = ec.id
+            JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
+            WHERE pv.order_consumption_size > 0
+              AND ec.timestamp > %s
+            ORDER BY ec.timestamp DESC
         """
 
-        trade_result = conn.execute(
-            trade_query,
-            (
-                symbol,
-                price_center - price_tolerance,
-                price_center + price_tolerance,
-                cycle_ts - time_tolerance,
-                cycle_ts + time_tolerance
+        cursor.execute(consumption_query, (time.time() - time_window_sec,))
+        consumptions = cursor.fetchall()
+
+        results = []
+
+        for cycle_id, symbol, consumed_size, cycle_ts, price_center in consumptions:
+            # Find trades near this price and time
+            price_tolerance = 100.0  # +/-$100 (should match node price_band)
+            time_tolerance = 5.0     # +/-5 seconds
+
+            trade_query = """
+                SELECT
+                    COUNT(*) as trade_count,
+                    SUM(volume) as total_trade_volume,
+                    AVG(price) as avg_trade_price
+                FROM trade_events
+                WHERE symbol = %s
+                  AND price BETWEEN %s AND %s
+                  AND timestamp BETWEEN %s AND %s
+            """
+
+            cursor.execute(
+                trade_query,
+                (
+                    symbol,
+                    price_center - price_tolerance,
+                    price_center + price_tolerance,
+                    cycle_ts - time_tolerance,
+                    cycle_ts + time_tolerance
+                )
             )
-        ).fetchone()
+            trade_result = cursor.fetchone()
 
-        trade_count, trade_volume, avg_price = trade_result
-        trade_volume = trade_volume or 0.0
+            trade_count, trade_volume, avg_price = trade_result
+            trade_volume = trade_volume or 0.0
 
-        # Calculate correlation metrics
-        volume_match_ratio = (
-            min(consumed_size, trade_volume) / max(consumed_size, trade_volume)
-            if max(consumed_size, trade_volume) > 0 else 0.0
-        )
+            # Calculate correlation metrics
+            volume_match_ratio = (
+                min(consumed_size, trade_volume) / max(consumed_size, trade_volume)
+                if max(consumed_size, trade_volume) > 0 else 0.0
+            )
 
-        price_match = (
-            abs(avg_price - price_center) < price_tolerance
-            if avg_price is not None else False
-        )
+            price_match = (
+                abs(avg_price - price_center) < price_tolerance
+                if avg_price is not None else False
+            )
 
-        results.append({
-            'cycle_id': cycle_id,
-            'symbol': symbol,
-            'consumed_size': consumed_size,
-            'trade_count': trade_count or 0,
-            'trade_volume': trade_volume,
-            'volume_match_ratio': volume_match_ratio,
-            'price_match': price_match,
-            'timestamp': cycle_ts
-        })
-
-    conn.close()
+            results.append({
+                'cycle_id': cycle_id,
+                'symbol': symbol,
+                'consumed_size': consumed_size,
+                'trade_count': trade_count or 0,
+                'trade_volume': trade_volume,
+                'volume_match_ratio': volume_match_ratio,
+                'price_match': price_match,
+                'timestamp': cycle_ts
+            })
+    finally:
+        put_conn(conn)
 
     # Aggregate statistics
     if len(results) == 0:
@@ -126,7 +127,7 @@ def validate_consumption_vs_trades(db_path: str, time_window_sec: float = 3600.0
     }
 
 
-def validate_absorption_vs_price_stability(db_path: str, time_window_sec: float = 3600.0) -> Dict:
+def validate_absorption_vs_price_stability(time_window_sec: float = 3600.0) -> Dict:
     """
     Validate that AbsorptionEvent corresponds to actual price stability.
 
@@ -137,63 +138,64 @@ def validate_absorption_vs_price_stability(db_path: str, time_window_sec: float 
 
     Returns: Dict with validation statistics
     """
-    conn = sqlite3.connect(db_path)
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
 
-    # Get all cycles with absorption events
-    absorption_query = """
-        SELECT
-            pv.cycle_id,
-            pv.symbol,
-            pv.order_consumption_size,
-            ec.timestamp as cycle_timestamp,
-            mn.price_center
-        FROM primitive_values pv
-        JOIN execution_cycles ec ON pv.cycle_id = ec.id
-        JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
-        WHERE pv.absorption_event = 1
-          AND ec.timestamp > ?
-        ORDER BY ec.timestamp DESC
-    """
-
-    absorptions = conn.execute(
-        absorption_query,
-        (time.time() - time_window_sec,)
-    ).fetchall()
-
-    results = []
-
-    for cycle_id, symbol, consumed_size, cycle_ts, price_center in absorptions:
-        # Find OHLC candle covering this timestamp
-        candle_query = """
-            SELECT open, high, low, close
-            FROM ohlc_candles
-            WHERE symbol = ?
-              AND timestamp <= ?
-            ORDER BY timestamp DESC
-            LIMIT 1
+        # Get all cycles with absorption events
+        absorption_query = """
+            SELECT
+                pv.cycle_id,
+                pv.symbol,
+                pv.order_consumption_size,
+                ec.timestamp as cycle_timestamp,
+                mn.price_center
+            FROM primitive_values pv
+            JOIN execution_cycles ec ON pv.cycle_id = ec.id
+            JOIN m2_nodes mn ON pv.cycle_id = mn.cycle_id AND pv.symbol = mn.symbol
+            WHERE pv.absorption_event = 1
+              AND ec.timestamp > %s
+            ORDER BY ec.timestamp DESC
         """
 
-        candle = conn.execute(candle_query, (symbol, cycle_ts)).fetchone()
+        cursor.execute(absorption_query, (time.time() - time_window_sec,))
+        absorptions = cursor.fetchall()
 
-        if candle:
-            open_price, high, low, close = candle
-            price_movement_pct = abs(high - low) / close * 100
+        results = []
 
-            # Absorption requires < 1% movement
-            is_stable = price_movement_pct < 1.0
+        for cycle_id, symbol, consumed_size, cycle_ts, price_center in absorptions:
+            # Find OHLC candle covering this timestamp
+            candle_query = """
+                SELECT open, high, low, close
+                FROM ohlc_candles
+                WHERE symbol = %s
+                  AND timestamp <= %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
 
-            results.append({
-                'cycle_id': cycle_id,
-                'symbol': symbol,
-                'consumed_size': consumed_size,
-                'price_movement_pct': price_movement_pct,
-                'is_stable': is_stable,
-                'high': high,
-                'low': low,
-                'timestamp': cycle_ts
-            })
+            cursor.execute(candle_query, (symbol, cycle_ts))
+            candle = cursor.fetchone()
 
-    conn.close()
+            if candle:
+                open_price, high, low, close = candle
+                price_movement_pct = abs(high - low) / close * 100
+
+                # Absorption requires < 1% movement
+                is_stable = price_movement_pct < 1.0
+
+                results.append({
+                    'cycle_id': cycle_id,
+                    'symbol': symbol,
+                    'consumed_size': consumed_size,
+                    'price_movement_pct': price_movement_pct,
+                    'is_stable': is_stable,
+                    'high': high,
+                    'low': low,
+                    'timestamp': cycle_ts
+                })
+    finally:
+        put_conn(conn)
 
     # Aggregate statistics
     if len(results) == 0:
@@ -213,25 +215,29 @@ def validate_absorption_vs_price_stability(db_path: str, time_window_sec: float 
     }
 
 
-def get_refill_count(db_path: str, time_window_sec: float = 3600.0) -> int:
+def get_refill_count(time_window_sec: float = 3600.0) -> int:
     """Get count of refill events in time window."""
-    conn = sqlite3.connect(db_path)
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
 
-    query = """
-        SELECT COUNT(*)
-        FROM primitive_values pv
-        JOIN execution_cycles ec ON pv.cycle_id = ec.id
-        WHERE pv.refill_event = 1
-          AND ec.timestamp > ?
-    """
+        query = """
+            SELECT COUNT(*)
+            FROM primitive_values pv
+            JOIN execution_cycles ec ON pv.cycle_id = ec.id
+            WHERE pv.refill_event = 1
+              AND ec.timestamp > %s
+        """
 
-    count = conn.execute(query, (time.time() - time_window_sec,)).fetchone()[0]
-    conn.close()
+        cursor.execute(query, (time.time() - time_window_sec,))
+        count = cursor.fetchone()[0]
+    finally:
+        put_conn(conn)
 
     return count
 
 
-def generate_orderbook_validation_report(db_path: str):
+def generate_orderbook_validation_report():
     """Generate comprehensive order book primitive validation report."""
     print("=" * 80)
     print("ORDER BOOK PRIMITIVE VALIDATION REPORT")
@@ -239,7 +245,7 @@ def generate_orderbook_validation_report(db_path: str):
 
     # 1. Consumption vs Trades
     print("\n[1] ORDER CONSUMPTION vs. TRADE FLOW")
-    consumption_stats = validate_consumption_vs_trades(db_path)
+    consumption_stats = validate_consumption_vs_trades()
 
     if 'error' in consumption_stats:
         print(f"  {consumption_stats['error']}")
@@ -253,7 +259,7 @@ def generate_orderbook_validation_report(db_path: str):
 
     # 2. Absorption vs Price Stability
     print("\n[2] ABSORPTION EVENT vs. PRICE STABILITY")
-    absorption_stats = validate_absorption_vs_price_stability(db_path)
+    absorption_stats = validate_absorption_vs_price_stability()
 
     if 'error' in absorption_stats:
         print(f"  {absorption_stats['error']}")
@@ -267,7 +273,7 @@ def generate_orderbook_validation_report(db_path: str):
 
     # 3. Refill Events (basic check)
     print("\n[3] REFILL EVENTS")
-    refill_count = get_refill_count(db_path)
+    refill_count = get_refill_count()
     print(f"  Total refill events: {refill_count}")
 
     print("\n" + "=" * 80)
@@ -276,7 +282,7 @@ def generate_orderbook_validation_report(db_path: str):
 
     # Success criteria
     if 'error' in consumption_stats or 'error' in absorption_stats:
-        print("⚠️  INSUFFICIENT DATA FOR VALIDATION")
+        print("INSUFFICIENT DATA FOR VALIDATION")
         print("   Run system for at least 1 hour to collect data")
         return
 
@@ -284,11 +290,11 @@ def generate_orderbook_validation_report(db_path: str):
     absorption_valid = absorption_stats['truly_stable_pct'] > 90
 
     if consumption_valid and absorption_valid:
-        print("✅ ORDER BOOK PRIMITIVES ARE VALID")
+        print("ORDER BOOK PRIMITIVES ARE VALID")
         print("   - Consumption correlates with trades")
         print("   - Absorption corresponds to price stability")
     else:
-        print("⚠️  VALIDATION ISSUES DETECTED")
+        print("VALIDATION ISSUES DETECTED")
         if not consumption_valid:
             print(f"   - Low consumption-trade correlation: "
                   f"{consumption_stats['consumptions_with_trades_pct']:.1f}% (need >80%)")
@@ -298,12 +304,12 @@ def generate_orderbook_validation_report(db_path: str):
 
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "logs/execution.db"
+    init_pool()
 
-    print(f"Validating order book primitives from: {db_path}\n")
+    print("Validating order book primitives from PostgreSQL\n")
 
     try:
-        generate_orderbook_validation_report(db_path)
+        generate_orderbook_validation_report()
     except Exception as e:
         print(f"ERROR: {e}")
         import traceback

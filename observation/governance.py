@@ -267,6 +267,128 @@ class ObservationSystem:
         """
         return self._m1.get_hl_price_returns(symbol, self._system_time)
 
+    def get_trend_context(self, symbol: str) -> Optional['TrendRegimeContext']:
+        """
+        Compute trend regime context from M1 raw trades and liquidations.
+
+        Used by cascade sniper trend kill-switch to block dangerous
+        reversal entries during strong directional moves.
+
+        Args:
+            symbol: Symbol to query (e.g., "BTCUSDT" or "BTC")
+
+        Returns:
+            TrendRegimeContext or None if insufficient data
+        """
+        from memory.m4_absorption_confirmation import TrendRegimeContext, TrendDirection
+
+        # Get raw data from M1 buffers
+        trades = list(self._m1.raw_trades.get(symbol, []))
+        liquidations = list(self._m1.raw_liquidations.get(symbol, []))
+
+        # 60-second lookback for trend
+        trend_cutoff = self._system_time - 60.0
+
+        recent_trades = [t for t in trades if t.get('timestamp', 0) > trend_cutoff]
+        recent_liqs = [l for l in liquidations if l.get('timestamp', 0) > trend_cutoff]
+
+        if len(recent_trades) < 10:
+            return TrendRegimeContext(
+                direction=TrendDirection.NEUTRAL,
+                price_change_pct=0.0,
+                higher_highs_count=0,
+                lower_lows_count=0,
+                trend_strength=0.0,
+                consecutive_direction=0,
+                long_liq_volume=0.0,
+                short_liq_volume=0.0,
+                liq_imbalance=0.0,
+                delta_60s=0.0,
+                delta_direction_aligned=False
+            )
+
+        # Price structure analysis
+        prices = [t['price'] for t in recent_trades]
+        first_price = prices[0]
+        last_price = prices[-1]
+        price_change_pct = (last_price - first_price) / first_price if first_price > 0 else 0.0
+
+        # Count higher highs and lower lows (using 6 segments)
+        segment_size = max(len(prices) // 6, 2)
+        segments = [prices[i:i + segment_size] for i in range(0, len(prices), segment_size)]
+
+        higher_highs = 0
+        lower_lows = 0
+        consecutive = 0
+        last_direction = 0
+
+        for i in range(1, len(segments)):
+            prev_high = max(segments[i - 1])
+            curr_high = max(segments[i])
+            prev_low = min(segments[i - 1])
+            curr_low = min(segments[i])
+
+            if curr_high > prev_high:
+                higher_highs += 1
+                if last_direction >= 0:
+                    consecutive += 1
+                else:
+                    consecutive = 1
+                last_direction = 1
+
+            if curr_low < prev_low:
+                lower_lows += 1
+                if last_direction <= 0:
+                    consecutive += 1
+                else:
+                    consecutive = 1
+                last_direction = -1
+
+        # Trend strength
+        total_signals = higher_highs + lower_lows
+        trend_strength = abs(higher_highs - lower_lows) / total_signals if total_signals > 0 else 0.0
+
+        # Determine direction (thresholds from AbsorptionConfirmationTracker)
+        TREND_PRICE_CHANGE_THRESHOLD = 0.0005  # 0.05%
+        STRONG_TREND_THRESHOLD = 0.6
+
+        if abs(price_change_pct) < TREND_PRICE_CHANGE_THRESHOLD:
+            direction = TrendDirection.NEUTRAL
+        elif price_change_pct > 0:
+            direction = TrendDirection.STRONG_UP if trend_strength >= STRONG_TREND_THRESHOLD else TrendDirection.WEAK_UP
+        else:
+            direction = TrendDirection.STRONG_DOWN if trend_strength >= STRONG_TREND_THRESHOLD else TrendDirection.WEAK_DOWN
+
+        # Liquidation context
+        long_liq = sum(l.get('quantity', 0) for l in recent_liqs if l.get('side', '').upper() in ('LONG', 'BUY'))
+        short_liq = sum(l.get('quantity', 0) for l in recent_liqs if l.get('side', '').upper() in ('SHORT', 'SELL'))
+        total_liq = long_liq + short_liq
+        liq_imbalance = (long_liq - short_liq) / total_liq if total_liq > 0 else 0.0
+
+        # Cumulative delta over 60s
+        buy_vol = sum(t.get('quantity', 0) for t in recent_trades if t.get('side', '') == 'BUY')
+        sell_vol = sum(t.get('quantity', 0) for t in recent_trades if t.get('side', '') == 'SELL')
+        delta_60s = buy_vol - sell_vol
+
+        delta_direction_aligned = (
+            (price_change_pct > 0 and delta_60s > 0) or
+            (price_change_pct < 0 and delta_60s < 0)
+        )
+
+        return TrendRegimeContext(
+            direction=direction,
+            price_change_pct=price_change_pct,
+            higher_highs_count=higher_highs,
+            lower_lows_count=lower_lows,
+            trend_strength=trend_strength,
+            consecutive_direction=consecutive,
+            long_liq_volume=long_liq,
+            short_liq_volume=short_liq,
+            liq_imbalance=liq_imbalance,
+            delta_60s=delta_60s,
+            delta_direction_aligned=delta_direction_aligned
+        )
+
     def ingest_observation(self, timestamp: float, symbol: str, event_type: str, payload: Dict) -> None:
         """
         Push external fact into memory.
@@ -972,12 +1094,18 @@ class ObservationSystem:
 
                     if len(active_nodes) > 0:
                         # Build presence intervals from M2 nodes
-                        # Each node contributes an interval from first_seen to last_interaction
+                        # Each node contributes an interval from first_seen to present.
+                        # Active nodes are structurally present until archived —
+                        # last_interaction_ts tracks trade activity, not structural existence.
+                        # With sparse HL fills, nodes rarely get trade interactions,
+                        # giving 0-duration intervals despite the structure persisting.
                         presence_intervals = []
                         for node in active_nodes:
                             # Only include intervals that overlap with observation window
                             interval_start = max(node.first_seen_ts, observation_start)
-                            interval_end = min(node.last_interaction_ts, observation_end)
+                            # Active node = structure still present. Use observation_end
+                            # (not last_interaction_ts) as the interval upper bound.
+                            interval_end = observation_end
 
                             if interval_start < interval_end:
                                 presence_intervals.append((interval_start, interval_end))

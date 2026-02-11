@@ -476,3 +476,59 @@ class BinanceClient:
         except Exception as e:
             self._logger.error(f"Failed to get klines for {symbol}: {e}")
             return []
+
+    async def get_klines_async(
+        self,
+        symbol: str,
+        interval: str = '5m',
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get historical klines/candlesticks asynchronously.
+
+        Non-blocking version for use in async context.
+
+        Args:
+            symbol: Hyperliquid symbol (e.g., 'BTC')
+            interval: Kline interval (1m, 5m, 15m, 30m, 1h, etc.)
+            limit: Number of klines to fetch (max 1500)
+
+        Returns:
+            List of kline dicts with keys: open_time, open, high, low, close, volume
+        """
+        if not AIOHTTP_AVAILABLE:
+            self._logger.error("aiohttp library not available")
+            return []
+
+        binance_symbol = self._to_binance_symbol(symbol)
+        url = f"{self.FUTURES_BASE}/fapi/v1/klines"
+
+        params = {
+            'symbol': binance_symbol,
+            'interval': interval,
+            'limit': min(limit, 1500)
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
+            # Binance klines format: [open_time, open, high, low, close, volume, ...]
+            results = []
+            for k in data:
+                results.append({
+                    'open_time': int(k[0]) / 1000.0,
+                    'open': float(k[1]),
+                    'high': float(k[2]),
+                    'low': float(k[3]),
+                    'close': float(k[4]),
+                    'volume': float(k[5]),
+                    'close_time': int(k[6]) / 1000.0
+                })
+
+            return results
+
+        except Exception as e:
+            self._logger.error(f"Failed to get klines async for {symbol}: {e}")
+            return []

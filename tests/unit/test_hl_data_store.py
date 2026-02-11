@@ -422,8 +422,8 @@ class TestHLP24Compliance:
     def test_no_computed_fields_in_position_snapshots(self, db):
         """Position snapshots table has no computed columns."""
         cursor = db.conn.cursor()
-        cursor.execute("PRAGMA table_info(hl_position_snapshots)")
-        columns = [row[1] for row in cursor.fetchall()]
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'hl_position_snapshots'")
+        columns = [row[0] for row in cursor.fetchall()]
 
         # These would be computed fields - should NOT exist
         forbidden = [

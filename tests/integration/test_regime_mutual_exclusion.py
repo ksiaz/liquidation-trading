@@ -47,6 +47,13 @@ class MockOrderConsumption:
 
 
 @dataclass
+class MockRestingSize:
+    """Mock resting size primitive."""
+    bid_size: float
+    ask_size: float
+
+
+@dataclass
 class MockPriceVelocity:
     """Mock price velocity primitive."""
     velocity: float
@@ -58,6 +65,7 @@ class TestRegimeMutualExclusion:
     def setup_method(self):
         """Reset strategy states before each test."""
         _slbrs_strategy.reset_state("BTCUSDT")
+        _slbrs_strategy._oc_seen["BTCUSDT"] = _slbrs_strategy.MIN_OC_OBSERVATIONS
         _effcs_strategy.reset_state("BTCUSDT")
 
         self.context = StrategyContext(
@@ -263,14 +271,14 @@ class TestRegimeMutualExclusion:
         regime_sideways = RegimeState(
             regime="SIDEWAYS_ACTIVE",
             vwap_distance=60.0,
-            atr_5m=50.0,
-            atr_30m=70.0
+            atr_5m=200.0,  # Must be >= 0.3% of price (50000*0.003=150)
+            atr_30m=250.0
         )
 
         # Step 3: Simulate EFFCS exit (position now FLAT)
 
-        # Step 4: Warm sideways streak (2+ cycles required for regime stability)
-        for i in range(2):
+        # Step 4: Warm sideways streak (4+ cycles required for regime stability)
+        for i in range(4):
             slbrs_proposal(
                 symbol="BTCUSDT",
                 regime_state=regime_sideways,
@@ -284,14 +292,14 @@ class TestRegimeMutualExclusion:
                 position_state=PositionState.FLAT
             )
 
-        # Step 5: First test detection
+        # Step 5: First test detection (full data required)
         proposal_first_test = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
-            zone_penetration=MockZonePenetration(penetration_depth=10.0),
-            resting_size=None,
-            order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=35.0),
+            zone_penetration=MockZonePenetration(penetration_depth=25.0),
+            resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
+            order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
             price=50000.0,
             context=StrategyContext("test1", 1100.0),
             permission=self.permission,
@@ -301,14 +309,14 @@ class TestRegimeMutualExclusion:
         # No entry on first test, but SLBRS evaluates (regime gate passed)
         assert proposal_first_test is None
 
-        # Step 6: Retest with absorption (consumed/initial >= 10%)
+        # Step 6: Retest with absorption (consumed/initial 0.65-0.95, full data)
         proposal_retest = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
-            zone_penetration=MockZonePenetration(penetration_depth=8.0),
-            resting_size=None,
-            order_consumption=MockOrderConsumption(consumed_size=100.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=40.0),
+            zone_penetration=MockZonePenetration(penetration_depth=25.0),
+            resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
+            order_consumption=MockOrderConsumption(consumed_size=400.0, initial_size=500.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
             price=50005.0,
             context=StrategyContext("test2", 1200.0),
             permission=self.permission,

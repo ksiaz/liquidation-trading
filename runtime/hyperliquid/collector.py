@@ -158,6 +158,7 @@ class HyperliquidCollector:
 
         # Start tasks
         asyncio.create_task(self._client.run_websocket())
+        asyncio.create_task(self._client.run_l2_overflow_ws())
         asyncio.create_task(self._poll_wallets_loop())
         asyncio.create_task(self._log_proximity_loop())
 

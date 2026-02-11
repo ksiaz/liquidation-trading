@@ -14,6 +14,7 @@ from memory.m5_access import (
 )
 from memory.m2_continuity_store import ContinuityMemoryStore
 from memory.m5_query_schemas import M4ViewType
+from memory.m4_interaction_density import InteractionDensityView
 
 # ==============================================================================
 # FIXTURES
@@ -28,16 +29,28 @@ def mock_store():
     mock_node = Mock()
     mock_node.id = "test_node"
     mock_node.state.name = "ACTIVE"
-    mock_node.timestamp = 100.0
-    mock_node.last_update_timestamp = 200.0
+    mock_node.get_lifecycle_state.return_value = "active"  # Returns lowercase, code calls .upper()
+    mock_node.first_seen_ts = 100.0
+    mock_node.last_interaction_ts = 200.0
     mock_node.price_center = 100.0
     mock_node.creation_reason = "TEST"
     
     store.get_node.return_value = mock_node
     
-    # Mock View for Local Context
-    mock_view = Mock()
-    mock_view.to_dict.return_value = {"metric": 1.0}
+    # Mock View for Local Context - use real dataclass for asdict() compatibility
+    mock_view = InteractionDensityView(
+        node_id="test_node",
+        interactions_per_hour=10.0,
+        median_gap_sec=360.0,
+        min_gap_sec=60.0,
+        max_gap_sec=3600.0,
+        gap_stddev_sec=100.0,
+        burstiness_coefficient=0.5,
+        longest_active_period_sec=7200.0,
+        longest_idle_period_sec=1800.0,
+        total_interaction_count=100,
+        observation_duration_sec=36000.0
+    )
     store.get_interaction_density_view.return_value = mock_view
     
     # Mock public members for Spatial/Proximity (since Access uses them)
@@ -151,8 +164,9 @@ def test_execute_local_context_query(access, mock_store):
         # For this test, let's pass the Enum as expected by Python.
     })
     
-    mock_store.get_interaction_density_view.assert_called_with("test_node")
-    assert result["metric"] == 1.0
+    mock_store.get_interaction_density_view.assert_called_with("test_node", 1000.0)
+    assert result["node_id"] == "test_node"
+    assert result["interactions_per_hour"] == 10.0
 
 # ==============================================================================
 # TEST 4: NORMALIZATION

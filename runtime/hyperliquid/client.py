@@ -66,6 +66,7 @@ class HyperliquidClient:
         # Connection state
         self._running = False
         self._ws = None
+        self._ws_l2_overflow = None  # Second WS for additional l2Book coins
         self._session: Optional[aiohttp.ClientSession] = None
 
         # Callbacks for different event types
@@ -106,6 +107,8 @@ class HyperliquidClient:
         self._running = False
         if self._ws:
             await self._ws.close()
+        if self._ws_l2_overflow:
+            await self._ws_l2_overflow.close()
         if self._session:
             await self._session.close()
 
@@ -419,25 +422,86 @@ class HyperliquidClient:
 
         self._logger.info(f"Subscribed to activeAssetCtx for {len(major_coins)} coins")
 
-    async def _subscribe_orderbooks(self, ws):
-        """Subscribe to L2 order books for major coins.
+    # L2 orderbook coins — split across two WS connections (max ~10 per connection).
+    # Subscribing >10 l2Book channels on one connection causes IncompleteReadError.
+    L2_COINS_PRIMARY = [
+        "BTC", "ETH", "SOL", "XRP", "DOGE",
+        "HYPE", "SUI", "LINK", "AVAX", "LTC",
+    ]
+    L2_COINS_OVERFLOW = [
+        "NEAR", "ATOM", "AAVE", "APT", "ARB",
+        "BNB", "OP", "TRX", "WLD", "TON",
+    ]
+
+    async def _subscribe_orderbooks(self, ws, coins: list = None):
+        """Subscribe to L2 order books for specified coins.
 
         L2 book provides bid/ask depth for absorption analysis:
         - Thin book at liquidation level = cascade continues
         - Thick book = cascade absorbed, reversal likely
         """
-        # Subscribe to books for all major coins (matches activeAssetCtx)
-        # Synced with TOP_10_SYMBOLS from collector service (BTCUSDT -> BTC)
-        orderbook_coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "TRX", "DOT"]
+        if coins is None:
+            coins = self.L2_COINS_PRIMARY
 
-        for coin in orderbook_coins:
+        for coin in coins:
             subscription = {
                 "method": "subscribe",
                 "subscription": {"type": "l2Book", "coin": coin}
             }
             await ws.send(json.dumps(subscription))
 
-        self._logger.info(f"Subscribed to l2Book for {len(orderbook_coins)} coins")
+        self._logger.info(f"Subscribed to l2Book for {len(coins)} coins")
+
+    async def run_l2_overflow_ws(self):
+        """Second WebSocket for overflow L2 orderbook subscriptions.
+
+        HL limits ~10 l2Book subscriptions per WS connection.
+        This handles the remaining coins not on the main WS.
+        """
+        import websockets
+
+        if not self.L2_COINS_OVERFLOW:
+            return
+
+        reconnect_delay = self.config.reconnect_delay
+
+        while self._running:
+            try:
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=self.config.ping_interval,
+                    ping_timeout=60,
+                    close_timeout=10
+                ) as ws:
+                    self._ws_l2_overflow = ws
+                    self._logger.info(
+                        f"L2 overflow WS connected for {len(self.L2_COINS_OVERFLOW)} coins"
+                    )
+                    reconnect_delay = self.config.reconnect_delay
+
+                    await self._subscribe_orderbooks(ws, self.L2_COINS_OVERFLOW)
+
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            channel = data.get('channel')
+                            if channel == 'l2Book':
+                                await self._handle_orderbook(data.get('data', {}))
+                            elif channel in ('subscriptionResponse', 'pong'):
+                                pass
+                            elif channel == 'error':
+                                self._logger.error(f"L2 overflow WS error: {data}")
+                        except json.JSONDecodeError:
+                            pass
+                        except Exception as e:
+                            self._logger.error(f"L2 overflow message error: {e}")
+
+            except Exception as e:
+                self._logger.warning(
+                    f"L2 overflow WS error: {e}, reconnecting in {reconnect_delay}s"
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, self.config.max_reconnect_delay)
 
     async def _subscribe_trades(self, ws, coins: List[str] = None):
         """Subscribe to real-time trades for specified coins.
@@ -514,6 +578,8 @@ class HyperliquidClient:
                 self._logger.debug(f"Subscription confirmed: {data.get('data', {})}")
             elif channel == 'error':
                 self._logger.error(f"WebSocket error: {data}")
+            elif channel == 'pong':
+                pass  # Expected keepalive response
 
         except json.JSONDecodeError:
             self._logger.warning(f"Invalid JSON: {message[:100]}")

@@ -127,16 +127,19 @@ print('=' * 70)
 absorption_time = now + 10  # 5 seconds since last liq
 
 # Add organic BUYING (opposing the DOWN cascade)
+# To trigger absorption, buying must exceed 50% of total flow
+# With $70k liq_selling, we need buying > $70k for ratio > 50%
 print('\nFeeding organic trades (buyers stepping in)...')
-for i in range(10):
-    record_organic_trade(symbol, 'BUY', 2000, absorption_time - 2 + i * 0.1)
-print(f'  Added 10 organic buys totaling $20,000')
+for i in range(40):
+    record_organic_trade(symbol, 'BUY', 2000, absorption_time - 2 + i * 0.05)
+print(f'  Added 40 organic buys totaling $80,000')
 
 # Add some sells (less than buys)
-for i in range(3):
+for i in range(5):
     record_organic_trade(symbol, 'SELL', 1000, absorption_time - 1 + i * 0.1)
-print(f'  Added 3 organic sells totaling $3,000')
-print(f'  Net organic: +$17,000 (buyers dominating)')
+print(f'  Added 5 organic sells totaling $5,000')
+print(f'  Net organic: +$75,000 (buyers dominating)')
+print(f'  Expected ratio: $80k / ($80k + $70k) = 53.3% > 50% threshold')
 
 # Update state - should detect absorption
 state = sm.update(symbol, proximity, None, absorption_time)
@@ -148,11 +151,12 @@ if signal:
     print(f'\nAbsorption signal:')
     print(f'  cascade_direction: {signal.cascade_direction.value}')
     print(f'  liqs_stopped: {signal.liqs_stopped}')
-    print(f'  time_since_last_liq: {signal.time_since_last_liq:.1f}s')
     print(f'  organic_net: ${signal.organic_net:,.0f}')
-    print(f'  organic_opposes: {signal.organic_opposes}')
-    print(f'  organic_ratio: {signal.organic_ratio:.1%}')
-    print(f'  absorption_detected: {signal.absorption_detected}')
+    print(f'  buying_volume: ${signal.buying_volume:,.0f}')
+    print(f'  liq_selling_volume: ${signal.liq_selling_volume:,.0f}')
+    print(f'  buying_ratio: {signal.buying_ratio:.1%}')
+    print(f'  is_absorbing: {signal.is_absorbing}')
+    print(f'  confidence: {signal.confidence:.1%}')
     print(f'  entry_direction: {signal.entry_direction}')
 
 assert state == CascadeState.ABSORBING, f"Expected ABSORBING, got {state}"

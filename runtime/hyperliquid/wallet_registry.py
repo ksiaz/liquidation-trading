@@ -2,22 +2,22 @@
 Dynamic Wallet Registry
 
 Manages whale wallet discovery, tracking, and pruning.
-Wallets are stored in SQLite with activity timestamps.
+Wallets are stored in PostgreSQL with activity timestamps.
 
 Usage:
-    registry = WalletRegistry(db_path)
+    registry = WalletRegistry()
     await registry.refresh_from_hyperdash()  # Discover new whales
     await registry.update_activity()          # Check which are active
     wallets = registry.get_active_wallets()   # Get for tracking
 """
 
-import sqlite3
 import time
 import asyncio
 import logging
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
-from pathlib import Path
+
+from runtime.logging.pg_pool import get_conn, put_conn
 
 # Import the static lists as fallback
 from .whale_wallets import SYSTEM_WALLETS, WHALE_WALLETS, VAULT_WALLETS, WalletInfo
@@ -41,7 +41,7 @@ class WalletRegistry:
     Dynamic wallet registry with automatic discovery and pruning.
 
     Features:
-    - SQLite storage for persistence
+    - PostgreSQL storage for persistence
     - Automatic refresh from Hyperdash
     - Activity-based pruning (removes inactive wallets)
     - Tiered tracking (prioritize large positions)
@@ -56,70 +56,48 @@ class WalletRegistry:
     INACTIVE_DAYS = 7  # Remove after 7 days of no activity
     MAX_TRACKED_WALLETS = 500  # Limit to avoid API overload
 
-    def __init__(self, db_path: str = "wallet_registry.db"):
-        self.db_path = db_path
+    def __init__(self, **kwargs):
         self._logger = logging.getLogger("WalletRegistry")
-        self._init_db()
         self._load_static_wallets()
-
-    def _init_db(self):
-        """Initialize SQLite database."""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                address TEXT PRIMARY KEY,
-                label TEXT,
-                wallet_type TEXT,
-                source TEXT,
-                position_value REAL DEFAULT 0,
-                last_active REAL,
-                first_seen REAL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_position_value
-            ON wallets(position_value DESC)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_last_active
-            ON wallets(last_active DESC)
-        """)
-        conn.commit()
-        conn.close()
 
     def _load_static_wallets(self):
         """Load static wallets from whale_wallets.py into registry."""
-        conn = sqlite3.connect(self.db_path)
-        now = time.time()
+        conn = get_conn()
+        try:
+            now = time.time()
+            cur = conn.cursor()
 
-        # System wallets (never pruned)
-        for w in SYSTEM_WALLETS:
-            conn.execute("""
-                INSERT OR IGNORE INTO wallets
-                (address, label, wallet_type, source, first_seen, last_active, notes)
-                VALUES (?, ?, 'SYSTEM', 'static', ?, ?, ?)
-            """, (w.address.lower(), w.label, now, now, w.notes))
+            # System wallets (never pruned)
+            for w in SYSTEM_WALLETS:
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'SYSTEM', 'static', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (w.address.lower(), w.label, now, now, w.notes))
 
-        # Curated whale wallets
-        for w in WHALE_WALLETS:
-            conn.execute("""
-                INSERT OR IGNORE INTO wallets
-                (address, label, wallet_type, source, first_seen, last_active, notes)
-                VALUES (?, ?, 'WHALE', 'curated', ?, ?, ?)
-            """, (w.address.lower(), w.label, now, now, w.notes))
+            # Curated whale wallets
+            for w in WHALE_WALLETS:
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'WHALE', 'curated', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (w.address.lower(), w.label, now, now, w.notes))
 
-        # Vault wallets
-        for w in VAULT_WALLETS:
-            conn.execute("""
-                INSERT OR IGNORE INTO wallets
-                (address, label, wallet_type, source, first_seen, last_active, notes)
-                VALUES (?, ?, 'VAULT', 'static', ?, ?, ?)
-            """, (w.address.lower(), w.label, now, now, w.notes))
+            # Vault wallets
+            for w in VAULT_WALLETS:
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'VAULT', 'static', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (w.address.lower(), w.label, now, now, w.notes))
 
-        conn.commit()
-        conn.close()
-        self._logger.info("Loaded static wallets into registry")
+            conn.commit()
+            self._logger.info("Loaded static wallets into registry")
+        finally:
+            put_conn(conn)
 
     # =========================================================================
     # Wallet Management
@@ -138,60 +116,75 @@ class WalletRegistry:
         label = label or f"Wallet-{addr[:8]}"
         now = time.time()
 
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            INSERT OR REPLACE INTO wallets
-            (address, label, wallet_type, source, first_seen, last_active, notes)
-            VALUES (?, ?, ?, ?,
-                COALESCE((SELECT first_seen FROM wallets WHERE address = ?), ?),
-                ?, ?)
-        """, (addr, label, wallet_type, source, addr, now, now, notes))
-        conn.commit()
-        conn.close()
+        conn = get_conn()
+        try:
+            conn.cursor().execute("""
+                INSERT INTO wallet_registry
+                (address, label, wallet_type, source, first_seen, last_active, notes)
+                VALUES (%s, %s, %s, %s,
+                    COALESCE((SELECT first_seen FROM wallet_registry WHERE address = %s), %s),
+                    %s, %s)
+                ON CONFLICT (address) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    wallet_type = EXCLUDED.wallet_type,
+                    source = EXCLUDED.source,
+                    last_active = EXCLUDED.last_active,
+                    notes = EXCLUDED.notes
+            """, (addr, label, wallet_type, source, addr, now, now, notes))
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def add_wallets_batch(self, addresses: List[str], source: str = "hyperdash"):
         """Add multiple wallets efficiently."""
         now = time.time()
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for i, addr in enumerate(addresses):
+                addr = addr.lower()
+                label = f"{source.capitalize()}-{i+1:03d}"
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, first_seen, last_active)
+                    VALUES (%s, %s, 'DISCOVERED', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (addr, label, source, now, now))
 
-        for i, addr in enumerate(addresses):
-            addr = addr.lower()
-            label = f"{source.capitalize()}-{i+1:03d}"
-            conn.execute("""
-                INSERT OR IGNORE INTO wallets
-                (address, label, wallet_type, source, first_seen, last_active)
-                VALUES (?, ?, 'DISCOVERED', ?, ?, ?)
-            """, (addr, label, source, now, now))
-
-        conn.commit()
-        conn.close()
-        self._logger.info(f"Added {len(addresses)} wallets from {source}")
+            conn.commit()
+            self._logger.info(f"Added {len(addresses)} wallets from {source}")
+        finally:
+            put_conn(conn)
 
     def update_activity(self, address: str, position_value: float):
         """Update wallet activity (called when position data received)."""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            UPDATE wallets
-            SET position_value = ?, last_active = ?
-            WHERE address = ?
-        """, (position_value, time.time(), address.lower()))
-        conn.commit()
-        conn.close()
+        conn = get_conn()
+        try:
+            conn.cursor().execute("""
+                UPDATE wallet_registry
+                SET position_value = %s, last_active = %s
+                WHERE address = %s
+            """, (position_value, time.time(), address.lower()))
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def update_activities_batch(self, updates: List[Tuple[str, float]]):
         """Batch update wallet activities."""
         now = time.time()
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for addr, position_value in updates:
+                cur.execute("""
+                    UPDATE wallet_registry
+                    SET position_value = %s, last_active = %s
+                    WHERE address = %s
+                """, (position_value, now, addr.lower()))
 
-        for addr, position_value in updates:
-            conn.execute("""
-                UPDATE wallets
-                SET position_value = ?, last_active = ?
-                WHERE address = ?
-            """, (position_value, now, addr.lower()))
-
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     # =========================================================================
     # Querying
@@ -201,64 +194,72 @@ class WalletRegistry:
         """Get wallets with recent activity and minimum position size."""
         cutoff = time.time() - (self.INACTIVE_DAYS * 24 * 3600)
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("""
-            SELECT address, label, wallet_type, source, position_value,
-                   last_active, first_seen, notes
-            FROM wallets
-            WHERE (last_active > ? OR wallet_type IN ('SYSTEM', 'VAULT'))
-              AND (position_value >= ? OR wallet_type IN ('SYSTEM', 'VAULT'))
-            ORDER BY position_value DESC
-            LIMIT ?
-        """, (cutoff, min_position, self.MAX_TRACKED_WALLETS))
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT address, label, wallet_type, source, position_value,
+                       last_active, first_seen, notes
+                FROM wallet_registry
+                WHERE (last_active > %s OR wallet_type IN ('SYSTEM', 'VAULT'))
+                  AND (position_value >= %s OR wallet_type IN ('SYSTEM', 'VAULT'))
+                ORDER BY position_value DESC
+                LIMIT %s
+            """, (cutoff, min_position, self.MAX_TRACKED_WALLETS))
 
-        wallets = []
-        for row in cursor:
-            wallets.append(TrackedWallet(
-                address=row[0],
-                label=row[1],
-                wallet_type=row[2],
-                source=row[3],
-                position_value=row[4] or 0,
-                last_active=row[5] or 0,
-                first_seen=row[6] or 0,
-                notes=row[7] or ""
-            ))
-
-        conn.close()
-        return wallets
+            wallets = []
+            for row in cur.fetchall():
+                wallets.append(TrackedWallet(
+                    address=row[0],
+                    label=row[1],
+                    wallet_type=row[2],
+                    source=row[3],
+                    position_value=row[4] or 0,
+                    last_active=row[5] or 0,
+                    first_seen=row[6] or 0,
+                    notes=row[7] or ""
+                ))
+            return wallets
+        finally:
+            put_conn(conn)
 
     def get_tier1_wallets(self) -> List[str]:
         """Get addresses of Tier 1 whales (>$10M positions)."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("""
-            SELECT address FROM wallets
-            WHERE position_value >= ?
-            ORDER BY position_value DESC
-        """, (self.TIER_1_THRESHOLD,))
-        addresses = [row[0] for row in cursor]
-        conn.close()
-        return addresses
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT address FROM wallet_registry
+                WHERE position_value >= %s
+                ORDER BY position_value DESC
+            """, (self.TIER_1_THRESHOLD,))
+            return [row[0] for row in cur.fetchall()]
+        finally:
+            put_conn(conn)
 
     def get_all_addresses(self) -> List[str]:
         """Get all tracked addresses."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("SELECT address FROM wallets")
-        addresses = [row[0] for row in cursor]
-        conn.close()
-        return addresses
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT address FROM wallet_registry")
+            return [row[0] for row in cur.fetchall()]
+        finally:
+            put_conn(conn)
 
     def get_wallet_count(self) -> Dict[str, int]:
         """Get wallet counts by type."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("""
-            SELECT wallet_type, COUNT(*)
-            FROM wallets
-            GROUP BY wallet_type
-        """)
-        counts = {row[0]: row[1] for row in cursor}
-        conn.close()
-        return counts
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT wallet_type, COUNT(*)
+                FROM wallet_registry
+                GROUP BY wallet_type
+            """)
+            return {row[0]: row[1] for row in cur.fetchall()}
+        finally:
+            put_conn(conn)
 
     # =========================================================================
     # Pruning
@@ -268,21 +269,24 @@ class WalletRegistry:
         """Remove wallets inactive for too long (except SYSTEM/VAULT)."""
         cutoff = time.time() - (self.INACTIVE_DAYS * 24 * 3600)
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("""
-            DELETE FROM wallets
-            WHERE last_active < ?
-              AND wallet_type NOT IN ('SYSTEM', 'VAULT', 'WHALE')
-              AND position_value < ?
-        """, (cutoff, self.TIER_3_THRESHOLD))
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                DELETE FROM wallet_registry
+                WHERE last_active < %s
+                  AND wallet_type NOT IN ('SYSTEM', 'VAULT', 'WHALE')
+                  AND position_value < %s
+            """, (cutoff, self.TIER_3_THRESHOLD))
 
-        deleted = cursor.rowcount
-        conn.commit()
-        conn.close()
+            deleted = cur.rowcount
+            conn.commit()
 
-        if deleted > 0:
-            self._logger.info(f"Pruned {deleted} inactive wallets")
-        return deleted
+            if deleted > 0:
+                self._logger.info(f"Pruned {deleted} inactive wallets")
+            return deleted
+        finally:
+            put_conn(conn)
 
     # =========================================================================
     # Live Discovery (from real-time data)
@@ -294,51 +298,40 @@ class WalletRegistry:
         liquidation_value: float,
         coin: str = ""
     ) -> bool:
-        """
-        Add wallet discovered from a liquidation event.
-
-        Only adds if liquidation is large enough to indicate whale activity.
-
-        Args:
-            address: Wallet address that was liquidated
-            liquidation_value: USD value of liquidation
-            coin: Coin that was liquidated (for notes)
-
-        Returns:
-            True if wallet was added, False if too small
-        """
-        # Minimum liquidation to consider - LOWERED for better coverage
-        MIN_LIQUIDATION = 20_000  # $20k liquidation (lowered from $50k)
+        """Add wallet discovered from a liquidation event."""
+        MIN_LIQUIDATION = 20_000
 
         if liquidation_value < MIN_LIQUIDATION:
             return False
 
         addr = address.lower()
 
-        # Check if already tracked
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute(
-            "SELECT address FROM wallets WHERE address = ?",
-            (addr,)
-        )
-        exists = cursor.fetchone() is not None
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT address FROM wallet_registry WHERE address = %s",
+                (addr,)
+            )
+            exists = cur.fetchone() is not None
 
-        if not exists:
-            now = time.time()
-            notes = f"Liquidated ${liquidation_value:,.0f}"
-            if coin:
-                notes += f" on {coin}"
+            if not exists:
+                now = time.time()
+                notes = f"Liquidated ${liquidation_value:,.0f}"
+                if coin:
+                    notes += f" on {coin}"
 
-            conn.execute("""
-                INSERT INTO wallets
-                (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
-                VALUES (?, ?, 'DISCOVERED', 'liquidation', ?, ?, ?, ?)
-            """, (addr, f"Liq-{addr[:8]}", liquidation_value, now, now, notes))
-            conn.commit()
-            self._logger.info(f"Discovered whale from liquidation: {addr[:12]}... (${liquidation_value:,.0f})")
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'DISCOVERED', 'liquidation', %s, %s, %s, %s)
+                """, (addr, f"Liq-{addr[:8]}", liquidation_value, now, now, notes))
+                conn.commit()
+                self._logger.info(f"Discovered whale from liquidation: {addr[:12]}... (${liquidation_value:,.0f})")
 
-        conn.close()
-        return not exists
+            return not exists
+        finally:
+            put_conn(conn)
 
     def add_from_large_trade(
         self,
@@ -347,51 +340,42 @@ class WalletRegistry:
         coin: str = "",
         side: str = ""
     ) -> bool:
-        """
-        Add wallet discovered from a large trade.
-
-        Args:
-            address: Wallet address that made the trade
-            trade_value: USD value of trade
-            coin: Coin traded
-            side: BUY or SELL
-
-        Returns:
-            True if wallet was added, False if too small or exists
-        """
-        # Minimum trade to consider - LOWERED for better coverage
-        MIN_TRADE = 50_000  # $50k single trade (lowered from $100k)
+        """Add wallet discovered from a large trade."""
+        MIN_TRADE = 50_000
 
         if trade_value < MIN_TRADE:
             return False
 
         addr = address.lower()
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute(
-            "SELECT address FROM wallets WHERE address = ?",
-            (addr,)
-        )
-        exists = cursor.fetchone() is not None
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT address FROM wallet_registry WHERE address = %s",
+                (addr,)
+            )
+            exists = cur.fetchone() is not None
 
-        if not exists:
-            now = time.time()
-            notes = f"Trade ${trade_value:,.0f}"
-            if coin:
-                notes += f" {coin}"
-            if side:
-                notes += f" ({side})"
+            if not exists:
+                now = time.time()
+                notes = f"Trade ${trade_value:,.0f}"
+                if coin:
+                    notes += f" {coin}"
+                if side:
+                    notes += f" ({side})"
 
-            conn.execute("""
-                INSERT INTO wallets
-                (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
-                VALUES (?, ?, 'DISCOVERED', 'trade', ?, ?, ?, ?)
-            """, (addr, f"Trade-{addr[:8]}", trade_value, now, now, notes))
-            conn.commit()
-            self._logger.info(f"Discovered whale from trade: {addr[:12]}... (${trade_value:,.0f})")
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'DISCOVERED', 'trade', %s, %s, %s, %s)
+                """, (addr, f"Trade-{addr[:8]}", trade_value, now, now, notes))
+                conn.commit()
+                self._logger.info(f"Discovered whale from trade: {addr[:12]}... (${trade_value:,.0f})")
 
-        conn.close()
-        return not exists
+            return not exists
+        finally:
+            put_conn(conn)
 
     def add_from_position_snapshot(
         self,
@@ -399,97 +383,85 @@ class WalletRegistry:
         position_value: float,
         coin: str = ""
     ) -> bool:
-        """
-        Add wallet discovered from observing a large position.
-
-        Args:
-            address: Wallet address with large position
-            position_value: Total position value in USD
-            coin: Primary coin (for notes)
-
-        Returns:
-            True if wallet was added/updated
-        """
-        # Minimum position to track
+        """Add wallet discovered from observing a large position."""
         if position_value < self.TIER_3_THRESHOLD:
             return False
 
         addr = address.lower()
         now = time.time()
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute(
-            "SELECT address, position_value FROM wallets WHERE address = ?",
-            (addr,)
-        )
-        row = cursor.fetchone()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT address, position_value FROM wallet_registry WHERE address = %s",
+                (addr,)
+            )
+            row = cur.fetchone()
 
-        if row is None:
-            # New wallet
-            notes = f"Position ${position_value:,.0f}"
-            if coin:
-                notes += f" ({coin})"
+            if row is None:
+                notes = f"Position ${position_value:,.0f}"
+                if coin:
+                    notes += f" ({coin})"
 
-            conn.execute("""
-                INSERT INTO wallets
-                (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
-                VALUES (?, ?, 'DISCOVERED', 'position', ?, ?, ?, ?)
-            """, (addr, f"Pos-{addr[:8]}", position_value, now, now, notes))
-            self._logger.info(f"Discovered whale from position: {addr[:12]}... (${position_value:,.0f})")
-            added = True
-        else:
-            # Update existing
-            conn.execute("""
-                UPDATE wallets
-                SET position_value = ?, last_active = ?
-                WHERE address = ?
-            """, (position_value, now, addr))
-            added = False
+                cur.execute("""
+                    INSERT INTO wallet_registry
+                    (address, label, wallet_type, source, position_value, first_seen, last_active, notes)
+                    VALUES (%s, %s, 'DISCOVERED', 'position', %s, %s, %s, %s)
+                """, (addr, f"Pos-{addr[:8]}", position_value, now, now, notes))
+                self._logger.info(f"Discovered whale from position: {addr[:12]}... (${position_value:,.0f})")
+                added = True
+            else:
+                cur.execute("""
+                    UPDATE wallet_registry
+                    SET position_value = %s, last_active = %s
+                    WHERE address = %s
+                """, (position_value, now, addr))
+                added = False
 
-        conn.commit()
-        conn.close()
-        return added
+            conn.commit()
+            return added
+        finally:
+            put_conn(conn)
 
     def get_recent_discoveries(self, hours: float = 24) -> List[TrackedWallet]:
         """Get wallets discovered in the last N hours."""
         cutoff = time.time() - (hours * 3600)
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute("""
-            SELECT address, label, wallet_type, source, position_value,
-                   last_active, first_seen, notes
-            FROM wallets
-            WHERE first_seen > ?
-              AND source IN ('liquidation', 'trade', 'position')
-            ORDER BY first_seen DESC
-        """, (cutoff,))
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT address, label, wallet_type, source, position_value,
+                       last_active, first_seen, notes
+                FROM wallet_registry
+                WHERE first_seen > %s
+                  AND source IN ('liquidation', 'trade', 'position')
+                ORDER BY first_seen DESC
+            """, (cutoff,))
 
-        wallets = []
-        for row in cursor:
-            wallets.append(TrackedWallet(
-                address=row[0],
-                label=row[1],
-                wallet_type=row[2],
-                source=row[3],
-                position_value=row[4] or 0,
-                last_active=row[5] or 0,
-                first_seen=row[6] or 0,
-                notes=row[7] or ""
-            ))
-
-        conn.close()
-        return wallets
+            wallets = []
+            for row in cur.fetchall():
+                wallets.append(TrackedWallet(
+                    address=row[0],
+                    label=row[1],
+                    wallet_type=row[2],
+                    source=row[3],
+                    position_value=row[4] or 0,
+                    last_active=row[5] or 0,
+                    first_seen=row[6] or 0,
+                    notes=row[7] or ""
+                ))
+            return wallets
+        finally:
+            put_conn(conn)
 
     # =========================================================================
     # Discovery (Hyperdash Scraping)
     # =========================================================================
 
     async def refresh_from_hyperdash(self):
-        """
-        Scrape Hyperdash for new whale addresses.
-
-        This should be run periodically (every 4-6 hours).
-        """
+        """Scrape Hyperdash for new whale addresses."""
         try:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
@@ -508,12 +480,10 @@ class WalletRegistry:
                 driver.get("https://hyperdash.info/top-traders")
                 await asyncio.sleep(8)
 
-                # Scroll to load content
                 for _ in range(3):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     await asyncio.sleep(1)
 
-                # Extract from network logs
                 logs = driver.get_log('performance')
                 addresses = set()
 
@@ -549,15 +519,7 @@ class WalletRegistry:
             self._logger.error(f"Hyperdash refresh failed: {e}")
 
     async def verify_positions(self, client) -> int:
-        """
-        Verify wallet positions using Hyperliquid API.
-
-        Args:
-            client: HyperliquidClient instance
-
-        Returns:
-            Number of wallets with active positions
-        """
+        """Verify wallet positions using Hyperliquid API."""
         addresses = self.get_all_addresses()
         updates = []
         active_count = 0
@@ -574,7 +536,7 @@ class WalletRegistry:
                     if total_value > 0:
                         active_count += 1
 
-                await asyncio.sleep(0.05)  # Rate limit
+                await asyncio.sleep(0.05)
             except:
                 pass
 
@@ -583,29 +545,14 @@ class WalletRegistry:
         return active_count
 
 
-# Convenience function for scheduled refresh
 async def scheduled_refresh(registry: WalletRegistry, client, interval_hours: float = 4):
-    """
-    Background task to periodically refresh wallet registry.
-
-    Args:
-        registry: WalletRegistry instance
-        client: HyperliquidClient instance
-        interval_hours: Hours between refreshes
-    """
+    """Background task to periodically refresh wallet registry."""
     while True:
         try:
-            # Discover new wallets
             await registry.refresh_from_hyperdash()
-
-            # Verify positions
             await registry.verify_positions(client)
-
-            # Prune inactive
             registry.prune_inactive()
-
         except Exception as e:
             logging.error(f"Scheduled refresh failed: {e}")
 
-        # Wait for next refresh
         await asyncio.sleep(interval_hours * 3600)

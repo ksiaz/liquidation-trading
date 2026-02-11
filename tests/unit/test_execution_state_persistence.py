@@ -29,19 +29,29 @@ from runtime.position.types import Position, PositionState, Direction
 from decimal import Decimal
 
 
+def _clean_execution_state_tables():
+    """Truncate execution state tables for test isolation."""
+    from runtime.logging.pg_pool import get_conn, put_conn
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        for table in ['stop_orders', 'trailing_stops', 'seen_fill_ids',
+                      'closing_timeouts', 'tracked_positions']:
+            cur.execute(f"DELETE FROM {table}")
+        conn.commit()
+    finally:
+        put_conn(conn)
+
+
 class TestStopOrderPersistence:
     """P1: Tests for stop order lifecycle persistence."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_save_and_load_stop_order(self):
         """Test saving and loading stop order state."""
@@ -149,15 +159,11 @@ class TestTrailingStopPersistence:
     """P2: Tests for trailing stop state persistence."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_save_and_load_trailing_stop(self):
         """Test saving and loading trailing stop state."""
@@ -253,15 +259,11 @@ class TestFillIdPersistence:
     """P3: Tests for fill ID deduplication persistence."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_save_and_check_fill_id(self):
         """Test saving and checking fill ID."""
@@ -300,15 +302,11 @@ class TestClosingTimeoutPersistence:
     """P4: Tests for CLOSING timeout persistence."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_save_and_load_closing_timeout(self):
         """Test saving and loading CLOSING timeout."""
@@ -345,15 +343,11 @@ class TestAtomicTransactions:
     """P6: Tests for atomic transaction support."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_atomic_commit(self):
         """Test atomic transaction commits all changes."""
@@ -546,15 +540,11 @@ class TestTrackedPositionPersistence:
     """P7: Tests for tracked position persistence."""
 
     def setup_method(self):
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = ExecutionStateRepository(self.temp_db)
+        _clean_execution_state_tables()
+        self.repo = ExecutionStateRepository()
 
     def teardown_method(self):
         self.repo.close()
-        try:
-            os.remove(self.temp_db)
-        except (PermissionError, FileNotFoundError):
-            pass
 
     def test_save_and_load_tracked_position(self):
         """Test saving and loading tracked positions."""

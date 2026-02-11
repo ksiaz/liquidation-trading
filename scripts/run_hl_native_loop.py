@@ -153,7 +153,7 @@ Examples:
     print("Connecting to adapter...")
     if not adapter.start():
         print("\nFailed to connect. Make sure the HL node adapter is running:")
-        print("  cd ~/.hl-node-adapter && cargo run --release")
+        print("  cd ~/.hl-adapter && cargo run --release")
         sys.exit(1)
 
     print(f"Connected! Running for {args.duration}s...\n")

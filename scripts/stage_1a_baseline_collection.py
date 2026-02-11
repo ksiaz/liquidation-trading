@@ -19,9 +19,9 @@ Data Collected:
 import asyncio
 import sys
 import time
-import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,8 +33,7 @@ from observation import ObservationSystem
 class Stage1AMonitor:
     """Monitor Stage 1A baseline collection progress."""
 
-    def __init__(self, db_path="logs/execution.db"):
-        self.db_path = db_path
+    def __init__(self):
         self.start_time = time.time()
         self.target_duration_hours = 48  # Maximum duration
         self.min_duration_hours = 24     # Minimum duration
@@ -52,8 +51,8 @@ class Stage1AMonitor:
         Returns:
             (should_stop: bool, reason: str, progress: dict)
         """
+        conn = get_conn()
         try:
-            conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
             elapsed_hours = (time.time() - self.start_time) / 3600
@@ -69,19 +68,19 @@ class Stage1AMonitor:
             # Check 3: Count cycles with all 3 primitives
             cursor.execute("""
                 SELECT COUNT(*) FROM policy_outcomes
-                WHERE active_primitives LIKE '%zone_penetration%'
-                  AND active_primitives LIKE '%traversal_compactness%'
-                  AND active_primitives LIKE '%central_tendency%'
-            """)
+                WHERE active_primitives LIKE %s
+                  AND active_primitives LIKE %s
+                  AND active_primitives LIKE %s
+            """, ('%zone_penetration%', '%traversal_compactness%', '%central_tendency%'))
             cycles_with_all_primitives = cursor.fetchone()[0]
 
             # Check 4: Samples per symbol
             cursor.execute("""
                 SELECT symbol, COUNT(*) as sample_count
                 FROM policy_outcomes
-                WHERE active_primitives LIKE '%zone_penetration%'
+                WHERE active_primitives LIKE %s
                 GROUP BY symbol
-            """)
+            """, ('%zone_penetration%',))
             samples_by_symbol = dict(cursor.fetchall())
             min_symbol_samples = min(samples_by_symbol.values()) if samples_by_symbol else 0
 
@@ -105,8 +104,6 @@ class Stage1AMonitor:
                 gaps = [recent_timestamps[i+1] - recent_timestamps[i]
                        for i in range(len(recent_timestamps)-1)]
                 max_gap = max(gaps) if gaps else 0
-
-            conn.close()
 
             progress = {
                 'elapsed_hours': elapsed_hours,
@@ -132,6 +129,8 @@ class Stage1AMonitor:
 
         except Exception as e:
             return False, f"Error checking criteria: {e}", {}
+        finally:
+            put_conn(conn)
 
     def print_progress_report(self):
         """Print progress toward stopping criteria."""
@@ -146,20 +145,20 @@ class Stage1AMonitor:
         print(f"Elapsed: {progress['elapsed_hours']:.1f}h / {self.target_duration_hours}h")
         print(f"")
         print(f"Cycles with all 3 primitives: {progress['cycles_with_all_primitives']:,} / {self.min_cycles:,}")
-        print(f"  {'✅' if progress['cycles_with_all_primitives'] >= self.min_cycles else '⏳'} Cycle count")
+        print(f"  {'[OK]' if progress['cycles_with_all_primitives'] >= self.min_cycles else '[..]'} Cycle count")
         print(f"")
         print(f"Min samples per symbol: {progress['min_symbol_samples']:,} / {self.min_samples_per_symbol:,}")
-        print(f"  {'✅' if progress['min_symbol_samples'] >= self.min_samples_per_symbol else '⏳'} Symbol coverage")
+        print(f"  {'[OK]' if progress['min_symbol_samples'] >= self.min_samples_per_symbol else '[..]'} Symbol coverage")
         print(f"")
         print(f"Primitive success rate: {progress['success_rate']:.1%}")
-        print(f"  {'✅' if progress['success_rate'] >= self.min_primitive_success_rate else '⏳'} Success rate")
+        print(f"  {'[OK]' if progress['success_rate'] >= self.min_primitive_success_rate else '[..]'} Success rate")
         print(f"")
         print(f"Max recent gap: {progress['max_recent_gap']:.1f}s / {self.max_gap_seconds}s")
-        print(f"  {'✅' if progress['max_recent_gap'] <= self.max_gap_seconds else '⏳'} Time continuity")
+        print(f"  {'[OK]' if progress['max_recent_gap'] <= self.max_gap_seconds else '[..]'} Time continuity")
         print(f"")
         print(f"Samples by symbol:")
         for symbol, count in sorted(progress['samples_by_symbol'].items()):
-            status = '✅' if count >= self.min_samples_per_symbol else '⏳'
+            status = '[OK]' if count >= self.min_samples_per_symbol else '[..]'
             print(f"  {status} {symbol}: {count:,}")
         print(f"")
         print(f"Status: {reason}")
@@ -240,4 +239,5 @@ if __name__ == "__main__":
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+    init_pool()
     asyncio.run(run_stage_1a_collection())

@@ -16,7 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
-import sqlite3
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 
 NODE_URL = "http://64.176.65.252:8080"
 
@@ -54,78 +54,79 @@ class PriceLevel:
 class ManipulationResearch:
     """Deep manipulation research with node data."""
 
-    def __init__(self, db_path: str = "manipulation_research.db"):
-        self.db_path = db_path
+    def __init__(self):
         self._init_db()
 
     def _init_db(self):
-        """Initialize research database."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        """Initialize research database tables in PostgreSQL."""
+        conn = get_conn()
+        try:
+            cursor = conn.cursor()
 
-        # Order flow aggregates
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS order_flow (
-                id INTEGER PRIMARY KEY,
-                timestamp REAL,
-                coin TEXT,
-                interval_sec INTEGER,
-                buy_volume REAL,
-                sell_volume REAL,
-                buy_orders INTEGER,
-                sell_orders INTEGER,
-                cancels INTEGER,
-                imbalance REAL
-            )
-        """)
+            # Order flow aggregates
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS order_flow (
+                    id SERIAL PRIMARY KEY,
+                    timestamp DOUBLE PRECISION,
+                    coin TEXT,
+                    interval_sec INTEGER,
+                    buy_volume DOUBLE PRECISION,
+                    sell_volume DOUBLE PRECISION,
+                    buy_orders INTEGER,
+                    sell_orders INTEGER,
+                    cancels INTEGER,
+                    imbalance DOUBLE PRECISION
+                )
+            """)
 
-        # Detected manipulation events
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS manipulation_events (
-                id INTEGER PRIMARY KEY,
-                timestamp REAL,
-                coin TEXT,
-                event_type TEXT,
-                wallet TEXT,
-                details TEXT,
-                price_before REAL,
-                price_after_1m REAL,
-                price_after_5m REAL,
-                profit_direction TEXT
-            )
-        """)
+            # Detected manipulation events
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS manipulation_events (
+                    id SERIAL PRIMARY KEY,
+                    timestamp DOUBLE PRECISION,
+                    coin TEXT,
+                    event_type TEXT,
+                    wallet TEXT,
+                    details TEXT,
+                    price_before DOUBLE PRECISION,
+                    price_after_1m DOUBLE PRECISION,
+                    price_after_5m DOUBLE PRECISION,
+                    profit_direction TEXT
+                )
+            """)
 
-        # Wallet profiles
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_profiles (
-                wallet TEXT PRIMARY KEY,
-                total_orders INTEGER DEFAULT 0,
-                total_cancels INTEGER DEFAULT 0,
-                cancel_rate REAL DEFAULT 0,
-                layering_events INTEGER DEFAULT 0,
-                wash_events INTEGER DEFAULT 0,
-                avg_order_lifetime_ms REAL,
-                profitable_manips INTEGER DEFAULT 0,
-                total_manips INTEGER DEFAULT 0,
-                last_seen REAL
-            )
-        """)
+            # Wallet profiles
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_profiles (
+                    wallet TEXT PRIMARY KEY,
+                    total_orders INTEGER DEFAULT 0,
+                    total_cancels INTEGER DEFAULT 0,
+                    cancel_rate DOUBLE PRECISION DEFAULT 0,
+                    layering_events INTEGER DEFAULT 0,
+                    wash_events INTEGER DEFAULT 0,
+                    avg_order_lifetime_ms DOUBLE PRECISION,
+                    profitable_manips INTEGER DEFAULT 0,
+                    total_manips INTEGER DEFAULT 0,
+                    last_seen DOUBLE PRECISION
+                )
+            """)
 
-        # Price level activity
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS price_levels (
-                id INTEGER PRIMARY KEY,
-                coin TEXT,
-                price_level REAL,
-                timestamp REAL,
-                activity_type TEXT,
-                volume REAL,
-                order_count INTEGER
-            )
-        """)
+            # Price level activity
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS price_levels (
+                    id SERIAL PRIMARY KEY,
+                    coin TEXT,
+                    price_level DOUBLE PRECISION,
+                    timestamp DOUBLE PRECISION,
+                    activity_type TEXT,
+                    volume DOUBLE PRECISION,
+                    order_count INTEGER
+                )
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def parse_block_data(self, block_data: str) -> Tuple[List[dict], Dict[str, float]]:
         """Parse orders and extract prices from block data."""
@@ -532,11 +533,12 @@ def fetch_and_analyze(blocks_to_fetch: int = 5000):
         print(f"\n{coin} (current: ${current:,.2f}):")
         print("  High-activity zones:")
         for z in zones[:5]:
-            direction = "↑" if z['distance_pct'] > 0 else "↓"
+            direction = "^" if z['distance_pct'] > 0 else "v"
             print(f"    ${z['price']:,.2f} ({direction}{abs(z['distance_pct']):.1f}%) - ${z['total_activity']:,.0f} activity, {z['order_count']} orders")
 
     return research, orders, prices
 
 
 if __name__ == "__main__":
+    init_pool()
     fetch_and_analyze(5000)

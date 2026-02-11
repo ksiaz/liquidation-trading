@@ -163,13 +163,9 @@ Is local position NOT on exchange?
 # Last 10 minutes of logs
 tail -1000 logs/trading.log | grep -E "position|fill|order"
 
-# Database query
-python3 -c "
-import sqlite3
-conn = sqlite3.connect('data/trading.db')
-cur = conn.cursor()
-cur.execute('''
-    SELECT * FROM trades
+# Database query (PostgreSQL)
+psql -U liqtrade -d liquidation_trading -c "
+    SELECT * FROM ghost_trades
     ORDER BY timestamp DESC
     LIMIT 20
 ''')

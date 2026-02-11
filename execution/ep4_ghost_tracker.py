@@ -6,7 +6,7 @@ Mechanical state tracking only. No interpretation.
 
 Authority: Ghost Trading Extension v1.0
 
-Persistence: Open positions are persisted to sqlite DB and restored on startup.
+Persistence: Open positions are persisted to PostgreSQL and restored on startup.
 This enables external queries for P&L and state reconciliation.
 """
 
@@ -15,8 +15,10 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime
 import json
-import sqlite3
 import os
+
+import psycopg2.extras
+from runtime.logging.pg_pool import get_conn, put_conn
 from execution.ep4_ghost_adapter import (
     GhostExchangeAdapter,
     GhostExecutionResult,
@@ -33,101 +35,46 @@ from runtime.diagnostics import diag, ReasonCode
 # Position Persistence
 # ==============================================================================
 
-DEFAULT_DB_PATH = "/tmp/ghost_trades.db"
+DEFAULT_DB_PATH = None  # No longer used (PostgreSQL)
 
 
-def _init_position_table(conn: sqlite3.Connection) -> None:
-    """Create ghost_positions table if not exists. Migrates old schema if needed."""
-    # Check if table exists with old UNIQUE(symbol, status) ON CONFLICT REPLACE constraint
-    # SQLite can't ALTER TABLE DROP CONSTRAINT, so we recreate the table
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ghost_positions'"
-    ).fetchone()
-    if row and "ON CONFLICT REPLACE" in (row[0] or ""):
-        print("[GHOST] Migrating ghost_positions: removing ON CONFLICT REPLACE constraint", flush=True)
-        conn.execute("ALTER TABLE ghost_positions RENAME TO ghost_positions_old")
-        conn.execute("""
-            CREATE TABLE ghost_positions (
-                trade_id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                qty REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                entry_time REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'OPEN',
-                entry_reason TEXT,
-                strategy_id TEXT,
-                exit_price REAL,
-                exit_time REAL,
-                pnl REAL,
-                zone_context TEXT
-            )
-        """)
-        conn.execute("""
-            INSERT INTO ghost_positions
-            SELECT trade_id, symbol, side, qty, entry_price, entry_time,
-                   status, entry_reason, strategy_id, exit_price, exit_time, pnl, zone_context
-            FROM ghost_positions_old
-        """)
-        conn.execute("DROP TABLE ghost_positions_old")
-        print("[GHOST] Migration complete: ghost_positions recreated without UNIQUE constraint", flush=True)
-    else:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ghost_positions (
-                trade_id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                qty REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                entry_time REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'OPEN',
-                entry_reason TEXT,
-                strategy_id TEXT,
-                exit_price REAL,
-                exit_time REAL,
-                pnl REAL,
-                zone_context TEXT
-            )
-        """)
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_status ON ghost_positions(status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ghost_positions_symbol ON ghost_positions(symbol)")
-
-    # Migration: add zone_context column if missing (for existing DBs)
+def _load_open_positions_pg() -> Dict[str, dict]:
+    """Load all OPEN positions from PostgreSQL. Returns dict keyed by symbol."""
+    conn = get_conn()
     try:
-        conn.execute("ALTER TABLE ghost_positions ADD COLUMN zone_context TEXT")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    conn.commit()
-
-
-def _load_open_positions(conn: sqlite3.Connection) -> Dict[str, dict]:
-    """Load all OPEN positions from DB. Returns dict keyed by symbol."""
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM ghost_positions WHERE status = 'OPEN'"
-    ).fetchall()
-    return {row['symbol']: dict(row) for row in rows}
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM ghost_positions WHERE status = 'OPEN'")
+        rows = cur.fetchall()
+        return {row['symbol']: dict(row) for row in rows}
+    finally:
+        put_conn(conn)
 
 
-def _insert_position(conn: sqlite3.Connection, pos: dict) -> None:
+def _insert_position_pg(pos: dict) -> None:
     """Insert new position with status=OPEN."""
-    conn.execute("""
-        INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id, zone_context)
-        VALUES (:trade_id, :symbol, :side, :qty, :entry_price, :entry_time, 'OPEN', :entry_reason, :strategy_id, :zone_context)
-    """, pos)
-    conn.commit()
+    conn = get_conn()
+    try:
+        conn.cursor().execute("""
+            INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id, zone_context)
+            VALUES (%(trade_id)s, %(symbol)s, %(side)s, %(qty)s, %(entry_price)s, %(entry_time)s, 'OPEN', %(entry_reason)s, %(strategy_id)s, %(zone_context)s)
+        """, pos)
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
-def _update_position_closed(conn: sqlite3.Connection, symbol: str, exit_price: float, exit_time: float, pnl: float) -> None:
+def _update_position_closed_pg(symbol: str, exit_price: float, exit_time: float, pnl: float) -> None:
     """Update position to CLOSED with exit data."""
-    conn.execute("""
-        UPDATE ghost_positions
-        SET status = 'CLOSED', exit_price = ?, exit_time = ?, pnl = ?
-        WHERE symbol = ? AND status = 'OPEN'
-    """, (exit_price, exit_time, pnl, symbol))
-    conn.commit()
+    conn = get_conn()
+    try:
+        conn.cursor().execute("""
+            UPDATE ghost_positions
+            SET status = 'CLOSED', exit_price = %s, exit_time = %s, pnl = %s
+            WHERE symbol = %s AND status = 'OPEN'
+        """, (exit_price, exit_time, pnl, symbol))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 # ==============================================================================
@@ -238,7 +185,7 @@ class GhostPositionTracker:
             symbols: List of trading symbols to support
             api_key: Optional Binance API key for live data
             buffered_db: BufferedResearchDatabase instance for execution.db writes
-            db_path: Path to sqlite DB for position persistence (default: /tmp/ghost_trades.db)
+            db_path: Unused (position persistence via PostgreSQL pool)
         """
         self._state = GhostAccountState(
             initial_balance=initial_balance,
@@ -247,10 +194,8 @@ class GhostPositionTracker:
         self._position_size_pct = position_size_pct
         self._buffered_db = buffered_db
         self._api_key = api_key
-        self._db_path = db_path
 
-        # Position persistence connection (separate from trade logging)
-        self._pos_conn: Optional[sqlite3.Connection] = None
+        # Position persistence via PostgreSQL pool (no dedicated connection)
         self._init_persistence()
 
         # Ghost adapters per symbol (created on-demand)
@@ -269,13 +214,10 @@ class GhostPositionTracker:
         self._next_trade_id = self._get_next_trade_id()
 
     def _init_persistence(self) -> None:
-        """Initialize position persistence DB and restore state."""
+        """Load persisted positions from PostgreSQL and restore state."""
         try:
-            self._pos_conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            _init_position_table(self._pos_conn)
-
-            # Load existing OPEN positions
-            saved_positions = _load_open_positions(self._pos_conn)
+            # Schema already created by pg_schema.ensure_schema() at startup
+            saved_positions = _load_open_positions_pg()
             persisted_contexts = {}
 
             for symbol, row in saved_positions.items():
@@ -302,19 +244,16 @@ class GhostPositionTracker:
                         pass
 
             if saved_positions:
-                print(f"[GHOST] Restored {len(saved_positions)} open positions from DB", flush=True)
+                print(f"[GHOST] Restored {len(saved_positions)} open positions from PG", flush=True)
 
                 # Restore geometry strategy zone contexts for proper exit detection
-                # NOTE: Geometry stores context by BASE symbol (BTC), DB stores by FULL symbol (BTCUSDT)
                 if persisted_contexts:
                     try:
                         from external_policy.ep2_strategy_geometry import restore_entry_context_from_positions
 
-                        # Helper to normalize symbol
                         def to_base(s: str) -> str:
                             return s.replace('USDT', '').replace('USD', '')
 
-                        # Convert positions list to base symbols for geometry
                         positions_list = [
                             {
                                 "symbol": to_base(sym),
@@ -325,9 +264,7 @@ class GhostPositionTracker:
                             for sym, row in saved_positions.items()
                         ]
 
-                        # Convert persisted_contexts keys to base symbols
                         base_contexts = {to_base(k): v for k, v in persisted_contexts.items()}
-
                         restore_entry_context_from_positions(positions_list, base_contexts)
                         print(f"[GHOST] Restored zone contexts for {len(persisted_contexts)} positions", flush=True)
                     except Exception as e:
@@ -335,7 +272,6 @@ class GhostPositionTracker:
 
         except Exception as e:
             print(f"[GHOST] Position persistence init failed: {e}", flush=True)
-            self._pos_conn = None
 
     def _get_next_trade_id(self) -> int:
         """Get next trade ID from DB or start at 1.
@@ -345,23 +281,26 @@ class GhostPositionTracker:
         """
         max_id = 0
 
-        # Check ghost_positions (pos_conn)
-        if self._pos_conn:
+        # Check ghost_positions via PG pool
+        try:
+            conn = get_conn()
             try:
-                row = self._pos_conn.execute(
-                    "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_positions"
-                ).fetchone()
-                if row[0] is not None:
-                    max_id = max(max_id, row[0])
-            except Exception:
-                pass
+                cur = conn.cursor()
+                cur.execute("SELECT MAX(CAST(SUBSTRING(trade_id FROM 7) AS INTEGER)) FROM ghost_positions")
+                result = cur.fetchone()
+                if result and result[0] is not None:
+                    max_id = max(max_id, result[0])
+            finally:
+                put_conn(conn)
+        except Exception:
+            pass
 
-        # Check ghost_trades in execution.db via BufferedResearchDatabase
+        # Check ghost_trades via BufferedResearchDatabase
         if self._buffered_db:
             try:
-                self._buffered_db.flush()  # Ensure pending writes are persisted
+                self._buffered_db.flush()
                 rows = self._buffered_db.read_sql(
-                    "SELECT MAX(CAST(SUBSTR(trade_id, 7) AS INTEGER)) FROM ghost_trades"
+                    "SELECT MAX(CAST(SUBSTRING(trade_id FROM 7) AS INTEGER)) FROM ghost_trades"
                 )
                 if rows and rows[0][0] is not None:
                     max_id = max(max_id, rows[0][0])
@@ -379,9 +318,7 @@ class GhostPositionTracker:
         return symbol.replace('USDT', '').replace('USD', '')
 
     def _persist_open_position(self, position: GhostPosition, strategy_id: Optional[str] = None) -> None:
-        """Persist new position to DB with status=OPEN, including zone context."""
-        if not self._pos_conn:
-            return
+        """Persist new position to PG with status=OPEN, including zone context."""
         try:
             # Get zone context from geometry strategy for proper exit detection on restart
             # Normalize symbol: geometry stores by base symbol (BTC), we use full symbol (BTCUSDT)
@@ -395,7 +332,7 @@ class GhostPositionTracker:
             except Exception:
                 pass  # Geometry module may not be available
 
-            _insert_position(self._pos_conn, {
+            _insert_position_pg({
                 'trade_id': position.entry_trade_id,
                 'symbol': position.symbol,
                 'side': position.side,
@@ -410,11 +347,9 @@ class GhostPositionTracker:
             print(f"[GHOST] Failed to persist position: {e}", flush=True)
 
     def _persist_position_closed(self, symbol: str, exit_price: float, exit_time: float, pnl: float) -> None:
-        """Update position in DB to status=CLOSED with exit data."""
-        if not self._pos_conn:
-            return
+        """Update position in PG to status=CLOSED with exit data."""
         try:
-            _update_position_closed(self._pos_conn, symbol, exit_price, exit_time, pnl)
+            _update_position_closed_pg(symbol, exit_price, exit_time, pnl)
         except Exception as e:
             print(f"[GHOST] Failed to update closed position: {e}", flush=True)
 
@@ -887,33 +822,35 @@ class GhostPositionTracker:
         return results
 
     @staticmethod
-    def query_positions_from_db(db_path: str = DEFAULT_DB_PATH, status: str = None) -> List[Dict]:
+    def query_positions_from_db(db_path: str = None, status: str = None) -> List[Dict]:
         """
-        Query positions directly from DB without creating tracker instance.
+        Query positions directly from PG without creating tracker instance.
 
         For external tools that need position state without running the tracker.
 
         Args:
-            db_path: Path to ghost trades DB
+            db_path: Ignored (kept for API compatibility). Uses PG pool.
             status: Filter by status ('OPEN', 'CLOSED', or None for all)
 
         Returns:
             List of position dicts from DB
         """
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM ghost_positions WHERE status = ? ORDER BY entry_time DESC",
-                    (status,)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM ghost_positions ORDER BY entry_time DESC"
-                ).fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
+            conn = get_conn()
+            try:
+                cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                if status:
+                    cur.execute(
+                        "SELECT * FROM ghost_positions WHERE status = %s ORDER BY entry_time DESC",
+                        (status,)
+                    )
+                else:
+                    cur.execute(
+                        "SELECT * FROM ghost_positions ORDER BY entry_time DESC"
+                    )
+                return [dict(row) for row in cur.fetchall()]
+            finally:
+                put_conn(conn)
         except Exception as e:
             return []
 

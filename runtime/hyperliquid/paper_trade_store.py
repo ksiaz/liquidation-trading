@@ -1,17 +1,18 @@
 """
 Paper Trade Persistence Store.
 
-Persists paper trades from LiquidationFadeExecutor to SQLite
+Persists paper trades from LiquidationFadeExecutor to PostgreSQL
 so they survive app restarts and can be analyzed.
 """
 
-import sqlite3
 import time
 import uuid
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+
+from runtime.logging.pg_pool import get_conn, put_conn
 
 
 @dataclass
@@ -36,85 +37,25 @@ class StoredTrade:
 
 
 class PaperTradeStore:
-    """SQLite persistence for paper trades."""
+    """PostgreSQL persistence for paper trades."""
 
-    def __init__(self, db_path: str = "paper_trades.db"):
-        self.db_path = db_path
+    def __init__(self, **kwargs):
         self._logger = logging.getLogger("PaperTradeStore")
-        self._init_db()
-
-    def _init_db(self):
-        """Create tables if not exist."""
-        conn = sqlite3.connect(self.db_path)
-
-        # Main trades table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS paper_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trade_id TEXT UNIQUE NOT NULL,
-                coin TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                entry_time REAL NOT NULL,
-                size REAL NOT NULL,
-                liquidated_wallet TEXT,
-                liquidation_value REAL,
-                take_profit_price REAL,
-                stop_loss_price REAL,
-                exit_price REAL,
-                exit_time REAL,
-                pnl REAL,
-                status TEXT NOT NULL,
-                highest_price REAL,
-                breakeven_triggered INTEGER DEFAULT 0,
-                original_stop_loss REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Daily stats table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS paper_trade_stats (
-                date TEXT PRIMARY KEY,
-                total_trades INTEGER DEFAULT 0,
-                winning_trades INTEGER DEFAULT 0,
-                losing_trades INTEGER DEFAULT 0,
-                total_pnl REAL DEFAULT 0,
-                largest_win REAL DEFAULT 0,
-                largest_loss REAL DEFAULT 0,
-                updated_at REAL
-            )
-        """)
-
-        # Indexes
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_coin ON paper_trades(coin)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_time ON paper_trades(entry_time DESC)")
-
-        conn.commit()
-        conn.close()
-        self._logger.info(f"Paper trade store initialized: {self.db_path}")
+        self._logger.info("Paper trade store initialized (PostgreSQL)")
 
     def save_trade(self, trade) -> str:
-        """
-        Save new trade to database.
-
-        Args:
-            trade: FadeTrade object from liquidation_fade.py
-
-        Returns:
-            trade_id: Unique identifier for the trade
-        """
+        """Save new trade to database."""
         trade_id = str(uuid.uuid4())[:8]
 
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
         try:
-            conn.execute("""
+            conn.cursor().execute("""
                 INSERT INTO paper_trades (
                     trade_id, coin, entry_price, entry_time, size,
                     liquidated_wallet, liquidation_value,
                     take_profit_price, stop_loss_price, status,
                     highest_price, breakeven_triggered, original_stop_loss
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 trade_id,
                 trade.coin,
@@ -137,24 +78,24 @@ class PaperTradeStore:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            put_conn(conn)
 
         return trade_id
 
     def update_trade(self, trade_id: str, trade):
         """Update existing trade (status, exit, P&L)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
         try:
-            conn.execute("""
+            conn.cursor().execute("""
                 UPDATE paper_trades SET
-                    status = ?,
-                    exit_price = ?,
-                    exit_time = ?,
-                    pnl = ?,
-                    highest_price = ?,
-                    breakeven_triggered = ?,
-                    original_stop_loss = ?
-                WHERE trade_id = ?
+                    status = %s,
+                    exit_price = %s,
+                    exit_time = %s,
+                    pnl = %s,
+                    highest_price = %s,
+                    breakeven_triggered = %s,
+                    original_stop_loss = %s
+                WHERE trade_id = %s
             """, (
                 trade.status.value if hasattr(trade.status, 'value') else str(trade.status),
                 trade.exit_price,
@@ -176,124 +117,129 @@ class PaperTradeStore:
             self._logger.error(f"Failed to update trade {trade_id}: {e}")
             conn.rollback()
         finally:
-            conn.close()
+            put_conn(conn)
 
     def get_active_trades(self) -> List[StoredTrade]:
         """Load all active (non-closed) trades."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = get_conn()
+        try:
+            import psycopg2.extras
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("""
+                SELECT * FROM paper_trades
+                WHERE status IN ('PENDING', 'ENTERED', 'pending', 'entered')
+                ORDER BY entry_time DESC
+            """)
 
-        cursor = conn.execute("""
-            SELECT * FROM paper_trades
-            WHERE status IN ('PENDING', 'ENTERED', 'pending', 'entered')
-            ORDER BY entry_time DESC
-        """)
-
-        trades = []
-        for row in cursor:
-            trades.append(StoredTrade(
-                trade_id=row['trade_id'],
-                coin=row['coin'],
-                entry_price=row['entry_price'],
-                entry_time=row['entry_time'],
-                size=row['size'],
-                liquidated_wallet=row['liquidated_wallet'],
-                liquidation_value=row['liquidation_value'],
-                take_profit_price=row['take_profit_price'],
-                stop_loss_price=row['stop_loss_price'],
-                status=row['status'],
-                exit_price=row['exit_price'],
-                exit_time=row['exit_time'],
-                pnl=row['pnl'],
-                highest_price=row['highest_price'],
-                breakeven_triggered=bool(row['breakeven_triggered']),
-                original_stop_loss=row['original_stop_loss']
-            ))
-
-        conn.close()
-        return trades
+            trades = []
+            for row in cur.fetchall():
+                trades.append(StoredTrade(
+                    trade_id=row['trade_id'],
+                    coin=row['coin'],
+                    entry_price=row['entry_price'],
+                    entry_time=row['entry_time'],
+                    size=row['size'],
+                    liquidated_wallet=row['liquidated_wallet'],
+                    liquidation_value=row['liquidation_value'],
+                    take_profit_price=row['take_profit_price'],
+                    stop_loss_price=row['stop_loss_price'],
+                    status=row['status'],
+                    exit_price=row['exit_price'],
+                    exit_time=row['exit_time'],
+                    pnl=row['pnl'],
+                    highest_price=row['highest_price'],
+                    breakeven_triggered=bool(row['breakeven_triggered']),
+                    original_stop_loss=row['original_stop_loss']
+                ))
+            return trades
+        finally:
+            put_conn(conn)
 
     def get_trade_history(self, limit: int = 100, coin: str = None) -> List[StoredTrade]:
         """Get recent closed trades."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = get_conn()
+        try:
+            import psycopg2.extras
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        if coin:
-            cursor = conn.execute("""
-                SELECT * FROM paper_trades
-                WHERE coin = ? AND status NOT IN ('PENDING', 'ENTERED', 'pending', 'entered')
-                ORDER BY exit_time DESC
-                LIMIT ?
-            """, (coin, limit))
-        else:
-            cursor = conn.execute("""
-                SELECT * FROM paper_trades
-                WHERE status NOT IN ('PENDING', 'ENTERED', 'pending', 'entered')
-                ORDER BY exit_time DESC
-                LIMIT ?
-            """, (limit,))
+            if coin:
+                cur.execute("""
+                    SELECT * FROM paper_trades
+                    WHERE coin = %s AND status NOT IN ('PENDING', 'ENTERED', 'pending', 'entered')
+                    ORDER BY exit_time DESC
+                    LIMIT %s
+                """, (coin, limit))
+            else:
+                cur.execute("""
+                    SELECT * FROM paper_trades
+                    WHERE status NOT IN ('PENDING', 'ENTERED', 'pending', 'entered')
+                    ORDER BY exit_time DESC
+                    LIMIT %s
+                """, (limit,))
 
-        trades = []
-        for row in cursor:
-            trades.append(StoredTrade(
-                trade_id=row['trade_id'],
-                coin=row['coin'],
-                entry_price=row['entry_price'],
-                entry_time=row['entry_time'],
-                size=row['size'],
-                liquidated_wallet=row['liquidated_wallet'],
-                liquidation_value=row['liquidation_value'],
-                take_profit_price=row['take_profit_price'],
-                stop_loss_price=row['stop_loss_price'],
-                status=row['status'],
-                exit_price=row['exit_price'],
-                exit_time=row['exit_time'],
-                pnl=row['pnl'],
-                highest_price=row['highest_price'],
-                breakeven_triggered=bool(row['breakeven_triggered']),
-                original_stop_loss=row['original_stop_loss']
-            ))
-
-        conn.close()
-        return trades
+            trades = []
+            for row in cur.fetchall():
+                trades.append(StoredTrade(
+                    trade_id=row['trade_id'],
+                    coin=row['coin'],
+                    entry_price=row['entry_price'],
+                    entry_time=row['entry_time'],
+                    size=row['size'],
+                    liquidated_wallet=row['liquidated_wallet'],
+                    liquidation_value=row['liquidation_value'],
+                    take_profit_price=row['take_profit_price'],
+                    stop_loss_price=row['stop_loss_price'],
+                    status=row['status'],
+                    exit_price=row['exit_price'],
+                    exit_time=row['exit_time'],
+                    pnl=row['pnl'],
+                    highest_price=row['highest_price'],
+                    breakeven_triggered=bool(row['breakeven_triggered']),
+                    original_stop_loss=row['original_stop_loss']
+                ))
+            return trades
+        finally:
+            put_conn(conn)
 
     def get_daily_stats(self, date: str = None) -> Dict:
         """Get stats for a day (default: today)."""
         if date is None:
             date = datetime.now().strftime('%Y-%m-%d')
 
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = get_conn()
+        try:
+            import psycopg2.extras
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                "SELECT * FROM paper_trade_stats WHERE date = %s",
+                (date,)
+            )
+            row = cur.fetchone()
 
-        cursor = conn.execute(
-            "SELECT * FROM paper_trade_stats WHERE date = ?",
-            (date,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-
-        if row:
-            return {
-                'date': row['date'],
-                'total_trades': row['total_trades'],
-                'winning_trades': row['winning_trades'],
-                'losing_trades': row['losing_trades'],
-                'total_pnl': row['total_pnl'],
-                'largest_win': row['largest_win'],
-                'largest_loss': row['largest_loss'],
-                'win_rate': row['winning_trades'] / row['total_trades'] * 100 if row['total_trades'] > 0 else 0
-            }
-        else:
-            return {
-                'date': date,
-                'total_trades': 0,
-                'winning_trades': 0,
-                'losing_trades': 0,
-                'total_pnl': 0,
-                'largest_win': 0,
-                'largest_loss': 0,
-                'win_rate': 0
-            }
+            if row:
+                return {
+                    'date': row['date'],
+                    'total_trades': row['total_trades'],
+                    'winning_trades': row['winning_trades'],
+                    'losing_trades': row['losing_trades'],
+                    'total_pnl': row['total_pnl'],
+                    'largest_win': row['largest_win'],
+                    'largest_loss': row['largest_loss'],
+                    'win_rate': row['winning_trades'] / row['total_trades'] * 100 if row['total_trades'] > 0 else 0
+                }
+            else:
+                return {
+                    'date': date,
+                    'total_trades': 0,
+                    'winning_trades': 0,
+                    'losing_trades': 0,
+                    'total_pnl': 0,
+                    'largest_win': 0,
+                    'largest_loss': 0,
+                    'win_rate': 0
+                }
+        finally:
+            put_conn(conn)
 
     def update_daily_stats(self, pnl: float):
         """Update daily stats when a trade closes."""
@@ -301,97 +247,100 @@ class PaperTradeStore:
         now = time.time()
         won = pnl > 0
 
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
 
-        # Get current stats
-        cursor = conn.execute(
-            "SELECT * FROM paper_trade_stats WHERE date = ?",
-            (date,)
-        )
-        row = cursor.fetchone()
+            # Get current stats
+            cur.execute(
+                "SELECT date FROM paper_trade_stats WHERE date = %s",
+                (date,)
+            )
+            row = cur.fetchone()
 
-        if row:
-            # Update existing
-            conn.execute("""
-                UPDATE paper_trade_stats SET
-                    total_trades = total_trades + 1,
-                    winning_trades = winning_trades + ?,
-                    losing_trades = losing_trades + ?,
-                    total_pnl = total_pnl + ?,
-                    largest_win = MAX(largest_win, ?),
-                    largest_loss = MIN(largest_loss, ?),
-                    updated_at = ?
-                WHERE date = ?
-            """, (
-                1 if won else 0,
-                0 if won else 1,
-                pnl,
-                pnl if won else 0,
-                pnl if not won else 0,
-                now,
-                date
-            ))
-        else:
-            # Insert new
-            conn.execute("""
-                INSERT INTO paper_trade_stats (
-                    date, total_trades, winning_trades, losing_trades,
-                    total_pnl, largest_win, largest_loss, updated_at
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
-            """, (
-                date,
-                1 if won else 0,
-                0 if won else 1,
-                pnl,
-                pnl if won else 0,
-                pnl if not won else 0,
-                now
-            ))
+            if row:
+                cur.execute("""
+                    UPDATE paper_trade_stats SET
+                        total_trades = total_trades + 1,
+                        winning_trades = winning_trades + %s,
+                        losing_trades = losing_trades + %s,
+                        total_pnl = total_pnl + %s,
+                        largest_win = GREATEST(largest_win, %s),
+                        largest_loss = LEAST(largest_loss, %s),
+                        updated_at = %s
+                    WHERE date = %s
+                """, (
+                    1 if won else 0,
+                    0 if won else 1,
+                    pnl,
+                    pnl if won else 0,
+                    pnl if not won else 0,
+                    now,
+                    date
+                ))
+            else:
+                cur.execute("""
+                    INSERT INTO paper_trade_stats (
+                        date, total_trades, winning_trades, losing_trades,
+                        total_pnl, largest_win, largest_loss, updated_at
+                    ) VALUES (%s, 1, %s, %s, %s, %s, %s, %s)
+                """, (
+                    date,
+                    1 if won else 0,
+                    0 if won else 1,
+                    pnl,
+                    pnl if won else 0,
+                    pnl if not won else 0,
+                    now
+                ))
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def get_all_time_stats(self) -> Dict:
         """Get aggregate stats across all time."""
-        conn = sqlite3.connect(self.db_path)
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
+                    COALESCE(SUM(pnl), 0) as total_pnl,
+                    COALESCE(MAX(pnl), 0) as largest_win,
+                    COALESCE(MIN(pnl), 0) as largest_loss,
+                    COALESCE(AVG(pnl), 0) as avg_pnl
+                FROM paper_trades
+                WHERE pnl IS NOT NULL
+            """)
 
-        cursor = conn.execute("""
-            SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
-                COALESCE(SUM(pnl), 0) as total_pnl,
-                COALESCE(MAX(pnl), 0) as largest_win,
-                COALESCE(MIN(pnl), 0) as largest_loss,
-                COALESCE(AVG(pnl), 0) as avg_pnl
-            FROM paper_trades
-            WHERE pnl IS NOT NULL
-        """)
+            row = cur.fetchone()
 
-        row = cursor.fetchone()
-        conn.close()
-
-        if row:
-            total = row[0] or 0
-            wins = row[1] or 0
-            return {
-                'total_trades': total,
-                'winning_trades': wins,
-                'losing_trades': row[2] or 0,
-                'total_pnl': row[3] or 0,
-                'largest_win': row[4] or 0,
-                'largest_loss': row[5] or 0,
-                'avg_pnl': row[6] or 0,
-                'win_rate': (wins / total * 100) if total > 0 else 0
-            }
-        else:
-            return {
-                'total_trades': 0,
-                'winning_trades': 0,
-                'losing_trades': 0,
-                'total_pnl': 0,
-                'largest_win': 0,
-                'largest_loss': 0,
-                'avg_pnl': 0,
-                'win_rate': 0
-            }
+            if row:
+                total = row[0] or 0
+                wins = row[1] or 0
+                return {
+                    'total_trades': total,
+                    'winning_trades': wins,
+                    'losing_trades': row[2] or 0,
+                    'total_pnl': row[3] or 0,
+                    'largest_win': row[4] or 0,
+                    'largest_loss': row[5] or 0,
+                    'avg_pnl': row[6] or 0,
+                    'win_rate': (wins / total * 100) if total > 0 else 0
+                }
+            else:
+                return {
+                    'total_trades': 0,
+                    'winning_trades': 0,
+                    'losing_trades': 0,
+                    'total_pnl': 0,
+                    'largest_win': 0,
+                    'largest_loss': 0,
+                    'avg_pnl': 0,
+                    'win_rate': 0
+                }
+        finally:
+            put_conn(conn)

@@ -5,16 +5,20 @@ Analyzes which primitive combinations lead to profitable trades.
 Constitutional: Factual correlation only, not prediction.
 
 Usage:
-    python scripts/analyze_primitive_performance.py logs/execution.db
+    python scripts/analyze_primitive_performance.py
 """
 
-import sqlite3
 import sys
+from pathlib import Path
 from typing import Dict, List
 from collections import defaultdict
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-def analyze_primitive_performance(db_path: str, min_trades: int = 10) -> Dict:
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
+
+
+def analyze_primitive_performance(min_trades: int = 10) -> Dict:
     """
     Analyze which primitive combinations lead to profitable trades.
 
@@ -24,30 +28,32 @@ def analyze_primitive_performance(db_path: str, min_trades: int = 10) -> Dict:
     - Holding duration by primitive pattern
 
     Args:
-        db_path: Path to execution database
         min_trades: Minimum trades required to include primitive combination
 
     Returns:
         Dict with analysis results
     """
-    conn = sqlite3.connect(db_path)
+    conn = get_conn()
+    try:
+        # Get all policy outcomes with ghost trade results
+        query = """
+            SELECT
+                po.symbol,
+                po.active_primitives,
+                po.realized_pnl,
+                po.holding_duration_sec,
+                po.exit_reason,
+                po.mandate_type
+            FROM policy_outcomes po
+            WHERE po.realized_pnl IS NOT NULL
+              AND po.executed_action = 'ENTRY'
+        """
 
-    # Get all policy outcomes with ghost trade results
-    query = """
-        SELECT
-            po.symbol,
-            po.active_primitives,
-            po.realized_pnl,
-            po.holding_duration_sec,
-            po.exit_reason,
-            po.mandate_type
-        FROM policy_outcomes po
-        WHERE po.realized_pnl IS NOT NULL
-          AND po.executed_action = 'ENTRY'
-    """
-
-    outcomes = conn.execute(query).fetchall()
-    conn.close()
+        cursor = conn.cursor()
+        cursor.execute(query)
+        outcomes = cursor.fetchall()
+    finally:
+        put_conn(conn)
 
     if len(outcomes) == 0:
         return {'error': 'No completed trades found'}
@@ -107,13 +113,13 @@ def analyze_primitive_performance(db_path: str, min_trades: int = 10) -> Dict:
     }
 
 
-def print_primitive_performance_report(db_path: str):
+def print_primitive_performance_report():
     """Print readable performance report."""
     print("=" * 80)
     print("PRIMITIVE PERFORMANCE ANALYSIS")
     print("=" * 80)
 
-    stats = analyze_primitive_performance(db_path)
+    stats = analyze_primitive_performance()
 
     if 'error' in stats:
         print(f"\nError: {stats['error']}")
@@ -149,12 +155,13 @@ def print_primitive_performance_report(db_path: str):
 
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "logs/execution.db"
+    # --db argument kept for backward compat but ignored (data comes from PostgreSQL now)
+    init_pool()
 
-    print(f"Analyzing primitive performance from: {db_path}\n")
+    print(f"Analyzing primitive performance from PostgreSQL\n")
 
     try:
-        print_primitive_performance_report(db_path)
+        print_primitive_performance_report()
     except Exception as e:
         print(f"ERROR: {e}")
         import traceback

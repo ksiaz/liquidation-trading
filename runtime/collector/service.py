@@ -26,8 +26,7 @@ from runtime.policy_adapter import PolicyAdapter, AdapterConfig
 from runtime.arbitration.arbitrator import MandateArbitrator
 from runtime.executor.controller import ExecutionController
 from runtime.risk.types import RiskConfig, AccountState
-from runtime.logging.execution_db import ResearchDatabase
-from runtime.logging.buffered_db import BufferedResearchDatabase
+from runtime.logging.pg_buffered_db import PgBufferedResearchDatabase
 
 # Import Ghost Tracker
 from execution.ep4_ghost_tracker import GhostPositionTracker
@@ -100,14 +99,11 @@ class CollectorService:
         self._warmup_complete = False
 
         # Initialize execution database for logging FIRST
-        # Wrap with buffered wrapper to prevent synchronous SQLite commits from blocking event loop
-        # Performance fix: 0.2 cycles/s -> 5 cycles/s (25x improvement)
-        _raw_db = ResearchDatabase(db_path="logs/execution.db")
-        self._execution_db = BufferedResearchDatabase(
-            db=_raw_db,
-            flush_interval_sec=1.0,  # Batch commits every 1 second
-            max_buffer_size=1000,    # Force flush if buffer exceeds 1000 writes
-            enable_high_frequency_logs=False  # Skip trade/orderbook logging by default
+        # PostgreSQL backend: no _db_lock, prune doesn't block writes (MVCC)
+        self._execution_db = PgBufferedResearchDatabase(
+            flush_interval_sec=1.0,
+            max_buffer_size=1000,
+            enable_high_frequency_logs=False,
         )
         
         # Inject event logger into observation system's M2 store
@@ -148,7 +144,7 @@ class CollectorService:
         self._last_stream_time = None
 
         # Ghost Trading Tracker ($1000 initial, 5% position size, all 10 symbols)
-        # All execution.db writes go through BufferedResearchDatabase (single writer).
+        # All writes go through PgBufferedResearchDatabase (PostgreSQL, no lock).
         self.ghost_tracker = GhostPositionTracker(
             initial_balance=1000.0,
             position_size_pct=0.05,
@@ -414,6 +410,23 @@ class CollectorService:
 
         return len(to_remove)
 
+    def _get_live_price(self, symbol: str) -> Optional[float]:
+        """Get the most reliable live price for a symbol.
+
+        Priority:
+        1. WebSocket mid price (live from HL API, not from lagging node)
+        2. _current_prices fallback (from node oracle or fills)
+
+        The WS allMids subscription provides real-time prices even when the
+        HL node is bootstrapping or behind the chain tip.
+        """
+        coin = symbol.replace('USDT', '')
+        if self._hyperliquid_collector and hasattr(self._hyperliquid_collector, '_client'):
+            ws_mid = self._hyperliquid_collector._client.get_mid_price(coin)
+            if ws_mid and ws_mid > 0:
+                return ws_mid
+        return self._current_prices.get(symbol)
+
     def get_calculator_metrics(self) -> dict:
         """Get calculator memory metrics."""
         return {
@@ -507,13 +520,12 @@ class CollectorService:
 
             # Also register trailing stops from ghost_positions (may have additional positions)
             try:
-                import sqlite3
-                ghost_db = "/tmp/ghost_trades.db"
-                if os.path.exists(ghost_db):
-                    conn = sqlite3.connect(ghost_db)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT symbol, side, entry_price FROM ghost_positions WHERE status = 'OPEN'")
-                    for row in cursor.fetchall():
+                from runtime.logging.pg_pool import get_conn, put_conn
+                pg_conn = get_conn()
+                try:
+                    cur = pg_conn.cursor()
+                    cur.execute("SELECT symbol, side, entry_price FROM ghost_positions WHERE status = 'OPEN'")
+                    for row in cur.fetchall():
                         symbol, side, entry_price = row
                         # Skip if already registered
                         if f"RECOVERED_{symbol}" in [s.entry_order_id for s in self._trailing_stop_manager.get_all_stops().values()]:
@@ -538,7 +550,8 @@ class CollectorService:
                             config=self._trailing_stop_config
                         )
                         self._logger.info(f"  {symbol}: registered ghost trailing stop @ ${initial_stop:,.2f}")
-                    conn.close()
+                finally:
+                    put_conn(pg_conn)
             except Exception as ghost_err:
                 self._logger.debug(f"Ghost position recovery: {ghost_err}")
 
@@ -860,9 +873,9 @@ class CollectorService:
                     self._process_ghost_trades()
 
             except Exception as e:
-                # Fail silently per constitutional rules - log but don't halt
-                self._logger.debug(f"Clock/Execution cycle exception: {e}")
-                pass
+                self._logger.warning(f"Clock/Execution cycle exception: {e}")
+                import traceback
+                traceback.print_exc()
 
             await asyncio.sleep(0.2)  # 5Hz cycle (was 0.1s / 10Hz)
 
@@ -921,18 +934,17 @@ class CollectorService:
                     continue
 
                 try:
-                    # Get current price from HL node oracle
+                    # Get current price — prefer live WS mid over node oracle
                     hl_symbol = symbol.replace('USDT', '')
-                    price = node_prices.get(hl_symbol) or self._current_prices.get(symbol)
+                    price = self._get_live_price(symbol) or node_prices.get(hl_symbol)
                     if price is None:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
                         continue  # No price data yet
 
-                    # Update price dicts from HL oracle so all paths use fresh data
-                    if node_prices.get(hl_symbol):
-                        self._mark_prices[symbol] = Decimal(str(price))
-                        self._current_prices[symbol] = price
+                    # Update price dicts so all paths use the best available price
+                    self._mark_prices[symbol] = Decimal(str(price))
+                    self._current_prices[symbol] = price
 
                     # Update trailing stops with oracle price every cycle
                     # (HL fills are sparse — oracle price ensures stops trail on moves)
@@ -998,19 +1010,23 @@ class CollectorService:
                         orderflow_fill_count=orderflow_fill_count
                     )
 
-                    # Classify regime
-                    regime_state = classify_regime(regime_metrics)
+                    # Classify regime (pass current state for hysteresis)
+                    prev_regime = self._prev_regime_states.get(symbol)
+                    regime_state = classify_regime(regime_metrics, prev_regime)
 
                     # Diagnostic: show why DISABLED (temporary)
                     if _diag_regime and regime_state.name == "DISABLED" and cycle_id and cycle_id % 50 == 1:
                         atr_ratio = atr_5m / atr_30m if atr_30m else 0
-                        print(f"[REGIME] {symbol}: DISABLED - vwap_d={vwap_distance:.1f} atr5={atr_5m:.1f} "
-                              f"atr30={atr_30m:.1f} ratio={atr_ratio:.2f} of={orderflow_imbalance:.3f} "
+                        atr5_pct = (atr_5m / price * 100) if price else 0
+                        atr30_pct = (atr_30m / price * 100) if price else 0
+                        print(f"[REGIME] {symbol}: DISABLED - vwap_d={vwap_distance:.4f} "
+                              f"atr5={atr5_pct:.2f}% atr30={atr30_pct:.2f}% "
+                              f"ratio={atr_ratio:.2f} of={orderflow_imbalance:.3f} "
                               f"liq_z={liquidation_zscore:.2f}", flush=True)
 
                     # Phase 6: Debounced regime transitions
                     # Require N consecutive cycles of the new state before applying
-                    prev_regime = self._prev_regime_states.get(symbol)
+                    # (prev_regime already read above for classifier hysteresis)
                     if prev_regime is not None and prev_regime != regime_state:
                         pending = self._regime_pending.get(symbol)
                         if pending and pending[0] == regime_state:
@@ -1021,10 +1037,13 @@ class CollectorService:
 
                         if count >= self._REGIME_DEBOUNCE_CYCLES:
                             # Confirmed transition
+                            atr5_pct = (atr_5m / price * 100) if price else 0
+                            atr30_pct = (atr_30m / price * 100) if price else 0
+                            atr_r = atr_5m / atr_30m if atr_30m else 0
                             self._logger.info(
                                 f"Regime transition: {symbol} {prev_regime.name} → {regime_state.name} "
-                                f"(VWAP dist={vwap_distance:.1f}, ATR 5m/30m={atr_5m:.1f}/{atr_30m:.1f}, "
-                                f"orderflow={orderflow_imbalance:.3f}, liq_z={liquidation_zscore:.2f})"
+                                f"(VWAP dist={vwap_distance:.4f}, ATR 5m={atr5_pct:.2f}% 30m={atr30_pct:.2f}% "
+                                f"ratio={atr_r:.2f}, orderflow={orderflow_imbalance:.3f}, liq_z={liquidation_zscore:.2f})"
                             )
                             self._prev_regime_states[symbol] = regime_state
                             self._regime_pending.pop(symbol, None)
@@ -1042,7 +1061,7 @@ class CollectorService:
 
                 except Exception as e:
                     # Don't fail cycle if regime classification fails
-                    self._logger.debug(f"Regime classification error for {symbol}: {e}")
+                    self._logger.warning(f"Regime classification error for {symbol}: {e}")
                     continue
 
             # Collect mandates from all active symbols
@@ -1076,7 +1095,7 @@ class CollectorService:
                     # Get regime state and metrics for this symbol (Phase 5)
                     regime_state = self._regime_states.get(symbol)
                     regime_metrics = self._regime_metrics.get(symbol)
-                    current_price = self._current_prices.get(symbol)
+                    current_price = self._get_live_price(symbol)
 
                     # Phase 6: Log which strategy will evaluate
                     if regime_state is not None:
@@ -1230,8 +1249,7 @@ class CollectorService:
                             stability_observer.record_mandate(m)
                     all_mandates.extend(mandates)
                 except Exception as e:
-                    # CRITICAL: Don't silently swallow exceptions - log and continue
-                    self._logger.debug(f"Policy generation exception for {symbol}: {e}")
+                    self._logger.warning(f"Policy generation exception for {symbol}: {e}")
                     import traceback
                     traceback.print_exc()
                     # Continue to next symbol
@@ -1300,7 +1318,7 @@ class CollectorService:
                 # --- EXIT: close ghost position (must stay in sync with controller) ---
                 elif result.action.name == "EXIT":
                     if self.ghost_tracker.has_open_position(result.symbol):
-                        current_price = self._get_current_price(result.symbol)
+                        current_price = self._get_live_price(result.symbol)
                         ok, err, trade = self.ghost_tracker.close_position(
                             symbol=result.symbol,
                             cycle_id=getattr(result, 'cycle_id', None),
@@ -1488,9 +1506,13 @@ class CollectorService:
         """
         symbol = hl_symbol + 'USDT'
 
-        # Update price dicts immediately (no regime loop dependency)
+        # Do NOT write to _current_prices here. This callback runs on a gRPC
+        # daemon thread — writing to _current_prices races with the asyncio
+        # event loop (regime loop + mandate processing). When the node is
+        # bootstrapping old blocks, the oracle price can be stale/wrong,
+        # overwriting the correct WS mid that _get_live_price() provides.
+        # The regime loop updates _current_prices every 2s from _get_live_price().
         self._mark_prices[symbol] = Decimal(str(price))
-        self._current_prices[symbol] = price
 
         # Feed ATR calculator with oracle prices (keeps ATR fresh between sparse fills).
         # Create ATR if it doesn't exist yet — symbols with zero fills would never
@@ -1554,8 +1576,10 @@ class CollectorService:
             is_buyer_maker = (side == "A")
             self._orderflow_calculators[normalized_symbol].update(is_buyer_maker, size, timestamp)
 
-            # 8. Track current price + rolling high/low (5-min window)
-            self._current_prices[normalized_symbol] = price
+            # 8. Track rolling high/low (5-min window)
+            # Do NOT write to _current_prices here — this runs on a gRPC daemon
+            # thread and races with the asyncio event loop. The regime loop
+            # updates _current_prices every 2s from _get_live_price() (WS mid).
             now = time.time()
             if normalized_symbol not in self._hl_reset_time or now - self._hl_reset_time[normalized_symbol] >= 300:
                 self._hl_reset_time[normalized_symbol] = now
@@ -1783,11 +1807,11 @@ class CollectorService:
         return active_primitives
 
     def _get_current_price(self, symbol: str) -> Optional[float]:
-        """Get current price for symbol from cache.
+        """Get current price — delegates to _get_live_price for WS mid priority.
 
-        Returns None if no price available.
+        Kept for backward compatibility. All new code should use _get_live_price().
         """
-        return self._current_prices.get(symbol)
+        return self._get_live_price(symbol)
 
     def _reconcile_positions_on_startup(self):
         """Reconcile ghost tracker with positions.db on startup.
@@ -1797,18 +1821,18 @@ class CollectorService:
         2. Controller OPEN + Ghost empty → register in ghost tracker + trailing stop
         """
         try:
-            import sqlite3
-            pos_db = 'logs/positions.db'
-            if not os.path.exists(pos_db):
-                return
-
-            conn = sqlite3.connect(pos_db, timeout=10)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT symbol, state, direction, quantity, entry_price, strategy_id "
-                "FROM positions"
-            ).fetchall()
-            conn.close()
+            import psycopg2.extras
+            from runtime.logging.pg_pool import get_conn, put_conn
+            pg_conn = get_conn()
+            try:
+                cur = pg_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cur.execute(
+                    "SELECT symbol, state, direction, quantity, entry_price, strategy_id "
+                    "FROM positions"
+                )
+                rows = cur.fetchall()
+            finally:
+                put_conn(pg_conn)
 
             controller_open = {}
             for row in rows:
@@ -1875,27 +1899,27 @@ class CollectorService:
             print(f"RECONCILE: Error during startup reconciliation: {e}")
 
     def _backfill_missing_exits(self):
-        """Backfill missing exit rows in execution.db from ghost_positions DB.
+        """Backfill missing exit rows in ghost_trades from ghost_positions.
 
         When the process is killed (kill -9), BRD buffer is lost. The position
-        DB (/tmp/ghost_trades.db) gets updated immediately (direct write), but
-        execution.db exit rows are lost. This method detects the mismatch and
+        table (ghost_positions) gets updated immediately (direct write), but
+        ghost_trades exit rows are lost. This method detects the mismatch and
         writes the missing exit rows on startup.
         """
         try:
-            import sqlite3
-            pos_db_path = '/tmp/ghost_trades.db'
-            if not os.path.exists(pos_db_path):
-                return
-
-            pos_conn = sqlite3.connect(pos_db_path, timeout=10)
-            closed_positions = pos_conn.execute('''
-                SELECT trade_id, symbol, side, qty, entry_price, exit_price,
-                       entry_time, exit_time, pnl, strategy_id
-                FROM ghost_positions
-                WHERE status = 'CLOSED' AND exit_price IS NOT NULL
-            ''').fetchall()
-            pos_conn.close()
+            from runtime.logging.pg_pool import get_conn, put_conn
+            pg_conn = get_conn()
+            try:
+                cur = pg_conn.cursor()
+                cur.execute('''
+                    SELECT trade_id, symbol, side, qty, entry_price, exit_price,
+                           entry_time, exit_time, pnl, strategy_id
+                    FROM ghost_positions
+                    WHERE status = 'CLOSED' AND exit_price IS NOT NULL
+                ''')
+                closed_positions = cur.fetchall()
+            finally:
+                put_conn(pg_conn)
 
             if not closed_positions:
                 return
@@ -1991,18 +2015,20 @@ class CollectorService:
             traceback.print_exc()
 
     def _force_position_flat(self, symbol: str):
-        """Set position to FLAT in positions.db."""
+        """Set position to FLAT in positions table."""
         try:
-            import sqlite3
-            conn = sqlite3.connect('logs/positions.db', timeout=10)
-            conn.execute(
-                "UPDATE positions SET state = 'FLAT', direction = NULL, quantity = '0', "
-                "entry_price = NULL, strategy_id = NULL, entry_context = NULL "
-                "WHERE symbol = ?",
-                (symbol,)
-            )
-            conn.commit()
-            conn.close()
+            from runtime.logging.pg_pool import get_conn, put_conn
+            pg_conn = get_conn()
+            try:
+                pg_conn.cursor().execute(
+                    "UPDATE positions SET state = 'FLAT', direction = NULL, quantity = '0', "
+                    "entry_price = NULL, strategy_id = NULL, entry_context = NULL "
+                    "WHERE symbol = %s",
+                    (symbol,)
+                )
+                pg_conn.commit()
+            finally:
+                put_conn(pg_conn)
         except Exception as e:
             print(f"WARN: _force_position_flat({symbol}) failed: {e}")
 
@@ -2014,14 +2040,18 @@ class CollectorService:
         opened before the unified path (or after a restart without reconciliation).
         """
         try:
-            import sqlite3
-            conn = sqlite3.connect('logs/positions.db', timeout=10)
-            row = conn.execute(
-                "SELECT quantity FROM positions WHERE symbol = ?",
-                (symbol,)
-            ).fetchone()
-            qty = float(row[0]) if row and row[0] else 0.0
-            conn.close()
+            from runtime.logging.pg_pool import get_conn, put_conn
+            pg_conn = get_conn()
+            try:
+                cur = pg_conn.cursor()
+                cur.execute(
+                    "SELECT quantity FROM positions WHERE symbol = %s",
+                    (symbol,)
+                )
+                row = cur.fetchone()
+                qty = float(row[0]) if row and row[0] else 0.0
+            finally:
+                put_conn(pg_conn)
 
             # Set FLAT
             self._force_position_flat(symbol)

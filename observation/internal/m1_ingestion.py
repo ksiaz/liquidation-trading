@@ -582,7 +582,7 @@ class M1IngestionEngine:
         """
         return {
             symbol: data['oracle_price']
-            for symbol, data in self.latest_hl_prices.items()
+            for symbol, data in list(self.latest_hl_prices.items())
         }
 
     def get_hl_price_at_offset(self, symbol: str, offset_sec: float, current_time: float) -> Optional[float]:
@@ -612,7 +612,7 @@ class M1IngestionEngine:
         best_price = None
         best_diff = float('inf')
 
-        for event in price_history:
+        for event in list(price_history):
             diff = abs(event['timestamp'] - target_time)
             if diff < best_diff:
                 best_diff = diff

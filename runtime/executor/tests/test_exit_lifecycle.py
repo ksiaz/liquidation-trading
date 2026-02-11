@@ -19,10 +19,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 import runtime.env_setup  # noqa: F401
 
 import pytest
-import tempfile
+import psycopg2.extras
 from decimal import Decimal
 from typing import Optional
 
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 from runtime.executor.controller import ExecutionController
 from runtime.arbitration.types import Mandate, MandateType, Action, ActionType
 from runtime.position.types import PositionState, Direction
@@ -48,11 +49,8 @@ from memory.m4_node_patterns import SupplyDemandZonePrimitive
 # Test Utilities
 # =============================================================================
 
-def _create_temp_db():
-    """Create temporary database for testing persistence."""
-    fd, path = tempfile.mkstemp(suffix='.db')
-    os.close(fd)
-    return path
+# Ensure PG pool is initialized before any DB access
+init_pool()
 
 
 def _create_account():
@@ -433,55 +431,48 @@ class TestEXITFullLifecycle:
 
     def test_entry_exit_across_persistence(self):
         """Full lifecycle across restart: ENTRY → [RESTART] → EXIT."""
-        db_path = _create_temp_db()
+        # Uses shared PG pool - test isolation from test data, not DB file
+        # Cycle 1: Execute ENTRY with persistence
+        controller1 = ExecutionController(db_path="pg")
+        account = _create_account()
+        mark_prices = _create_mark_prices()
 
-        try:
-            # Cycle 1: Execute ENTRY with persistence
-            controller1 = ExecutionController(db_path=db_path)
-            account = _create_account()
-            mark_prices = _create_mark_prices()
+        entry_mandates = [Mandate(
+            symbol="BTCUSDT",
+            type=MandateType.ENTRY,
+            authority=5.0,
+            timestamp=100.0,
+            direction="LONG",
+            quantity=Decimal("100") / Decimal("50000"),
+            entry_price=Decimal("50000")
+        )]
 
-            entry_mandates = [Mandate(
-                symbol="BTCUSDT",
-                type=MandateType.ENTRY,
-                authority=5.0,
-                timestamp=100.0,
-                direction="LONG",
-                quantity=Decimal("100") / Decimal("50000"),
-                entry_price=Decimal("50000")
-            )]
+        controller1.process_cycle(entry_mandates, account, mark_prices)
 
-            controller1.process_cycle(entry_mandates, account, mark_prices)
+        position = controller1.state_machine.get_position("BTCUSDT")
+        assert position.state == PositionState.OPEN
 
-            position = controller1.state_machine.get_position("BTCUSDT")
-            assert position.state == PositionState.OPEN
+        # Simulate restart: Create new controller with same PG pool
+        controller2 = ExecutionController(db_path="pg")
 
-            # Simulate restart: Create new controller with same DB
-            controller2 = ExecutionController(db_path=db_path)
+        # Verify position loaded from DB
+        position_loaded = controller2.state_machine.get_position("BTCUSDT")
+        assert position_loaded.state == PositionState.OPEN
+        assert position_loaded.symbol == "BTCUSDT"
 
-            # Verify position loaded from DB
-            position_loaded = controller2.state_machine.get_position("BTCUSDT")
-            assert position_loaded.state == PositionState.OPEN
-            assert position_loaded.symbol == "BTCUSDT"
+        # Cycle 2: Execute EXIT on reloaded position
+        exit_mandates = [Mandate(
+            symbol="BTCUSDT",
+            type=MandateType.EXIT,
+            authority=5.0,
+            timestamp=200.0
+        )]
 
-            # Cycle 2: Execute EXIT on reloaded position
-            exit_mandates = [Mandate(
-                symbol="BTCUSDT",
-                type=MandateType.EXIT,
-                authority=5.0,
-                timestamp=200.0
-            )]
+        controller2.process_cycle(exit_mandates, account, mark_prices)
 
-            controller2.process_cycle(exit_mandates, account, mark_prices)
-
-            # Assert: Position correctly closed
-            position_after = controller2.state_machine.get_position("BTCUSDT")
-            assert position_after.state == PositionState.FLAT
-
-        finally:
-            # Cleanup temp DB
-            if os.path.exists(db_path):
-                os.remove(db_path)
+        # Assert: Position correctly closed
+        position_after = controller2.state_machine.get_position("BTCUSDT")
+        assert position_after.state == PositionState.FLAT
 
 
 # =============================================================================
@@ -540,92 +531,72 @@ class TestPositionPersistence:
 
     def test_open_position_persists_to_db(self):
         """OPEN position is saved to database."""
-        db_path = _create_temp_db()
+        controller = ExecutionController(db_path="pg")
+        account = _create_account()
+        mark_prices = _create_mark_prices()
 
+        # Action: Transition to OPEN
+        _execute_entry(controller, "BTCUSDT", account, mark_prices)
+
+        position = controller.state_machine.get_position("BTCUSDT")
+        assert position.state == PositionState.OPEN
+
+        # Assert: PG contains position record
+        conn = get_conn()
         try:
-            controller = ExecutionController(db_path=db_path)
-            account = _create_account()
-            mark_prices = _create_mark_prices()
-
-            # Action: Transition to OPEN
-            _execute_entry(controller, "BTCUSDT", account, mark_prices)
-
-            position = controller.state_machine.get_position("BTCUSDT")
-            assert position.state == PositionState.OPEN
-
-            # Assert: DB contains position record
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
             cursor.execute('''
                 SELECT symbol, state FROM positions
                 WHERE symbol = 'BTCUSDT'
             ''')
             row = cursor.fetchone()
-            conn.close()
 
             assert row is not None
-            assert row[0] == "BTCUSDT"
-            assert row[1] == "OPEN"
-
+            assert row['symbol'] == "BTCUSDT"
+            assert row['state'] == "OPEN"
         finally:
-            if os.path.exists(db_path):
-                os.remove(db_path)
+            put_conn(conn)
 
     def test_load_positions_on_startup(self):
         """Position loaded from DB on startup."""
-        db_path = _create_temp_db()
+        # Setup: Create position in PG via controller
+        controller1 = ExecutionController(db_path="pg")
+        account = _create_account()
+        mark_prices = _create_mark_prices()
 
-        try:
-            # Setup: Create position in DB
-            controller1 = ExecutionController(db_path=db_path)
-            account = _create_account()
-            mark_prices = _create_mark_prices()
+        _execute_entry(controller1, "BTCUSDT", account, mark_prices)
 
-            _execute_entry(controller1, "BTCUSDT", account, mark_prices)
+        # Action: Create new controller (simulates restart)
+        controller2 = ExecutionController(db_path="pg")
 
-            # Action: Create new controller (simulates restart)
-            controller2 = ExecutionController(db_path=db_path)
-
-            # Assert: Position loaded into _positions dict
-            position = controller2.state_machine.get_position("BTCUSDT")
-            assert position.state == PositionState.OPEN
-            assert position.symbol == "BTCUSDT"
-
-        finally:
-            if os.path.exists(db_path):
-                os.remove(db_path)
+        # Assert: Position loaded into _positions dict
+        position = controller2.state_machine.get_position("BTCUSDT")
+        assert position.state == PositionState.OPEN
+        assert position.symbol == "BTCUSDT"
 
     def test_flat_position_excluded_from_load(self):
         """FLAT position excluded from load_all (not loaded on restart)."""
-        db_path = _create_temp_db()
+        controller = ExecutionController(db_path="pg")
+        account = _create_account()
+        mark_prices = _create_mark_prices()
 
-        try:
-            controller = ExecutionController(db_path=db_path)
-            account = _create_account()
-            mark_prices = _create_mark_prices()
+        # Setup: Create OPEN position
+        _execute_entry(controller, "BTCUSDT", account, mark_prices)
 
-            # Setup: Create OPEN position
-            _execute_entry(controller, "BTCUSDT", account, mark_prices)
+        position = controller.state_machine.get_position("BTCUSDT")
+        assert position.state == PositionState.OPEN
 
-            position = controller.state_machine.get_position("BTCUSDT")
-            assert position.state == PositionState.OPEN
+        # Action: Transition to FLAT (EXIT)
+        exit_mandates = [Mandate(
+            symbol="BTCUSDT",
+            type=MandateType.EXIT,
+            authority=5.0,
+            timestamp=200.0
+        )]
 
-            # Action: Transition to FLAT (EXIT)
-            exit_mandates = [Mandate(
-                symbol="BTCUSDT",
-                type=MandateType.EXIT,
-                authority=5.0,
-                timestamp=200.0
-            )]
+        controller.process_cycle(exit_mandates, account, mark_prices)
 
-            controller.process_cycle(exit_mandates, account, mark_prices)
-
-            # Assert: FLAT position not loaded on restart
-            controller2 = ExecutionController(db_path=db_path)
-            position_after = controller2.state_machine.get_position("BTCUSDT")
-            assert position_after.state == PositionState.FLAT  # Default FLAT (not loaded)
-
-        finally:
-            if os.path.exists(db_path):
-                os.remove(db_path)
+        # Assert: FLAT position not loaded on restart
+        controller2 = ExecutionController(db_path="pg")
+        position_after = controller2.state_machine.get_position("BTCUSDT")
+        assert position_after.state == PositionState.FLAT  # Default FLAT (not loaded)

@@ -38,7 +38,7 @@ python scripts/analyze_research_db.py --primitives --symbol BTCUSDT
 python scripts/analyze_research_db.py --nodes
 
 # Database direct query
-python -c "import sqlite3; c = sqlite3.connect('logs/execution.db'); ..."
+psql -U liqtrade -d liquidation_trading -c "SELECT COUNT(*) FROM execution_cycles;"
 ```
 
 ### Ready for Extended Run:

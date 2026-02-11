@@ -136,6 +136,13 @@ _exit_stability_counter: dict = {}
 # Requires N consecutive cycles of breakage before invalidation — filters noise
 _break_confirmation_counter: dict = {}
 
+# Track invalidated zones per symbol — prevents re-entry into broken zones.
+# Stores (zone_type, zone_low, zone_high, timestamp) tuples. Matches by geometric
+# overlap AND zone_type, so supply invalidation doesn't block demand entries.
+# Expires after max age (M2 nodes decayed, zone structure gone).
+_invalidated_zones: dict = {}  # symbol -> list of (zone_type, zone_low, zone_high, invalidation_ts)
+_INVALIDATED_ZONE_MAX_AGE_SEC = 600  # 10 minutes — well beyond M2 node decay
+
 # Minimum consecutive cycles price must be beyond zone bounds before invalidation
 MIN_BREAK_CONFIRMATION_CYCLES = 3
 
@@ -237,12 +244,13 @@ def _clear_entry_zone(symbol: str):
 
 def reset_entry_context():
     """Reset all entry context (for testing)."""
-    global _entry_zone_context, _entry_method, _stability_counter, _exit_stability_counter, _break_confirmation_counter
+    global _entry_zone_context, _entry_method, _stability_counter, _exit_stability_counter, _break_confirmation_counter, _invalidated_zones
     _entry_zone_context = {}
     _entry_method = {}
     _stability_counter = {}
     _exit_stability_counter = {}
     _break_confirmation_counter = {}
+    _invalidated_zones = {}
 
 
 def restore_entry_context_from_positions(open_positions: list, persisted_contexts: dict = None):
@@ -564,6 +572,16 @@ def generate_geometry_proposal(
 
             # Pattern-based exit: check zone invalidation
             if _is_zone_invalidated(supply_demand_zone, entry_context, context.current_price, config):
+                # Blacklist this zone's price range — prevents re-entry on same broken structure.
+                # Uses geometric bounds (not zone_id) because zone_id is unstable across cycles.
+                # Includes zone_type so supply invalidation doesn't block demand entries.
+                z_low = entry_context.get("zone_low")
+                z_high = entry_context.get("zone_high")
+                z_type = entry_context.get("zone_type")
+                if z_low is not None and z_high is not None and z_type:
+                    _invalidated_zones.setdefault(symbol, []).append(
+                        (z_type, z_low, z_high, context.timestamp)
+                    )
                 _clear_entry_zone(symbol)
                 _entry_method.pop(symbol, None)
                 return StrategyProposal(
@@ -597,9 +615,30 @@ def generate_geometry_proposal(
 
     # Rule 3: Position FLAT -> check for ENTRY
     if position_state == PositionState.FLAT or position_state is None:
+        # Expire old invalidated zones (time-based cleanup)
+        if symbol in _invalidated_zones:
+            _invalidated_zones[symbol] = [
+                entry for entry in _invalidated_zones[symbol]
+                if context.timestamp - entry[3] < _INVALIDATED_ZONE_MAX_AGE_SEC
+            ]
+            if not _invalidated_zones[symbol]:
+                del _invalidated_zones[symbol]
+
         # Priority 1: Pattern-based entry (preferred, no oscillation risk)
         # Must check: 1) zone confirmed, 2) price at zone (not below supply / not above demand)
+        # 3) zone not recently invalidated (broken zones stay blacklisted until expired)
         if has_pattern_primitive and _is_zone_confirmed(supply_demand_zone, config) and _is_price_at_zone(supply_demand_zone, context.current_price, config):
+            # Block re-entry if current zone overlaps any invalidated zone of same type
+            cur_type = supply_demand_zone.zone_type
+            cur_lo = supply_demand_zone.zone_low
+            cur_hi = supply_demand_zone.zone_high
+            for inv_type, inv_lo, inv_hi, inv_ts in _invalidated_zones.get(symbol, []):
+                if inv_type == cur_type and cur_lo <= inv_hi and cur_hi >= inv_lo:
+                    age = int(context.timestamp - inv_ts)
+                    print(f"[GEOMETRY] {symbol}: blocked re-entry into invalidated {cur_type} zone "
+                          f"[{cur_lo:.0f}-{cur_hi:.0f}] overlaps [{inv_lo:.0f}-{inv_hi:.0f}] "
+                          f"(invalidated {age}s ago)")
+                    return None
             _record_entry_zone(symbol, supply_demand_zone)
             _entry_method[symbol] = "PATTERN"
             # Derive direction from zone type: demand=LONG (buy support), supply=SHORT (sell resistance)

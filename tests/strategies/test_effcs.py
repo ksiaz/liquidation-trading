@@ -84,8 +84,12 @@ class TestEFFCSStrategy:
         # EFFCS should not generate proposal when regime is not EXPANSION
         assert proposal is None
 
-    def test_regime_gate_exit_when_regime_changes(self):
-        """Test EFFCS exits position when regime changes from EXPANSION."""
+    def test_regime_gate_blocks_when_regime_changes(self):
+        """Test EFFCS blocks (returns None) when regime changes from EXPANSION.
+
+        Per Constitution §110.2.5: Regime mismatch = BLOCK, not EXIT.
+        Strategy cannot exit positions based solely on regime change.
+        """
         regime_changed = RegimeState(
             regime="SIDEWAYS_ACTIVE",
             vwap_distance=60.0,
@@ -107,10 +111,9 @@ class TestEFFCSStrategy:
             position_state=PositionState.OPEN  # Position exists
         )
 
-        # Should generate EXIT due to regime change
-        assert proposal is not None
-        assert proposal.action_type == "EXIT"
-        assert "REGIME_CHANGE" in proposal.justification_ref
+        # Should return None (BLOCK) - not EXIT
+        # Per §110.2.5: Regime mismatch blocks new evaluations, doesn't exit
+        assert proposal is None
 
     def test_impulse_detection(self):
         """Test EFFCS detects and records impulse."""

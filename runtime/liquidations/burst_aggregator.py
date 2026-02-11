@@ -134,7 +134,7 @@ class LiquidationBurstAggregator:
 
         # Filter to window
         window_start = current_time - self._window_sec
-        window_events = [e for e in events if e.timestamp >= window_start]
+        window_events = [e for e in list(events) if e.timestamp >= window_start]
 
         if not window_events:
             return None
@@ -176,7 +176,7 @@ class LiquidationBurstAggregator:
         current_time = current_time or time.time()
         bursts = {}
 
-        for symbol in self._events.keys():
+        for symbol in list(self._events.keys()):
             burst = self.get_burst(symbol, current_time)
             if burst and burst.liquidation_count > 0:
                 bursts[symbol] = burst
@@ -192,18 +192,20 @@ class LiquidationBurstAggregator:
         """
         cutoff = time.time() - max_age_seconds
 
-        for symbol, events in self._events.items():
-            # Deque doesn't support efficient pruning, so filter in place
-            while events and events[0].timestamp < cutoff:
-                events.popleft()
+        for symbol in list(self._events.keys()):
+            events = self._events.get(symbol)
+            if events:
+                while events and events[0].timestamp < cutoff:
+                    events.popleft()
 
     def get_summary(self) -> Dict:
         """Get aggregator summary."""
+        items = list(self._events.items())
         return {
-            'symbols_tracked': len(self._events),
-            'total_events': sum(len(e) for e in self._events.values()),
+            'symbols_tracked': len(items),
+            'total_events': sum(len(e) for _, e in items),
             'events_per_symbol': {
                 symbol: len(events)
-                for symbol, events in self._events.items()
+                for symbol, events in items
             }
         }

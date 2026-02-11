@@ -25,7 +25,7 @@ def populated_store():
     store = ContinuityMemoryStore()
     
     # 1. Create a Node
-    store.add_or_update_node("node_1", 100.0, 0.5, "BID", 1000.0, "TEST_CREATION")
+    store.add_or_update_node("node_1", "BTC", 100.0, 0.5, "BID", 1000.0, "TEST_CREATION")
     
     # 2. Add some M3 Events
     # We access the node directly to inject history for testing
@@ -39,7 +39,7 @@ def populated_store():
     node.sequence_buffer.append(M3EventType.TRADE_EXEC, 1002.0)
     
     # 3. Create another Node for Spatial
-    store.add_or_update_node("node_2", 200.0, 0.5, "ASK", 1000.0, "TEST_SPATIAL")
+    store.add_or_update_node("node_2", "BTC", 200.0, 0.5, "ASK", 1000.0, "TEST_SPATIAL")
     
     return store
 

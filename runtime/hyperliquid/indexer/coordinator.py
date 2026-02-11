@@ -159,7 +159,7 @@ class IndexerCoordinator:
         self._parser = TransactionParser()
 
         # Wallet store
-        self._store = IndexedWalletStore(self.config.db_path)
+        self._store = IndexedWalletStore()
 
         # Position poller
         poller_config = PollerConfig(

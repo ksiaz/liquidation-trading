@@ -102,6 +102,10 @@ class FillEvent:
     method: str
     fill_id: int
     tx_hash: str
+    # Capitulation tracking fields
+    dir: str = ""              # "Open Long", "Close Short", "Long > Short", etc.
+    start_position: str = ""   # Position size before fill
+    closed_pnl: str = ""      # Realized PnL for this fill
 
     @property
     def price_float(self) -> float:
@@ -112,6 +116,21 @@ class FillEvent:
     def size_float(self) -> float:
         """Get size as float."""
         return float(self.size) if self.size else 0.0
+
+    @property
+    def closed_pnl_float(self) -> float:
+        """Get closed PnL as float."""
+        return float(self.closed_pnl) if self.closed_pnl else 0.0
+
+    @property
+    def start_position_float(self) -> float:
+        """Get start position as float."""
+        return float(self.start_position) if self.start_position else 0.0
+
+    @property
+    def is_close(self) -> bool:
+        """True if this fill closes or reduces a position."""
+        return self.dir.startswith('Close') or '>' in self.dir
 
 class SyncStatusCode(Enum):
     """Sync status codes from adapter."""

@@ -1,33 +1,33 @@
 """Unit tests for PositionRepository."""
 
 import pytest
-import tempfile
-import os
 from decimal import Decimal
 
+from runtime.logging.pg_pool import get_conn, put_conn
 from runtime.position.repository import PositionRepository
 from runtime.position.types import Position, PositionState, Direction
 from runtime.position.state_machine import PositionStateMachine
+
+
+def _clean_positions_table():
+    """Truncate positions table for test isolation."""
+    conn = get_conn()
+    try:
+        conn.cursor().execute("DELETE FROM positions")
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 class TestPositionRepository:
     """Tests for PositionRepository."""
 
     def setup_method(self):
-        """Create temp database for each test."""
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = PositionRepository(self.temp_db)
+        _clean_positions_table()
+        self.repo = PositionRepository()
 
     def teardown_method(self):
-        """Cleanup temp database."""
         self.repo.close()
-        import gc
-        gc.collect()  # Help release any lingering references
-        try:
-            if os.path.exists(self.temp_db):
-                os.remove(self.temp_db)
-        except PermissionError:
-            pass  # Windows may still hold lock briefly
 
     def test_save_and_load_position(self):
         """Test saving and loading a single position."""
@@ -56,7 +56,6 @@ class TestPositionRepository:
 
     def test_save_overwrites_existing(self):
         """Test that save updates existing position."""
-        # Save initial
         position1 = Position(
             symbol="BTCUSDT",
             state=PositionState.OPEN,
@@ -66,7 +65,6 @@ class TestPositionRepository:
         )
         self.repo.save(position1)
 
-        # Save update
         position2 = Position(
             symbol="BTCUSDT",
             state=PositionState.CLOSING,
@@ -248,24 +246,14 @@ class TestStateMachineWithPersistence:
     """Tests for PositionStateMachine with repository."""
 
     def setup_method(self):
-        """Create temp database for each test."""
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self.repo = PositionRepository(self.temp_db)
+        _clean_positions_table()
+        self.repo = PositionRepository()
 
     def teardown_method(self):
-        """Cleanup temp database."""
         self.repo.close()
-        import gc
-        gc.collect()  # Help release any lingering references
-        try:
-            if os.path.exists(self.temp_db):
-                os.remove(self.temp_db)
-        except PermissionError:
-            pass  # Windows may still hold lock briefly
 
     def test_state_machine_loads_positions_on_init(self):
         """Test that state machine loads existing positions."""
-        # Pre-populate database
         self.repo.save(Position(
             symbol="BTCUSDT",
             state=PositionState.OPEN,
@@ -274,10 +262,8 @@ class TestStateMachineWithPersistence:
             entry_price=Decimal("50000.0")
         ))
 
-        # Create new state machine with same repo
         sm = PositionStateMachine(repository=self.repo)
 
-        # Position should be loaded
         pos = sm.get_position("BTCUSDT")
         assert pos.state == PositionState.OPEN
         assert pos.quantity == Decimal("1.0")
@@ -286,38 +272,30 @@ class TestStateMachineWithPersistence:
         """Test that transitions are persisted."""
         sm = PositionStateMachine(repository=self.repo)
 
-        # Perform transitions
         sm.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
         sm.transition("BTCUSDT", "SUCCESS",
                       quantity=Decimal("1.0"),
                       entry_price=Decimal("50000.0"))
 
-        # Verify persisted
         loaded = self.repo.load("BTCUSDT")
         assert loaded.state == PositionState.OPEN
         assert loaded.quantity == Decimal("1.0")
 
     def test_position_survives_restart(self):
         """Test position recovery after simulated restart."""
-        # First session: open position
         sm1 = PositionStateMachine(repository=self.repo)
         sm1.transition("BTCUSDT", "ENTRY", direction=Direction.LONG)
         sm1.transition("BTCUSDT", "SUCCESS",
                        quantity=Decimal("2.5"),
                        entry_price=Decimal("45000.0"))
 
-        # Verify position is OPEN
         pos1 = sm1.get_position("BTCUSDT")
         assert pos1.state == PositionState.OPEN
 
-        # Close first repo before simulating restart
-        self.repo.close()
-
-        # Simulate restart: create new state machine with same DB
-        repo2 = PositionRepository(self.temp_db)
+        # Simulate restart: new repo + state machine, same PG database
+        repo2 = PositionRepository()
         sm2 = PositionStateMachine(repository=repo2)
 
-        # Position should be recovered
         pos2 = sm2.get_position("BTCUSDT")
         assert pos2.state == PositionState.OPEN
         assert pos2.direction == Direction.LONG
@@ -326,21 +304,14 @@ class TestStateMachineWithPersistence:
 
         repo2.close()
 
-        # Re-open for teardown consistency
-        self.repo = PositionRepository(self.temp_db)
-
     def test_flat_positions_not_loaded(self):
         """Test that FLAT positions are not loaded on restart."""
-        # Pre-populate with FLAT position
         self.repo.save(Position.create_flat("BTCUSDT"))
 
-        # Create state machine
         sm = PositionStateMachine(repository=self.repo)
 
-        # FLAT position should not be in _positions dict
         assert "BTCUSDT" not in sm._positions
 
-        # But get_position should still return FLAT
         pos = sm.get_position("BTCUSDT")
         assert pos.state == PositionState.FLAT
 
@@ -349,32 +320,20 @@ class TestExecutionControllerWithPersistence:
     """Tests for ExecutionController with position persistence."""
 
     def setup_method(self):
-        """Create temp database for each test."""
-        self.temp_db = tempfile.mkstemp(suffix='.db')[1]
-        self._controllers = []  # Track controllers for cleanup
+        _clean_positions_table()
+        self._controllers = []
 
     def teardown_method(self):
-        """Cleanup temp database."""
-        # Close all controllers' repositories
         for controller in self._controllers:
             if controller._repository:
                 controller._repository.close()
         self._controllers.clear()
 
-        # Now safe to remove file
-        import gc
-        gc.collect()  # Help release any lingering references
-        try:
-            if os.path.exists(self.temp_db):
-                os.remove(self.temp_db)
-        except PermissionError:
-            pass  # Windows may still hold lock briefly
-
     def test_controller_with_persistence(self):
         """Test controller creates repository when db_path provided."""
         from runtime.executor.controller import ExecutionController
 
-        controller = ExecutionController(db_path=self.temp_db)
+        controller = ExecutionController(db_path="ignored")
         self._controllers.append(controller)
 
         assert controller._repository is not None
@@ -397,8 +356,7 @@ class TestExecutionControllerWithPersistence:
         from runtime.risk.types import AccountState
         import time
 
-        # First session
-        controller1 = ExecutionController(db_path=self.temp_db)
+        controller1 = ExecutionController(db_path="ignored")
         self._controllers.append(controller1)
 
         mandates = [
@@ -408,7 +366,7 @@ class TestExecutionControllerWithPersistence:
                 authority=10,
                 timestamp=time.time(),
                 direction="LONG",
-                quantity=Decimal("0.1"),  # F5: Required quantity
+                quantity=Decimal("0.1"),
             ),
         ]
 
@@ -421,18 +379,13 @@ class TestExecutionControllerWithPersistence:
 
         controller1.process_cycle(mandates, account, mark_prices)
 
-        # Verify position opened
         pos1 = controller1.state_machine.get_position("BTCUSDT")
         assert pos1.state == PositionState.OPEN
 
-        # Close first controller before simulating restart
-        controller1._repository.close()
-
-        # Simulate restart
-        controller2 = ExecutionController(db_path=self.temp_db)
+        # Simulate restart — new controller, same PG database
+        controller2 = ExecutionController(db_path="ignored")
         self._controllers.append(controller2)
 
-        # Position should be recovered
         pos2 = controller2.state_machine.get_position("BTCUSDT")
         assert pos2.state == PositionState.OPEN
         assert pos2.direction == Direction.LONG

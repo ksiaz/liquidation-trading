@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package hl.events;
+
+message SchemaVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message MarketPriceEvent {
+  uint32 asset_id = 1;
+  string symbol = 2;
+  string oracle_price = 3;
+  string mark_price = 4;
+  int64 timestamp_ns = 5;
+  uint64 block_height = 6;
+}
+
+message LiquidationEvent {
+  string symbol = 1;
+  string side = 2;
+  string price = 3;
+  string size = 4;
+  string value_usd = 5;
+  string liquidator_wallet = 6;
+  string liquidated_wallet = 7;
+  string mark_price = 8;
+  string method = 9;
+  int64 timestamp_ms = 10;
+  uint64 fill_id = 11;
+  string tx_hash = 12;
+}
+
+message SyncStatusEvent {
+  enum Status {
+    UNKNOWN = 0;
+    HEALTHY = 1;
+    LAGGING = 2;
+    STALE = 3;
+    ERROR = 4;
+  }
+
+  Status status = 1;
+  uint64 latest_block_height = 2;
+  int64 latest_block_time_ns = 3;
+  uint32 blocks_behind = 4;
+  string current_session = 5;
+  uint64 prices_emitted = 6;
+  uint64 liquidations_emitted = 7;
+  string last_error = 8;
+  uint64 uptime_seconds = 9;
+  int64 timestamp_ns = 10;
+  SchemaVersion schema_version = 11;
+}
+
+message FillEvent {
+  string symbol = 1;
+  string side = 2;
+  string price = 3;
+  string size = 4;
+  string value_usd = 5;
+  int64 timestamp_ms = 6;
+  uint64 block_height = 7;
+  string wallet = 8;
+  bool is_liquidation = 9;
+  string liquidated_wallet = 10;
+  string method = 11;
+  string mark_price = 12;
+  uint64 fill_id = 13;
+  string tx_hash = 14;
+  // Phase 1: Capitulation tracking fields (added 2026-02-09)
+  string dir = 15;             // "Open Long", "Close Short", "Long > Short", etc.
+  string start_position = 16;  // Position size before this fill (e.g., "-42.57")
+  string closed_pnl = 17;     // Realized PnL for this fill (e.g., "-6.081366")
+}
+
+message HandshakeRequest {
+  SchemaVersion client_version = 1;
+  string client_id = 2;
+}
+
+message StreamRequest {
+  repeated string symbols = 1;
+  uint64 start_block = 2;
+}
+
+message Empty {}
+
+message HandshakeResponse {
+  SchemaVersion server_version = 1;
+  bool compatible = 2;
+  string message = 3;
+  uint64 server_uptime_seconds = 4;
+}
+
+service HLNodeAdapter {
+  rpc StreamPrices(StreamRequest) returns (stream MarketPriceEvent);
+  rpc StreamLiquidations(StreamRequest) returns (stream LiquidationEvent);
+  rpc StreamFills(StreamRequest) returns (stream FillEvent);
+  rpc StreamStatus(StreamRequest) returns (stream SyncStatusEvent);
+  rpc GetStatus(Empty) returns (SyncStatusEvent);
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+}

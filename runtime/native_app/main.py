@@ -26,8 +26,9 @@ import runtime.env_setup  # noqa: F401
 import asyncio
 import threading
 import time
-import sqlite3
+import psycopg2.extras
 import requests
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -117,8 +118,6 @@ def fetch_mids_fast() -> dict:
 
 # Use paths relative to project root
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-DB_PATH = os.path.join(_PROJECT_ROOT, "logs/execution.db")
-HL_INDEXED_DB_PATH = os.path.join(_PROJECT_ROOT, "indexed_wallets.db")
 
 # Staleness threshold - positions older than this are considered stale for display
 POSITION_STALENESS_SECONDS = 180  # 3 minutes - accuracy over stability
@@ -126,13 +125,9 @@ POSITION_STALENESS_SECONDS = 180  # 3 minutes - accuracy over stability
 POSITION_DELETE_SECONDS = 300  # 5 minutes - don't keep zombie data
 
 
-def get_indexed_db_connection(timeout: float = 5.0) -> sqlite3.Connection:
-    """Get a connection to the indexed wallets database with WAL mode."""
-    conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=timeout)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_pg_dict_conn():
+    """Get a PG connection from the pool. Caller MUST return with put_conn()."""
+    return get_conn()
 
 
 # ==============================================================================
@@ -178,24 +173,24 @@ def fetch_live_positions_near_liq(
 
     try:
         # Step 1: Get wallets to check from database (just addresses, fast query)
-        if not os.path.exists(HL_INDEXED_DB_PATH):
-            return []
+        conn = get_pg_dict_conn()
+        try:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            # Wider filter for candidates, we'll recalculate live
+            # Include small positions if very close to liq (<2%)
+            cursor.execute("""
+                SELECT DISTINCT wallet_address, coin, liquidation_price, side
+                FROM indexed_wallet_positions
+                WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < %s
+                  AND (position_value >= %s OR distance_to_liq_pct < 2)
+                ORDER BY distance_to_liq_pct ASC
+                LIMIT 100
+            """, (max_distance_pct * 2, min_value / 2))
 
-        conn = get_indexed_db_connection(timeout=2.0)
-        # Wider filter for candidates, we'll recalculate live
-        # Include small positions if very close to liq (<2%)
-        cursor = conn.execute("""
-            SELECT DISTINCT wallet_address, coin, liquidation_price, side
-            FROM positions
-            WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < ?
-              AND (position_value >= ? OR distance_to_liq_pct < 2)
-            ORDER BY distance_to_liq_pct ASC
-            LIMIT 100
-        """, (max_distance_pct * 2, min_value / 2))
-
-        db_positions = list(cursor.fetchall())
-        wallets_to_check = set(row['wallet_address'] for row in db_positions)
-        conn.close()
+            db_positions = list(cursor.fetchall())
+            wallets_to_check = set(row['wallet_address'] for row in db_positions)
+        finally:
+            put_conn(conn)
 
         if not wallets_to_check:
             _live_positions_cache['data'] = []
@@ -483,43 +478,35 @@ def aggregate_prices(snapshot: ObservationSnapshot) -> Dict[str, Dict]:
 
 def aggregate_cascade_state_from_hyperliquid() -> Dict:
     """Aggregate cascade state from Hyperliquid positions (ground truth)."""
-    if not os.path.exists(HL_INDEXED_DB_PATH):
-        return {
-            'phase': 'NO_DATA',
-            'positions_at_risk': 0,
-            'total_at_risk': 0,
-            'closest_pct': None,
-            'closest_symbol': None,
-            'clusters': []
-        }
-
     try:
-        conn = get_indexed_db_connection()
-        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+        conn = get_pg_dict_conn()
+        try:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            stale_threshold = time.time() - POSITION_STALENESS_SECONDS
 
-        # Get positions close to liquidation (within 10%)
-        # Prioritize proximity over value - show small positions if very close to liq
-        cursor = conn.execute("""
-            SELECT coin, side, position_value, distance_to_liq_pct, liquidation_price, entry_price
-            FROM positions
-            WHERE distance_to_liq_pct >= 0 AND distance_to_liq_pct <= 10
-              AND (position_value >= 10000 OR distance_to_liq_pct < 2)
-              AND updated_at >= ?
-            ORDER BY distance_to_liq_pct ASC
-        """, (stale_threshold,))
+            # Get positions close to liquidation (within 10%)
+            # Prioritize proximity over value - show small positions if very close to liq
+            cursor.execute("""
+                SELECT coin, side, position_value, distance_to_liq_pct, liquidation_price, entry_price
+                FROM indexed_wallet_positions
+                WHERE distance_to_liq_pct >= 0 AND distance_to_liq_pct <= 10
+                  AND (position_value >= 10000 OR distance_to_liq_pct < 2)
+                  AND updated_at >= %s
+                ORDER BY distance_to_liq_pct ASC
+            """, (stale_threshold,))
 
-        positions_at_risk = []
-        for row in cursor.fetchall():
-            positions_at_risk.append({
-                'coin': row[0],
-                'side': row[1],
-                'value': float(row[2]),
-                'dist_pct': float(row[3]),
-                'liq_price': float(row[4]),
-                'entry_price': float(row[5])
-            })
-
-        conn.close()
+            positions_at_risk = []
+            for row in cursor.fetchall():
+                positions_at_risk.append({
+                    'coin': row[0],
+                    'side': row[1],
+                    'value': float(row[2]),
+                    'dist_pct': float(row[3]),
+                    'liq_price': float(row[4]),
+                    'entry_price': float(row[5])
+                })
+        finally:
+            put_conn(conn)
 
         if not positions_at_risk:
             return {
@@ -628,26 +615,24 @@ def get_orderbook_depth(snapshot: ObservationSnapshot) -> List[Dict]:
 
 
 def load_recent_trades(limit: int = 15) -> List[Dict]:
-    """Load recent ghost trades from execution.db."""
-    if not os.path.exists(DB_PATH):
-        return []
-
+    """Load recent ghost trades from PostgreSQL."""
+    conn = get_pg_dict_conn()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute("""
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("""
             SELECT symbol, side, price, timestamp, is_entry, pnl, pnl_pct,
                    holding_duration_sec, exit_reason, winning_policy_name
             FROM ghost_trades
             ORDER BY timestamp DESC
-            LIMIT ?
+            LIMIT %s
         """, (limit,))
         trades = [dict(row) for row in cursor.fetchall()]
-        conn.close()
         return trades
     except Exception as e:
         print(f"Error loading trades: {e}")
         return []
+    finally:
+        put_conn(conn)
 
 
 def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, sort_by: str = "impact", min_value: float = 10000.0) -> List[Dict]:
@@ -660,11 +645,9 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
         sort_by: "impact" (size * impact DESC) or "distance" (closest to liq first)
         min_value: Minimum position value to display (default $50k)
     """
-    if not os.path.exists(HL_INDEXED_DB_PATH):
-        return []
-
+    conn = get_pg_dict_conn()
     try:
-        conn = get_indexed_db_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # Filter: distance > 0.1% (exclude stale/liquidated), distance < max, value >= min
         min_distance_pct = 0.1
@@ -675,35 +658,34 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
         if sort_by == "distance":
             # Sort by distance to liquidation (closest first)
             # Prioritize proximity - show small positions if very close to liq (<2%)
-            cursor = conn.execute("""
+            cursor.execute("""
                 SELECT wallet_address, coin, side, entry_price, position_size,
                        position_value, leverage, liquidation_price, margin_used,
                        unrealized_pnl, distance_to_liq_pct, daily_volume, impact_score, updated_at,
                        liq_touched, liq_breached, recent_high, recent_low
-                FROM positions
-                WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND distance_to_liq_pct < 999
-                  AND (position_value >= ? OR distance_to_liq_pct < 2) AND updated_at >= ?
+                FROM indexed_wallet_positions
+                WHERE distance_to_liq_pct > %s AND distance_to_liq_pct <= %s AND distance_to_liq_pct < 999
+                  AND (position_value >= %s OR distance_to_liq_pct < 2) AND updated_at >= %s
                 ORDER BY distance_to_liq_pct ASC
-                LIMIT ?
+                LIMIT %s
             """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
         else:
             # Sort by impact (size * impact, highest first)
             # Prioritize proximity - show small positions if very close to liq (<2%)
-            cursor = conn.execute("""
+            cursor.execute("""
                 SELECT wallet_address, coin, side, entry_price, position_size,
                        position_value, leverage, liquidation_price, margin_used,
                        unrealized_pnl, distance_to_liq_pct, daily_volume, impact_score, updated_at,
                        liq_touched, liq_breached, recent_high, recent_low,
                        (position_value * impact_score) as combined_score
-                FROM positions
-                WHERE distance_to_liq_pct > ? AND distance_to_liq_pct <= ? AND impact_score > 0
-                  AND (position_value >= ? OR distance_to_liq_pct < 2) AND updated_at >= ?
+                FROM indexed_wallet_positions
+                WHERE distance_to_liq_pct > %s AND distance_to_liq_pct <= %s AND impact_score > 0
+                  AND (position_value >= %s OR distance_to_liq_pct < 2) AND updated_at >= %s
                 ORDER BY combined_score DESC
-                LIMIT ?
+                LIMIT %s
             """, (min_distance_pct, max_distance_pct, min_value, stale_threshold, limit))
 
         positions = [dict(row) for row in cursor.fetchall()]
-        conn.close()
 
         # ZOMBIE FILTER: Validate positions against current prices
         # This prevents showing positions that have been liquidated since last DB update
@@ -741,6 +723,8 @@ def load_hyperliquid_positions(limit: int = 30, max_distance_pct: float = 10.0, 
     except Exception as e:
         print(f"Error loading HL positions: {e}")
         return []
+    finally:
+        put_conn(conn)
 
 
 def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10.0, bucket_size_pct: float = 0.5) -> Dict:
@@ -763,22 +747,21 @@ def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10
         - total_short_value: Total value of short liquidations
         - max_bucket_value: Highest value in any bucket (for scaling)
     """
-    if not os.path.exists(HL_INDEXED_DB_PATH):
-        return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
-
+    conn = get_pg_dict_conn()
     try:
-        conn = get_indexed_db_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # Get current price for the coin (from freshest position)
         stale_threshold = time.time() - POSITION_STALENESS_SECONDS
-        price_cursor = conn.execute("""
-            SELECT entry_price FROM positions
-            WHERE coin = ? AND entry_price > 0 AND updated_at >= ?
+        cursor.execute("""
+            SELECT entry_price FROM indexed_wallet_positions
+            WHERE coin = %s AND entry_price > 0 AND updated_at >= %s
             ORDER BY updated_at DESC LIMIT 1
         """, (coin, stale_threshold))
-        price_row = price_cursor.fetchone()
+        price_row = cursor.fetchone()
         if not price_row:
-            conn.close()
+            put_conn(conn)
+            conn = None
             return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
 
         current_price = float(price_row['entry_price'])
@@ -789,18 +772,17 @@ def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10
 
         # Query all positions with liquidation prices in range (only fresh data)
         # Include small positions if they're very close to current price
-        cursor = conn.execute("""
+        cursor.execute("""
             SELECT side, position_value, liquidation_price
-            FROM positions
-            WHERE coin = ?
+            FROM indexed_wallet_positions
+            WHERE coin = %s
               AND liquidation_price > 0
-              AND liquidation_price BETWEEN ? AND ?
-              AND (position_value >= 10000 OR ABS(liquidation_price - ?) / ? * 100 < 2)
-              AND updated_at >= ?
+              AND liquidation_price BETWEEN %s AND %s
+              AND (position_value >= 10000 OR ABS(liquidation_price - %s) / %s * 100 < 2)
+              AND updated_at >= %s
         """, (coin, min_price, max_price, current_price, current_price, stale_threshold))
 
         positions = cursor.fetchall()
-        conn.close()
 
         # Create buckets
         num_buckets = int(2 * price_range_pct / bucket_size_pct) + 1
@@ -857,6 +839,9 @@ def load_liquidation_heatmap_data(coin: str = "BTC", price_range_pct: float = 10
     except Exception as e:
         print(f"Error loading heatmap data: {e}")
         return {"current_price": 0, "buckets": [], "total_long_value": 0, "total_short_value": 0, "max_bucket_value": 0}
+    finally:
+        if conn is not None:
+            put_conn(conn)
 
 
 # Global orderbook cache (updated by background thread)
@@ -1093,9 +1078,9 @@ class PositionRefresher(threading.Thread):
     MIN_WALLET_VALUE = 10000  # $10k minimum to track a wallet (lowered from $50k for more retail coverage)
     MIN_RISKY_POSITION = 5000  # $5k minimum for positions near liquidation
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str = None):
         super().__init__(daemon=True)
-        self.db_path = db_path
+        # db_path kept for API compatibility but no longer used (PG pool instead)
         self._running = True
         self._last_refresh = 0
         self._last_zoom_refresh = 0
@@ -1132,21 +1117,20 @@ class PositionRefresher(threading.Thread):
         self._on_wallet_discovered = callback
 
     def _load_wallets_from_db(self):
-        """Load high-value wallets from indexed_wallets database."""
+        """Load high-value wallets from wallet_registry table."""
+        conn = get_pg_dict_conn()
         try:
-            conn = sqlite3.connect(self.db_path, timeout=5)
             cursor = conn.cursor()
 
             # Get wallets with significant position value (increased limit for more coverage)
             cursor.execute("""
-                SELECT DISTINCT address FROM indexed_wallets
-                WHERE position_value > ?
+                SELECT DISTINCT address FROM wallet_registry
+                WHERE position_value > %s
                 ORDER BY position_value DESC
                 LIMIT 200
             """, (self.MIN_WALLET_VALUE,))
 
             db_wallets = [row[0] for row in cursor.fetchall()]
-            conn.close()
 
             # Combine core whales + DB wallets
             self.TRACKED_WHALES = list(self.CORE_WHALES)
@@ -1159,6 +1143,8 @@ class PositionRefresher(threading.Thread):
         except Exception as e:
             print(f"[PositionRefresher] Error loading wallets from DB: {e}")
             self.TRACKED_WHALES = list(self.CORE_WHALES)
+        finally:
+            put_conn(conn)
 
     def _discover_wallets_from_trades(self):
         """Discover new wallets from recent trades across major coins."""
@@ -1239,28 +1225,30 @@ class PositionRefresher(threading.Thread):
             print(f"[DISCOVERY] Error: {e}")
 
     def _scan_stale_wallets(self):
-        """Scan stale wallets from indexed_wallets DB to find retail positions at risk.
+        """Scan stale wallets from wallet_registry to find retail positions at risk.
 
         This method scans wallets that haven't been checked recently and adds
         any with positions close to liquidation, even if they're small.
         """
+        conn = get_pg_dict_conn()
         try:
-            conn = sqlite3.connect(self.db_path, timeout=5)
             cursor = conn.cursor()
 
             # Get wallets with old position data that might have risky positions
             cursor.execute("""
                 SELECT address, position_value
-                FROM indexed_wallets
+                FROM wallet_registry
                 WHERE position_value > 5000
                   AND (last_position_check IS NULL
-                       OR last_position_check < datetime('now', '-2 hours'))
+                       OR last_position_check < NOW() - INTERVAL '2 hours')
                 ORDER BY position_value DESC
                 LIMIT 30
             """)
             stale_wallets = cursor.fetchall()
-            conn.close()
+        finally:
+            put_conn(conn)
 
+        try:
             added = 0
             risky_found = 0
 
@@ -1569,10 +1557,6 @@ class PositionRefresher(threading.Thread):
             # Use cached volumes or empty dict
             volumes = getattr(self, '_cached_volumes', {})
 
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-
             # Fetch all core whale states in parallel
             print(f"[PositionRefresher] Fetching {len(self.CORE_WHALES)} core whale states...")
             wallet_states = {}
@@ -1593,15 +1577,17 @@ class PositionRefresher(threading.Thread):
             print(f"[PositionRefresher] Got states for {len(wallet_states)} wallets")
 
             # Update positions in DB (skip candle fetch for speed)
-            for wallet, state in wallet_states.items():
-                self._update_wallet_positions(conn, wallet, state, mid_prices, volumes, skip_candle_fetch=True)
+            conn = get_pg_dict_conn()
+            try:
+                for wallet, state in wallet_states.items():
+                    self._update_wallet_positions(conn, wallet, state, mid_prices, volumes, skip_candle_fetch=True)
 
-            conn.commit()
+                conn.commit()
 
-            # Now identify priority wallets
-            self._identify_priority_wallets(conn)
-
-            conn.close()
+                # Now identify priority wallets
+                self._identify_priority_wallets(conn)
+            finally:
+                put_conn(conn)
 
             elapsed = time.time() - start
             print(f"[PositionRefresher] Startup: {len(wallet_states)} core whales in {elapsed:.1f}s, {len(self._priority_wallets)} priority")
@@ -1637,9 +1623,7 @@ class PositionRefresher(threading.Thread):
             self._cached_volumes = volumes
             self._volumes_cache_time = time.time()
 
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn = get_pg_dict_conn()
 
         updated = 0
         liquidated = []
@@ -1756,7 +1740,7 @@ class PositionRefresher(threading.Thread):
         self._position_states = position_changes
 
         conn.commit()
-        conn.close()
+        put_conn(conn)
 
         elapsed = time.time() - start_time
         wallet_elapsed = time.time() - wallet_start
@@ -1835,57 +1819,53 @@ class PositionRefresher(threading.Thread):
         """Poll positions for all tracked wallets."""
         print(f"[PositionRefresher] Starting full refresh...")
 
-        if not os.path.exists(self.db_path):
-            print(f"[PositionRefresher] DB not found: {self.db_path}")
-            return
+        conn = get_pg_dict_conn()
+        try:
+            cursor = conn.cursor()
 
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        cursor = conn.cursor()
+            # Use tracked whale list, not just positions in DB (positions may be stale/deleted)
+            wallets = list(self.TRACKED_WHALES)[:100]  # Limit to 100 for performance
+            print(f"[PositionRefresher] Refreshing {len(wallets)} tracked wallets")
 
-        # Use tracked whale list, not just positions in DB (positions may be stale/deleted)
-        wallets = list(self.TRACKED_WHALES)[:100]  # Limit to 100 for performance
-        print(f"[PositionRefresher] Refreshing {len(wallets)} tracked wallets")
+            # Get all mid prices
+            mid_prices = self._get_all_mids()
+            volumes = self._get_asset_volumes()
 
-        # Get all mid prices
-        mid_prices = self._get_all_mids()
-        volumes = self._get_asset_volumes()
+            updated = 0
+            skipped = 0
+            for wallet in wallets:
+                # Skip priority wallets - they're refreshed separately at higher frequency
+                if wallet in self._priority_wallets:
+                    skipped += 1
+                    continue
 
-        updated = 0
-        skipped = 0
-        for wallet in wallets:
-            # Skip priority wallets - they're refreshed separately at higher frequency
-            if wallet in self._priority_wallets:
-                skipped += 1
-                continue
+                try:
+                    state = self._get_clearinghouse_state(wallet)
+                    if state:
+                        self._update_wallet_positions(conn, wallet, state, mid_prices, volumes)
+                        updated += 1
+                except Exception as e:
+                    print(f"[PositionRefresher] Error polling {wallet[:10]}...: {e}")
 
-            try:
-                state = self._get_clearinghouse_state(wallet)
-                if state:
-                    self._update_wallet_positions(conn, wallet, state, mid_prices, volumes)
-                    updated += 1
-            except Exception as e:
-                print(f"[PositionRefresher] Error polling {wallet[:10]}...: {e}")
+                # Reduced delay between requests (was 0.1)
+                time.sleep(0.05)
 
-            # Reduced delay between requests (was 0.1)
-            time.sleep(0.05)
+            conn.commit()
 
-        conn.commit()
+            # Cleanup truly old positions (5 minutes) - prevents zombie data
+            delete_threshold = time.time() - POSITION_DELETE_SECONDS
+            cursor.execute("DELETE FROM indexed_wallet_positions WHERE updated_at < %s", (delete_threshold,))
+            deleted = cursor.rowcount
+            if deleted > 0:
+                print(f"[PositionRefresher] Cleaned up {deleted} old positions (>5min)")
+            conn.commit()
 
-        # Cleanup truly old positions (5 minutes) - prevents zombie data
-        delete_threshold = time.time() - POSITION_DELETE_SECONDS
-        cursor.execute("DELETE FROM positions WHERE updated_at < ?", (delete_threshold,))
-        deleted = cursor.rowcount
-        if deleted > 0:
-            print(f"[PositionRefresher] Cleaned up {deleted} old positions (>5min)")
-        conn.commit()
+            # Identify priority wallets for zoom mode
+            self._identify_priority_wallets(conn)
 
-        # Identify priority wallets for zoom mode
-        self._identify_priority_wallets(conn)
-
-        conn.close()
-        print(f"[PositionRefresher] Updated {updated} wallets")
+            print(f"[PositionRefresher] Updated {updated} wallets")
+        finally:
+            put_conn(conn)
 
     def _identify_priority_wallets(self, conn):
         """Find wallets with positions close to liquidation and enable zoom mode."""
@@ -1897,11 +1877,11 @@ class PositionRefresher(threading.Thread):
         # Prioritize proximity - show small positions if very close to liq
         cursor.execute("""
             SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
-            FROM positions
+            FROM indexed_wallet_positions
             WHERE distance_to_liq_pct > 0
-              AND distance_to_liq_pct <= ?
+              AND distance_to_liq_pct <= %s
               AND (position_value >= 10000 OR distance_to_liq_pct < 2)
-              AND updated_at >= ?
+              AND updated_at >= %s
             ORDER BY distance_to_liq_pct ASC
         """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
 
@@ -1945,7 +1925,7 @@ class PositionRefresher(threading.Thread):
         # Prioritize proximity - show small positions if very close to liq (<2%)
         cursor.execute("""
             SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, impact_score
-            FROM positions
+            FROM indexed_wallet_positions
             WHERE distance_to_liq_pct IS NOT NULL
               AND distance_to_liq_pct > 0
               AND (position_value > 20000 OR distance_to_liq_pct < 2)
@@ -2006,39 +1986,37 @@ class PositionRefresher(threading.Thread):
 
     def _update_zoom_positions(self):
         """Update zoom position details from database."""
-        if not os.path.exists(self.db_path):
-            return
+        conn = get_pg_dict_conn()
+        try:
+            cursor = conn.cursor()
+            stale_threshold = time.time() - POSITION_STALENESS_SECONDS
 
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        cursor = conn.cursor()
-        stale_threshold = time.time() - POSITION_STALENESS_SECONDS
+            # Prioritize proximity - show small positions if very close to liq
+            cursor.execute("""
+                SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
+                FROM indexed_wallet_positions
+                WHERE distance_to_liq_pct > 0
+                  AND distance_to_liq_pct <= %s
+                  AND (position_value >= 10000 OR distance_to_liq_pct < 2)
+                  AND updated_at >= %s
+                ORDER BY distance_to_liq_pct ASC
+            """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
 
-        # Prioritize proximity - show small positions if very close to liq
-        cursor.execute("""
-            SELECT wallet_address, coin, side, position_value, distance_to_liq_pct, liquidation_price
-            FROM positions
-            WHERE distance_to_liq_pct > 0
-              AND distance_to_liq_pct <= ?
-              AND (position_value >= 10000 OR distance_to_liq_pct < 2)
-              AND updated_at >= ?
-            ORDER BY distance_to_liq_pct ASC
-        """, (self.ZOOM_THRESHOLD_PCT, stale_threshold))
+            zoom_positions = []
+            for row in cursor.fetchall():
+                wallet, coin, side, value, dist_pct, liq_price = row
+                zoom_positions.append({
+                    'wallet': wallet[:10] + '...',
+                    'coin': coin,
+                    'side': side,
+                    'value': float(value),
+                    'dist_pct': float(dist_pct),
+                    'liq_price': float(liq_price)
+                })
 
-        zoom_positions = []
-        for row in cursor.fetchall():
-            wallet, coin, side, value, dist_pct, liq_price = row
-            zoom_positions.append({
-                'wallet': wallet[:10] + '...',
-                'coin': coin,
-                'side': side,
-                'value': float(value),
-                'dist_pct': float(dist_pct),
-                'liq_price': float(liq_price)
-            })
-
-        self._zoom_positions = zoom_positions
-        conn.close()
+            self._zoom_positions = zoom_positions
+        finally:
+            put_conn(conn)
 
     def _get_clearinghouse_state(self, wallet: str) -> Optional[Dict]:
         """Get clearinghouse state for a wallet."""
@@ -2214,13 +2192,32 @@ class PositionRefresher(threading.Thread):
                     pass
 
             # Upsert position
-            conn.execute("""
-                INSERT OR REPLACE INTO positions
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cursor.execute("""
+                INSERT INTO indexed_wallet_positions
                 (wallet_address, coin, side, entry_price, position_size, position_value,
                  leverage, liquidation_price, margin_used, unrealized_pnl,
                  distance_to_liq_pct, daily_volume, impact_score, updated_at,
                  liq_touched, liq_breached, recent_high, recent_low)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (wallet_address, coin)
+                DO UPDATE SET
+                    side = EXCLUDED.side,
+                    entry_price = EXCLUDED.entry_price,
+                    position_size = EXCLUDED.position_size,
+                    position_value = EXCLUDED.position_value,
+                    leverage = EXCLUDED.leverage,
+                    liquidation_price = EXCLUDED.liquidation_price,
+                    margin_used = EXCLUDED.margin_used,
+                    unrealized_pnl = EXCLUDED.unrealized_pnl,
+                    distance_to_liq_pct = EXCLUDED.distance_to_liq_pct,
+                    daily_volume = EXCLUDED.daily_volume,
+                    impact_score = EXCLUDED.impact_score,
+                    updated_at = EXCLUDED.updated_at,
+                    liq_touched = EXCLUDED.liq_touched,
+                    liq_breached = EXCLUDED.liq_breached,
+                    recent_high = EXCLUDED.recent_high,
+                    recent_low = EXCLUDED.recent_low
             """, (
                 wallet, coin, side, entry_price, abs(szi), position_value,
                 leverage, liq_price, margin_used, unrealized_pnl,
@@ -2231,12 +2228,12 @@ class PositionRefresher(threading.Thread):
         # Delete positions for this wallet that no longer exist (closed or liquidated)
         if active_coins:
             # First, detect which positions are being liquidated/closed
-            placeholders = ','.join('?' * len(active_coins))
-            cursor = conn.cursor()
+            placeholders = ','.join(['%s'] * len(active_coins))
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
             cursor.execute(f"""
                 SELECT coin, side, position_value, liquidation_price, distance_to_liq_pct
-                FROM positions
-                WHERE wallet_address = ? AND coin NOT IN ({placeholders})
+                FROM indexed_wallet_positions
+                WHERE wallet_address = %s AND coin NOT IN ({placeholders})
             """, (wallet, *active_coins))
             liquidated = cursor.fetchall()
 
@@ -2247,17 +2244,17 @@ class PositionRefresher(threading.Thread):
                 value = pos['position_value']
                 liq_px = pos['liquidation_price']
                 dist = pos['distance_to_liq_pct']
-                print(f"[LIQUIDATED] ⚡ {coin} {side} ${value:,.0f} @ ${liq_px:,.2f} (was {dist:.1f}% away)")
+                print(f"[LIQUIDATED] {coin} {side} ${value:,.0f} @ ${liq_px:,.2f} (was {dist:.1f}% away)")
 
             # Now delete them
-            conn.execute(f"""
-                DELETE FROM positions
-                WHERE wallet_address = ? AND coin NOT IN ({placeholders})
+            cursor.execute(f"""
+                DELETE FROM indexed_wallet_positions
+                WHERE wallet_address = %s AND coin NOT IN ({placeholders})
             """, (wallet, *active_coins))
         else:
             # Empty API response - check if wallet previously had positions
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM positions WHERE wallet_address = ?", (wallet,))
+            cursor.execute("SELECT COUNT(*) FROM indexed_wallet_positions WHERE wallet_address = %s", (wallet,))
             result = cursor.fetchone()
             prev_count = result[0] if result else 0
 
@@ -2267,7 +2264,8 @@ class PositionRefresher(threading.Thread):
                 print(f"[WARNING] Wallet {wallet[:12]}... returned empty but had {prev_count} positions - keeping data")
             else:
                 # Wallet genuinely has no positions, delete any stale records
-                conn.execute("DELETE FROM positions WHERE wallet_address = ?", (wallet,))
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM indexed_wallet_positions WHERE wallet_address = %s", (wallet,))
 
 
 # ==============================================================================
@@ -3329,26 +3327,27 @@ class CascadeWarningWidget(QFrame):
         2. Uses current price for value calculation
         3. Calculates cascade risk (high impact positions trigger more liquidations)
         """
-        import sqlite3
         import time
 
+        conn = get_pg_dict_conn()
         try:
-            conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5)
             cursor = conn.cursor()
 
             # Get all positions with liquidation info
             cursor.execute("""
                 SELECT coin, side, position_size, entry_price, liquidation_price,
                        impact_score, daily_volume
-                FROM positions
+                FROM indexed_wallet_positions
                 WHERE liquidation_price IS NOT NULL
                   AND liquidation_price > 0
                   AND position_size != 0
             """)
 
             rows = cursor.fetchall()
-            conn.close()
+        finally:
+            put_conn(conn)
 
+        try:
             # Get current prices
             resp = requests.post(
                 'https://api.hyperliquid.xyz/info',
@@ -3584,12 +3583,10 @@ class WhaleBiasWidget(QFrame):
 
     def _refresh_bias_data(self):
         """Refresh whale bias data from database."""
-        import sqlite3
         import time
 
+        conn = get_pg_dict_conn()
         try:
-            conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
 
             # Get bias for major coins
@@ -3602,8 +3599,8 @@ class WhaleBiasWidget(QFrame):
                         SUM(CASE WHEN side='LONG' THEN ABS(position_value) ELSE 0 END) as long_val,
                         SUM(CASE WHEN side='SHORT' THEN ABS(position_value) ELSE 0 END) as short_val,
                         COUNT(DISTINCT wallet_address) as wallet_count
-                    FROM positions
-                    WHERE coin = ?
+                    FROM indexed_wallet_positions
+                    WHERE coin = %s
                 """, (coin,))
                 row = cursor.fetchone()
 
@@ -3646,17 +3643,18 @@ class WhaleBiasWidget(QFrame):
             # Get retail wallet count (small wallets <$100k)
             cursor.execute("""
                 SELECT COUNT(DISTINCT wallet_address)
-                FROM positions
+                FROM indexed_wallet_positions
                 WHERE ABS(position_value) < 100000
             """)
             retail_count = cursor.fetchone()[0] or 0
 
             # Get total tracked wallets
-            cursor.execute("SELECT COUNT(DISTINCT wallet_address) FROM positions")
+            cursor.execute("SELECT COUNT(DISTINCT wallet_address) FROM indexed_wallet_positions")
             total_wallets = cursor.fetchone()[0] or 0
+        finally:
+            put_conn(conn)
 
-            conn.close()
-
+        try:
             # Update table
             self.bias_table.setRowCount(len(bias_data))
             for i, data in enumerate(bias_data):
@@ -4367,19 +4365,20 @@ class TradingChartWidget(QFrame):
 
     def _update_liq_levels(self, current_price: float, force_redraw: bool = False):
         """Update liquidation level price lines only if changed."""
+        conn = get_pg_dict_conn()
         try:
-            conn = get_indexed_db_connection()
-            cursor = conn.cursor()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
             cursor.execute("""
                 SELECT liquidation_price, position_value, side, distance_to_liq_pct
-                FROM positions
-                WHERE coin = ? AND distance_to_liq_pct > 0 AND distance_to_liq_pct < 10.0
+                FROM indexed_wallet_positions
+                WHERE coin = %s AND distance_to_liq_pct > 0 AND distance_to_liq_pct < 10.0
                 ORDER BY position_value DESC
                 LIMIT 15
             """, (self._current_coin,))
 
             rows = cursor.fetchall()
-            conn.close()
+            put_conn(conn)
+            conn = None
 
             # Filter out zombie positions (price has crossed liq - already liquidated)
             # Real-time validation against current price
@@ -4433,6 +4432,9 @@ class TradingChartWidget(QFrame):
 
         except Exception as e:
             print(f"[Chart] Error fetching liq levels: {e}")
+        finally:
+            if conn is not None:
+                put_conn(conn)
 
     def show_our_position(self, entry_price: float, side: str, liq_price: float):
         """Show our current position on the chart."""
@@ -4909,7 +4911,7 @@ class MainWindow(QMainWindow):
         self.collector = CollectorService(self.obs_system, warmup_duration_sec=0)
 
         # 1.5 Start background position refresher for Hyperliquid (REST polling)
-        self.position_refresher = PositionRefresher(HL_INDEXED_DB_PATH)
+        self.position_refresher = PositionRefresher()
         self.position_refresher.start()
 
         # 1.5.1 Start WebSocket position tracker for real-time updates (sub-50ms)
@@ -5696,24 +5698,25 @@ class MainWindow(QMainWindow):
 
     def _get_danger_wallets(self) -> list:
         """Get wallets with positions close to liquidation (within 10%)."""
+        conn = get_pg_dict_conn()
         try:
-            conn = sqlite3.connect(HL_INDEXED_DB_PATH, timeout=5)
             cursor = conn.cursor()
             # Expanded threshold (10%) and limit (100) for faster detection
             # This catches positions that might enter danger zone soon
             cursor.execute("""
                 SELECT DISTINCT wallet_address
-                FROM positions
+                FROM indexed_wallet_positions
                 WHERE distance_to_liq_pct > 0 AND distance_to_liq_pct < 10
                 ORDER BY distance_to_liq_pct ASC
                 LIMIT 100
             """)
             wallets = [row[0] for row in cursor.fetchall()]
-            conn.close()
             return wallets
         except Exception as e:
             print(f"[WSTracker] Error getting danger wallets: {e}")
             return []
+        finally:
+            put_conn(conn)
 
     def _init_fade_executor(self):
         """Initialize the Liquidation Fade Executor (dry run mode by default)."""
@@ -5873,6 +5876,9 @@ def kill_existing_instances():
 def main():
     # Ensure single instance
     kill_existing_instances()
+
+    # Initialize PostgreSQL connection pool for standalone use
+    init_pool()
 
     app = QApplication(sys.argv)
     window = MainWindow()

@@ -4,19 +4,18 @@ HLP24: Cold Storage.
 Append-only raw data storage for historical analysis and backtesting.
 
 Features:
-- SQLite-based storage for reliability
+- PostgreSQL-based storage for reliability
 - Efficient batch inserts
 - Time-range queries
 - Integer microseconds for precision
-- Compression support for exports
 
 Schema:
-- market_snapshots: Periodic market state (OI, funding, prices, depth)
-- trades: Individual trade records with liquidation flags
-- events: Detected liquidation events with labels
+- cold_market_snapshots: Periodic market state (OI, funding, prices, depth)
+- cold_trades: Individual trade records with liquidation flags
+- cold_events: Detected liquidation events with labels
 
 Usage:
-    storage = ColdStorage('data/cold_storage.db')
+    storage = ColdStorage()
 
     # Store market data
     snapshot = MarketSnapshot(
@@ -36,24 +35,18 @@ Usage:
     )
 """
 
-import sqlite3
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Iterator
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
-import threading
+
+from runtime.logging.pg_pool import get_conn, put_conn
 
 
 @dataclass
 class StorageConfig:
     """Configuration for cold storage."""
-    db_path: str = 'data/cold_storage.db'
     batch_size: int = 1000
-    vacuum_interval_hours: int = 24
-    enable_wal: bool = True  # Write-ahead logging for performance
-    enable_compression: bool = False  # Future: compress on export
 
 
 @dataclass
@@ -137,129 +130,55 @@ class ColdStorage:
     """
     Append-only cold storage for market data.
 
-    Uses SQLite for reliability and simplicity.
+    Uses PostgreSQL for reliability and concurrency.
     All timestamps stored as microseconds since epoch.
     All prices/sizes stored as integers (scaled by 1e8).
     """
-
-    SCHEMA = {
-        'market_snapshots': '''
-            CREATE TABLE IF NOT EXISTS market_snapshots (
-                ts_us INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                open_interest INTEGER,
-                funding_rate INTEGER,
-                mark_price INTEGER,
-                index_price INTEGER,
-                bid_depth_1pct INTEGER,
-                ask_depth_1pct INTEGER,
-                volume_24h INTEGER,
-                PRIMARY KEY (ts_us, symbol)
-            )
-        ''',
-        'trades': '''
-            CREATE TABLE IF NOT EXISTS trades (
-                ts_us INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                price INTEGER,
-                size INTEGER,
-                side TEXT,
-                is_liquidation INTEGER DEFAULT 0,
-                trade_id TEXT
-            )
-        ''',
-        'events': '''
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                ts_start_us INTEGER NOT NULL,
-                ts_end_us INTEGER,
-                symbol TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                severity TEXT,
-                metrics TEXT,
-                label TEXT
-            )
-        ''',
-    }
-
-    INDEXES = [
-        'CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_ts ON market_snapshots(symbol, ts_us)',
-        'CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades(symbol, ts_us)',
-        'CREATE INDEX IF NOT EXISTS idx_trades_liquidation ON trades(is_liquidation) WHERE is_liquidation = 1',
-        'CREATE INDEX IF NOT EXISTS idx_events_symbol_ts ON events(symbol, ts_start_us)',
-        'CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)',
-    ]
 
     def __init__(
         self,
         config: StorageConfig = None,
         logger: logging.Logger = None,
+        **kwargs,
     ):
-        """
-        Initialize cold storage.
-
-        Args:
-            config: Storage configuration
-            logger: Logger instance
-        """
         self._config = config or StorageConfig()
         self._logger = logger or logging.getLogger(__name__)
-        self._local = threading.local()
-
-        # Ensure directory exists
-        Path(self._config.db_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # Initialize database
-        self._init_db()
-
-    def _get_connection(self) -> sqlite3.Connection:
-        """Get thread-local database connection."""
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self._config.db_path)
-            if self._config.enable_wal:
-                self._local.conn.execute('PRAGMA journal_mode=WAL')
-            self._local.conn.execute('PRAGMA synchronous=NORMAL')
-        return self._local.conn
+        self._logger.debug("Initialized cold storage (PostgreSQL)")
 
     @contextmanager
     def _transaction(self):
         """Context manager for transactions."""
-        conn = self._get_connection()
+        conn = get_conn()
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
+            put_conn(conn)
             raise
-
-    def _init_db(self):
-        """Initialize database schema."""
-        with self._transaction() as conn:
-            for table_sql in self.SCHEMA.values():
-                conn.execute(table_sql)
-            for index_sql in self.INDEXES:
-                conn.execute(index_sql)
-
-        self._logger.debug(f"Initialized cold storage at {self._config.db_path}")
+        else:
+            put_conn(conn)
 
     def insert_snapshot(self, snapshot: MarketSnapshot):
         """Insert single market snapshot."""
         with self._transaction() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO market_snapshots
+            conn.cursor().execute('''
+                INSERT INTO cold_market_snapshots
                 (ts_us, symbol, open_interest, funding_rate, mark_price,
                  index_price, bid_depth_1pct, ask_depth_1pct, volume_24h)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ts_us, symbol) DO UPDATE SET
+                    open_interest = EXCLUDED.open_interest,
+                    funding_rate = EXCLUDED.funding_rate,
+                    mark_price = EXCLUDED.mark_price,
+                    index_price = EXCLUDED.index_price,
+                    bid_depth_1pct = EXCLUDED.bid_depth_1pct,
+                    ask_depth_1pct = EXCLUDED.ask_depth_1pct,
+                    volume_24h = EXCLUDED.volume_24h
             ''', (
-                snapshot.ts_us,
-                snapshot.symbol,
-                snapshot.open_interest,
-                snapshot.funding_rate,
-                snapshot.mark_price,
-                snapshot.index_price,
-                snapshot.bid_depth_1pct,
-                snapshot.ask_depth_1pct,
-                snapshot.volume_24h,
+                snapshot.ts_us, snapshot.symbol, snapshot.open_interest,
+                snapshot.funding_rate, snapshot.mark_price, snapshot.index_price,
+                snapshot.bid_depth_1pct, snapshot.ask_depth_1pct, snapshot.volume_24h,
             ))
 
     def insert_snapshots_batch(self, snapshots: List[MarketSnapshot]):
@@ -268,34 +187,38 @@ class ColdStorage:
             return
 
         with self._transaction() as conn:
-            conn.executemany('''
-                INSERT OR REPLACE INTO market_snapshots
-                (ts_us, symbol, open_interest, funding_rate, mark_price,
-                 index_price, bid_depth_1pct, ask_depth_1pct, volume_24h)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', [
-                (s.ts_us, s.symbol, s.open_interest, s.funding_rate, s.mark_price,
-                 s.index_price, s.bid_depth_1pct, s.ask_depth_1pct, s.volume_24h)
-                for s in snapshots
-            ])
+            cur = conn.cursor()
+            for s in snapshots:
+                cur.execute('''
+                    INSERT INTO cold_market_snapshots
+                    (ts_us, symbol, open_interest, funding_rate, mark_price,
+                     index_price, bid_depth_1pct, ask_depth_1pct, volume_24h)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ts_us, symbol) DO UPDATE SET
+                        open_interest = EXCLUDED.open_interest,
+                        funding_rate = EXCLUDED.funding_rate,
+                        mark_price = EXCLUDED.mark_price,
+                        index_price = EXCLUDED.index_price,
+                        bid_depth_1pct = EXCLUDED.bid_depth_1pct,
+                        ask_depth_1pct = EXCLUDED.ask_depth_1pct,
+                        volume_24h = EXCLUDED.volume_24h
+                ''', (
+                    s.ts_us, s.symbol, s.open_interest, s.funding_rate, s.mark_price,
+                    s.index_price, s.bid_depth_1pct, s.ask_depth_1pct, s.volume_24h,
+                ))
 
         self._logger.debug(f"Inserted {len(snapshots)} snapshots")
 
     def insert_trade(self, trade: TradeRecord):
         """Insert single trade record."""
         with self._transaction() as conn:
-            conn.execute('''
-                INSERT INTO trades
+            conn.cursor().execute('''
+                INSERT INTO cold_trades
                 (ts_us, symbol, price, size, side, is_liquidation, trade_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             ''', (
-                trade.ts_us,
-                trade.symbol,
-                trade.price,
-                trade.size,
-                trade.side,
-                1 if trade.is_liquidation else 0,
-                trade.trade_id,
+                trade.ts_us, trade.symbol, trade.price, trade.size,
+                trade.side, 1 if trade.is_liquidation else 0, trade.trade_id,
             ))
 
     def insert_trades_batch(self, trades: List[TradeRecord]):
@@ -304,15 +227,16 @@ class ColdStorage:
             return
 
         with self._transaction() as conn:
-            conn.executemany('''
-                INSERT INTO trades
-                (ts_us, symbol, price, size, side, is_liquidation, trade_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', [
-                (t.ts_us, t.symbol, t.price, t.size, t.side,
-                 1 if t.is_liquidation else 0, t.trade_id)
-                for t in trades
-            ])
+            cur = conn.cursor()
+            for t in trades:
+                cur.execute('''
+                    INSERT INTO cold_trades
+                    (ts_us, symbol, price, size, side, is_liquidation, trade_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    t.ts_us, t.symbol, t.price, t.size, t.side,
+                    1 if t.is_liquidation else 0, t.trade_id,
+                ))
 
         self._logger.debug(f"Inserted {len(trades)} trades")
 
@@ -323,18 +247,7 @@ class ColdStorage:
         end_ts: Optional[int] = None,
         limit: int = 10000,
     ) -> QueryResult:
-        """
-        Query market snapshots.
-
-        Args:
-            symbol: Filter by symbol (optional)
-            start_ts: Start timestamp in microseconds (inclusive)
-            end_ts: End timestamp in microseconds (exclusive)
-            limit: Maximum rows to return
-
-        Returns:
-            QueryResult with list of MarketSnapshot
-        """
+        """Query market snapshots."""
         import time
         query_start = time.time()
 
@@ -342,37 +255,41 @@ class ColdStorage:
         params = []
 
         if symbol:
-            conditions.append('symbol = ?')
+            conditions.append('symbol = %s')
             params.append(symbol)
         if start_ts is not None:
-            conditions.append('ts_us >= ?')
+            conditions.append('ts_us >= %s')
             params.append(start_ts)
         if end_ts is not None:
-            conditions.append('ts_us < ?')
+            conditions.append('ts_us < %s')
             params.append(end_ts)
 
         where_clause = ' AND '.join(conditions) if conditions else '1=1'
 
-        conn = self._get_connection()
-        cursor = conn.execute(f'''
-            SELECT ts_us, symbol, open_interest, funding_rate, mark_price,
-                   index_price, bid_depth_1pct, ask_depth_1pct, volume_24h
-            FROM market_snapshots
-            WHERE {where_clause}
-            ORDER BY ts_us ASC
-            LIMIT ?
-        ''', params + [limit])
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f'''
+                SELECT ts_us, symbol, open_interest, funding_rate, mark_price,
+                       index_price, bid_depth_1pct, ask_depth_1pct, volume_24h
+                FROM cold_market_snapshots
+                WHERE {where_clause}
+                ORDER BY ts_us ASC
+                LIMIT %s
+            ''', params + [limit])
 
-        rows = [MarketSnapshot.from_row(row) for row in cursor.fetchall()]
-        query_time = (time.time() - query_start) * 1000
+            rows = [MarketSnapshot.from_row(row) for row in cur.fetchall()]
+            query_time = (time.time() - query_start) * 1000
 
-        return QueryResult(
-            rows=rows,
-            count=len(rows),
-            start_ts=start_ts,
-            end_ts=end_ts,
-            query_time_ms=query_time,
-        )
+            return QueryResult(
+                rows=rows,
+                count=len(rows),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                query_time_ms=query_time,
+            )
+        finally:
+            put_conn(conn)
 
     def query_trades(
         self,
@@ -382,19 +299,7 @@ class ColdStorage:
         liquidations_only: bool = False,
         limit: int = 10000,
     ) -> QueryResult:
-        """
-        Query trade records.
-
-        Args:
-            symbol: Filter by symbol (optional)
-            start_ts: Start timestamp in microseconds
-            end_ts: End timestamp in microseconds
-            liquidations_only: Only return liquidation trades
-            limit: Maximum rows to return
-
-        Returns:
-            QueryResult with list of TradeRecord
-        """
+        """Query trade records."""
         import time
         query_start = time.time()
 
@@ -402,105 +307,104 @@ class ColdStorage:
         params = []
 
         if symbol:
-            conditions.append('symbol = ?')
+            conditions.append('symbol = %s')
             params.append(symbol)
         if start_ts is not None:
-            conditions.append('ts_us >= ?')
+            conditions.append('ts_us >= %s')
             params.append(start_ts)
         if end_ts is not None:
-            conditions.append('ts_us < ?')
+            conditions.append('ts_us < %s')
             params.append(end_ts)
         if liquidations_only:
             conditions.append('is_liquidation = 1')
 
         where_clause = ' AND '.join(conditions) if conditions else '1=1'
 
-        conn = self._get_connection()
-        cursor = conn.execute(f'''
-            SELECT ts_us, symbol, price, size, side, is_liquidation, trade_id
-            FROM trades
-            WHERE {where_clause}
-            ORDER BY ts_us ASC
-            LIMIT ?
-        ''', params + [limit])
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(f'''
+                SELECT ts_us, symbol, price, size, side, is_liquidation, trade_id
+                FROM cold_trades
+                WHERE {where_clause}
+                ORDER BY ts_us ASC
+                LIMIT %s
+            ''', params + [limit])
 
-        rows = [TradeRecord.from_row(row) for row in cursor.fetchall()]
-        query_time = (time.time() - query_start) * 1000
+            rows = [TradeRecord.from_row(row) for row in cur.fetchall()]
+            query_time = (time.time() - query_start) * 1000
 
-        return QueryResult(
-            rows=rows,
-            count=len(rows),
-            start_ts=start_ts,
-            end_ts=end_ts,
-            query_time_ms=query_time,
-        )
+            return QueryResult(
+                rows=rows,
+                count=len(rows),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                query_time_ms=query_time,
+            )
+        finally:
+            put_conn(conn)
 
     def get_symbols(self) -> List[str]:
         """Get list of unique symbols in storage."""
-        conn = self._get_connection()
-        cursor = conn.execute('''
-            SELECT DISTINCT symbol FROM market_snapshots
-            UNION
-            SELECT DISTINCT symbol FROM trades
-        ''')
-        return [row[0] for row in cursor.fetchall()]
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT DISTINCT symbol FROM cold_market_snapshots
+                UNION
+                SELECT DISTINCT symbol FROM cold_trades
+            ''')
+            return [row[0] for row in cur.fetchall()]
+        finally:
+            put_conn(conn)
 
     def get_time_range(self, symbol: Optional[str] = None) -> Optional[tuple]:
         """Get min/max timestamps for data."""
-        conn = self._get_connection()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            if symbol:
+                cur.execute('''
+                    SELECT MIN(ts_us), MAX(ts_us) FROM cold_market_snapshots
+                    WHERE symbol = %s
+                ''', (symbol,))
+            else:
+                cur.execute('''
+                    SELECT MIN(ts_us), MAX(ts_us) FROM cold_market_snapshots
+                ''')
 
-        if symbol:
-            cursor = conn.execute('''
-                SELECT MIN(ts_us), MAX(ts_us) FROM market_snapshots
-                WHERE symbol = ?
-            ''', (symbol,))
-        else:
-            cursor = conn.execute('''
-                SELECT MIN(ts_us), MAX(ts_us) FROM market_snapshots
-            ''')
-
-        row = cursor.fetchone()
-        if row and row[0] is not None:
-            return (row[0], row[1])
-        return None
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return (row[0], row[1])
+            return None
+        finally:
+            put_conn(conn)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get storage statistics."""
-        conn = self._get_connection()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
 
-        snapshot_count = conn.execute(
-            'SELECT COUNT(*) FROM market_snapshots'
-        ).fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM cold_market_snapshots')
+            snapshot_count = cur.fetchone()[0]
 
-        trade_count = conn.execute(
-            'SELECT COUNT(*) FROM trades'
-        ).fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM cold_trades')
+            trade_count = cur.fetchone()[0]
 
-        liq_count = conn.execute(
-            'SELECT COUNT(*) FROM trades WHERE is_liquidation = 1'
-        ).fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM cold_trades WHERE is_liquidation = 1')
+            liq_count = cur.fetchone()[0]
 
-        db_size = Path(self._config.db_path).stat().st_size if \
-            Path(self._config.db_path).exists() else 0
-
-        return {
-            'snapshot_count': snapshot_count,
-            'trade_count': trade_count,
-            'liquidation_count': liq_count,
-            'db_size_bytes': db_size,
-            'db_size_mb': db_size / (1024 * 1024),
-            'symbols': self.get_symbols(),
-            'time_range': self.get_time_range(),
-        }
-
-    def vacuum(self):
-        """Optimize database storage."""
-        conn = self._get_connection()
-        conn.execute('VACUUM')
-        self._logger.info("Database vacuumed")
+            return {
+                'snapshot_count': snapshot_count,
+                'trade_count': trade_count,
+                'liquidation_count': liq_count,
+                'symbols': self.get_symbols(),
+                'time_range': self.get_time_range(),
+            }
+        finally:
+            put_conn(conn)
 
     def close(self):
-        """Close database connection."""
-        if hasattr(self._local, 'conn') and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None
+        """No-op — pool manages connections."""
+        pass

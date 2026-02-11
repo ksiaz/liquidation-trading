@@ -1,0 +1,91 @@
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-tertiary: #334155;
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --accent-green: #22c55e;
+  --accent-red: #ef4444;
+  --accent-yellow: #eab308;
+  --accent-blue: #3b82f6;
+  --border-color: #334155;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.app { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: 240px;
+  background-color: var(--bg-secondary);
+  border-right: 1px solid var(--border-color);
+  padding: 1rem;
+}
+
+.sidebar h1 { font-size: 1.25rem; margin-bottom: 2rem; color: var(--accent-blue); }
+.sidebar nav { display: flex; flex-direction: column; gap: 0.5rem; }
+.sidebar a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+}
+.sidebar a:hover { background-color: var(--bg-tertiary); color: var(--text-primary); }
+.sidebar a.active { background-color: var(--accent-blue); color: white; }
+
+.main-content { flex: 1; padding: 1.5rem; overflow-x: auto; }
+.page-header { margin-bottom: 1.5rem; }
+.page-header h2 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+.page-header p { color: var(--text-secondary); font-size: 0.875rem; }
+
+.card {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.card-title { font-size: 1rem; font-weight: 600; }
+
+.status-badge {
+  display: inline-flex; align-items: center; padding: 0.25rem 0.75rem;
+  border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+}
+.status-stable { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+.status-warning { background-color: rgba(234, 179, 8, 0.2); color: var(--accent-yellow); }
+.status-critical { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+.status-unknown { background-color: var(--bg-tertiary); color: var(--text-muted); }
+
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+.stat-card { background-color: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px; padding: 1rem; }
+.stat-label { font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 0.25rem; }
+.stat-value { font-size: 1.5rem; font-weight: 600; }
+
+.table-container { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+th { text-align: left; padding: 0.75rem; background-color: var(--bg-tertiary); color: var(--text-secondary); font-weight: 500; text-transform: uppercase; font-size: 0.75rem; }
+td { padding: 0.75rem; border-bottom: 1px solid var(--border-color); }
+tr:hover { background-color: var(--bg-tertiary); }
+
+.filters { display: flex; gap: 1rem; margin-bottom: 1rem; }
+.filter-select { padding: 0.5rem 1rem; background-color: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); font-size: 0.875rem; }
+
+.loading { display: flex; justify-content: center; padding: 2rem; color: var(--text-secondary); }
+.error { padding: 1rem; background-color: rgba(239, 68, 68, 0.1); border: 1px solid var(--accent-red); border-radius: 4px; color: var(--accent-red); }
+.timestamp { color: var(--text-secondary); font-family: monospace; font-size: 0.8125rem; }
+.direction-long { color: var(--accent-green); }
+.direction-short { color: var(--accent-red); }
+.mandate-type { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }
+.mandate-entry { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+.mandate-exit { background-color: rgba(59, 130, 246, 0.2); color: var(--accent-blue); }
+.mandate-block { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }

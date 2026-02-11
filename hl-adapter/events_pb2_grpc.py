@@ -26,11 +26,7 @@ if _version_not_supported:
 
 
 class HLNodeAdapterStub(object):
-    """============================================================
-    gRPC Service Definition
-    ============================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -71,55 +67,40 @@ class HLNodeAdapterStub(object):
 
 
 class HLNodeAdapterServicer(object):
-    """============================================================
-    gRPC Service Definition
-    ============================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def StreamPrices(self, request, context):
-        """Stream market prices for all assets
-        Client receives continuous stream of price updates
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def StreamLiquidations(self, request, context):
-        """Stream liquidation events
-        Client receives continuous stream of liquidations
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def StreamFills(self, request, context):
-        """Stream ALL fills (organic + liquidation) for absorption detection
-        Client receives continuous stream of trade executions
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def StreamStatus(self, request, context):
-        """Stream sync status updates
-        Client receives periodic health/status updates
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetStatus(self, request, context):
-        """Get current sync status (unary, not streaming)
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Handshake(self, request, context):
-        """Handshake to verify schema compatibility
-        Clients should call this before subscribing to verify version
-        """
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -166,11 +147,7 @@ def add_HLNodeAdapterServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class HLNodeAdapter(object):
-    """============================================================
-    gRPC Service Definition
-    ============================================================
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def StreamPrices(request,

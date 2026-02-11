@@ -37,9 +37,10 @@ async def test_mandates():
     await asyncio.sleep(1)
 
     # Check if any mandates were generated via database
+    from runtime.logging.pg_pool import get_conn, put_conn, init_pool
+    init_pool()
+    conn = get_conn()
     try:
-        import sqlite3
-        conn = sqlite3.connect('logs/execution.db')
         c = conn.cursor()
 
         # Get mandate count
@@ -56,20 +57,20 @@ async def test_mandates():
             GROUP BY policy_name
         ''')
 
-        print(f"\n✓ Total mandates generated: {mandate_count}")
+        print(f"\n Total mandates generated: {mandate_count}")
         print("\nRecent policy evaluations:")
         for row in c.fetchall():
             print(f"  {row[0]}: {row[2]}/{row[1]} proposals")
 
-        conn.close()
-
         if mandate_count > 0:
-            print("\n✓✓✓ SUCCESS - Mandates are being generated! ✓✓✓")
+            print("\n SUCCESS - Mandates are being generated!")
         else:
-            print("\n⚠ No mandates yet - may need more time or volatility")
+            print("\n No mandates yet - may need more time or volatility")
 
     except Exception as e:
         print(f"\nError checking database: {e}")
+    finally:
+        put_conn(conn)
 
     print("=" * 70)
 

@@ -11,7 +11,7 @@ Constitutional Compliance:
 - Candidate zones track factual price action, not predictions
 
 Archive:
-- Expired zones are archived to SQLite for long-term learning
+- Expired zones are archived to PostgreSQL for long-term learning
 - Historical zone data enriches new zones at similar price levels
 - System builds knowledge: "more time = richer understanding"
 """
@@ -19,11 +19,11 @@ Archive:
 import math
 import time
 import logging
-import sqlite3
-import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
+
+from runtime.logging.pg_pool import get_conn, put_conn
 
 logger = logging.getLogger(__name__)
 
@@ -34,75 +34,14 @@ logger = logging.getLogger(__name__)
 
 class CandidateZoneArchive:
     """
-    SQLite archive for expired candidate zones.
+    PostgreSQL archive for expired candidate zones.
 
     Enables long-term learning by preserving price action history
     at liquidation price levels across sessions.
     """
 
-    def __init__(self, db_path: str = "candidate_zones.db"):
-        self._db_path = db_path
-        self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
-
-    def _init_db(self) -> None:
-        """Initialize database schema."""
-        self._conn = sqlite3.connect(self._db_path)
-        self._conn.row_factory = sqlite3.Row
-
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS archived_zones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                zone_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                price_center REAL NOT NULL,
-                price_low REAL NOT NULL,
-                price_high REAL NOT NULL,
-
-                -- Origin
-                created_at REAL NOT NULL,
-                expired_at REAL NOT NULL,
-                initial_positions_at_risk INTEGER,
-                initial_value_at_risk REAL,
-                dominant_side TEXT,
-
-                -- Price action evidence
-                price_visits INTEGER DEFAULT 0,
-                price_rejections INTEGER DEFAULT 0,
-                price_breakthroughs INTEGER DEFAULT 0,
-                time_in_zone_sec REAL DEFAULT 0,
-                max_penetration_depth REAL DEFAULT 0,
-
-                -- Volume evidence
-                total_volume_in_zone REAL DEFAULT 0,
-                buy_volume_in_zone REAL DEFAULT 0,
-                sell_volume_in_zone REAL DEFAULT 0,
-
-                -- Absorption evidence
-                absorption_events INTEGER DEFAULT 0,
-
-                -- Outcome
-                was_validated INTEGER DEFAULT 0,  -- 1 if liquidation occurred
-                final_strength REAL DEFAULT 0,
-
-                -- Indexing
-                price_bucket TEXT NOT NULL  -- For fast lookup of nearby zones
-            )
-        """)
-
-        # Index for fast price-level lookups
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_zones_symbol_bucket
-            ON archived_zones(symbol, price_bucket)
-        """)
-
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_zones_created
-            ON archived_zones(created_at)
-        """)
-
-        self._conn.commit()
-        logger.info(f"[CANDIDATE_ZONES] Archive initialized: {self._db_path}")
+    def __init__(self):
+        logger.info("[CANDIDATE_ZONES] Archive initialized (PostgreSQL)")
 
     def archive_zone(self, zone: 'CandidateZone', was_validated: bool = False) -> None:
         """Archive an expired or validated zone."""
@@ -110,26 +49,30 @@ class CandidateZoneArchive:
         bucket_size = zone.price_center * 0.005
         price_bucket = f"{zone.symbol}_{int(zone.price_center / bucket_size) * bucket_size:.0f}"
 
-        self._conn.execute("""
-            INSERT INTO archived_zones (
-                zone_id, symbol, price_center, price_low, price_high,
-                created_at, expired_at, initial_positions_at_risk,
-                initial_value_at_risk, dominant_side,
-                price_visits, price_rejections, price_breakthroughs,
-                time_in_zone_sec, max_penetration_depth,
-                total_volume_in_zone, buy_volume_in_zone, sell_volume_in_zone,
-                absorption_events, was_validated, final_strength, price_bucket
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            zone.zone_id, zone.symbol, zone.price_center, zone.price_low, zone.price_high,
-            zone.created_at, time.time(), zone.initial_positions_at_risk,
-            zone.initial_value_at_risk, zone.dominant_side,
-            zone.price_visits, zone.price_rejections, zone.price_breakthroughs,
-            zone.time_in_zone_sec, zone.max_penetration_depth,
-            zone.total_volume_in_zone, zone.buy_volume_in_zone, zone.sell_volume_in_zone,
-            zone.absorption_events, 1 if was_validated else 0, zone.strength, price_bucket
-        ))
-        self._conn.commit()
+        conn = get_conn()
+        try:
+            conn.cursor().execute("""
+                INSERT INTO archived_zones (
+                    zone_id, symbol, price_center, price_low, price_high,
+                    created_at, expired_at, initial_positions_at_risk,
+                    initial_value_at_risk, dominant_side,
+                    price_visits, price_rejections, price_breakthroughs,
+                    time_in_zone_sec, max_penetration_depth,
+                    total_volume_in_zone, buy_volume_in_zone, sell_volume_in_zone,
+                    absorption_events, was_validated, final_strength, price_bucket
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                zone.zone_id, zone.symbol, zone.price_center, zone.price_low, zone.price_high,
+                zone.created_at, time.time(), zone.initial_positions_at_risk,
+                zone.initial_value_at_risk, zone.dominant_side,
+                zone.price_visits, zone.price_rejections, zone.price_breakthroughs,
+                zone.time_in_zone_sec, zone.max_penetration_depth,
+                zone.total_volume_in_zone, zone.buy_volume_in_zone, zone.sell_volume_in_zone,
+                zone.absorption_events, 1 if was_validated else 0, zone.strength, price_bucket
+            ))
+            conn.commit()
+        finally:
+            put_conn(conn)
 
     def get_historical_context(
         self,
@@ -147,60 +90,71 @@ class CandidateZoneArchive:
         price_high = price * (1 + tolerance_pct)
         min_created = time.time() - (max_age_days * 86400)
 
-        rows = self._conn.execute("""
-            SELECT
-                COUNT(*) as zone_count,
-                SUM(price_visits) as total_visits,
-                SUM(price_rejections) as total_rejections,
-                SUM(price_breakthroughs) as total_breakthroughs,
-                SUM(time_in_zone_sec) as total_time_in_zone,
-                SUM(was_validated) as times_validated,
-                AVG(final_strength) as avg_final_strength,
-                MAX(initial_value_at_risk) as max_value_at_risk
-            FROM archived_zones
-            WHERE symbol = ?
-              AND price_center BETWEEN ? AND ?
-              AND created_at > ?
-        """, (symbol, price_low, price_high, min_created)).fetchone()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COUNT(*) as zone_count,
+                    SUM(price_visits) as total_visits,
+                    SUM(price_rejections) as total_rejections,
+                    SUM(price_breakthroughs) as total_breakthroughs,
+                    SUM(time_in_zone_sec) as total_time_in_zone,
+                    SUM(was_validated) as times_validated,
+                    AVG(final_strength) as avg_final_strength,
+                    MAX(initial_value_at_risk) as max_value_at_risk
+                FROM archived_zones
+                WHERE symbol = %s
+                  AND price_center BETWEEN %s AND %s
+                  AND created_at > %s
+            """, (symbol, price_low, price_high, min_created))
+            row = cur.fetchone()
 
-        if rows['zone_count'] == 0:
-            return {}
+            if row is None or row[0] == 0:
+                return {}
 
-        return {
-            'historical_zone_count': rows['zone_count'],
-            'total_historical_visits': rows['total_visits'] or 0,
-            'total_historical_rejections': rows['total_rejections'] or 0,
-            'total_historical_breakthroughs': rows['total_breakthroughs'] or 0,
-            'total_historical_time_sec': rows['total_time_in_zone'] or 0,
-            'times_validated': rows['times_validated'] or 0,
-            'avg_final_strength': rows['avg_final_strength'] or 0,
-            'max_historical_value': rows['max_value_at_risk'] or 0,
-        }
+            return {
+                'historical_zone_count': row[0],
+                'total_historical_visits': row[1] or 0,
+                'total_historical_rejections': row[2] or 0,
+                'total_historical_breakthroughs': row[3] or 0,
+                'total_historical_time_sec': row[4] or 0,
+                'times_validated': row[5] or 0,
+                'avg_final_strength': row[6] or 0,
+                'max_historical_value': row[7] or 0,
+            }
+        finally:
+            put_conn(conn)
 
     def get_stats(self) -> Dict:
         """Get archive statistics."""
-        row = self._conn.execute("""
-            SELECT
-                COUNT(*) as total_archived,
-                SUM(was_validated) as total_validated,
-                COUNT(DISTINCT symbol) as symbols,
-                MIN(created_at) as oldest,
-                MAX(expired_at) as newest
-            FROM archived_zones
-        """).fetchone()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COUNT(*) as total_archived,
+                    SUM(was_validated) as total_validated,
+                    COUNT(DISTINCT symbol) as symbols,
+                    MIN(created_at) as oldest,
+                    MAX(expired_at) as newest
+                FROM archived_zones
+            """)
+            row = cur.fetchone()
 
-        return {
-            'total_archived': row['total_archived'],
-            'total_validated': row['total_validated'] or 0,
-            'symbols_tracked': row['symbols'],
-            'oldest_zone': row['oldest'],
-            'newest_zone': row['newest'],
-        }
+            return {
+                'total_archived': row[0],
+                'total_validated': row[1] or 0,
+                'symbols_tracked': row[2],
+                'oldest_zone': row[3],
+                'newest_zone': row[4],
+            }
+        finally:
+            put_conn(conn)
 
     def close(self) -> None:
-        """Close database connection."""
-        if self._conn:
-            self._conn.close()
+        """No-op — pool manages connections."""
+        pass
 
 
 # ==============================================================================
@@ -391,7 +345,7 @@ class CandidateZoneManager:
     - Decay and expire old zones
     """
 
-    def __init__(self, config: CandidateZoneConfig = DEFAULT_CONFIG, db_path: str = "candidate_zones.db"):
+    def __init__(self, config: CandidateZoneConfig = DEFAULT_CONFIG, **kwargs):
         self._config = config
         self._zones: Dict[str, Dict[str, CandidateZone]] = defaultdict(dict)  # symbol -> zone_id -> zone
         self._proximity_buffer: Dict[str, Dict[float, ProximityCluster]] = defaultdict(dict)  # symbol -> price_bucket -> cluster
@@ -400,7 +354,7 @@ class CandidateZoneManager:
         self._validation_times: List[float] = []
 
         # Archive for long-term learning
-        self._archive = CandidateZoneArchive(db_path)
+        self._archive = CandidateZoneArchive()
 
         logger.info("[CANDIDATE_ZONES] Manager initialized")
 

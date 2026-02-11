@@ -51,12 +51,14 @@ except ImportError:
     print("ERROR: mcp package not installed. Run: pip install mcp", file=sys.stderr)
     sys.exit(1)
 
-# Try to import Gemini
+# Try to import Gemini (new SDK)
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     GEMINI_AVAILABLE = True
 except ImportError:
     genai = None
+    genai_types = None
     GEMINI_AVAILABLE = False
 
 # Try to import Groq (fallback)
@@ -64,6 +66,14 @@ try:
     from groq import Groq
 except ImportError:
     Groq = None
+
+# Try to import OpenAI (for OpenRouter)
+try:
+    from openai import OpenAI
+    OPENROUTER_AVAILABLE = True
+except ImportError:
+    OpenAI = None
+    OPENROUTER_AVAILABLE = False
 
 
 # ============================================================================
@@ -86,7 +96,7 @@ TOOL_COSTS = {
     "run_command": 30,         # Variable
     "get_git_context": 30,     # Variable
 }
-DEFAULT_CONTEXT_BUDGET = 500  # Total budget in "tokens"
+DEFAULT_CONTEXT_BUDGET = 1500  # Total budget in "tokens"
 
 
 # ============================================================================
@@ -418,7 +428,7 @@ def execute_tool(name: str, args: dict) -> str:
 # GPT Interaction
 # ============================================================================
 
-SYSTEM_PROMPT = """You are a technical expert in a debate with Claude (Anthropic).
+SYSTEM_PROMPT_WITH_TOOLS = """You are a technical expert in a debate with Claude (Anthropic).
 Be direct, specific, and willing to disagree.
 
 You have tools to explore the codebase. Use PROGRESSIVE DISCLOSURE:
@@ -429,8 +439,10 @@ You have tools to explore the codebase. Use PROGRESSIVE DISCLOSURE:
 
 DON'T dump entire files. DO target specific functions.
 
-IMPORTANT: Use the provided tools via the API's native function calling mechanism.
-Do NOT write function calls as text like <function=...> - just call the tools directly.
+CRITICAL RULES:
+- NEVER write function calls as text like <function=...> or ```function```. Use the API's native tool calling.
+- If file outlines are already shown in the prompt (under "Pre-loaded File Outlines"), DO NOT call get_file_outline on those files again - the content is already there.
+- Only use tools to explore files NOT already provided in the context.
 
 When you've formed your opinion:
 - State your position clearly
@@ -438,25 +450,46 @@ When you've formed your opinion:
 - If you agree with Claude, say so and add what you'd emphasize
 - If you disagree, explain why with evidence from the codebase"""
 
+SYSTEM_PROMPT_NO_TOOLS = """You are a technical expert in a debate with Claude (Anthropic).
+Be direct, specific, and willing to disagree.
+
+The relevant code files have been pre-loaded in the prompt. Analyze them directly.
+DO NOT attempt to call any functions or tools - just analyze the provided content.
+
+When you've formed your opinion:
+- State your position clearly
+- Reference specific code/lines when relevant
+- If you agree with Claude, say so and add what you'd emphasize
+- If you disagree, explain why with evidence from the provided code"""
+
 # Model configuration
 GROQ_MODEL = "llama-3.3-70b-versatile"
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
-# Track which backend is active
-active_backend = "none"
+# OpenRouter models (cheap first, then free fallbacks)
+OPENROUTER_MODELS = [
+    "openrouter/pony-alpha",               # Free stealth model - strong reasoning
+    "deepseek/deepseek-v3.2",              # $0.25/M in, $0.38/M out - best value
+    "deepseek/deepseek-r1-0528:free",      # Free reasoning model
+    "tngtech/deepseek-r1t2-chimera:free",  # Free DeepSeek variant
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+]
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _convert_tools_for_gemini():
-    """Convert OpenAI-style tools to Gemini format."""
-    gemini_tools = []
+    """Convert OpenAI-style tools to new google.genai FunctionDeclaration format."""
+    function_declarations = []
     for tool in GPT_TOOLS:
         func = tool["function"]
-        gemini_tools.append({
-            "name": func["name"],
-            "description": func["description"],
-            "parameters": func["parameters"]
-        })
-    return gemini_tools
+        fd = genai_types.FunctionDeclaration(
+            name=func["name"],
+            description=func["description"],
+            parameters_json_schema=func.get("parameters"),
+        )
+        function_declarations.append(fd)
+    return genai_types.Tool(function_declarations=function_declarations)
 
 
 def prefetch_hint_files(hint_files: list[str]) -> str:
@@ -504,78 +537,152 @@ class ContextBudget:
         return f"Budget: {self.spent}/{self.budget} tokens used"
 
 
+def _get_gemini_key() -> Optional[str]:
+    """Get Gemini API key from env or config file."""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("LLM_API_KEY")
+    if key:
+        return key
+    # Fallback: read from config file
+    config_file = PROJECT_ROOT / ".gemini_key"
+    if config_file.exists():
+        return config_file.read_text().strip()
+    return None
+
+
 def call_gemini(prompt: str, allow_tools: bool = True, context_budget: int = DEFAULT_CONTEXT_BUDGET) -> tuple[str, list]:
     """Call Gemini with context-budget-aware tool use. Returns (response, tools_used)."""
-    global active_backend
-
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = _get_gemini_key()
     if not api_key or not GEMINI_AVAILABLE:
         return "ERROR: Gemini not available", []
 
-    genai.configure(api_key=api_key)
+    # Create client with new SDK
+    client = genai.Client(api_key=api_key)
 
     # Convert tools to Gemini format
-    gemini_tools = _convert_tools_for_gemini() if allow_tools else None
+    gemini_tools = [_convert_tools_for_gemini()] if allow_tools else None
+    system_prompt = SYSTEM_PROMPT_WITH_TOOLS if allow_tools else SYSTEM_PROMPT_NO_TOOLS
 
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT,
-        tools=gemini_tools if gemini_tools else None
-    )
-
-    chat = model.start_chat()
     budget = ContextBudget(context_budget)
 
-    # Initial message
-    response = chat.send_message(prompt)
+    # Build conversation history
+    contents = [
+        genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt)])
+    ]
 
     max_iterations = 30  # Safety limit
     for _ in range(max_iterations):
+        # Generate response
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=gemini_tools,
+            ),
+        )
+
         # Check for function calls
-        if response.candidates[0].content.parts:
-            has_function_call = False
-            function_responses = []
+        if response.function_calls:
+            # Add model response to history
+            contents.append(response.candidates[0].content)
 
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'function_call') and part.function_call:
-                    has_function_call = True
-                    fc = part.function_call
-                    tool_name = fc.name
-                    tool_args = dict(fc.args) if fc.args else {}
+            # Process each function call
+            function_response_parts = []
+            for fc in response.function_calls:
+                tool_name = fc.name
+                tool_args = dict(fc.args) if fc.args else {}
 
-                    # Check budget before executing
-                    if not budget.can_afford(tool_name):
-                        result = f"Budget exhausted ({budget.summary()}). Provide your answer with current information."
-                    else:
-                        result = execute_tool(tool_name, tool_args)
-                        budget.spend(tool_name, tool_args)
+                # Check budget before executing
+                if not budget.can_afford(tool_name):
+                    result = f"Budget exhausted ({budget.summary()}). Provide your answer with current information."
+                else:
+                    result = execute_tool(tool_name, tool_args)
+                    budget.spend(tool_name, tool_args)
 
-                    function_responses.append(
-                        genai.protos.Part(
-                            function_response=genai.protos.FunctionResponse(
-                                name=tool_name,
-                                response={"result": result}
-                            )
-                        )
+                function_response_parts.append(
+                    genai_types.Part.from_function_response(
+                        name=tool_name,
+                        response={"result": result}
                     )
+                )
 
-            if has_function_call and function_responses:
-                # Send function results back
-                response = chat.send_message(function_responses)
-            else:
-                # No more function calls, extract text
-                break
+            # Add function responses to history
+            contents.append(genai_types.Content(role="tool", parts=function_response_parts))
         else:
+            # No function calls, we're done
             break
 
     # Extract final text response
-    text_response = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, 'text') and part.text:
-            text_response += part.text
+    text_response = response.text if hasattr(response, 'text') and response.text else "(no response)"
+    return text_response, budget.tools_used
 
-    active_backend = "gemini"
-    return text_response or "(no response)", budget.tools_used
+
+def _get_openrouter_key() -> Optional[str]:
+    """Get OpenRouter API key from env or config file."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    config_file = PROJECT_ROOT / ".openrouter_key"
+    if config_file.exists():
+        return config_file.read_text().strip()
+    return None
+
+
+def call_openrouter(prompt: str, allow_tools: bool = True, context_budget: int = DEFAULT_CONTEXT_BUDGET) -> tuple[str, list, str]:
+    """Call OpenRouter with free models. Returns (response, tools_used, model_name)."""
+    api_key = _get_openrouter_key()
+    if not api_key or not OPENROUTER_AVAILABLE:
+        return "ERROR: OpenRouter not available", [], ""
+
+    client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=api_key,
+    )
+
+    system_prompt = SYSTEM_PROMPT_WITH_TOOLS if allow_tools else SYSTEM_PROMPT_NO_TOOLS
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+    budget = ContextBudget(context_budget)
+
+    # Try each model until one works
+    last_error = None
+    for model in OPENROUTER_MODELS:
+        try:
+            max_iterations = 30
+            for _ in range(max_iterations):
+                kwargs = {"model": model, "max_tokens": 4000, "messages": messages}
+                if allow_tools and budget.remaining() > 0:
+                    kwargs["tools"] = GPT_TOOLS
+                    kwargs["tool_choice"] = "auto"
+
+                resp = client.chat.completions.create(**kwargs)
+                msg = resp.choices[0].message
+
+                if msg.tool_calls and allow_tools:
+                    messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
+                        {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ]})
+                    for tc in msg.tool_calls:
+                        tool_name = tc.function.name
+                        tool_args = json.loads(tc.function.arguments)
+
+                        if not budget.can_afford(tool_name):
+                            result = f"Budget exhausted ({budget.summary()}). Provide your answer now."
+                        else:
+                            result = execute_tool(tool_name, tool_args)
+                            budget.spend(tool_name, tool_args)
+
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                else:
+                    return msg.content or "", budget.tools_used, model
+
+            return msg.content or f"(iterations exhausted)", budget.tools_used, model
+
+        except Exception as e:
+            last_error = e
+            continue  # Try next model
+
+    return f"ERROR: All OpenRouter models failed. Last error: {last_error}", [], ""
 
 
 def _parse_text_tool_calls(content: str) -> list[tuple[str, dict]]:
@@ -608,13 +715,12 @@ def _parse_text_tool_calls(content: str) -> list[tuple[str, dict]]:
 
 def call_groq(prompt: str, allow_tools: bool = True, context_budget: int = DEFAULT_CONTEXT_BUDGET) -> tuple[str, list]:
     """Call Llama via Groq with context-budget-aware tool use. Returns (response, tools_used)."""
-    global active_backend
-
     if Groq is None:
         return "ERROR: groq not installed. Run: pip install groq", []
 
     client = Groq()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+    system_prompt = SYSTEM_PROMPT_WITH_TOOLS if allow_tools else SYSTEM_PROMPT_NO_TOOLS
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
     budget = ContextBudget(context_budget)
     tools_disabled_due_to_error = False
 
@@ -672,18 +778,28 @@ def call_groq(prompt: str, allow_tools: bool = True, context_budget: int = DEFAU
                     # Append as user message with tool result (workaround since no tool_call_id)
                     messages.append({"role": "user", "content": f"Tool result for {tool_name}({tool_args}):\n{result}"})
             else:
-                active_backend = "groq"
                 return msg.content or "", budget.tools_used
 
-    active_backend = "groq"
     return msg.content or f"(iterations exhausted, {budget.summary()})", budget.tools_used
 
 
 def call_llm(prompt: str, allow_tools: bool = True, context_budget: int = DEFAULT_CONTEXT_BUDGET) -> tuple[str, list, str]:
     """Call LLM with automatic fallback and context budget. Returns (response, tools_used, backend_name)."""
 
-    # Try Gemini first if available
-    gemini_key = os.environ.get("GEMINI_API_KEY")
+    # Try OpenRouter first (free models)
+    openrouter_key = _get_openrouter_key()
+    if OPENROUTER_AVAILABLE and openrouter_key:
+        try:
+            response, tools, model = call_openrouter(prompt, allow_tools, context_budget)
+            if not response.startswith("ERROR:"):
+                # Extract short model name
+                short_name = model.split("/")[-1].replace(":free", "") if model else "OpenRouter"
+                return response, tools, short_name
+        except Exception as e:
+            pass  # Fall through to Gemini
+
+    # Try Gemini if available
+    gemini_key = _get_gemini_key()
     if GEMINI_AVAILABLE and gemini_key:
         try:
             response, tools = call_gemini(prompt, allow_tools, context_budget)
@@ -699,9 +815,9 @@ def call_llm(prompt: str, allow_tools: bool = True, context_budget: int = DEFAUL
             response, tools = call_groq(prompt, allow_tools, context_budget)
             return response, tools, "Llama (Groq)"
         except Exception as e:
-            return f"ERROR: Both backends failed. Groq error: {e}", [], "none"
+            return f"ERROR: All backends failed. Groq error: {e}", [], "none"
 
-    return "ERROR: No LLM backend available. Set GEMINI_API_KEY or GROQ_API_KEY.", [], "none"
+    return "ERROR: No LLM backend available.", [], "none"
 
 
 # ============================================================================
@@ -811,8 +927,11 @@ Context:
             prompt += f"""
 {hint_context}
 
-IMPORTANT: The files above were pre-loaded because they are directly relevant to the question.
-Start your analysis from these files. Only explore other files if needed.
+IMPORTANT INSTRUCTIONS:
+1. The files above are ALREADY LOADED - DO NOT call get_file_outline() or read_file() on them.
+2. Analyze the pre-loaded content directly - it's all there.
+3. Only use tools if you need to explore OTHER files not shown above.
+4. If the pre-loaded files are sufficient, just answer the question directly.
 """
         if my_position:
             prompt += f"""
@@ -825,7 +944,12 @@ Do you agree or disagree? Reference the pre-loaded files above, then respond:"""
 Analyze the pre-loaded files above, explore further if needed, then give your assessment:"""
 
     # Call LLM (Gemini with Groq fallback)
-    response, tools_used, backend = call_llm(prompt)
+    # When hint_files are provided, disable tools entirely. The content is pre-loaded,
+    # so tools shouldn't be needed. This prevents Llama from trying to re-fetch files
+    # using text-based function calls (which Groq rejects). If LLM needs more context,
+    # it can say so in its response and Claude can make a follow-up call without hint_files.
+    allow_tools = not bool(hint_files)
+    response, tools_used, backend = call_llm(prompt, allow_tools=allow_tools)
 
     # Update history
     if my_position:
@@ -849,6 +973,15 @@ Analyze the pre-loaded files above, explore further if needed, then give your as
 
 
 async def main():
+    # Debug: log env vars to file at startup
+    debug_file = PROJECT_ROOT / "mcp_debug.log"
+    with open(debug_file, "w") as f:
+        f.write(f"OPENROUTER_KEY={'set' if _get_openrouter_key() else 'NOT SET'}\n")
+        f.write(f"GEMINI_KEY={'set' if _get_gemini_key() else 'NOT SET'}\n")
+        f.write(f"GROQ_API_KEY={'set' if os.environ.get('GROQ_API_KEY') else 'NOT SET'}\n")
+        f.write(f"OPENROUTER_AVAILABLE={OPENROUTER_AVAILABLE}\n")
+        f.write(f"GEMINI_AVAILABLE={GEMINI_AVAILABLE}\n")
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

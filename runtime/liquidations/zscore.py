@@ -74,14 +74,17 @@ class LiquidationZScoreCalculator:
         Returns:
             Z-score, or 0.0 if no liquidations (baseline/neutral activity)
         """
-        if not self._events:
+        # Snapshot deque once — gRPC thread may append concurrently
+        events_snapshot = list(self._events)
+
+        if not events_snapshot:
             # No liquidations = baseline activity (Z-score 0.0)
             return 0.0
 
         # Calculate baseline statistics (full window)
         baseline_cutoff = current_timestamp - self.baseline_window_seconds
         baseline_events = [
-            (ts, qty) for ts, qty in self._events
+            (ts, qty) for ts, qty in events_snapshot
             if ts >= baseline_cutoff
         ]
 
@@ -106,7 +109,7 @@ class LiquidationZScoreCalculator:
             # If current matches or is below baseline, return 0.
             current_cutoff = current_timestamp - self.current_window_seconds
             current_total = sum(
-                qty for ts, qty in self._events if ts >= current_cutoff
+                qty for ts, qty in events_snapshot if ts >= current_cutoff
             )
             current_rate_check = current_total / (self.current_window_seconds / 60.0)
             if current_rate_check > mean_rate and mean_rate > 0:
@@ -118,7 +121,7 @@ class LiquidationZScoreCalculator:
         # Current rate: Liquidations in recent window
         current_cutoff = current_timestamp - self.current_window_seconds
         current_events = [
-            qty for ts, qty in self._events
+            qty for ts, qty in events_snapshot
             if ts >= current_cutoff
         ]
 
@@ -191,7 +194,7 @@ class LiquidationZScoreCalculator:
         """
         current_cutoff = current_timestamp - self.current_window_seconds
         current_events = [
-            qty for ts, qty in self._events
+            qty for ts, qty in list(self._events)
             if ts >= current_cutoff
         ]
 

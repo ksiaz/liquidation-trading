@@ -33,6 +33,10 @@ class FillEvent:
     method: str                # "market" or "backstop" (empty if none)
     fill_id: int               # Unique fill ID
     tx_hash: str               # Transaction hash
+    # Capitulation tracking fields
+    dir: str = ""              # "Open Long", "Close Short", "Long > Short", etc.
+    start_position: str = ""   # Position size before fill (e.g., "-42.57")
+    closed_pnl: str = ""      # Realized PnL (e.g., "-6.081366")
 
 
 class FillReader:
@@ -179,15 +183,12 @@ class FillReader:
             if self._focus_symbols and symbol not in self._focus_symbols:
                 return None
 
-            # Deduplication
-            if fill_id and fill_id in self._seen_fill_ids:
+            # Only emit taker fills (crossed=true) for correct orderflow direction.
+            # Each trade produces two fills: taker (crossed) and maker (uncrossed).
+            # The taker's side (B/A) indicates aggressor direction.
+            crossed = fill.get('crossed', True)  # Default True for backwards compat
+            if not crossed:
                 return None
-
-            if fill_id:
-                self._seen_fill_ids.add(fill_id)
-                if len(self._seen_fill_ids) > self._max_seen_ids:
-                    to_remove = sorted(self._seen_fill_ids)[:self._max_seen_ids // 2]
-                    self._seen_fill_ids -= set(to_remove)
 
             # Calculate USD value
             try:
@@ -201,6 +202,11 @@ class FillReader:
             liquidated_wallet = liq_info.get('liquidatedUser', '') if liq_info else ''
             mark_price = liq_info.get('markPx', '') if liq_info else ''
             method = liq_info.get('method', '') if liq_info else ''
+
+            # Capitulation tracking fields
+            dir_type = fill.get('dir', '')
+            start_position = fill.get('startPosition', '')
+            closed_pnl = fill.get('closedPnl', '')
 
             return FillEvent(
                 symbol=symbol,
@@ -217,6 +223,9 @@ class FillReader:
                 method=method,
                 fill_id=fill_id,
                 tx_hash=tx_hash,
+                dir=str(dir_type),
+                start_position=str(start_position),
+                closed_pnl=str(closed_pnl),
             )
 
         except json.JSONDecodeError:

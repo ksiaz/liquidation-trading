@@ -101,7 +101,7 @@ class PositionTracker:
         # Dynamic wallet registry (optional)
         self._wallet_registry: Optional[WalletRegistry] = None
         if self._config.use_dynamic_registry:
-            self._wallet_registry = WalletRegistry(self._config.registry_db_path)
+            self._wallet_registry = WalletRegistry()
 
         # Setup wallets
         if self._config.use_dynamic_registry:

@@ -145,7 +145,10 @@ class CleanupCoordinator:
             if asyncio.iscoroutinefunction(prune_fn):
                 result = await prune_fn(*args, **kwargs)
             else:
-                result = prune_fn(*args, **kwargs)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, lambda: prune_fn(*args, **kwargs)
+                )
 
             items_pruned = result if isinstance(result, int) else 0
             duration = (time.time() - start) * 1000

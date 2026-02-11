@@ -12,1127 +12,53 @@ Captures complete system state for analysis:
 Constitutional: Factual logging only, no interpretation.
 """
 
-import sqlite3
+import threading
 import time
 import json
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 from datetime import datetime
 
+from runtime.logging.pg_pool import get_conn, put_conn, PgConnAdapter, init_pool
+
 
 class ResearchDatabase:
-    """SQLite database for comprehensive execution logging."""
-    
-    def __init__(self, db_path: str = "logs/execution.db"):
-        """Initialize database connection.
-        
+    """PostgreSQL database for comprehensive execution logging."""
+
+    def __init__(self, db_path: str = None, **kwargs):
+        """Initialize database connection via PostgreSQL pool.
+
         Args:
-            db_path: Path to SQLite database file
+            db_path: Ignored (legacy compatibility). All data goes to PostgreSQL.
         """
-        # Ensure logs directory exists
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # Auto-init pool if not yet initialized (for standalone scripts)
+        try:
+            init_pool()
+        except Exception:
+            pass
+
+        self._pg_conn = get_conn()
+        self.conn = PgConnAdapter(self._pg_conn, commit_passthrough=True)
+        self.db_path = None  # Legacy compat
+
+        # Cycle counter for direct usage (not through PgBRD)
+        self._cycle_counter = 0
+        self._cycle_lock = threading.Lock()
+        try:
+            cur = self._pg_conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(id), 0) FROM execution_cycles")
+            row = cur.fetchone()
+            self._cycle_counter = row[0] if row else 0
+            self._pg_conn.rollback()  # Clean up read transaction
+        except Exception:
+            self._pg_conn.rollback()
 
         self._create_schema()
     
     def _create_schema(self):
-        """Create complete research database schema."""
-        cursor = self.conn.cursor()
-        
-        # Table 1: Execution Cycles (Core)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS execution_cycles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                observation_status TEXT NOT NULL,
-                
-                m2_active_nodes INTEGER,
-                m2_dormant_nodes INTEGER,
-                m2_archived_nodes INTEGER,
-                m2_total_created INTEGER,
-                m2_total_interactions INTEGER,
-                
-                symbols_active_count INTEGER,
-                symbols_active_list TEXT,
-                
-                primitives_computing_total INTEGER,
-                primitives_possible_total INTEGER,
-                
-                snapshot_generation_ms REAL,
-                primitive_computation_ms REAL,
-                policy_evaluation_ms REAL,
-                arbitration_ms REAL,
-                
-                memory_usage_mb REAL,
-                cpu_percent REAL,
-                
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table 2: M2 Memory Nodes (Full State)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS m2_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                
-                node_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT,
-                
-                price_center REAL NOT NULL,
-                price_band REAL NOT NULL,
-                
-                state TEXT,
-                active BOOLEAN,
-                
-                strength REAL,
-                confidence REAL,
-                decay_rate REAL,
-                
-                first_seen_ts REAL,
-                last_interaction_ts REAL,
-                age_seconds REAL,
-                
-                liquidation_count INTEGER,
-                trade_execution_count INTEGER,
-                liquidation_proximity_count INTEGER,
-                
-                volume_total REAL,
-                creation_reason TEXT,
-                
-                presence_intervals_json TEXT,
-                
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-        
-        # Table 3: Primitive Values (Actual Values)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS primitive_values (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                
-                zone_penetration_depth REAL,
-                zone_penetration_direction TEXT,
-                displacement_anchor_dwell_time REAL,
-                
-                price_velocity REAL,
-                traversal_compactness REAL,
-                acceptance_ratio REAL,
-                acceptance_accepted_range REAL,
-                acceptance_rejected_range REAL,
-                
-                central_tendency_deviation REAL,
-                
-                absence_duration REAL,
-                
-                persistence_duration REAL,
-                persistence_presence_pct REAL,
-                
-                void_span_max REAL,
-                event_non_occurrence_count INTEGER,
-                
-                resting_size_bid REAL,
-                resting_size_ask REAL,
-                order_consumption_size REAL,
-                order_consumption_rate REAL,
-                absorption_event BOOLEAN,
-                refill_event BOOLEAN,
-                
-                liquidation_density REAL,
-                directional_continuity_value REAL,
-                trade_burst_count INTEGER,
-                
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-        
-        # Table 4: Policy Evaluations (Decision Tracking)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS policy_evaluations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                policy_name TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                
-                primitives_available TEXT,
-                conditions_checked TEXT,
-                
-                generated_proposal BOOLEAN,
-                proposal_action_type TEXT,
-                proposal_reason TEXT,
-                
-                triggering_primitives TEXT,
-                evaluation_time_ms REAL,
-                
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-        
-        # Table 5: Mandates (Enhanced)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS mandates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                policy_evaluation_id INTEGER,
-                
-                symbol TEXT NOT NULL,
-                mandate_type TEXT NOT NULL,
-                authority REAL NOT NULL,
-                timestamp REAL NOT NULL,
-                
-                source_policy TEXT,
-                triggering_primitives TEXT,
-                
-                price_at_mandate REAL,
-                m2_nodes_active_count INTEGER,
-                
-                submitted_to_arbitration BOOLEAN,
-                was_arbitration_winner BOOLEAN,
-                arbitration_conflict_count INTEGER,
-                
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-        
-        # Table 6: Arbitration Rounds (Conflict Resolution)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS arbitration_rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                
-                mandate_count INTEGER,
-                conflicting_mandates TEXT,
-                
-                winning_mandate_id INTEGER,
-                winning_policy TEXT,
-                resolution_reason TEXT,
-                
-                exit_supremacy_invoked BOOLEAN,
-                arbitration_time_ms REAL,
-                
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-        
-        # Table 7: Liquidation Events (Market Context)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS liquidation_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-                
-                side TEXT,
-                price REAL NOT NULL,
-                volume REAL NOT NULL,
-                
-                created_node_id TEXT,
-                reinforced_node_id TEXT,
-                
-                price_change_1m_pct REAL,
-                
-                ingested_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table 8: OHLC Candles (Price Context)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ohlc_candles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timestamp REAL NOT NULL,
+        """No-op — schema managed by pg_schema.ensure_schema()."""
+        pass
 
-                open REAL NOT NULL,
-                high REAL NOT NULL,
-                low REAL NOT NULL,
-                close REAL NOT NULL,
-
-                volume REAL,
-                trade_count INTEGER
-            )
-        """)
-
-        # Table 8.4: Order Book Events (Best Bid/Ask Updates)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS orderbook_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-
-                best_bid_price REAL NOT NULL,
-                best_bid_qty REAL NOT NULL,
-                best_ask_price REAL NOT NULL,
-                best_ask_qty REAL NOT NULL,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table 8.1: Orderbook Depth (L2 - 20 levels)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS orderbook_depth (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-
-                bids TEXT NOT NULL,
-                asks TEXT NOT NULL,
-
-                bid_total_qty REAL,
-                ask_total_qty REAL,
-                mid_price REAL,
-                spread_bps REAL,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table 8.2: Mark Prices (Official Binance Mark Price)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS mark_prices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-
-                mark_price REAL NOT NULL,
-                index_price REAL,
-                funding_rate REAL,
-                next_funding_time REAL,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table 8.5: Trade Events (Ground Truth for Validation)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trade_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-
-                price REAL NOT NULL,
-                volume REAL NOT NULL,
-
-                is_buyer_maker BOOLEAN,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table 8.6: Ghost Trades (Paper Trading Record)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ghost_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trade_id TEXT NOT NULL,
-                cycle_id INTEGER,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                quantity REAL NOT NULL,
-                price REAL NOT NULL,
-                timestamp REAL NOT NULL,
-                position_side TEXT NOT NULL,
-                is_entry BOOLEAN NOT NULL,
-                pnl REAL,
-                account_balance_after REAL NOT NULL,
-                entry_cycle_id INTEGER,
-                exit_cycle_id INTEGER,
-                winning_policy_name TEXT,
-                active_primitives TEXT,
-                spread_bps REAL,
-                concurrent_positions INTEGER,
-                holding_duration_sec REAL,
-                exit_reason TEXT,
-                entry_trade_id TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id)
-            )
-        """)
-
-        # Table 8.7: Ghost Trade Rejections (Tracking Failed Trade Attempts)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ghost_trade_rejections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                timestamp REAL NOT NULL,
-                symbol TEXT NOT NULL,
-                attempted_action TEXT NOT NULL,
-                attempted_side TEXT,
-                rejection_reason TEXT NOT NULL,
-                mandate_id INTEGER,
-                policy_name TEXT,
-                account_balance REAL,
-                account_equity REAL,
-                open_positions_count INTEGER,
-                current_price REAL,
-                spread_bps REAL,
-                triggering_primitives TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table 8.8: Policy Outcomes (Primitive Performance Attribution)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS policy_outcomes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                timestamp REAL NOT NULL,
-
-                mandate_type TEXT NOT NULL,
-                authority REAL NOT NULL,
-                policy_name TEXT,
-
-                active_primitives TEXT,
-
-                executed_action TEXT,
-                execution_success BOOLEAN,
-                rejection_reason TEXT,
-
-                ghost_trade_id INTEGER,
-                realized_pnl REAL,
-                holding_duration_sec REAL,
-                exit_reason TEXT,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (cycle_id) REFERENCES execution_cycles(id),
-                FOREIGN KEY (ghost_trade_id) REFERENCES ghost_trades(id)
-            )
-        """)
-
-        # Table 9: M2 Node Events (Event-level capture)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS m2_node_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                event_type TEXT NOT NULL,
-                
-                node_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                price REAL NOT NULL,
-                side TEXT,
-                volume REAL,
-                
-                strength_after REAL,
-                
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Phase 6: Add regime tracking columns (migration-safe)
-        # Check if columns exist before adding
-        cursor.execute("PRAGMA table_info(execution_cycles)")
-        existing_columns = [row[1] for row in cursor.fetchall()]
-
-        if 'regime_state' not in existing_columns:
-            try:
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN regime_state TEXT")
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN vwap REAL")
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN atr_5m REAL")
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN atr_30m REAL")
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN orderflow_imbalance REAL")
-                cursor.execute("ALTER TABLE execution_cycles ADD COLUMN liquidation_zscore REAL")
-                self.conn.commit()
-            except sqlite3.OperationalError:
-                # Columns might already exist from a previous migration
-                pass
-
-        # Create indexes for performance
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cycles_timestamp ON execution_cycles(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cycle ON m2_nodes(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON m2_nodes(symbol)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_primitives_cycle ON primitive_values(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_primitives_symbol ON primitive_values(symbol)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_eval_cycle ON policy_evaluations(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mandates_cycle ON mandates(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mandates_symbol ON mandates(symbol)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_arbitration_cycle ON arbitration_rounds(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_liquidations_timestamp ON liquidation_events(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON ohlc_candles(symbol, timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_orderbook_symbol_ts ON orderbook_events(symbol, timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trade_events(symbol, timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_cycle ON policy_outcomes(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_symbol_ts ON policy_outcomes(symbol, timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_policy_outcomes_trade ON policy_outcomes(ghost_trade_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol ON ghost_trades(symbol)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_timestamp ON ghost_trades(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_trades_cycle ON ghost_trades(cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_rejections_symbol ON ghost_trade_rejections(symbol)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ghost_rejections_cycle ON ghost_trade_rejections(cycle_id)")
-
-        # =====================================================================
-        # Hyperliquid Integration Tables
-        # =====================================================================
-
-        # Table: Hyperliquid positions (position snapshots)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                wallet_address TEXT NOT NULL,
-                coin TEXT NOT NULL,
-                side TEXT NOT NULL,
-                position_size REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                liquidation_price REAL NOT NULL,
-                leverage REAL,
-                margin_used REAL,
-                unrealized_pnl REAL,
-                position_value REAL,
-                distance_to_liquidation_pct REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Hyperliquid liquidation proximity (aggregated)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_liquidation_proximity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                coin TEXT NOT NULL,
-                current_price REAL NOT NULL,
-                threshold_pct REAL NOT NULL,
-
-                long_positions_count INTEGER,
-                long_positions_size REAL,
-                long_positions_value REAL,
-                long_avg_distance_pct REAL,
-                long_closest_liquidation REAL,
-
-                short_positions_count INTEGER,
-                short_positions_size REAL,
-                short_positions_value REAL,
-                short_avg_distance_pct REAL,
-                short_closest_liquidation REAL,
-
-                total_positions_at_risk INTEGER,
-                total_value_at_risk REAL,
-
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Hyperliquid wallet tracking (which wallets we monitor)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_tracked_wallets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_address TEXT NOT NULL UNIQUE,
-                wallet_type TEXT,
-                label TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TEXT
-            )
-        """)
-
-        # Table: Hyperliquid cascade events (when proximity threshold crossed)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_cascade_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                coin TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                current_price REAL NOT NULL,
-                threshold_pct REAL NOT NULL,
-                positions_at_risk INTEGER,
-                value_at_risk REAL,
-                dominant_side TEXT,
-                closest_liquidation REAL,
-                notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Hyperliquid indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_ts ON hl_positions(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_wallet ON hl_positions(wallet_address)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_positions_coin ON hl_positions(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_proximity_ts ON hl_liquidation_proximity(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_proximity_coin ON hl_liquidation_proximity(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_ts ON hl_cascade_events(timestamp)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascade_coin ON hl_cascade_events(coin)")
-
-        # =====================================================================
-        # HLP24-Compliant Raw Data Tables (Append-Only, No Computed Fields)
-        # Store raw API responses exactly as received. Labels computed at query time.
-        # =====================================================================
-
-        # Table: Raw position snapshots (store API response strings)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_position_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                poll_cycle_id INTEGER NOT NULL,
-                wallet_address TEXT NOT NULL,
-                coin TEXT NOT NULL,
-                szi TEXT NOT NULL,
-                entry_px TEXT NOT NULL,
-                liquidation_px TEXT,
-                leverage_type TEXT,
-                leverage_value REAL,
-                margin_used TEXT,
-                position_value TEXT,
-                unrealized_pnl TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Raw wallet account snapshots
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_wallet_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                poll_cycle_id INTEGER NOT NULL,
-                wallet_address TEXT NOT NULL,
-                account_value TEXT,
-                total_margin_used TEXT,
-                withdrawable TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Liquidation events (detected from position disappearance)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_liquidation_events_raw (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                detected_ts INTEGER NOT NULL,
-                wallet_address TEXT NOT NULL,
-                coin TEXT NOT NULL,
-                last_known_szi TEXT NOT NULL,
-                last_known_entry_px TEXT NOT NULL,
-                last_known_liquidation_px TEXT,
-                last_known_position_value TEXT,
-                last_known_unrealized_pnl TEXT,
-                prev_snapshot_id INTEGER,
-                detection_method TEXT DEFAULT 'position_disappearance',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: OI/Funding snapshots (raw API response)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_oi_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                coin TEXT NOT NULL,
-                open_interest TEXT NOT NULL,
-                funding_rate TEXT,
-                premium TEXT,
-                day_ntl_vlm TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Mark price snapshots (raw)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_mark_prices_raw (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                coin TEXT NOT NULL,
-                mark_px TEXT NOT NULL,
-                oracle_px TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Funding rate snapshots
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_funding_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                coin TEXT NOT NULL,
-                funding_rate TEXT NOT NULL,
-                next_funding_ts INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Binance funding rate snapshots (for cross-exchange comparison)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS binance_funding_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                coin TEXT NOT NULL,
-                funding_rate TEXT NOT NULL,
-                funding_time INTEGER,
-                mark_price TEXT,
-                index_price TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Spot price snapshots (for basis calculation)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS spot_price_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_ts INTEGER NOT NULL,
-                coin TEXT NOT NULL,
-                price TEXT NOT NULL,
-                source TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Wallet discovery provenance
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_wallet_discovery (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_address TEXT NOT NULL,
-                discovery_ts INTEGER NOT NULL,
-                source_type TEXT NOT NULL,
-                source_coin TEXT,
-                source_value REAL,
-                source_metadata TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Poll cycle tracking
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_poll_cycles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_ts INTEGER NOT NULL,
-                cycle_type TEXT NOT NULL,
-                wallets_polled INTEGER DEFAULT 0,
-                positions_found INTEGER DEFAULT 0,
-                liquidations_detected INTEGER DEFAULT 0,
-                api_errors INTEGER DEFAULT 0,
-                duration_ms INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Wallet polling configuration (tiered intervals)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_wallet_polling_config (
-                wallet_address TEXT PRIMARY KEY,
-                tier INTEGER NOT NULL,
-                last_poll_ts INTEGER,
-                next_poll_ts INTEGER,
-                poll_count INTEGER DEFAULT 0,
-                consecutive_empty INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # HLP25 Validation Tables
-        # Table: Labeled cascade events (from raw data)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_labeled_cascades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                coin TEXT NOT NULL,
-                start_ts INTEGER NOT NULL,
-                end_ts INTEGER NOT NULL,
-                oi_drop_pct TEXT NOT NULL,
-                liquidation_count INTEGER NOT NULL,
-                wave_count INTEGER,
-                price_start TEXT,
-                price_end TEXT,
-                price_5min_after TEXT,
-                outcome TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Wave structure within cascades
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_cascade_waves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cascade_id INTEGER NOT NULL,
-                wave_num INTEGER NOT NULL,
-                start_ts INTEGER NOT NULL,
-                end_ts INTEGER NOT NULL,
-                liquidation_count INTEGER NOT NULL,
-                oi_drop_pct TEXT,
-                FOREIGN KEY (cascade_id) REFERENCES hl_labeled_cascades(id)
-            )
-        """)
-
-        # Table: Validation results for HLP25 hypotheses
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_validation_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                hypothesis_name TEXT NOT NULL,
-                run_ts INTEGER NOT NULL,
-                total_events INTEGER NOT NULL,
-                supporting_events INTEGER NOT NULL,
-                success_rate REAL NOT NULL,
-                calibrated_threshold REAL,
-                status TEXT NOT NULL,
-                notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: HLP23 threshold configurations
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_threshold_configs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                value REAL NOT NULL,
-                method TEXT NOT NULL,
-                date_set TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                sharpe_ratio REAL,
-                win_rate REAL,
-                trades_per_month REAL,
-                validation_sharpe REAL,
-                validation_degradation_pct REAL,
-                status TEXT NOT NULL DEFAULT 'HYPOTHESIS',
-                sensitivity_range_pct REAL,
-                is_robust INTEGER DEFAULT 0,
-                next_review_date TEXT,
-                regime TEXT,
-                strategy_name TEXT,
-                version INTEGER DEFAULT 1,
-                notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Table: Threshold optimization history
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_threshold_optimization_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                threshold_name TEXT NOT NULL,
-                run_ts INTEGER NOT NULL,
-                method TEXT NOT NULL,
-                optimal_value REAL NOT NULL,
-                in_sample_sharpe REAL,
-                out_of_sample_sharpe REAL,
-                degradation_pct REAL,
-                is_robust INTEGER DEFAULT 0,
-                grid_min REAL,
-                grid_max REAL,
-                grid_step REAL,
-                candidates_json TEXT,
-                sensitivity_json TEXT,
-                notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Edge Preservation: Time-windowed metric snapshots
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_metric_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                window_name TEXT NOT NULL,
-                metric_name TEXT NOT NULL,
-                sample_count INTEGER NOT NULL,
-                mean_value REAL,
-                p50 REAL,
-                p75 REAL,
-                p95 REAL,
-                p99 REAL,
-                max_value REAL,
-                min_value REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Edge Preservation: Decay signal log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_decay_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                metric_name TEXT NOT NULL,
-                recent_window TEXT NOT NULL,
-                baseline_window TEXT NOT NULL,
-                recent_value REAL NOT NULL,
-                baseline_value REAL NOT NULL,
-                change_pct REAL NOT NULL,
-                z_score REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Catastrophe Playbooks: Event log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_catastrophe_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                details TEXT,
-                previous_state TEXT NOT NULL,
-                new_state TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Catastrophe Playbooks: Kill switch state (single row)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_kill_switch_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                triggered INTEGER NOT NULL DEFAULT 0,
-                trigger_ts_ns INTEGER,
-                trigger_reason TEXT,
-                manual_override_required INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Catastrophe Playbooks: Recovery attempt log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_recovery_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                failure_type TEXT NOT NULL,
-                attempt_num INTEGER NOT NULL,
-                success INTEGER NOT NULL,
-                details TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Trade Gating: Gating decisions log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_gating_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                decision TEXT NOT NULL,
-                execution_state TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                size_factor REAL NOT NULL,
-                delay_ns INTEGER NOT NULL DEFAULT 0,
-                latency_p50_ns INTEGER,
-                latency_p95_ns INTEGER,
-                latency_p99_ns INTEGER,
-                slippage_mean_bps REAL,
-                slippage_p95_bps REAL,
-                sample_count INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Strategy Performance: Performance snapshots
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_strategy_performance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                strategy_id TEXT NOT NULL,
-                window_type TEXT NOT NULL,
-                trade_count INTEGER NOT NULL,
-                win_count INTEGER NOT NULL,
-                loss_count INTEGER NOT NULL,
-                win_rate REAL NOT NULL,
-                total_pnl REAL NOT NULL,
-                total_pnl_bps REAL NOT NULL,
-                gross_profit REAL NOT NULL,
-                gross_loss REAL NOT NULL,
-                profit_factor REAL NOT NULL,
-                expectancy_bps REAL NOT NULL,
-                avg_slippage_bps REAL NOT NULL,
-                max_slippage_bps REAL NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Alpha Decay Governor: Governor decisions log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_governor_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                strategy_id TEXT,
-                symbol TEXT,
-                size_factor REAL NOT NULL,
-                win_rate REAL,
-                expectancy_bps REAL,
-                profit_factor REAL,
-                sample_count INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # =====================================================================
-        # Pillar 4: Sovereign Capital Governor Tables
-        # =====================================================================
-
-        # Capital Governor State (single row - current scaling state)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_capital_governor_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                scaling_state TEXT NOT NULL,
-                confidence_score REAL NOT NULL,
-                allowed_capital_fraction REAL NOT NULL,
-                freeze_until_ns INTEGER,
-                freeze_reason TEXT,
-                quarantine_active INTEGER DEFAULT 0,
-                quarantine_pct REAL DEFAULT 0.0,
-                last_ath_ns INTEGER,
-                ath_value REAL,
-                consecutive_wins INTEGER DEFAULT 0,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Capital Governor Decision Log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_capital_governor_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                scaling_state TEXT NOT NULL,
-                confidence_score REAL NOT NULL,
-                allowed_capital_fraction REAL NOT NULL,
-                edge_stability REAL,
-                market_stability REAL,
-                execution_quality REAL,
-                impact_containment REAL,
-                drawdown_discipline REAL,
-                strategy_diversification REAL,
-                reason TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # =====================================================================
-        # Pillar 5: Sovereign Meta-Governor Tables
-        # =====================================================================
-
-        # Meta Governor State (single row - current trust state)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_meta_governor_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                trust_state TEXT NOT NULL,
-                trust_score REAL NOT NULL,
-                allows_trading INTEGER NOT NULL,
-                allows_entries INTEGER NOT NULL,
-                allows_exits INTEGER NOT NULL,
-                capital_override REAL,
-                requires_manual_reset INTEGER DEFAULT 0,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Meta Governor Decision Log
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_meta_governor_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                trust_state TEXT NOT NULL,
-                trust_score REAL NOT NULL,
-                data_trust REAL,
-                execution_trust REAL,
-                alpha_trust REAL,
-                risk_trust REAL,
-                consistency_trust REAL,
-                allows_trading INTEGER NOT NULL,
-                capital_override REAL,
-                reason TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Unknown Threat Signals (anomaly detection log)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS hl_unknown_threat_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_ns INTEGER NOT NULL,
-                metric_name TEXT NOT NULL,
-                observed_value REAL NOT NULL,
-                baseline_mean REAL NOT NULL,
-                baseline_std REAL NOT NULL,
-                z_score REAL NOT NULL,
-                description TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # HLP24 table indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_ts ON hl_position_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_wallet ON hl_position_snapshots(wallet_address)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_coin ON hl_position_snapshots(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_pos_snap_cycle ON hl_position_snapshots(poll_cycle_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_wallet_snap_ts ON hl_wallet_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_wallet_snap_addr ON hl_wallet_snapshots(wallet_address)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_ts ON hl_liquidation_events_raw(detected_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_wallet ON hl_liquidation_events_raw(wallet_address)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_liq_events_raw_coin ON hl_liquidation_events_raw(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_oi_snap_ts ON hl_oi_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_oi_snap_coin ON hl_oi_snapshots(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_mark_raw_ts ON hl_mark_prices_raw(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_mark_raw_coin ON hl_mark_prices_raw(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_ts ON hl_funding_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_funding_coin ON hl_funding_snapshots(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_binance_funding_ts ON binance_funding_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_binance_funding_coin ON binance_funding_snapshots(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_spot_price_ts ON spot_price_snapshots(snapshot_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_spot_price_coin ON spot_price_snapshots(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_addr ON hl_wallet_discovery(wallet_address)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_disc_ts ON hl_wallet_discovery(discovery_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cycles_ts ON hl_poll_cycles(cycle_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_tier ON hl_wallet_polling_config(tier)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_poll_next ON hl_wallet_polling_config(next_poll_ts)")
-
-        # HLP25 validation indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascades_coin ON hl_labeled_cascades(coin)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cascades_ts ON hl_labeled_cascades(start_ts)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_waves_cascade ON hl_cascade_waves(cascade_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_name ON hl_validation_results(hypothesis_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_validation_ts ON hl_validation_results(run_ts)")
-
-        # HLP23 threshold indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_name ON hl_threshold_configs(name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_status ON hl_threshold_configs(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_regime ON hl_threshold_configs(regime)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_strategy ON hl_threshold_configs(strategy_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_review ON hl_threshold_configs(next_review_date)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_name ON hl_threshold_optimization_runs(threshold_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_thresh_opt_ts ON hl_threshold_optimization_runs(run_ts)")
-
-        # Edge Preservation indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_ts ON hl_metric_snapshots(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_name ON hl_metric_snapshots(metric_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_metric_snap_window ON hl_metric_snapshots(window_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_decay_ts ON hl_decay_signals(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_decay_metric ON hl_decay_signals(metric_name)")
-
-        # Catastrophe Playbooks indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_catastrophe_ts ON hl_catastrophe_events(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_catastrophe_type ON hl_catastrophe_events(event_type)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_ts ON hl_recovery_attempts(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_recovery_type ON hl_recovery_attempts(failure_type)")
-
-        # Trade Gating indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_ts ON hl_gating_decisions(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_decision ON hl_gating_decisions(decision)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_gating_state ON hl_gating_decisions(execution_state)")
-
-        # Strategy Performance indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_ts ON hl_strategy_performance(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_strategy ON hl_strategy_performance(strategy_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_strat_perf_window ON hl_strategy_performance(window_type)")
-
-        # Alpha Decay Governor indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_ts ON hl_governor_decisions(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_action ON hl_governor_decisions(action)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_severity ON hl_governor_decisions(severity)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_governor_strategy ON hl_governor_decisions(strategy_id)")
-
-        # Capital Governor indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cap_gov_dec_ts ON hl_capital_governor_decisions(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_cap_gov_dec_state ON hl_capital_governor_decisions(scaling_state)")
-
-        # Meta Governor indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_meta_gov_dec_ts ON hl_meta_governor_decisions(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_meta_gov_dec_state ON hl_meta_governor_decisions(trust_state)")
-
-        # Unknown Threat Signal indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_threat_ts ON hl_unknown_threat_signals(ts_ns)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hl_threat_metric ON hl_unknown_threat_signals(metric_name)")
-
-        self.conn.commit()
-    
     def log_cycle(
         self,
         timestamp: float,
@@ -1143,28 +69,17 @@ class ResearchDatabase:
         primitives_total: int,
         performance: Optional[Dict[str, float]] = None,
         regime_state: Optional[str] = None,
-        regime_metrics: Optional[Dict[str, float]] = None
+        regime_metrics: Optional[Dict[str, float]] = None,
+        cycle_id: Optional[int] = None
     ) -> int:
         """Log execution cycle (Phase 1 - Core).
-        
+
         Returns:
             cycle_id for linking related data
         """
         cursor = self.conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO execution_cycles (
-                timestamp, observation_status,
-                m2_active_nodes, m2_dormant_nodes, m2_archived_nodes,
-                m2_total_created, m2_total_interactions,
-                symbols_active_count, symbols_active_list,
-                primitives_computing_total, primitives_possible_total,
-                snapshot_generation_ms, primitive_computation_ms,
-                policy_evaluation_ms, arbitration_ms,
-                memory_usage_mb, cpu_percent,
-                regime_state, vwap, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+
+        params = (
             timestamp, observation_status,
             m2_metrics.get('active_nodes', 0),
             m2_metrics.get('dormant_nodes', 0),
@@ -1187,9 +102,29 @@ class ResearchDatabase:
             regime_metrics.get('atr_30m') if regime_metrics else None,
             regime_metrics.get('orderflow_imbalance') if regime_metrics else None,
             regime_metrics.get('liquidation_zscore') if regime_metrics else None
-        ))
-        
-        cycle_id = cursor.lastrowid
+        )
+
+        if cycle_id is None:
+            # Auto-assign cycle_id from local counter
+            with self._cycle_lock:
+                self._cycle_counter += 1
+                cycle_id = self._cycle_counter
+
+        cursor.execute("""
+            INSERT INTO execution_cycles (
+                id, timestamp, observation_status,
+                m2_active_nodes, m2_dormant_nodes, m2_archived_nodes,
+                m2_total_created, m2_total_interactions,
+                symbols_active_count, symbols_active_list,
+                primitives_computing_total, primitives_possible_total,
+                snapshot_generation_ms, primitive_computation_ms,
+                policy_evaluation_ms, arbitration_ms,
+                memory_usage_mb, cpu_percent,
+                regime_state, vwap, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO NOTHING
+        """, (cycle_id,) + params)
+
         self.conn.commit()
         return cycle_id
     
@@ -3837,14 +2772,7 @@ class ResearchDatabase:
     def prune_old_data(self, max_age_hours: int = 48) -> dict:
         """Prune data older than max_age_hours from all tables.
 
-        This is critical for disk space management. The database can grow
-        to several GB per day without pruning.
-
-        Args:
-            max_age_hours: Maximum data age in hours (default 48h)
-
-        Returns:
-            dict with deleted row counts per table and space reclaimed
+        PostgreSQL autovacuum handles space reclamation — no manual VACUUM needed.
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -3852,92 +2780,17 @@ class ResearchDatabase:
         cutoff_ts = time.time() - (max_age_hours * 3600)
         cutoff_ns = int(cutoff_ts * 1_000_000_000)
 
-        # Tables with 'timestamp' column (float seconds)
-        tables_with_timestamp = [
-            'execution_cycles',
-            'liquidation_events',
-            'ohlc_candles',
-            'orderbook_events',
-            'orderbook_depth',
-            'mark_prices',
-            'trade_events',
-            'policy_outcomes',
-            'm2_node_events',
-            'hl_positions',
-            'hl_liquidation_proximity',
-            'hl_cascade_events',
-        ]
-
-        # Tables with 'ts_ns' column (nanoseconds)
-        tables_with_ts_ns = [
-            'hl_metric_snapshots',
-            'hl_decay_signals',
-            'hl_catastrophe_events',
-            'hl_recovery_attempts',
-            'hl_gating_decisions',
-            'hl_strategy_performance',
-            'hl_governor_decisions',
-            'hl_capital_governor_decisions',
-            'hl_meta_governor_decisions',
-            'hl_unknown_threat_signals',
-        ]
-
-        # Tables with 'snapshot_ts' column (nanoseconds)
-        tables_with_snapshot_ts = [
-            'hl_position_snapshots',
-            'hl_wallet_snapshots',
-            'hl_oi_snapshots',
-            'hl_mark_prices_raw',
-            'hl_funding_snapshots',
-            'binance_funding_snapshots',
-            'spot_price_snapshots',
-        ]
-
-        # Tables with 'detected_ts' column (nanoseconds)
-        tables_with_detected_ts = [
-            'hl_liquidation_events_raw',
-        ]
-
-        # Tables with 'cycle_ts' column (nanoseconds)
-        tables_with_cycle_ts = [
-            'hl_poll_cycles',
-        ]
-
-        # Tables with 'discovery_ts' column (nanoseconds)
-        tables_with_discovery_ts = [
-            'hl_wallet_discovery',
-        ]
-
-        # Tables with 'start_ts' column (nanoseconds)
-        tables_with_start_ts = [
-            'hl_labeled_cascades',
-        ]
-
-        # Tables with 'run_ts' column (nanoseconds)
-        tables_with_run_ts = [
-            'hl_validation_results',
-            'hl_threshold_optimization_runs',
-        ]
-
-        # Child tables that need cycle_id-based deletion
-        child_tables = [
-            'm2_nodes',
-            'primitive_values',
-            'policy_evaluations',
-            'mandates',
-            'arbitration_rounds',
-        ]
-
         cursor = self.conn.cursor()
         deleted_counts = {}
 
-        # Get initial db size
-        cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
-        initial_size = cursor.fetchone()[0]
-
         try:
-            # Delete from tables with 'timestamp' column
-            for table in tables_with_timestamp:
+            # Tables with 'timestamp' column (float seconds)
+            for table in [
+                'execution_cycles', 'liquidation_events', 'ohlc_candles',
+                'orderbook_events', 'orderbook_depth', 'mark_prices',
+                'trade_events', 'policy_outcomes', 'm2_node_events',
+                'hl_positions', 'hl_liquidation_proximity', 'hl_cascade_events',
+            ]:
                 try:
                     cursor.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff_ts,))
                     deleted_counts[table] = cursor.rowcount
@@ -3945,8 +2798,14 @@ class ResearchDatabase:
                     logger.debug(f"Error pruning {table}: {e}")
                     deleted_counts[table] = 0
 
-            # Delete from tables with 'ts_ns' column
-            for table in tables_with_ts_ns:
+            # Tables with 'ts_ns' column (nanoseconds)
+            for table in [
+                'hl_metric_snapshots', 'hl_decay_signals',
+                'hl_catastrophe_events', 'hl_recovery_attempts',
+                'hl_gating_decisions', 'hl_strategy_performance',
+                'hl_governor_decisions', 'hl_capital_governor_decisions',
+                'hl_meta_governor_decisions', 'hl_unknown_threat_signals',
+            ]:
                 try:
                     cursor.execute(f"DELETE FROM {table} WHERE ts_ns < ?", (cutoff_ns,))
                     deleted_counts[table] = cursor.rowcount
@@ -3954,8 +2813,13 @@ class ResearchDatabase:
                     logger.debug(f"Error pruning {table}: {e}")
                     deleted_counts[table] = 0
 
-            # Delete from tables with 'snapshot_ts' column
-            for table in tables_with_snapshot_ts:
+            # Tables with 'snapshot_ts' column (nanoseconds)
+            for table in [
+                'hl_position_snapshots', 'hl_wallet_snapshots',
+                'hl_oi_snapshots', 'hl_mark_prices_raw',
+                'hl_funding_snapshots', 'binance_funding_snapshots',
+                'spot_price_snapshots',
+            ]:
                 try:
                     cursor.execute(f"DELETE FROM {table} WHERE snapshot_ts < ?", (cutoff_ns,))
                     deleted_counts[table] = cursor.rowcount
@@ -3963,63 +2827,33 @@ class ResearchDatabase:
                     logger.debug(f"Error pruning {table}: {e}")
                     deleted_counts[table] = 0
 
-            # Delete from tables with 'detected_ts' column
-            for table in tables_with_detected_ts:
+            # Tables with other timestamp columns
+            for table, col in [
+                ('hl_liquidation_events_raw', 'detected_ts'),
+                ('hl_poll_cycles', 'cycle_ts'),
+                ('hl_wallet_discovery', 'discovery_ts'),
+                ('hl_labeled_cascades', 'start_ts'),
+                ('hl_validation_results', 'run_ts'),
+                ('hl_threshold_optimization_runs', 'run_ts'),
+            ]:
                 try:
-                    cursor.execute(f"DELETE FROM {table} WHERE detected_ts < ?", (cutoff_ns,))
+                    cursor.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff_ns,))
                     deleted_counts[table] = cursor.rowcount
                 except Exception as e:
                     logger.debug(f"Error pruning {table}: {e}")
                     deleted_counts[table] = 0
 
-            # Delete from tables with 'cycle_ts' column
-            for table in tables_with_cycle_ts:
-                try:
-                    cursor.execute(f"DELETE FROM {table} WHERE cycle_ts < ?", (cutoff_ns,))
-                    deleted_counts[table] = cursor.rowcount
-                except Exception as e:
-                    logger.debug(f"Error pruning {table}: {e}")
-                    deleted_counts[table] = 0
-
-            # Delete from tables with 'discovery_ts' column
-            for table in tables_with_discovery_ts:
-                try:
-                    cursor.execute(f"DELETE FROM {table} WHERE discovery_ts < ?", (cutoff_ns,))
-                    deleted_counts[table] = cursor.rowcount
-                except Exception as e:
-                    logger.debug(f"Error pruning {table}: {e}")
-                    deleted_counts[table] = 0
-
-            # Delete from tables with 'start_ts' column
-            for table in tables_with_start_ts:
-                try:
-                    cursor.execute(f"DELETE FROM {table} WHERE start_ts < ?", (cutoff_ns,))
-                    deleted_counts[table] = cursor.rowcount
-                except Exception as e:
-                    logger.debug(f"Error pruning {table}: {e}")
-                    deleted_counts[table] = 0
-
-            # Delete from tables with 'run_ts' column
-            for table in tables_with_run_ts:
-                try:
-                    cursor.execute(f"DELETE FROM {table} WHERE run_ts < ?", (cutoff_ns,))
-                    deleted_counts[table] = cursor.rowcount
-                except Exception as e:
-                    logger.debug(f"Error pruning {table}: {e}")
-                    deleted_counts[table] = 0
-
-            # Delete child tables based on old cycle_ids
-            old_cycle_ids_query = "SELECT id FROM execution_cycles WHERE timestamp < ?"
-            cursor.execute(old_cycle_ids_query, (cutoff_ts,))
+            # Child tables: delete by old cycle_ids
+            cursor.execute("SELECT id FROM execution_cycles WHERE timestamp < ?", (cutoff_ts,))
             old_cycle_ids = [row[0] for row in cursor.fetchall()]
 
             if old_cycle_ids:
-                placeholders = ','.join('?' * len(old_cycle_ids))
-                for table in child_tables:
+                for table in ['m2_nodes', 'primitive_values', 'policy_evaluations',
+                              'mandates', 'arbitration_rounds']:
                     try:
                         cursor.execute(
-                            f"DELETE FROM {table} WHERE cycle_id IN ({placeholders})",
-                            old_cycle_ids
+                            f"DELETE FROM {table} WHERE cycle_id = ANY(?)",
+                            (old_cycle_ids,)
                         )
                         deleted_counts[table] = cursor.rowcount
                     except Exception as e:
@@ -4033,32 +2867,17 @@ class ResearchDatabase:
                     WHERE cascade_id NOT IN (SELECT id FROM hl_labeled_cascades)
                 """)
                 deleted_counts['hl_cascade_waves'] = cursor.rowcount
-            except Exception as e:
-                logger.debug(f"Error pruning hl_cascade_waves: {e}")
+            except Exception:
+                pass
 
             self.conn.commit()
 
-            # VACUUM to reclaim disk space
-            cursor.execute("VACUUM")
-
-            # Get final db size
-            cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
-            final_size = cursor.fetchone()[0]
-
             total_deleted = sum(deleted_counts.values())
-            space_reclaimed_mb = (initial_size - final_size) / (1024 * 1024)
-
-            logger.info(
-                f"[PRUNE] Deleted {total_deleted} rows, reclaimed {space_reclaimed_mb:.1f}MB "
-                f"(max_age={max_age_hours}h)"
-            )
+            logger.info(f"[PRUNE] Deleted {total_deleted} rows (max_age={max_age_hours}h)")
 
             return {
                 'deleted_counts': deleted_counts,
                 'total_deleted': total_deleted,
-                'initial_size_mb': initial_size / (1024 * 1024),
-                'final_size_mb': final_size / (1024 * 1024),
-                'space_reclaimed_mb': space_reclaimed_mb,
                 'max_age_hours': max_age_hours,
             }
 
@@ -4072,15 +2891,12 @@ class ResearchDatabase:
             }
 
     def get_table_sizes(self) -> dict:
-        """Get row counts for all tables (for monitoring).
-
-        Returns:
-            dict mapping table names to row counts
-        """
+        """Get row counts for all tables (for monitoring)."""
         cursor = self.conn.cursor()
 
-        # Get all table names
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        cursor.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        )
         tables = [row[0] for row in cursor.fetchall()]
 
         sizes = {}
@@ -4094,5 +2910,8 @@ class ResearchDatabase:
         return sizes
 
     def close(self):
-        """Close database connection."""
-        self.conn.close()
+        """Return connection to pool."""
+        if hasattr(self, '_pg_conn') and self._pg_conn is not None:
+            put_conn(self._pg_conn)
+            self._pg_conn = None
+            self.conn = None

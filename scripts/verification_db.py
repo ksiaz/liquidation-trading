@@ -7,116 +7,116 @@ Stores:
 - Cascade alerts and corresponding liquidations
 - Price snapshots for post-hoc analysis
 
-SQLite for simplicity - no external dependencies.
+PostgreSQL backed via pg_pool.
 """
-import sqlite3
-import os
 import json
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, asdict
-
-DB_PATH = '/tmp/paper_trade_verification.db'
-
-
-def get_connection():
-    """Get database connection, creating tables if needed."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    _create_tables(conn)
-    return conn
+import psycopg2.extras
+from runtime.logging.pg_pool import get_conn, put_conn, init_pool
 
 
-def _create_tables(conn):
-    """Create verification tables."""
-    conn.executescript("""
-        -- Zone events: track lifecycle of each detected zone
-        CREATE TABLE IF NOT EXISTS zone_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            symbol TEXT NOT NULL,
-            zone_type TEXT NOT NULL,  -- 'demand' or 'supply'
-            zone_center REAL,
-            zone_low REAL,
-            zone_high REAL,
-            node_count INTEGER,
-            avg_strength REAL,
-            displacement_detected INTEGER DEFAULT 0,
-            displacement_time REAL,
-            retest_detected INTEGER DEFAULT 0,
-            retest_time REAL,
-            entry_proposed INTEGER DEFAULT 0,
-            entry_time REAL,
-            -- Outcome tracking (filled in later)
-            max_favorable_excursion REAL,
-            max_adverse_excursion REAL,
-            zone_respected INTEGER,  -- 1 if price bounced, 0 if broke through
-            outcome_recorded_at REAL,
-            metadata TEXT  -- JSON for extra data
-        );
+def _ensure_tables():
+    """Create verification tables if they don't exist."""
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            -- Zone events: track lifecycle of each detected zone
+            CREATE TABLE IF NOT EXISTS zone_events (
+                id SERIAL PRIMARY KEY,
+                timestamp DOUBLE PRECISION NOT NULL,
+                symbol TEXT NOT NULL,
+                zone_type TEXT NOT NULL,  -- 'demand' or 'supply'
+                zone_center DOUBLE PRECISION,
+                zone_low DOUBLE PRECISION,
+                zone_high DOUBLE PRECISION,
+                node_count INTEGER,
+                avg_strength DOUBLE PRECISION,
+                displacement_detected SMALLINT DEFAULT 0,
+                displacement_time DOUBLE PRECISION,
+                retest_detected SMALLINT DEFAULT 0,
+                retest_time DOUBLE PRECISION,
+                entry_proposed SMALLINT DEFAULT 0,
+                entry_time DOUBLE PRECISION,
+                -- Outcome tracking (filled in later)
+                max_favorable_excursion DOUBLE PRECISION,
+                max_adverse_excursion DOUBLE PRECISION,
+                zone_respected SMALLINT,  -- 1 if price bounced, 0 if broke through
+                outcome_recorded_at DOUBLE PRECISION,
+                metadata TEXT  -- JSON for extra data
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_zone_symbol ON zone_events(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_zone_timestamp ON zone_events(timestamp)")
 
-        CREATE INDEX IF NOT EXISTS idx_zone_symbol ON zone_events(symbol);
-        CREATE INDEX IF NOT EXISTS idx_zone_timestamp ON zone_events(timestamp);
+        cursor.execute("""
+            -- Cascade alerts: track alerts and their verification
+            CREATE TABLE IF NOT EXISTS cascade_alerts (
+                id SERIAL PRIMARY KEY,
+                timestamp DOUBLE PRECISION NOT NULL,
+                symbol TEXT NOT NULL,
+                positions_count INTEGER,
+                value_at_risk DOUBLE PRECISION,
+                dominant_side TEXT,  -- 'LONG' or 'SHORT'
+                closest_liq_price DOUBLE PRECISION,
+                -- Verification against actual liquidations
+                liq_burst_detected SMALLINT DEFAULT 0,
+                liq_burst_time DOUBLE PRECISION,
+                liq_burst_value DOUBLE PRECISION,
+                time_to_burst DOUBLE PRECISION,  -- seconds between alert and burst
+                false_positive SMALLINT DEFAULT 0,
+                metadata TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cascade_symbol ON cascade_alerts(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_cascade_timestamp ON cascade_alerts(timestamp)")
 
-        -- Cascade alerts: track alerts and their verification
-        CREATE TABLE IF NOT EXISTS cascade_alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            symbol TEXT NOT NULL,
-            positions_count INTEGER,
-            value_at_risk REAL,
-            dominant_side TEXT,  -- 'LONG' or 'SHORT'
-            closest_liq_price REAL,
-            -- Verification against actual liquidations
-            liq_burst_detected INTEGER DEFAULT 0,
-            liq_burst_time REAL,
-            liq_burst_value REAL,
-            time_to_burst REAL,  -- seconds between alert and burst
-            false_positive INTEGER DEFAULT 0,
-            metadata TEXT
-        );
+        cursor.execute("""
+            -- Liquidation events: raw liquidations for verification
+            CREATE TABLE IF NOT EXISTS verification_liquidation_events (
+                id SERIAL PRIMARY KEY,
+                timestamp DOUBLE PRECISION NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                value_usd DOUBLE PRECISION,
+                price DOUBLE PRECISION,
+                source TEXT DEFAULT 'HL'  -- 'HL' or 'BINANCE'
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vliq_symbol ON verification_liquidation_events(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vliq_timestamp ON verification_liquidation_events(timestamp)")
 
-        CREATE INDEX IF NOT EXISTS idx_cascade_symbol ON cascade_alerts(symbol);
-        CREATE INDEX IF NOT EXISTS idx_cascade_timestamp ON cascade_alerts(timestamp);
+        cursor.execute("""
+            -- Price snapshots: periodic price recording
+            CREATE TABLE IF NOT EXISTS price_snapshots (
+                id SERIAL PRIMARY KEY,
+                timestamp DOUBLE PRECISION NOT NULL,
+                symbol TEXT NOT NULL,
+                hl_price DOUBLE PRECISION,
+                binance_price DOUBLE PRECISION,
+                drift_pct DOUBLE PRECISION
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_snapshots(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_snapshots(timestamp)")
 
-        -- Liquidation events: raw liquidations for verification
-        CREATE TABLE IF NOT EXISTS liquidation_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            value_usd REAL,
-            price REAL,
-            source TEXT DEFAULT 'HL'  -- 'HL' or 'BINANCE'
-        );
+        cursor.execute("""
+            -- Verification metrics: aggregated stats
+            CREATE TABLE IF NOT EXISTS verification_metrics (
+                id SERIAL PRIMARY KEY,
+                timestamp DOUBLE PRECISION NOT NULL,
+                metric_name TEXT NOT NULL,
+                metric_value DOUBLE PRECISION,
+                symbol TEXT,
+                metadata TEXT
+            )
+        """)
 
-        CREATE INDEX IF NOT EXISTS idx_liq_symbol ON liquidation_events(symbol);
-        CREATE INDEX IF NOT EXISTS idx_liq_timestamp ON liquidation_events(timestamp);
-
-        -- Price snapshots: periodic price recording
-        CREATE TABLE IF NOT EXISTS price_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            symbol TEXT NOT NULL,
-            hl_price REAL,
-            binance_price REAL,
-            drift_pct REAL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_price_symbol ON price_snapshots(symbol);
-        CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_snapshots(timestamp);
-
-        -- Verification metrics: aggregated stats
-        CREATE TABLE IF NOT EXISTS verification_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            metric_name TEXT NOT NULL,
-            metric_value REAL,
-            symbol TEXT,
-            metadata TEXT
-        );
-    """)
-    conn.commit()
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -134,41 +134,51 @@ def record_zone_detected(
     timestamp: Optional[float] = None
 ) -> int:
     """Record a newly detected zone. Returns zone_id."""
-    conn = get_connection()
-    cursor = conn.execute("""
-        INSERT INTO zone_events
-        (timestamp, symbol, zone_type, zone_center, zone_low, zone_high, node_count, avg_strength)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (timestamp or datetime.now().timestamp(), symbol, zone_type,
-          zone_center, zone_low, zone_high, node_count, avg_strength))
-    conn.commit()
-    zone_id = cursor.lastrowid
-    conn.close()
-    return zone_id
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO zone_events
+            (timestamp, symbol, zone_type, zone_center, zone_low, zone_high, node_count, avg_strength)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (timestamp or datetime.now().timestamp(), symbol, zone_type,
+              zone_center, zone_low, zone_high, node_count, avg_strength))
+        zone_id = cursor.fetchone()[0]
+        conn.commit()
+        return zone_id
+    finally:
+        put_conn(conn)
 
 
 def update_zone_displacement(zone_id: int, timestamp: float):
     """Mark zone as having displacement detected."""
-    conn = get_connection()
-    conn.execute("""
-        UPDATE zone_events
-        SET displacement_detected = 1, displacement_time = ?
-        WHERE id = ?
-    """, (timestamp, zone_id))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE zone_events
+            SET displacement_detected = 1, displacement_time = %s
+            WHERE id = %s
+        """, (timestamp, zone_id))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def update_zone_retest(zone_id: int, timestamp: float):
     """Mark zone as having retest detected."""
-    conn = get_connection()
-    conn.execute("""
-        UPDATE zone_events
-        SET retest_detected = 1, retest_time = ?
-        WHERE id = ?
-    """, (timestamp, zone_id))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE zone_events
+            SET retest_detected = 1, retest_time = %s
+            WHERE id = %s
+        """, (timestamp, zone_id))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def update_zone_outcome(
@@ -179,32 +189,39 @@ def update_zone_outcome(
     timestamp: Optional[float] = None
 ):
     """Record zone outcome after entry."""
-    conn = get_connection()
-    conn.execute("""
-        UPDATE zone_events
-        SET max_favorable_excursion = ?, max_adverse_excursion = ?,
-            zone_respected = ?, outcome_recorded_at = ?
-        WHERE id = ?
-    """, (max_favorable, max_adverse, 1 if zone_respected else 0,
-          timestamp or datetime.now().timestamp(), zone_id))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE zone_events
+            SET max_favorable_excursion = %s, max_adverse_excursion = %s,
+                zone_respected = %s, outcome_recorded_at = %s
+            WHERE id = %s
+        """, (max_favorable, max_adverse, 1 if zone_respected else 0,
+              timestamp or datetime.now().timestamp(), zone_id))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def get_recent_zones(symbol: Optional[str] = None, limit: int = 50) -> List[Dict]:
     """Get recent zone events."""
-    conn = get_connection()
-    if symbol:
-        rows = conn.execute("""
-            SELECT * FROM zone_events WHERE symbol = ?
-            ORDER BY timestamp DESC LIMIT ?
-        """, (symbol, limit)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT * FROM zone_events ORDER BY timestamp DESC LIMIT ?
-        """, (limit,)).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        if symbol:
+            cursor.execute("""
+                SELECT * FROM zone_events WHERE symbol = %s
+                ORDER BY timestamp DESC LIMIT %s
+            """, (symbol, limit))
+        else:
+            cursor.execute("""
+                SELECT * FROM zone_events ORDER BY timestamp DESC LIMIT %s
+            """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -220,17 +237,21 @@ def record_cascade_alert(
     timestamp: Optional[float] = None
 ) -> int:
     """Record a cascade alert. Returns alert_id."""
-    conn = get_connection()
-    cursor = conn.execute("""
-        INSERT INTO cascade_alerts
-        (timestamp, symbol, positions_count, value_at_risk, dominant_side, closest_liq_price)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (timestamp or datetime.now().timestamp(), symbol, positions_count,
-          value_at_risk, dominant_side, closest_liq_price))
-    conn.commit()
-    alert_id = cursor.lastrowid
-    conn.close()
-    return alert_id
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO cascade_alerts
+            (timestamp, symbol, positions_count, value_at_risk, dominant_side, closest_liq_price)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (timestamp or datetime.now().timestamp(), symbol, positions_count,
+              value_at_risk, dominant_side, closest_liq_price))
+        alert_id = cursor.fetchone()[0]
+        conn.commit()
+        return alert_id
+    finally:
+        put_conn(conn)
 
 
 def verify_cascade_alert(
@@ -241,32 +262,39 @@ def verify_cascade_alert(
     time_to_burst: Optional[float]
 ):
     """Update cascade alert with verification results."""
-    conn = get_connection()
-    conn.execute("""
-        UPDATE cascade_alerts
-        SET liq_burst_detected = ?, liq_burst_time = ?, liq_burst_value = ?,
-            time_to_burst = ?, false_positive = ?
-        WHERE id = ?
-    """, (1 if liq_burst_detected else 0, liq_burst_time, liq_burst_value,
-          time_to_burst, 0 if liq_burst_detected else 1, alert_id))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE cascade_alerts
+            SET liq_burst_detected = %s, liq_burst_time = %s, liq_burst_value = %s,
+                time_to_burst = %s, false_positive = %s
+            WHERE id = %s
+        """, (1 if liq_burst_detected else 0, liq_burst_time, liq_burst_value,
+              time_to_burst, 0 if liq_burst_detected else 1, alert_id))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def get_recent_cascade_alerts(symbol: Optional[str] = None, limit: int = 50) -> List[Dict]:
     """Get recent cascade alerts."""
-    conn = get_connection()
-    if symbol:
-        rows = conn.execute("""
-            SELECT * FROM cascade_alerts WHERE symbol = ?
-            ORDER BY timestamp DESC LIMIT ?
-        """, (symbol, limit)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT * FROM cascade_alerts ORDER BY timestamp DESC LIMIT ?
-        """, (limit,)).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        if symbol:
+            cursor.execute("""
+                SELECT * FROM cascade_alerts WHERE symbol = %s
+                ORDER BY timestamp DESC LIMIT %s
+            """, (symbol, limit))
+        else:
+            cursor.execute("""
+                SELECT * FROM cascade_alerts ORDER BY timestamp DESC LIMIT %s
+            """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -282,13 +310,16 @@ def record_liquidation(
     timestamp: Optional[float] = None
 ):
     """Record a liquidation event."""
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO liquidation_events (timestamp, symbol, side, value_usd, price, source)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (timestamp or datetime.now().timestamp(), symbol, side, value_usd, price, source))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO verification_liquidation_events (timestamp, symbol, side, value_usd, price, source)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (timestamp or datetime.now().timestamp(), symbol, side, value_usd, price, source))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def get_liquidations_in_window(
@@ -297,14 +328,18 @@ def get_liquidations_in_window(
     end_time: float
 ) -> List[Dict]:
     """Get liquidations within a time window."""
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT * FROM liquidation_events
-        WHERE symbol = ? AND timestamp BETWEEN ? AND ?
-        ORDER BY timestamp
-    """, (symbol, start_time, end_time)).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("""
+            SELECT * FROM verification_liquidation_events
+            WHERE symbol = %s AND timestamp BETWEEN %s AND %s
+            ORDER BY timestamp
+        """, (symbol, start_time, end_time))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -322,13 +357,16 @@ def record_price_snapshot(
     if hl_price and binance_price:
         drift_pct = (hl_price - binance_price) / binance_price * 100
 
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO price_snapshots (timestamp, symbol, hl_price, binance_price, drift_pct)
-        VALUES (?, ?, ?, ?, ?)
-    """, (timestamp or datetime.now().timestamp(), symbol, hl_price, binance_price, drift_pct))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO price_snapshots (timestamp, symbol, hl_price, binance_price, drift_pct)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (timestamp or datetime.now().timestamp(), symbol, hl_price, binance_price, drift_pct))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -337,13 +375,16 @@ def record_price_snapshot(
 
 def record_metric(metric_name: str, metric_value: float, symbol: Optional[str] = None):
     """Record a verification metric."""
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO verification_metrics (timestamp, metric_name, metric_value, symbol)
-        VALUES (?, ?, ?, ?)
-    """, (datetime.now().timestamp(), metric_name, metric_value, symbol))
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO verification_metrics (timestamp, metric_name, metric_value, symbol)
+            VALUES (%s, %s, %s, %s)
+        """, (datetime.now().timestamp(), metric_name, metric_value, symbol))
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 # =============================================================================
@@ -352,87 +393,102 @@ def record_metric(metric_name: str, metric_value: float, symbol: Optional[str] =
 
 def get_zone_stats() -> Dict[str, Any]:
     """Get zone detection statistics."""
-    conn = get_connection()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-    stats = {}
+        stats = {}
 
-    # Total zones
-    row = conn.execute("SELECT COUNT(*) as cnt FROM zone_events").fetchone()
-    stats['total_zones'] = row['cnt']
+        # Total zones
+        cursor.execute("SELECT COUNT(*) as cnt FROM zone_events")
+        row = cursor.fetchone()
+        stats['total_zones'] = row['cnt']
 
-    # By type
-    rows = conn.execute("""
-        SELECT zone_type, COUNT(*) as cnt FROM zone_events GROUP BY zone_type
-    """).fetchall()
-    stats['by_type'] = {row['zone_type']: row['cnt'] for row in rows}
+        # By type
+        cursor.execute("""
+            SELECT zone_type, COUNT(*) as cnt FROM zone_events GROUP BY zone_type
+        """)
+        rows = cursor.fetchall()
+        stats['by_type'] = {row['zone_type']: row['cnt'] for row in rows}
 
-    # Displacement rate
-    row = conn.execute("""
-        SELECT
-            SUM(CASE WHEN displacement_detected = 1 THEN 1 ELSE 0 END) as disp,
-            COUNT(*) as total
-        FROM zone_events
-    """).fetchone()
-    stats['displacement_rate'] = row['disp'] / row['total'] if row['total'] > 0 else 0
+        # Displacement rate
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN displacement_detected = 1 THEN 1 ELSE 0 END) as disp,
+                COUNT(*) as total
+            FROM zone_events
+        """)
+        row = cursor.fetchone()
+        stats['displacement_rate'] = row['disp'] / row['total'] if row['total'] > 0 else 0
 
-    # Retest rate (of those with displacement)
-    row = conn.execute("""
-        SELECT
-            SUM(CASE WHEN retest_detected = 1 THEN 1 ELSE 0 END) as retest,
-            COUNT(*) as total
-        FROM zone_events WHERE displacement_detected = 1
-    """).fetchone()
-    stats['retest_rate'] = row['retest'] / row['total'] if row['total'] > 0 else 0
+        # Retest rate (of those with displacement)
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN retest_detected = 1 THEN 1 ELSE 0 END) as retest,
+                COUNT(*) as total
+            FROM zone_events WHERE displacement_detected = 1
+        """)
+        row = cursor.fetchone()
+        stats['retest_rate'] = row['retest'] / row['total'] if row['total'] > 0 else 0
 
-    # Zone respected rate
-    row = conn.execute("""
-        SELECT
-            SUM(CASE WHEN zone_respected = 1 THEN 1 ELSE 0 END) as respected,
-            COUNT(*) as total
-        FROM zone_events WHERE outcome_recorded_at IS NOT NULL
-    """).fetchone()
-    stats['zone_respected_rate'] = row['respected'] / row['total'] if row['total'] > 0 else 0
+        # Zone respected rate
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN zone_respected = 1 THEN 1 ELSE 0 END) as respected,
+                COUNT(*) as total
+            FROM zone_events WHERE outcome_recorded_at IS NOT NULL
+        """)
+        row = cursor.fetchone()
+        stats['zone_respected_rate'] = row['respected'] / row['total'] if row['total'] > 0 else 0
 
-    conn.close()
-    return stats
+        return stats
+    finally:
+        put_conn(conn)
 
 
 def get_cascade_stats() -> Dict[str, Any]:
     """Get cascade alert statistics."""
-    conn = get_connection()
+    conn = get_conn()
+    try:
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-    stats = {}
+        stats = {}
 
-    # Total alerts
-    row = conn.execute("SELECT COUNT(*) as cnt FROM cascade_alerts").fetchone()
-    stats['total_alerts'] = row['cnt']
+        # Total alerts
+        cursor.execute("SELECT COUNT(*) as cnt FROM cascade_alerts")
+        row = cursor.fetchone()
+        stats['total_alerts'] = row['cnt']
 
-    # Verified (had liquidation burst)
-    row = conn.execute("""
-        SELECT
-            SUM(CASE WHEN liq_burst_detected = 1 THEN 1 ELSE 0 END) as verified,
-            SUM(CASE WHEN false_positive = 1 THEN 1 ELSE 0 END) as false_pos,
-            COUNT(*) as total
-        FROM cascade_alerts
-    """).fetchone()
-    stats['verified_rate'] = row['verified'] / row['total'] if row['total'] > 0 else 0
-    stats['false_positive_rate'] = row['false_pos'] / row['total'] if row['total'] > 0 else 0
+        # Verified (had liquidation burst)
+        cursor.execute("""
+            SELECT
+                SUM(CASE WHEN liq_burst_detected = 1 THEN 1 ELSE 0 END) as verified,
+                SUM(CASE WHEN false_positive = 1 THEN 1 ELSE 0 END) as false_pos,
+                COUNT(*) as total
+            FROM cascade_alerts
+        """)
+        row = cursor.fetchone()
+        stats['verified_rate'] = row['verified'] / row['total'] if row['total'] > 0 else 0
+        stats['false_positive_rate'] = row['false_pos'] / row['total'] if row['total'] > 0 else 0
 
-    # Average time to burst
-    row = conn.execute("""
-        SELECT AVG(time_to_burst) as avg_time
-        FROM cascade_alerts WHERE liq_burst_detected = 1
-    """).fetchone()
-    stats['avg_time_to_burst'] = row['avg_time']
+        # Average time to burst
+        cursor.execute("""
+            SELECT AVG(time_to_burst) as avg_time
+            FROM cascade_alerts WHERE liq_burst_detected = 1
+        """)
+        row = cursor.fetchone()
+        stats['avg_time_to_burst'] = row['avg_time']
 
-    conn.close()
-    return stats
+        return stats
+    finally:
+        put_conn(conn)
 
 
 if __name__ == '__main__':
-    # Initialize database
-    conn = get_connection()
-    print(f"Database initialized at {DB_PATH}")
+    # Initialize pool and tables
+    init_pool()
+    _ensure_tables()
+    print("Database tables initialized in PostgreSQL")
 
     # Show stats if any data exists
     zone_stats = get_zone_stats()

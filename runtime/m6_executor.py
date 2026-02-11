@@ -82,6 +82,9 @@ from execution.ep4_hyperliquid_adapter import (
 from runtime.risk.capital_manager import CapitalManager, CapitalManagerConfig
 from runtime.validation.entry_quality import EntryQualityScorer
 
+# Structured diagnostics for silent paths
+from runtime.diagnostics import diag, ReasonCode
+
 
 class M6State(Enum):
     """M6 executor state."""
@@ -222,6 +225,14 @@ class M6Executor:
 
         # UNINITIALIZED = skip cycle (normal during warmup)
         if observation_snapshot.status == ObservationStatus.UNINITIALIZED:
+            # DIAGNOSTIC: System not initialized - cycle skipped
+            diag.record_skip(
+                component="M6Executor",
+                function="execute",
+                reason_code=ReasonCode.M6_UNINITIALIZED,
+                symbol=None,
+                context={"status": observation_snapshot.status.name}
+            )
             return None
 
         self._state = M6State.RUNNING
@@ -265,12 +276,28 @@ class M6Executor:
             )
 
             if not mandates:
+                # DIAGNOSTIC: No mandates generated - cycle produces no action
+                diag.record_skip(
+                    component="M6Executor",
+                    function="_execute_symbol",
+                    reason_code=ReasonCode.M6_NO_MANDATES,
+                    symbol=symbol,
+                    context={"position_state": position.state.value if position else "UNKNOWN"}
+                )
                 return None
 
             # STEP 2: Arbitrate mandates (highest authority wins)
             winning_mandate = self._arbitrate(mandates)
 
             if winning_mandate is None:
+                # DIAGNOSTIC: No mandate won arbitration
+                diag.record_skip(
+                    component="M6Executor",
+                    function="_execute_symbol",
+                    reason_code=ReasonCode.M6_NO_WINNING_MANDATE,
+                    symbol=symbol,
+                    context={"mandate_count": len(mandates)}
+                )
                 return None
 
             # STEP 3: Convert mandate to action

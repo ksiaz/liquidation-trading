@@ -17,6 +17,12 @@ Hysteresis: Once a regime is established, relaxed thresholds keep it active.
 This prevents chattering at threshold boundaries (e.g., orderflow oscillating
 around 0.82 flipping SIDEWAYS↔DISABLED every few seconds with sparse HL fills).
 
+Low-fill neutralization: When orderflow_fill_count < _MIN_OF_FILLS, orderflow
+is treated as 0.5 (neutral). HL fills are sparse — a 60s window may have <10
+taker fills, making the buy/sell ratio swing wildly between 0.0 and 1.0 on
+each individual fill. This noise drove ~2000 SIDEWAYS↔DISABLED transitions
+per session before this fix.
+
 Entry thresholds = standard thresholds (must clearly qualify)
 Hold thresholds = relaxed thresholds (must clearly DISqualify to leave)
 """
@@ -29,6 +35,10 @@ from .types import RegimeState, RegimeMetrics
 # ─── Threshold Tables ────────────────────────────────────────────────
 # Entry: used when transitioning INTO a regime (strict)
 # Hold:  used when ALREADY in a regime (relaxed — harder to leave)
+
+# Minimum fills required for orderflow to influence classification.
+# Below this, orderflow is treated as 0.5 (neutral/balanced).
+_MIN_OF_FILLS = 15
 
 # SIDEWAYS entry / hold
 _SW_VWAP_ENTRY = 1.25       # ≤ 1.25 × ATR_5m
@@ -72,6 +82,17 @@ def classify_regime(
     Returns:
         RegimeState: SIDEWAYS_ACTIVE, EXPANSION_ACTIVE, or DISABLED
     """
+    # Neutralize noisy orderflow when fill count is too low
+    if metrics.orderflow_fill_count < _MIN_OF_FILLS:
+        metrics = RegimeMetrics(
+            vwap_distance=metrics.vwap_distance,
+            atr_5m=metrics.atr_5m,
+            atr_30m=metrics.atr_30m,
+            orderflow_imbalance=0.5,
+            liquidation_zscore=metrics.liquidation_zscore,
+            orderflow_fill_count=metrics.orderflow_fill_count,
+        )
+
     # If currently in a regime, check if we should HOLD it (relaxed thresholds)
     if current_state == RegimeState.SIDEWAYS_ACTIVE:
         if _check_sideways_hold(metrics):

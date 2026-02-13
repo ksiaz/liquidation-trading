@@ -270,7 +270,7 @@ class TestRegimeMutualExclusion:
         # Step 2: Regime transitions to SIDEWAYS
         regime_sideways = RegimeState(
             regime="SIDEWAYS_ACTIVE",
-            vwap_distance=60.0,
+            vwap_distance=120.0,  # R:R = 120/60 = 2.0 >= 1.5
             atr_5m=200.0,  # Must be >= 0.3% of price (50000*0.003=150)
             atr_30m=250.0
         )
@@ -309,18 +309,37 @@ class TestRegimeMutualExclusion:
         # No entry on first test, but SLBRS evaluates (regime gate passed)
         assert proposal_first_test is None
 
-        # Step 6: Retest with absorption (consumed/initial 0.65-0.95, full data)
+        # Step 6: Rejection displacement (price bounces up for LONG direction)
+        # Threshold = max(50000*0.0008, 0.25*200) = max(40, 50) = 50
+        # Price 50060 gives displacement = 60 > 50 → REJECTION_CONFIRMED
+        slbrs_proposal(
+            symbol="BTCUSDT",
+            regime_state=regime_sideways,
+            zone_penetration=None, resting_size=None,
+            order_consumption=None, structural_persistence=None,
+            price=50060.0,
+            context=StrategyContext("rejection", 1110.0),
+            permission=self.permission,
+            position_state=PositionState.FLAT
+        )
+
+        # Step 7: Retest with reduced volume/impact and absorption
+        # First test: consumed=50, impact=25
+        # Retest: consumed=30 (< 50*0.70=35 ✓), impact=15 (< 25 ✓)
+        # Absorption: 30/40 = 0.75 ✓
         proposal_retest = slbrs_proposal(
             symbol="BTCUSDT",
             regime_state=regime_sideways,
-            zone_penetration=MockZonePenetration(penetration_depth=25.0),
+            zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
-            order_consumption=MockOrderConsumption(consumed_size=400.0, initial_size=500.0),
+            order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
             structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
             price=50005.0,
-            context=StrategyContext("test2", 1200.0),
+            context=StrategyContext("retest", 1120.0),
             permission=self.permission,
-            position_state=PositionState.FLAT
+            position_state=PositionState.FLAT,
+            orderflow_imbalance=0.55,
+            orderflow_fill_count=30
         )
 
         # SLBRS can enter now

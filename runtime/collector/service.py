@@ -246,7 +246,7 @@ class CollectorService:
         # Regime debounce: require N consecutive cycles of new state before transitioning
         # Prevents orderflow noise from causing SIDEWAYS↔DISABLED chatter at 5Hz
         self._regime_pending: Dict[str, tuple] = {}  # symbol → (pending_state, count)
-        self._REGIME_DEBOUNCE_CYCLES = 5  # 5 cycles × 200ms = 1 second
+        self._REGIME_DEBOUNCE_CYCLES = 50  # 50 cycles × ~200ms = ~10 seconds
 
         # Hyperliquid Integration (optional)
         # Two modes: Node Adapter (direct node access) or WebSocket Collector

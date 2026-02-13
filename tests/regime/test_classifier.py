@@ -49,7 +49,8 @@ class TestRegimeClassifier:
             atr_5m=80.0,  # Distance = 150, 1.5 × ATR = 120 → escaped ✓
             atr_30m=70.0,  # Ratio = 80/70 = 1.143 ≥ 1.0 → expanded ✓
             orderflow_imbalance=0.70,  # |0.70 - 0.5| = 0.20 ≥ 0.15 → dominant ✓
-            liquidation_zscore=3.2  # ≥ 2.5 → elevated ✓
+            liquidation_zscore=3.2,  # ≥ 2.5 → elevated ✓
+            orderflow_fill_count=25  # Above _MIN_OF_FILLS → OF not neutralized
         )
 
         regime = classify_regime(metrics)
@@ -79,7 +80,8 @@ class TestRegimeClassifier:
             atr_5m=50.0,
             atr_30m=60.0,  # Compressed ✓
             orderflow_imbalance=0.90,  # |0.90-0.5|=0.40 ≥ 0.32 → NOT balanced ✗
-            liquidation_zscore=1.0  # Subdued ✓
+            liquidation_zscore=1.0,  # Subdued ✓
+            orderflow_fill_count=25  # Above _MIN_OF_FILLS → OF not neutralized
         )
 
         regime = classify_regime(metrics)

@@ -21,13 +21,13 @@ State Machine: IDLE → FIRST_TEST_OBSERVED → REJECTION_CONFIRMED → ENTRY
 - Entry requires: volume reduction, impact reduction, absorption, R:R ≥ 1.5
 
 Thresholds from Market Mechanics (NOT backtest optimization):
-- 0.65 resting imbalance: One side ≥ 65% of top-5 depth (directional wall)
+- 0.55 resting imbalance: One side ≥ 55% of top-5 depth (directional wall)
 - 120s persistence: Minimum block stability
 - 0.65-0.95 absorption ratio: Orders consumed but block still standing
 - 0.30 block width: Proximity threshold for retest
-- 0.2% ATR floor: No entry when ATR < 0.2% of price
+- 0.1% ATR floor: No entry when ATR < 0.1% of price
 - $3k OC notional minimum: consumed_size × price_level must be significant
-- $5k resting minor side minimum: filter microstructure noise
+- $2k resting minor side minimum: filter microstructure noise
 - 10s primitive cache + timestamp coherence: prevent mixed-age false confluence
 - ALL primitives required: zone_penetration, structural_persistence, resting_size, order_consumption
 - Max 3 concurrent SLBRS positions
@@ -459,7 +459,7 @@ class SLBRSStrategy:
 
         # ATR gate: require real measured volatility
         atr_width = regime_state.atr_5m
-        min_meaningful_atr = price * 0.002
+        min_meaningful_atr = price * 0.001
         if atr_width < min_meaningful_atr:
             self._count_reject("atr_low")
             if _diag:
@@ -484,13 +484,13 @@ class SLBRSStrategy:
             return None
 
         resting_ratio = max(bid_sz, ask_sz) / total_resting
-        if resting_ratio < 0.65:
+        if resting_ratio < 0.55:
             self._count_reject("resting_ratio")
             if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: resting_ratio={resting_ratio:.2f}<0.65 bid={bid_sz:.1f} ask={ask_sz:.1f}")
+                print(f"[SLBRS-DIAG] {symbol}: resting_ratio={resting_ratio:.2f}<0.55 bid={bid_sz:.1f} ask={ask_sz:.1f}")
             return None
 
-        MIN_MINOR_SIDE_USD = 5000.0
+        MIN_MINOR_SIDE_USD = 2000.0
         minor_side_usd = min(bid_sz, ask_sz) * price
         if minor_side_usd < MIN_MINOR_SIDE_USD:
             self._count_reject("minor_usd")

@@ -158,31 +158,31 @@ class RunningPivotDetector:
 # These represent the 95th percentile of typical burst sizes per coin
 # Bursts exceeding these values are statistically significant
 COIN_LIQUIDATION_THRESHOLDS = {
-    # Major coins (high liquidity, need larger bursts to cascade)
-    'BTC': 50_000.0,
-    'ETH': 30_000.0,
-    'BNB': 20_000.0,
+    # HL liquidation fills are $11-$376 each. In a 10s burst window with a real
+    # cascade (5-15 fills), total is $100-$5,000. Thresholds set at meaningful
+    # burst level (was 100x higher, calibrated for Binance).
+    'BTC': 500.0,
+    'ETH': 300.0,
+    'BNB': 200.0,
 
-    # High volatility / meme coins (lower thresholds)
-    'HYPE': 20_000.0,
-    'SOL': 2_300.0,
-    'DOGE': 1_000.0,
-    'XRP': 5_000.0,
-    'PEPE': 1_000.0,
-    'WIF': 1_500.0,
-    'BONK': 500.0,
+    'HYPE': 200.0,
+    'SOL': 100.0,
+    'DOGE': 50.0,
+    'XRP': 100.0,
+    'PEPE': 50.0,
+    'WIF': 50.0,
+    'BONK': 30.0,
 
-    # Mid-cap alts
-    'AVAX': 5_000.0,
-    'LINK': 3_000.0,
-    'ARB': 2_000.0,
-    'OP': 2_000.0,
-    'SUI': 2_000.0,
-    'APT': 2_000.0,
+    'AVAX': 100.0,
+    'LINK': 80.0,
+    'ARB': 50.0,
+    'OP': 50.0,
+    'SUI': 80.0,
+    'APT': 80.0,
 }
 
 # Default threshold for coins not in the list
-DEFAULT_LIQUIDATION_THRESHOLD = 10_000.0
+DEFAULT_LIQUIDATION_THRESHOLD = 100.0
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,7 @@ class CascadeSniperConfig:
     proximity_threshold_pct: float = 0.005
 
     # Minimum value at risk to consider a cluster ($USD)
-    min_cluster_value: float = 100_000.0
+    min_cluster_value: float = 5_000.0
 
     # Minimum positions to form a cluster
     min_cluster_positions: int = 5  # Restored from testing value of 2
@@ -246,7 +246,7 @@ class CascadeSniperConfig:
     organic_flow_window_sec: float = 10.0
 
     # Minimum organic volume to confirm absorption ($USD)
-    min_organic_volume: float = 5000.0
+    min_organic_volume: float = 500.0
 
     # Minimum quiet time since last liquidation (seconds)
     organic_quiet_time_sec: float = 2.0
@@ -288,7 +288,7 @@ class CascadeSniperConfig:
     # Strict block when price data unavailable (both ret_1m and ret_3m are None)
     # Override requires BOTH high absorption AND extreme burst
     trend_gate_no_data_absorption_override: float = 0.75  # Higher threshold for no-data
-    trend_gate_no_data_min_burst_value: float = 100_000.0  # Minimum cascade value for override
+    trend_gate_no_data_min_burst_value: float = 5_000.0  # Minimum cascade value for override
 
     # Cascade confirmation gate (Gate C)
     # Requires multiple bursts before triggering to avoid single-burst false positives

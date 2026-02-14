@@ -962,7 +962,7 @@ class CollectorService:
                 try:
                     # Get current price — prefer live WS mid over node oracle
                     hl_symbol = symbol.replace('USDT', '')
-                    price = self._get_live_price(symbol) or node_prices.get(hl_symbol)
+                    price = self._get_live_price(symbol) or node_prices.get(symbol)
                     if price is None:
                         if _diag_regime and cycle_id and cycle_id % 10 == 1:
                             print(f"[REGIME] {symbol}: SKIP - no price", flush=True)
@@ -978,7 +978,7 @@ class CollectorService:
 
                     # Log when HL oracle price is used (activation proof)
                     # Log first 5 cycles then every 50th to reduce noise
-                    if _diag_regime and node_prices.get(hl_symbol) and cycle_id and (cycle_id <= 5 or cycle_id % 50 == 1):
+                    if _diag_regime and node_prices.get(symbol) and cycle_id and (cycle_id <= 5 or cycle_id % 50 == 1):
                         print(f"[HL_PRICE] {symbol}: using oracle price {price:.2f} from HL node", flush=True)
 
                     # Get calculators
@@ -1570,6 +1570,17 @@ class CollectorService:
             atr_calc = MultiTimeframeATR(period=3)
             self._atr_calculators[symbol] = atr_calc
         atr_calc.update_trade(price, timestamp)
+
+        # Feed M1 observation system so latest_hl_prices is populated.
+        # Without this, get_all_hl_prices() returns {} (symbols=0 bug).
+        # Throttle to 1 per symbol per 5s (oracle arrives ~1/s × 20 symbols).
+        if not hasattr(self, '_last_hl_price_buffered'):
+            self._last_hl_price_buffered = {}
+        if timestamp - self._last_hl_price_buffered.get(symbol, 0) >= 5.0:
+            self._last_hl_price_buffered[symbol] = timestamp
+            self._governance_event_buffer.append(('HL_PRICE', symbol, {
+                'oracle_price': price, 'mark_price': None, 'timestamp': timestamp,
+            }))
 
     def _handle_hl_fill(
         self,

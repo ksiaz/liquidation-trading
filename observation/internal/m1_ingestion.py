@@ -161,7 +161,7 @@ class M1IngestionEngine:
 
     def normalize_liquidation(self, symbol: str, raw_payload: Dict) -> Optional[Dict]:
         """
-        Normalize raw binance liquidation payload.
+        Normalize raw liquidation payload (Binance or HL format).
         """
         try:
             # Binance ForceOrder format
@@ -170,18 +170,21 @@ class M1IngestionEngine:
             quantity = float(order['q'])
             timestamp = int(raw_payload['E']) / 1000.0
             side = order['S'] # BUY or SELL
-            
+
+            # Normalize symbol to USDT format (HL sends "BTC", M2 nodes keyed by "BTCUSDT")
+            norm_symbol = f"{symbol}USDT" if not symbol.endswith("USDT") and not symbol.endswith("USD") else symbol
+
             # 1. Update Raw Buffer
             event = {
                 'timestamp': timestamp,
-                'symbol': symbol,
+                'symbol': norm_symbol,
                 'price': price,
                 'quantity': quantity,
                 'side': side,
                 'base_qty': quantity,
                 'quote_qty': quantity * price
             }
-            self.raw_liquidations[symbol].append(event)
+            self.raw_liquidations[norm_symbol].append(event)
             self.counters['liquidations'] += 1
             
             return event
@@ -427,9 +430,12 @@ class M1IngestionEngine:
             Normalized event dict or None on error
         """
         try:
+            # Normalize symbol: HL uses "BTC", M2 nodes keyed by "BTCUSDT"
+            norm_symbol = f"{symbol}USDT" if not symbol.endswith("USDT") and not symbol.endswith("USD") else symbol
+
             event = {
                 'timestamp': float(payload.get('timestamp', 0)),
-                'symbol': symbol,
+                'symbol': norm_symbol,
                 'wallet_address': payload.get('wallet_address', ''),
                 'liquidated_size': abs(float(payload.get('liquidated_size', 0))),
                 'liquidation_price': float(payload.get('liquidation_price', payload.get('price', 0))),
@@ -438,7 +444,7 @@ class M1IngestionEngine:
                 'event_type': 'HL_LIQUIDATION',
                 'exchange': 'HYPERLIQUID'
             }
-            self.hl_liquidations[symbol].append(event)
+            self.hl_liquidations[norm_symbol].append(event)
             self.counters['hl_liquidations'] += 1
             return event
 

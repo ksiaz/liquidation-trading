@@ -202,7 +202,10 @@ BINANCE_SYMBOLS = [
     'BNBUSDT', 'OPUSDT', 'TRXUSDT', 'WLDUSDT', 'TONUSDT',
 ]
 HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
-SYMBOLS = BINANCE_SYMBOLS + HL_SYMBOLS  # Both formats for observation whitelist
+# Only USDT-suffixed symbols for observation — short-form HL symbols have no M1 data
+# and waste 50% of SLBRS evaluations as primitives_missing. gRPC fills are normalized
+# to USDT format in the governance event buffer.
+SYMBOLS = BINANCE_SYMBOLS
 
 
 async def run_paper_trade():

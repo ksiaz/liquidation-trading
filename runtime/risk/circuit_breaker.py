@@ -166,13 +166,16 @@ class CircuitBreaker:
 
 class DataFreshnessBreaker(CircuitBreaker):
     """
-    Trips when node/adapter data becomes stale. Auto-resets when data resumes.
+    Trips when node data actually stops flowing. Auto-resets when data resumes.
 
     Staleness checks (evaluated every regime cycle ~2s):
     1. gRPC disconnected: bridge.is_connected == False
-    2. Adapter stale: bridge.is_healthy == False (>30s no block)
+    2. Fill stale: no fills for 300s
     3. Price stale: no prices for 60s
-    4. Fill stale: no fills for 300s
+
+    Adapter's STALE status is intentionally NOT checked — it uses block
+    timestamps which lag behind wall clock on non-validator nodes even when
+    data is flowing normally (false trips every ~5 min).
 
     When tripped: blocks new entries, exits always permitted.
     Anti-flap: requires N consecutive healthy evaluations to close.
@@ -213,22 +216,31 @@ class DataFreshnessBreaker(CircuitBreaker):
                 self._consecutive_healthy = 0
 
     def _check_staleness(self, bridge, now: float) -> Optional[str]:
-        """Return trip reason string, or None if healthy."""
+        """Return trip reason string, or None if healthy.
+
+        Trust actual data flow over adapter status. The adapter reports STALE
+        based on block timestamps which lag behind wall clock on non-validator
+        nodes even when data is flowing normally. If fills arrived recently,
+        the node is working regardless of what the adapter thinks.
+        """
         if not bridge.is_connected:
             return "gRPC disconnected"
-
-        if not bridge.is_healthy:
-            return "adapter reports STALE (>30s no block)"
 
         metrics = bridge.get_metrics()
         last_price = metrics.get('last_price_time', 0)
         last_fill = metrics.get('last_fill_time', 0)
 
-        if last_price > 0 and (now - last_price) > self._PRICE_STALE_SEC:
-            return f"no prices for {now - last_price:.0f}s"
-
+        # Data flow checks — these prove the node is actually producing data
         if last_fill > 0 and (now - last_fill) > self._FILL_STALE_SEC:
             return f"no fills for {now - last_fill:.0f}s"
+        elif last_fill == 0 and (now - self._created_at) > self._FILL_STALE_SEC:
+            # Never received any fills after startup grace — fill stream may be dead
+            return "no fills ever received"
+
+        if last_price > 0 and (now - last_price) > self._PRICE_STALE_SEC:
+            return f"no prices for {now - last_price:.0f}s"
+        elif last_price == 0 and (now - self._created_at) > self._PRICE_STALE_SEC:
+            return "no prices ever received"
 
         return None
 

@@ -560,8 +560,7 @@ class TestMultiSymbolTradeFlow:
         assert state_machine.get_position("BTCUSDT").state == PositionState.FLAT
         assert state_machine.get_position("ETHUSDT").state == PositionState.OPEN
 
-    @pytest.mark.asyncio
-    async def test_circuit_breaker_affects_all_symbols(self):
+    def test_circuit_breaker_affects_all_symbols(self):
         """
         Test that circuit breaker trip blocks all entries.
         """

@@ -169,17 +169,27 @@ class EnrichedLiquidityMemoryNode:
             self.record_orderbook_appearance(timestamp)
     
     def apply_decay(self, current_timestamp: float, current_price: float = None):
-        """Apply time-based decay."""
+        """Apply time-based decay using incremental time since last decay call.
+
+        Uses time since last decay application (not total time since last interaction)
+        to prevent super-exponential strength loss from compounding non-incremental factors.
+        """
         if not self.active:
             return
-        
-        time_elapsed = current_timestamp - self.last_interaction_ts
+
+        # Incremental: time since last decay call (or last interaction if first call)
+        reference_ts = self.last_decay_application_ts if self.last_decay_application_ts > 0 else self.last_interaction_ts
+        time_elapsed = current_timestamp - reference_ts
+        if time_elapsed <= 0:
+            self.last_decay_application_ts = current_timestamp
+            return
+
         decay_factor = max(0.0, 1.0 - (self.decay_rate * time_elapsed))
         self.strength *= decay_factor
-        
+
         if self.strength < 0.01:
             self.active = False
-        
+
         self.last_decay_application_ts = current_timestamp
     
     def apply_enhanced_decay(self, current_timestamp: float, current_price: float = None) -> dict:

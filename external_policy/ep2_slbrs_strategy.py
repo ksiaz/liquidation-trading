@@ -9,7 +9,7 @@ Purpose:
 Exploits absorption, negotiation, and inventory rebalancing in range-bound conditions.
 
 Strategy Logic (from OB-SLBRSorderblockstrat.md):
-1. Detect liquidity blocks (persistence ≥ 60s, resting imbalance ≥ 75%)
+1. Detect liquidity blocks (persistence ≥ 60s, resting imbalance ≥ 65%)
 2. Observe first test (price enters block, aggressive volume, price rejects)
 3. Wait for rejection displacement ≥ max(8 bps, 0.25 × ATR)
 4. Enter on retest (reduced volume < 70%, reduced impact, absorption 65-95%)
@@ -21,11 +21,14 @@ State Machine: IDLE → FIRST_TEST_OBSERVED → REJECTION_CONFIRMED → ENTRY
 - Entry requires: volume reduction, impact reduction, absorption, R:R ≥ 1.5
 
 Thresholds from Market Mechanics (NOT backtest optimization):
-- 0.75 resting imbalance: One side ≥ 75% of top-5 depth (directional wall)
-- 60s persistence: Minimum block stability
+- 0.65 resting imbalance: One side ≥ 65% of top-5 depth (directional wall)
+- 120s persistence: Minimum block stability
 - 0.65-0.95 absorption ratio: Orders consumed but block still standing
 - 0.30 block width: Proximity threshold for retest
-- 0.3% ATR floor: No entry when ATR < 0.3% of price
+- 0.2% ATR floor: No entry when ATR < 0.2% of price
+- $3k OC notional minimum: consumed_size × price_level must be significant
+- $5k resting minor side minimum: filter microstructure noise
+- 10s primitive cache + timestamp coherence: prevent mixed-age false confluence
 - ALL primitives required: zone_penetration, structural_persistence, resting_size, order_consumption
 - Max 3 concurrent SLBRS positions
 - 5-minute post-exit cooldown, hard kill on ≥2 consecutive losses
@@ -81,6 +84,7 @@ class RegimeState:
     vwap_distance: float
     atr_5m: float
     atr_30m: float
+    vwap_z: float = 0.0  # Signed z-score: (price - VWAP) / σ
 
 
 # ==============================================================================
@@ -133,20 +137,29 @@ class SLBRSStrategy:
     _DIAG_INTERVAL = 150
 
     # Maximum age (seconds) for cached OC/SP values.
-    _OC_CACHE_MAX_AGE_SEC = 30.0
+    _OC_CACHE_MAX_AGE_SEC = 10.0
+
+    # Maximum age gap (seconds) between OC and SP for timestamp coherence.
+    _PRIMITIVE_COHERENCE_SEC = 10.0
+
+    # Minimum notional consumed (consumed_size × price_level) for OC significance.
+    # HL top-5 L2: meaningful test consumes $1k-$5k (Binance was $10k with deeper books).
+    _MIN_OC_NOTIONAL_USD = 3_000.0
 
     # Capitulation confidence threshold (softer than cascade sniper's 0.7)
     CAPITULATION_MIN_CONFIDENCE = 0.5
 
     # ── A3: Rejection displacement ──────────────────────────────────
-    # Design: abs(price − block_edge) ≥ max(8 bps, 0.25 × ATR(1m))
-    # Using ATR_5m as proxy for ATR_1m (available data).
-    _REJECTION_MIN_BPS = 0.0008   # 8 basis points
-    _REJECTION_ATR_MULT = 0.25    # 0.25 × ATR
+    # Design: abs(price − block_edge) ≥ max(15 bps, 0.50 × ATR(5m))
+    # Raised from 8bps/0.25×ATR: with HL sparse data, small rejections
+    # are noise. Real blocks produce meaningful bounce (15+ bps).
+    _REJECTION_MIN_BPS = 0.0015   # 15 basis points
+    _REJECTION_ATR_MULT = 0.50    # 0.50 × ATR
 
     # ── A3: Price acceptance ────────────────────────────────────────
     # Block broken if price stays beyond for this long.
-    _ACCEPTANCE_TIMEOUT_SEC = 10.0
+    # Raised from 10s: in sideways, 10s excursion at 3bps is noise.
+    _ACCEPTANCE_TIMEOUT_SEC = 30.0
 
     # ── A4: Retest volume reduction ─────────────────────────────────
     # Retest consumed volume must be < 70% of first test volume.
@@ -163,7 +176,7 @@ class SLBRSStrategy:
     _COOLDOWN_SEC = 300.0            # 5 minutes post-exit cooldown (design spec)
 
     # ── Section 7: Fail-safes ───────────────────────────────────────
-    _MAX_CONSECUTIVE_LOSSES = 2      # Hard kill per symbol
+    _MAX_CONSECUTIVE_LOSSES = 3      # Hard kill per symbol (raised from 2: with wider thresholds, allow more attempts)
     _MIN_WINRATE = 0.35              # Structural failure threshold
     _WINRATE_SAMPLE_SIZE = 20        # Sample window for winrate check
 
@@ -445,7 +458,7 @@ class SLBRSStrategy:
 
         # ATR gate: require real measured volatility
         atr_width = regime_state.atr_5m
-        min_meaningful_atr = price * 0.003
+        min_meaningful_atr = price * 0.002
         if atr_width < min_meaningful_atr:
             self._count_reject("atr_low")
             if _diag:
@@ -453,16 +466,10 @@ class SLBRSStrategy:
             return None
 
         # Block detection gates
-        if zone_penetration.penetration_depth < atr_width * 0.1:
-            self._count_reject("pen_depth")
-            if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: pen_depth={zone_penetration.penetration_depth:.4f}<{atr_width*0.1:.4f}")
-            return None
-
-        if structural_persistence.total_persistence_duration < 60.0:
+        if structural_persistence.total_persistence_duration < 120.0:
             self._count_reject("persist_low")
             if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: persist={structural_persistence.total_persistence_duration:.1f}s<60s")
+                print(f"[SLBRS-DIAG] {symbol}: persist={structural_persistence.total_persistence_duration:.1f}s<120s")
             return None
 
         # Resting size: directional wall
@@ -476,10 +483,10 @@ class SLBRSStrategy:
             return None
 
         resting_ratio = max(bid_sz, ask_sz) / total_resting
-        if resting_ratio < 0.75:
+        if resting_ratio < 0.65:
             self._count_reject("resting_ratio")
             if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: resting_ratio={resting_ratio:.2f}<0.75 bid={bid_sz:.1f} ask={ask_sz:.1f}")
+                print(f"[SLBRS-DIAG] {symbol}: resting_ratio={resting_ratio:.2f}<0.65 bid={bid_sz:.1f} ask={ask_sz:.1f}")
             return None
 
         MIN_MINOR_SIDE_USD = 5000.0
@@ -531,12 +538,23 @@ class SLBRSStrategy:
                     print(f"[SLBRS-DIAG] {symbol}: winrate={winrate:.2f}<{self._MIN_WINRATE}")
                 return None
 
-        # Test volume required (for retest comparison)
+        # Timestamp coherence: OC and SP must be from similar times
+        oc_ts = getattr(order_consumption, 'timestamp', 0) or 0
+        sp_ts = getattr(structural_persistence, 'timestamp', 0) or 0
+        if oc_ts > 0 and sp_ts > 0 and abs(oc_ts - sp_ts) > self._PRIMITIVE_COHERENCE_SEC:
+            self._count_reject("coherence_gap")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: coherence_gap OC-SP={abs(oc_ts - sp_ts):.1f}s>{self._PRIMITIVE_COHERENCE_SEC}s")
+            return None
+
+        # Test volume required (for retest comparison) — notional minimum
         first_consumed = getattr(order_consumption, 'consumed_size', 0) or 0.0
-        if first_consumed <= 0:
+        oc_price = getattr(order_consumption, 'price_level', 0) or price
+        first_consumed_notional = first_consumed * oc_price
+        if first_consumed <= 0 or first_consumed_notional < self._MIN_OC_NOTIONAL_USD:
             self._count_reject("no_test_volume")
             if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: no_test_volume (consumed=0)")
+                print(f"[SLBRS-DIAG] {symbol}: no_test_volume (notional=${first_consumed_notional:.0f}<${self._MIN_OC_NOTIONAL_USD:.0f})")
             return None
 
         # ======================================================================
@@ -589,11 +607,11 @@ class SLBRSStrategy:
         if first_test.direction == "LONG":
             # LONG: block is support below. Rejection = price bounces UP.
             rejection_disp = price - first_test.block_edge
-            beyond = price < first_test.block_edge * (1 - 0.0003)
+            beyond = price < first_test.block_edge * (1 - 0.0015)
         else:
             # SHORT: block is resistance above. Rejection = price bounces DOWN.
             rejection_disp = first_test.block_edge - price
-            beyond = price > first_test.block_edge * (1 + 0.0003)
+            beyond = price > first_test.block_edge * (1 + 0.0015)
 
         # Track max rejection displacement
         if rejection_disp > first_test.max_rejection:
@@ -657,9 +675,9 @@ class SLBRSStrategy:
 
         # Price acceptance check (block broken during retest wait)
         if first_test.direction == "LONG":
-            beyond = price < first_test.block_edge * (1 - 0.0003)
+            beyond = price < first_test.block_edge * (1 - 0.0015)
         else:
-            beyond = price > first_test.block_edge * (1 + 0.0003)
+            beyond = price > first_test.block_edge * (1 + 0.0015)
 
         if beyond:
             if first_test.beyond_block_since is None:
@@ -696,9 +714,15 @@ class SLBRSStrategy:
             return None
 
         # A4: Volume reduction — consumed < 70% of first test volume
+        # Also require minimum retest volume (>5% of first test) to filter
+        # "ghost retests" where price drifts back with zero aggression.
         if first_test.test_volume > 0:
-            if consumed >= first_test.test_volume * self._RETEST_VOLUME_RATIO:
+            vol_ratio = consumed / first_test.test_volume
+            if vol_ratio >= self._RETEST_VOLUME_RATIO:
                 self._count_reject("volume_reduction")
+                return None
+            if vol_ratio < 0.05:
+                self._count_reject("retest_vol_too_low")
                 return None
 
         # A4: Impact reduction — penetration < first test impact
@@ -766,12 +790,13 @@ class SLBRSStrategy:
             impact_str = f"impact={zone_penetration.penetration_depth:.4f}/{first_test.test_price_impact:.4f} "
         of_str = f"{orderflow_imbalance:.3f}" if orderflow_imbalance is not None else "None"
         rr = target_distance / stop_distance if stop_distance > 0 else 0
+        vwap_z_val = regime_state.vwap_z if regime_state else 0.0
         print(f"[SLBRS-ENTRY-DIAG] {symbol}: dir={direction} "
               f"block_edge={first_test.block_edge:.4f} "
               f"rejection={first_test.max_rejection:.6f} "
               f"vol_ratio={vol_ratio_str} {impact_str}"
               f"abs={absorption_pct*100:.1f}% of={of_str} fills={orderflow_fill_count} "
-              f"rr={rr:.2f} price={price:.4f}", flush=True)
+              f"rr={rr:.2f} vwap_z={vwap_z_val:+.2f} price={price:.4f}", flush=True)
 
         return StrategyProposal(
             strategy_id="EP2-SLBRS-V1",
@@ -827,9 +852,9 @@ class SLBRSStrategy:
         block_edge = info.get('block_edge')
         if block_edge:
             if direction == "LONG":
-                beyond = price < block_edge * (1 - 0.0003)
+                beyond = price < block_edge * (1 - 0.0015)
             else:
-                beyond = price > block_edge * (1 + 0.0003)
+                beyond = price > block_edge * (1 + 0.0015)
 
             if beyond:
                 if info.get('beyond_block_since') is None:

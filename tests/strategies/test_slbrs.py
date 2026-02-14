@@ -44,11 +44,14 @@ class MockRestingSize:
 class MockOrderConsumption:
     consumed_size: float
     initial_size: float = 500.0
+    price_level: float = 50000.0
+    timestamp: float = 1000.0
 
 
 @dataclass
 class MockStructuralPersistence:
     total_persistence_duration: float
+    timestamp: float = 1000.0
 
 
 class TestSLBRSStrategy:
@@ -101,7 +104,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=price,
             context=StrategyContext("first_test", ts),
             permission=self.permission, position_state=PositionState.FLAT
@@ -134,7 +137,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", ts),
             permission=self.permission, position_state=PositionState.FLAT,
@@ -151,7 +154,7 @@ class TestSLBRSStrategy:
             symbol="BTCUSDT", regime_state=regime_not_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None, order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0, context=self.context,
             permission=self.permission, position_state=PositionState.FLAT
         )
@@ -185,7 +188,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0, context=self.context,
             permission=self.permission, position_state=PositionState.FLAT
         )
@@ -236,7 +239,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=70.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0, context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
             orderflow_imbalance=0.55, orderflow_fill_count=30
@@ -255,7 +258,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),  # Same as first test
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0, context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
             orderflow_imbalance=0.55, orderflow_fill_count=30
@@ -280,7 +283,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0, context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
             orderflow_imbalance=0.55, orderflow_fill_count=30
@@ -342,7 +345,7 @@ class TestSLBRSStrategy:
             symbol="BTCUSDT", regime_state=self.regime_sideways,
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None, order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0, context=self.context,
             permission=permission_denied, position_state=PositionState.FLAT
         )
@@ -360,7 +363,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0, context=self.context,
             permission=self.permission, position_state=PositionState.FLAT
         )
@@ -376,7 +379,7 @@ class TestSLBRSStrategy:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0, context=self.context,
             permission=self.permission, position_state=PositionState.FLAT
         )
@@ -481,7 +484,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0,
             context=StrategyContext("first_test", 1000.0),
             permission=self.permission, position_state=PositionState.FLAT
@@ -508,7 +511,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
@@ -528,7 +531,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
@@ -546,7 +549,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None,
             order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0,
             context=StrategyContext("first_test", 1000.0),
             permission=self.permission, position_state=PositionState.FLAT
@@ -562,7 +565,7 @@ class TestSLBRSPartialDataRejection:
             symbol="BTCUSDT", regime_state=self.regime,
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None, order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0,
             context=StrategyContext("first_test", 1000.0),
             permission=self.permission, position_state=PositionState.FLAT
@@ -572,7 +575,7 @@ class TestSLBRSPartialDataRejection:
             symbol="BTCUSDT", regime_state=self.regime,
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None, order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1050.0),
             permission=self.permission, position_state=PositionState.FLAT
@@ -588,7 +591,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=None,
             order_consumption=None,
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0,
             context=StrategyContext("first_test", 1000.0),
             permission=self.permission, position_state=PositionState.FLAT
@@ -606,7 +609,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,
@@ -625,7 +628,7 @@ class TestSLBRSPartialDataRejection:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1020.0),
             permission=self.permission, position_state=PositionState.FLAT,

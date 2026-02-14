@@ -37,6 +37,7 @@ class MockZonePenetration:
 class MockStructuralPersistence:
     """Mock structural persistence primitive."""
     total_persistence_duration: float
+    timestamp: float = 1000.0
 
 
 @dataclass
@@ -44,6 +45,8 @@ class MockOrderConsumption:
     """Mock order consumption primitive."""
     consumed_size: float
     initial_size: float = 500.0
+    price_level: float = 50000.0
+    timestamp: float = 1000.0
 
 
 @dataclass
@@ -299,7 +302,7 @@ class TestRegimeMutualExclusion:
             zone_penetration=MockZonePenetration(penetration_depth=25.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=50.0, initial_size=500.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50000.0,
             context=StrategyContext("test1", 1100.0),
             permission=self.permission,
@@ -333,7 +336,7 @@ class TestRegimeMutualExclusion:
             zone_penetration=MockZonePenetration(penetration_depth=15.0),
             resting_size=MockRestingSize(bid_size=800.0, ask_size=200.0),
             order_consumption=MockOrderConsumption(consumed_size=30.0, initial_size=40.0),
-            structural_persistence=MockStructuralPersistence(total_persistence_duration=65.0),
+            structural_persistence=MockStructuralPersistence(total_persistence_duration=125.0),
             price=50005.0,
             context=StrategyContext("retest", 1120.0),
             permission=self.permission,

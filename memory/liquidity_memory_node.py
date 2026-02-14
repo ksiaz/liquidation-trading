@@ -58,6 +58,7 @@ class LiquidityMemoryNode:
     # Interaction counters (observational only)
     interaction_count: int = 0  # Number of times price interacted with this band
     volume_observed: float = 0.0  # Total volume observed at this level
+    last_decay_application_ts: float = 0.0  # Track last decay call for incremental decay
     
     def __post_init__(self):
         """Validate node parameters."""
@@ -81,23 +82,28 @@ class LiquidityMemoryNode:
         self.volume_observed += volume
     
     def apply_decay(self, current_timestamp: float, current_price: float = None):
-        """
-        Apply time-based decay to strength.
-        
-        Args:
-            current_timestamp: Current time for decay calculation
-            current_price: Optional current price for invalidation detection
+        """Apply time-based decay using incremental time since last decay call.
+
+        Uses time since last decay application (not total time since last interaction)
+        to prevent super-exponential strength loss from compounding non-incremental factors.
         """
         if not self.active:
             return
-        
-        time_elapsed = current_timestamp - self.last_interaction_ts
+
+        reference_ts = self.last_decay_application_ts if self.last_decay_application_ts > 0 else self.last_interaction_ts
+        time_elapsed = current_timestamp - reference_ts
+        if time_elapsed <= 0:
+            self.last_decay_application_ts = current_timestamp
+            return
+
         decay_factor = max(0.0, 1.0 - (self.decay_rate * time_elapsed))
         self.strength *= decay_factor
-        
+
         # Archive if strength drops below threshold
         if self.strength < 0.01:
             self.active = False
+
+        self.last_decay_application_ts = current_timestamp
     
     def apply_enhanced_decay(self, current_timestamp: float, current_price: float = None) -> dict:
         """

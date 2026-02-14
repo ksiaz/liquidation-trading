@@ -114,7 +114,7 @@ class CollectorService:
 
         # Phase 8: M6 Integration
         self.policy_adapter = PolicyAdapter(AdapterConfig(
-            enable_geometry=True,        # TESTING: Enable for immediate mandate generation (no regime needed)
+            enable_geometry=False,       # DISABLED: 10% win rate, zones from fill-only data lack L2 confirmation
             enable_orderbook_test=False,  # Test policy (disabled)
             # Phase 5: Enable regime-gated strategies
             enable_slbrs=True,           # NEW: SLBRS strategy (SIDEWAYS regime)
@@ -212,6 +212,10 @@ class CollectorService:
         # HL fill accumulator: aggregates taker fills per symbol per cycle
         # Each entry: (side_consumed: "bid"|"ask", size: float, price: float, ts: float)
         self._hl_fill_accumulator: Dict[str, list] = {}
+        # Governance event buffer: daemon threads append, regime loop drains to _obs.
+        # Bridges HL fills/liquidations from gRPC thread to governance (M2 nodes).
+        from collections import deque as _deque
+        self._governance_event_buffer: _deque = _deque(maxlen=10000)
         # Rolling price high/low tracker (5-min window) for EFFCS impulse detection
         self._price_highs: Dict[str, float] = {}
         self._price_lows: Dict[str, float] = {}
@@ -864,6 +868,23 @@ class CollectorService:
                 continue
 
             try:
+                # 0. Drain governance event buffer (fills + liquidations from gRPC thread)
+                # This feeds M2 node creation so structural_persistence is available.
+                _gov_drained = 0
+                while self._governance_event_buffer:
+                    try:
+                        event_type, symbol, payload = self._governance_event_buffer.popleft()
+                        self._obs.ingest_observation(
+                            timestamp=payload.get('timestamp', current_time),
+                            symbol=symbol,
+                            event_type=event_type,
+                            payload=payload,
+                        )
+                        _gov_drained += 1
+                    except Exception as e:
+                        self._logger.warning(f"Governance drain error ({event_type}/{symbol}): {e}")
+                        continue  # Skip bad event, process remaining
+
                 # 1. Advance System Time
                 self._obs.advance_time(current_time)
 
@@ -1005,6 +1026,9 @@ class CollectorService:
                             print(f"[REGIME] {symbol}: SKIP - calculator warm-up incomplete: {missing}", flush=True)
                         continue  # Calculator warm-up not complete
 
+                    # Compute VWAP z-score (signed deviation from VWAP in σ units)
+                    vwap_z = vwap_calc.get_z(price) or 0.0
+
                     # Create regime metrics object
                     regime_metrics = RegimeMetrics(
                         vwap_distance=vwap_distance,
@@ -1012,7 +1036,8 @@ class CollectorService:
                         atr_30m=atr_30m,
                         orderflow_imbalance=orderflow_imbalance,
                         liquidation_zscore=liquidation_zscore,
-                        orderflow_fill_count=orderflow_fill_count
+                        orderflow_fill_count=orderflow_fill_count,
+                        vwap_z=vwap_z
                     )
 
                     # Classify regime (pass current state for hysteresis)
@@ -1619,6 +1644,13 @@ class CollectorService:
                 self._hl_fill_accumulator[normalized_symbol] = []
             self._hl_fill_accumulator[normalized_symbol].append((side_consumed, size, price, timestamp))
 
+            # 9b. Buffer for governance M2 node creation (drained in regime loop)
+            self._governance_event_buffer.append(('HL_FILL', normalized_symbol, {
+                'side': side, 'price': price, 'size': size,
+                'value_usd': price * size, 'timestamp': timestamp,
+                'timestamp_ms': int(timestamp * 1000),
+            }))
+
             # 10. Update trailing stops and check for triggers
             self._update_trailing_stops(normalized_symbol, price)
 
@@ -1716,6 +1748,13 @@ class CollectorService:
 
             # 6. Track activity for calculator pruning
             self._calculator_last_activity[normalized_symbol] = timestamp
+
+            # 6b. Buffer for governance M2 node creation (drained in regime loop)
+            self._governance_event_buffer.append(('HL_LIQUIDATION', normalized_symbol, {
+                'side': side, 'price': price,
+                'liquidated_size': size, 'value': price * size,
+                'timestamp': timestamp,
+            }))
 
             # 7. Feed cascade sniper organic flow detector
             try:
@@ -1883,6 +1922,30 @@ class CollectorService:
                     entry_px = float(row['entry_price'])
                     if qty <= 0 or not side:
                         continue
+
+                    # Price sanity check: entry must be within 20% of current market
+                    live_price = self._get_live_price(symbol)
+                    if live_price and entry_px > 0:
+                        deviation = abs(entry_px - live_price) / live_price
+                        if deviation > 0.20:
+                            print(f"RECONCILE: STALE {symbol} entry=${entry_px:,.2f} vs market=${live_price:,.2f} "
+                                  f"(dev={deviation:.1%}) — forcing FLAT")
+                            # Force controller to FLAT instead of creating bogus ghost trade
+                            try:
+                                pg2 = get_conn()
+                                try:
+                                    c2 = pg2.cursor()
+                                    c2.execute(
+                                        "UPDATE positions SET state='FLAT', direction=NULL, "
+                                        "quantity='0', entry_price=NULL, updated_at=%s WHERE symbol=%s",
+                                        (time.time(), symbol)
+                                    )
+                                    pg2.commit()
+                                finally:
+                                    put_conn(pg2)
+                            except Exception as e2:
+                                print(f"RECONCILE: Failed to clear stale {symbol}: {e2}")
+                            continue
 
                     print(f"RECONCILE: Controller OPEN for {symbol} but ghost empty — registering")
                     success, error, trade = self.ghost_tracker.open_position(

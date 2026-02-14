@@ -32,35 +32,49 @@ class EnhancedDecayEngine:
     @classmethod
     def apply_decay(cls, node, context: DecayContext) -> dict:
         """
-        Apply enhanced decay to node.
-        
+        Apply enhanced decay to node using incremental time.
+
         Returns:
             Dictionary with decay details for logging
         """
-        time_elapsed = context.current_time - node.last_interaction_ts
-        
+        # Use incremental time since last decay (not total since last interaction)
+        ref_ts = getattr(node, 'last_decay_application_ts', 0.0)
+        reference = ref_ts if ref_ts > 0 else node.last_interaction_ts
+        time_elapsed = context.current_time - reference
+        if time_elapsed <= 0:
+            if hasattr(node, 'last_decay_application_ts'):
+                node.last_decay_application_ts = context.current_time
+            return {'decay_type': 'skipped', 'time_elapsed': 0, 'decay_rate': 0,
+                    'old_strength': node.strength, 'new_strength': node.strength, 'archived': not node.active}
+
+        # For invalidation check, use total time since last interaction
+        total_elapsed = context.current_time - node.last_interaction_ts
+
         # Base decay rate
         decay_rate = node.decay_rate
         decay_type = "time_based"
-        
+
         # Check for invalidation (if current price provided)
         if context.current_price is not None:
-            is_invalidated, reason = cls._check_invalidation(node, context.current_price, time_elapsed)
-            
+            is_invalidated, reason = cls._check_invalidation(node, context.current_price, total_elapsed)
+
             if is_invalidated:
                 # Accelerate decay
                 decay_rate *= cls.INVALIDATION_DECAY_MULTIPLIER
                 decay_type = f"invalidation_{reason}"
-        
-        # Apply exponential decay
+
+        # Apply decay with incremental time
         decay_factor = max(0.0, 1.0 - (decay_rate * time_elapsed))
         old_strength = node.strength
         node.strength *= decay_factor
-        
+
         # Archive if below threshold
         if node.strength < 0.01:
             node.active = False
-        
+
+        if hasattr(node, 'last_decay_application_ts'):
+            node.last_decay_application_ts = context.current_time
+
         return {
             'decay_type': decay_type,
             'time_elapsed': time_elapsed,

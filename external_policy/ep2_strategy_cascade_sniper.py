@@ -195,7 +195,7 @@ class CascadeSniperConfig:
     min_cluster_value: float = 100_000.0
 
     # Minimum positions to form a cluster
-    min_cluster_positions: int = 2  # Lowered for testing (was 5)
+    min_cluster_positions: int = 5  # Restored from testing value of 2
 
     # Dominance ratio - how much more one side must have
     # e.g., 0.7 means 70% of value must be on one side

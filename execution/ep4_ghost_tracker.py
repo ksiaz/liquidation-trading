@@ -16,6 +16,7 @@ from decimal import Decimal
 from datetime import datetime
 import json
 import os
+import threading
 
 import psycopg2.extras
 from runtime.logging.pg_pool import get_conn, put_conn
@@ -191,6 +192,7 @@ class GhostPositionTracker:
             initial_balance=initial_balance,
             current_balance=initial_balance
         )
+        self._position_lock = threading.Lock()  # Guards open/close against concurrent gRPC + asyncio
         self._position_size_pct = position_size_pct
         self._buffered_db = buffered_db
         self._api_key = api_key
@@ -448,13 +450,24 @@ class GhostPositionTracker:
         Returns:
             (success, error_reason, trade_record)
         """
+        with self._position_lock:
+            return self._open_position_locked(
+                symbol=symbol, side=side, quantity=quantity, cycle_id=cycle_id,
+                policy_name=policy_name, active_primitives=active_primitives,
+                orderbook=orderbook, entry_price=entry_price, timestamp=timestamp
+            )
+
+    def _open_position_locked(
+        self, *, symbol, side, quantity, cycle_id, policy_name,
+        active_primitives, orderbook, entry_price, timestamp
+    ):
         # Close existing position on same symbol before opening new one
         # Prevents orphaned entries from ON CONFLICT REPLACE or state desync
         if self.has_open_position(symbol):
             existing = self.get_open_position(symbol)
             if existing:
                 print(f"[GHOST] Closing existing {symbol} {existing.side} position before new open", flush=True)
-                self.close_position(
+                self._close_position_locked(
                     symbol=symbol,
                     exit_reason="REPLACED_BY_NEW_ENTRY",
                     exit_price=existing.entry_price,  # Flat PnL
@@ -565,7 +578,7 @@ class GhostPositionTracker:
         timestamp: Optional[float] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
-        Close position (simulated).
+        Close position (simulated). Thread-safe.
 
         Args:
             symbol: Trading symbol
@@ -581,6 +594,18 @@ class GhostPositionTracker:
         Returns:
             (success, error_reason, trade_record)
         """
+        with self._position_lock:
+            return self._close_position_locked(
+                symbol=symbol, quantity=quantity, cycle_id=cycle_id,
+                exit_reason=exit_reason, orderbook=orderbook,
+                exit_price=exit_price, timestamp=timestamp
+            )
+
+    def _close_position_locked(
+        self, *, symbol, quantity=None, cycle_id=None,
+        exit_reason="FULL_EXIT", orderbook=None,
+        exit_price=None, timestamp=None
+    ):
         # Check position exists
         position = self.get_open_position(symbol)
         if not position:

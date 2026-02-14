@@ -7,6 +7,8 @@ from .internal.m3_temporal import M3TemporalEngine
 
 # Diagnostic flag for M2 node tracing
 _DIAG_M2 = os.environ.get('DIAG_M2', '').lower() in ('1', 'true', 'yes')
+_M2_DIAG_INTERVAL = 30  # seconds
+_m2_last_diag = 0.0
 
 # Structured diagnostics for silent paths
 from runtime.diagnostics import diag, ReasonCode
@@ -120,7 +122,7 @@ class ObservationSystem:
         self._failure_reason = ""
 
         # Internal Modules
-        self._m1 = M1IngestionEngine()
+        self._m1 = M1IngestionEngine(trade_buffer_size=2000)
         self._m3 = M3TemporalEngine()
 
         # M2 Memory Store (STUB: Not populated yet)
@@ -487,8 +489,11 @@ class ObservationSystem:
                 )
                 self._create_or_update_node_from_liquidation(normalized_event)
         except Exception as e:
-            # Internal crash -> FAILED state
-             self._trigger_failure(f"Internal Processing Error: {e}")
+            # Log but don't kill the system — one bad event shouldn't be fatal.
+            # FAILED state is reserved for invariant violations (time regression).
+            import traceback
+            print(f"[GOVERNANCE WARNING] Processing error for {event_type}/{symbol}: {e}", flush=True)
+            traceback.print_exc()
 
     def advance_time(self, new_timestamp: float) -> None:
         """
@@ -545,7 +550,7 @@ class ObservationSystem:
         """Enter FAILED state. Irreversible."""
         self._status = ObservationStatus.FAILED
         self._failure_reason = reason
-        # Log fatal error here?
+        print(f"[GOVERNANCE FATAL] Observation system FAILED: {reason}", flush=True)
         
     def _update_liveness(self):
         """Check Invariant D: Liveness."""
@@ -637,8 +642,10 @@ class ObservationSystem:
                     volume=volume,
                     is_buyer_maker=is_taker_sell  # is_taker_sell = is_buyer_maker (same semantic)
                 )
-        elif volume >= 1000.0:  # Large trade threshold: $1000
-            # Create new node from large trade
+        else:
+            # Create new node from trade at uncovered price level.
+            # No volume threshold — node count is bounded by price bands (10bps each).
+            # A coin moving 2% creates ~20 bands; decay removes stale nodes within 25 min.
             import math
             price_precision = max(1, int(-math.log10(price * 0.001)))
             price_bucket = round(price, price_precision)
@@ -655,7 +662,7 @@ class ObservationSystem:
                     price_band=price_band,
                     side=side,
                     timestamp=timestamp,
-                    creation_reason="large_trade",
+                    creation_reason="trade",
                     initial_strength=0.3,
                     volume=volume
                 )
@@ -907,15 +914,14 @@ class ObservationSystem:
             )
 
             # Get M2 nodes for this symbol
-            # Normalize symbol: HL uses base symbols (BTC), Binance uses BTCUSDT
-            base_symbol = symbol.replace('USDT', '').replace('USD', '')
-            active_nodes = self._m2_store.get_active_nodes_for_symbol(base_symbol)
+            # M2 nodes use USDT-suffixed symbols (normalized in M1 ingestion)
+            active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
 
             # DIAG: Log M2 node counts (always log for debug)
             if _DIAG_M2:
                 total_nodes = len(self._m2_store._active_nodes)
                 if self._cycle_count % 100 == 1:  # Less frequent but always fires
-                    print(f"[M2-DIAG] {symbol} (base={base_symbol}): {len(active_nodes)} nodes (store: {total_nodes})", flush=True)
+                    print(f"[M2-DIAG] {symbol}: {len(active_nodes)} nodes (store: {total_nodes})", flush=True)
 
             if active_nodes:
                 # Detect order blocks from individual nodes
@@ -1091,6 +1097,26 @@ class ObservationSystem:
                 if observation_end > observation_start:
                     # Get active M2 nodes for this symbol
                     active_nodes = self._m2_store.get_active_nodes_for_symbol(symbol)
+
+                    # Periodic M2 diagnostic — per-symbol node counts
+                    global _m2_last_diag
+                    now_diag = time.time()
+                    if symbol == 'BTCUSDT' and now_diag - _m2_last_diag > _M2_DIAG_INTERVAL:
+                        _m2_last_diag = now_diag
+                        total_active = len(self._m2_store._active_nodes)
+                        total_dormant = len(self._m2_store._dormant_nodes)
+                        # Per-symbol node counts
+                        sym_counts = {}
+                        for n in self._m2_store._active_nodes.values():
+                            sym_counts[n.symbol] = sym_counts.get(n.symbol, 0) + 1
+                        # Only check USDT-suffixed symbols (M2 nodes use USDT format)
+                        usdt_syms = [s for s in (self._allowed_symbols or self._observed_symbols)
+                                     if s.endswith('USDT')]
+                        no_node_syms = [s for s in usdt_syms if sym_counts.get(s, 0) == 0]
+                        print(f"[M2-SP] store: {total_active} active, {total_dormant} dormant | "
+                              f"per-sym: {sym_counts} | no_nodes: {no_node_syms} | "
+                              f"created={self._m2_diag_nodes_created} trades={self._m2_diag_trades}",
+                              flush=True)
 
                     if len(active_nodes) > 0:
                         # Build presence intervals from M2 nodes

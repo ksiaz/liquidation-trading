@@ -74,7 +74,7 @@ class AdapterConfig:
     Contains only wiring parameters, no strategy logic.
     """
     default_authority: float = 5.0  # Authority level for policy mandates
-    enable_geometry: bool = True
+    enable_geometry: bool = False  # Disabled: needs L2 hybrid rebuild
     enable_orderbook_test: bool = False  # Test policy for verification
 
     # Phase 5: Regime-gated strategies (SLBRS/EFFCS)
@@ -307,7 +307,8 @@ class PolicyAdapter:
                 regime=regime_state.name,  # "SIDEWAYS_ACTIVE", "EXPANSION_ACTIVE", or "DISABLED"
                 vwap_distance=regime_metrics.vwap_distance,
                 atr_5m=regime_metrics.atr_5m,
-                atr_30m=regime_metrics.atr_30m
+                atr_30m=regime_metrics.atr_30m,
+                vwap_z=regime_metrics.vwap_z
             )
 
             # Use current price from collector (if not available, skip strategy calls)

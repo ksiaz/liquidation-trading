@@ -140,7 +140,10 @@ class PgBufferedResearchDatabase:
                         sql, params = args
                         pg_sql = sql.replace('?', '%s')
                         pg_params = PgCursorAdapter._coerce_params(params)
-                        conn.cursor().execute(pg_sql, pg_params)
+                        if pg_params:
+                            conn.cursor().execute(pg_sql, pg_params)
+                        else:
+                            conn.cursor().execute(pg_sql)
                     else:
                         method = getattr(db_shell, method_name, None)
                         if method:
@@ -249,7 +252,10 @@ class PgBufferedResearchDatabase:
         conn = get_conn()
         try:
             cur = conn.cursor()
-            cur.execute(pg_sql, params)
+            if params:
+                cur.execute(pg_sql, params)
+            else:
+                cur.execute(pg_sql)
             return cur.fetchall()
         finally:
             put_conn(conn)

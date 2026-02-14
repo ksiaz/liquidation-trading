@@ -165,23 +165,23 @@ class CollectorService:
         self._trailing_stop_config = TrailingStopConfig(
             mode=TrailingMode.ATR_PROGRESSIVE,
             # Two-phase ATR tightening
-            atr_prog_start_mult=2.5,        # Wide at entry (was 2.8)
-            atr_prog_phase1_end_mult=1.8,   # End of phase 1
-            atr_prog_phase1_range=0.01,     # Phase 1: 0-1% MFE (fast tightening)
-            atr_prog_end_mult=1.0,          # Tight at target (was 1.1)
+            atr_prog_start_mult=2.5,        # Wide at entry
+            atr_prog_phase1_end_mult=2.0,   # End of phase 1 (was 1.8 — too aggressive)
+            atr_prog_phase1_range=0.02,     # Phase 1: 0-2% MFE (was 1% — tightened too fast)
+            atr_prog_end_mult=1.0,          # Tight at target
             atr_prog_profit_range=0.04,     # Full range unchanged
             atr_prog_min_pct=0.005,         # Floor: 0.5% distance
             # Orderflow tightening
             orderflow_tighten_threshold=0.38,  # Adverse flow threshold
             orderflow_tighten_mult=0.6,        # 40% tighter when adverse
             # Break-even settings
-            break_even_trigger_pct=0.006,   # Trigger break-even after 0.6% profit
+            break_even_trigger_pct=0.008,   # Trigger break-even after 0.8% profit (was 0.6%)
             break_even_offset_pct=0.002,    # Lock in 0.2% profit at break-even
             # ATR-relative update gate
-            min_move_atr_fraction=0.05,     # Update if move >= 5% of ATR
-            min_move_to_update_pct=0.001,   # Lowered fallback (was 0.0012)
-            # Lock ratio: retain 45% of unrealized profit
-            atr_prog_min_lock_ratio=0.45,
+            min_move_atr_fraction=0.10,     # Update if move >= 10% of ATR (was 5% — too jittery)
+            min_move_to_update_pct=0.002,   # Fallback min move 0.2% (was 0.1%)
+            # Lock ratio: retain 35% of unrealized profit (was 45% — too greedy early)
+            atr_prog_min_lock_ratio=0.35,
         )
         # Create execution state repository for trailing stop persistence
         self._execution_state_repo = ExecutionStateRepository(db_path="logs/execution_state.db")

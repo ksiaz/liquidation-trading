@@ -150,11 +150,11 @@ class SLBRSStrategy:
     CAPITULATION_MIN_CONFIDENCE = 0.5
 
     # ── A3: Rejection displacement ──────────────────────────────────
-    # Design: abs(price − block_edge) ≥ max(15 bps, 0.50 × ATR(5m))
-    # Raised from 8bps/0.25×ATR: with HL sparse data, small rejections
-    # are noise. Real blocks produce meaningful bounce (15+ bps).
-    _REJECTION_MIN_BPS = 0.0015   # 15 basis points
-    _REJECTION_ATR_MULT = 0.50    # 0.50 × ATR
+    # Design: abs(price − block_edge) ≥ max(25 bps, 0.75 × ATR(5m))
+    # Must be a REAL bounce, not noise. At $87 SOL, 25bps = $0.22.
+    # Previous 15bps let $0.14 rejections through → instant reversals.
+    _REJECTION_MIN_BPS = 0.0025   # 25 basis points
+    _REJECTION_ATR_MULT = 0.75    # 0.75 × ATR
 
     # ── A3: Price acceptance ────────────────────────────────────────
     # Block broken if price stays beyond for this long.
@@ -184,6 +184,7 @@ class SLBRSStrategy:
     # Matches classifier SIDEWAYS hold threshold — if classifier would exit
     # SIDEWAYS, invalidate immediately (faster than regime debounce).
     _INVALIDATION_ATR_RATIO = 0.95
+
 
     def __init__(self):
         """Initialize SLBRS strategy with empty state."""
@@ -629,16 +630,20 @@ class SLBRSStrategy:
         else:
             first_test.beyond_block_since = None
 
-        # Check rejection threshold: max(8 bps, 0.25 × ATR)
+        # Check rejection threshold: max(25 bps, 0.75 × ATR)
+        # BOTH conditions: peak displacement exceeded threshold AND price is
+        # currently displaced (not a one-tick spike that already reversed).
         rejection_threshold = max(
             first_test.block_edge * self._REJECTION_MIN_BPS,
             self._REJECTION_ATR_MULT * first_test.block_width
         )
 
-        if first_test.max_rejection >= rejection_threshold:
+        if (first_test.max_rejection >= rejection_threshold
+                and rejection_disp >= rejection_threshold * 0.5):
             self._state[symbol] = SLBRSState.REJECTION_CONFIRMED
             print(f"[SLBRS-REJECTION] {symbol}: dir={first_test.direction} "
                   f"displacement={first_test.max_rejection:.6f} "
+                  f"current={rejection_disp:.6f} "
                   f"threshold={rejection_threshold:.6f} "
                   f"elapsed={elapsed:.1f}s", flush=True)
 

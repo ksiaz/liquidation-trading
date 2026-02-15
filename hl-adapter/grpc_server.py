@@ -53,6 +53,11 @@ class EventBroadcaster:
                 print(f"[GRPC] {self._name}: client '{client_id}' unsubscribed "
                       f"(total: {len(self._subscribers)})", file=sys.stderr)
 
+    def is_subscribed(self, client_id: str) -> bool:
+        """Return True if client is still an active subscriber."""
+        with self._lock:
+            return client_id in self._subscribers
+
     def broadcast(self, event):
         """Broadcast event to all subscribers."""
         with self._lock:
@@ -158,6 +163,11 @@ class HLNodeAdapterServicer(events_pb2_grpc.HLNodeAdapterServicer):
 
         try:
             while context.is_active():
+                if not self._price_broadcaster.is_subscribed(client_id):
+                    print(f"[GRPC] prices: client '{client_id}' dropped, closing stream",
+                          file=sys.stderr)
+                    break
+
                 try:
                     event = queue.get(timeout=1.0)
 
@@ -178,6 +188,11 @@ class HLNodeAdapterServicer(events_pb2_grpc.HLNodeAdapterServicer):
 
         try:
             while context.is_active():
+                if not self._liq_broadcaster.is_subscribed(client_id):
+                    print(f"[GRPC] liquidations: client '{client_id}' dropped, closing stream",
+                          file=sys.stderr)
+                    break
+
                 try:
                     event = queue.get(timeout=1.0)
 
@@ -198,6 +213,11 @@ class HLNodeAdapterServicer(events_pb2_grpc.HLNodeAdapterServicer):
 
         try:
             while context.is_active():
+                if not self._fill_broadcaster.is_subscribed(client_id):
+                    print(f"[GRPC] fills: client '{client_id}' dropped, closing stream",
+                          file=sys.stderr)
+                    break
+
                 try:
                     event = queue.get(timeout=1.0)
 
@@ -218,6 +238,11 @@ class HLNodeAdapterServicer(events_pb2_grpc.HLNodeAdapterServicer):
 
         try:
             while context.is_active():
+                if not self._status_broadcaster.is_subscribed(client_id):
+                    print(f"[GRPC] status: client '{client_id}' dropped, closing stream",
+                          file=sys.stderr)
+                    break
+
                 try:
                     event = queue.get(timeout=1.0)
                     yield event

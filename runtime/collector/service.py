@@ -121,7 +121,7 @@ class CollectorService:
             enable_effcs=True,           # NEW: EFFCS strategy (EXPANSION regime)
             # Phase 6: Cascade Sniper (Hyperliquid proximity)
             enable_cascade_sniper=True,  # NEW: Cascade sniper (liquidation proximity)
-            cascade_sniper_entry_mode="CASCADE_MOMENTUM"  # Aggressive: ride the cascade
+            cascade_sniper_entry_mode="EXHAUSTION_FADE"  # Fade post-liquidation overextension
         ))
         self.arbitrator = MandateArbitrator()
         # Fix: Enable position persistence to survive restarts

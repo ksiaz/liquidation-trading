@@ -87,7 +87,7 @@ class AdapterConfig:
 
     # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
     enable_cascade_sniper: bool = False  # Cascade sniper (liquidation proximity)
-    cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL" or "CASCADE_MOMENTUM"
+    cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL", "CASCADE_MOMENTUM", or "EXHAUSTION_FADE"
 
 
 class PolicyAdapter:
@@ -392,6 +392,8 @@ class PolicyAdapter:
             entry_mode = CascadeSniperEntryMode.ABSORPTION_REVERSAL
             if self.config.cascade_sniper_entry_mode == "CASCADE_MOMENTUM":
                 entry_mode = CascadeSniperEntryMode.CASCADE_MOMENTUM
+            elif self.config.cascade_sniper_entry_mode == "EXHAUSTION_FADE":
+                entry_mode = CascadeSniperEntryMode.EXHAUSTION_FADE
 
             # Get liq_z from regime_metrics (if available) for cascade sniper override
             cascade_liq_z = regime_metrics.liquidation_zscore if regime_metrics is not None else None

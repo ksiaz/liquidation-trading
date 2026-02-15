@@ -184,6 +184,14 @@ COIN_LIQUIDATION_THRESHOLDS = {
 # Default threshold for coins not in the list
 DEFAULT_LIQUIDATION_THRESHOLD = 100.0
 
+# Post-liquidation exhaustion fade requires a stronger burst than trigger-only entry.
+# These are per-coin minimum burst values (USD) calibrated for major symbols.
+EXHAUSTION_FADE_MIN_BURST_BY_COIN = {
+    "BTC": 2_500.0,
+    "ETH": 1_500.0,
+    "SOL": 600.0,
+}
+
 
 @dataclass(frozen=True)
 class CascadeSniperConfig:
@@ -327,6 +335,11 @@ class CascadeSniperConfig:
     # Absorption-aware stop: exit quickly if absorption collapses
     atr_stop_absorption_exit_threshold: float = 0.30  # Exit if buy_ratio < 0.30
 
+    # Exhaustion fade mode: stricter burst confirmation
+    # For non-overridden symbols, required_burst = max(default, trigger_threshold * multiplier)
+    exhaustion_fade_default_min_burst_value: float = 500.0
+    exhaustion_fade_burst_multiplier: float = 4.0
+
 
 # ==============================================================================
 # Types
@@ -345,6 +358,7 @@ class EntryMode(Enum):
     """Entry timing modes."""
     ABSORPTION_REVERSAL = "ABSORPTION_REVERSAL"  # Enter on reversal (conservative)
     CASCADE_MOMENTUM = "CASCADE_MOMENTUM"        # Ride the cascade (aggressive)
+    EXHAUSTION_FADE = "EXHAUSTION_FADE"          # Fade only after strong burst + absorption (selective)
 
 
 @dataclass(frozen=True)
@@ -467,6 +481,10 @@ class CascadeStateMachine:
         self._triggered_at: Dict[str, float] = {}
         self._absorption_data: Dict[str, AbsorptionAnalysis] = {}
 
+        # Trigger burst: snapshot of burst that caused TRIGGERED transition
+        # (10s window expires before EXHAUSTED state, so we preserve it here)
+        self._trigger_burst: Dict[str, 'LiquidationBurst'] = {}
+
         # Gate C: Burst history for cascade confirmation
         # Per symbol: list of (timestamp, volume) tuples for each qualifying burst
         self._burst_history: Dict[str, List[tuple]] = {}
@@ -542,6 +560,8 @@ class CascadeStateMachine:
             elif self._is_cascade_triggered(liquidations, symbol, timestamp):
                 self._states[symbol] = CascadeState.TRIGGERED
                 self._triggered_at[symbol] = timestamp
+                if liquidations:
+                    self._trigger_burst[symbol] = liquidations
                 new_state = CascadeState.TRIGGERED
 
                 # Set cascade direction for organic flow detector
@@ -606,6 +626,7 @@ class CascadeStateMachine:
                 self._triggered_at.pop(symbol, None)
                 self._absorption_data.pop(symbol, None)
                 self._burst_history.pop(symbol, None)  # Gate C: Clear burst history
+                self._trigger_burst.pop(symbol, None)
                 # Clear cascade direction to prevent stale data
                 if self._organic_detector:
                     self._organic_detector.clear_cascade(symbol)
@@ -935,6 +956,9 @@ class CascadeStateMachine:
         elif entry_mode == EntryMode.CASCADE_MOMENTUM:
             # Need thin book for cascade to continue (ratio < threshold)
             return ratio <= self._config.max_absorption_ratio_for_momentum
+        elif entry_mode == EntryMode.EXHAUSTION_FADE:
+            # Exhaustion fade enters at EXHAUSTED state — absorption is implicit
+            return True
 
         return True
 
@@ -1799,6 +1823,75 @@ def generate_cascade_sniper_proposal(
                     direction=entry_direction,
                     confidence="CASCADE_MOMENTUM",
                     justification_ref=f"HL_PROX|TRIGGER|{primed.total_positions_at_risk}pos|${primed.total_value_at_risk:.0f}{ratio_str}{eq_str}{burst_str}{density_str}",
+                    timestamp=context.timestamp
+                )
+
+    elif entry_mode == EntryMode.EXHAUSTION_FADE:
+        # Enter on EXHAUSTED state: burst is over, fade the overextension
+        if state == CascadeState.EXHAUSTED:
+            dominant_side = sm.get_dominant_side(symbol)
+            primed = sm.get_primed_data(symbol)
+
+            # Use the trigger burst (stored when entering TRIGGERED), not current 10s window
+            trigger_burst = sm._trigger_burst.get(symbol)
+            if dominant_side and primed and trigger_burst:
+                # Signed burst: positive = short-liq (forced buys), negative = long-liq (forced sells)
+                signed_burst = trigger_burst.short_liquidations - trigger_burst.long_liquidations
+                abs_burst = abs(signed_burst)
+
+                # Per-coin minimum burst threshold
+                coin = symbol.replace('USDT', '').replace('USD', '')
+                min_burst = EXHAUSTION_FADE_MIN_BURST_BY_COIN.get(
+                    coin,
+                    _config.exhaustion_fade_default_min_burst_value
+                )
+                # Also check multiplier-based threshold
+                trigger_threshold = COIN_LIQUIDATION_THRESHOLDS.get(coin, DEFAULT_LIQUIDATION_THRESHOLD)
+                min_burst = max(min_burst, trigger_threshold * _config.exhaustion_fade_burst_multiplier)
+
+                if abs_burst < min_burst:
+                    return None  # Burst too small for fade
+
+                # Fade direction: opposite to cascade
+                # Longs liquidated (dominant=LONG) → price overshot down → fade LONG
+                entry_direction = dominant_side
+
+                # Gate B: trend gate (same as absorption reversal)
+                structural_pivot = sm._structural_pivot.get(symbol, False)
+                if not structural_pivot:
+                    absorption_signal = sm.get_absorption_signal(symbol)
+                    absorption_ratio = absorption_signal.buying_ratio if absorption_signal else None
+                    cascade_value = primed.total_value_at_risk if primed else None
+                    trend_ok, trend_reason = _check_trend_gate(
+                        symbol, entry_direction, price_returns, absorption_ratio, cascade_value
+                    )
+                    if not trend_ok:
+                        print(f"[TREND GATE] {symbol}: {entry_direction} exhaustion fade blocked - {trend_reason}")
+                        return None
+
+                # Entry quality filter
+                if _config and _config.use_entry_quality_filter:
+                    should_enter, eq_score = eq_scorer.get_entry_recommendation(
+                        symbol=symbol,
+                        intended_side=entry_direction,
+                        min_quality=_config.min_entry_quality,
+                        require_large_liq=_config.require_large_liquidations,
+                        trend_context=trend_context
+                    )
+                    if not should_enter:
+                        print(f"[EQ FILTER] {symbol}: {entry_direction} exhaustion fade blocked - {eq_score.reason}")
+                        return None
+                else:
+                    eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
+
+                eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
+
+                return StrategyProposal(
+                    strategy_id="EP2-CASCADE-SNIPER-V1",
+                    action_type="ENTRY",
+                    direction=entry_direction,
+                    confidence="EXHAUSTION_FADE",
+                    justification_ref=f"HL_PROX|EXHAUST|{primed.total_positions_at_risk}pos|${abs_burst:.0f}burst{eq_str}",
                     timestamp=context.timestamp
                 )
 

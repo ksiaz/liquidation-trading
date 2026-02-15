@@ -198,6 +198,35 @@ class LiquidationBurstAggregator:
                 while events and events[0].timestamp < cutoff:
                     events.popleft()
 
+    def get_events_in_range(
+        self,
+        symbol: str,
+        start_ts: float,
+        end_ts: float
+    ) -> list:
+        """
+        Get raw liquidation events within a time range.
+
+        Used by ExhaustionScorer to snapshot burst events at TRIGGERED time.
+
+        Args:
+            symbol: Trading symbol
+            start_ts: Window start timestamp
+            end_ts: Window end timestamp
+
+        Returns:
+            List of LiquidationEvent within [start_ts, end_ts]
+        """
+        symbol = symbol.upper()
+        events = self._events.get(symbol)
+        if not events:
+            return []
+        # Thread-safe snapshot
+        return [
+            e for e in list(events)
+            if start_ts <= e.timestamp <= end_ts
+        ]
+
     def get_summary(self) -> Dict:
         """Get aggregator summary."""
         items = list(self._events.items())

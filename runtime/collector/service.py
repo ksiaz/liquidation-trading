@@ -233,6 +233,10 @@ class CollectorService:
             max_events=1000
         )
 
+        # Exhaustion scorer DISABLED — backtest showed anti-predictive at 30s timing.
+        # EXHAUSTION_FADE now enters at TRIGGERED (immediate) with counter-trend gate.
+        self._exhaustion_scorer = None
+
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
 
@@ -735,6 +739,9 @@ class CollectorService:
                             self._logger.info("Capitulation tracker injected into cascade sniper")
                         except ImportError:
                             pass
+
+                        # Exhaustion scorer DISABLED — anti-predictive per backtest.
+                        # EXHAUSTION_FADE uses counter-trend + liq count gates instead.
 
                         # Verify adapter is responding (STALE is OK during warmup)
                         await asyncio.sleep(2)  # Give adapter time to send status
@@ -1349,14 +1356,25 @@ class CollectorService:
                             policy_name=result.strategy_id
                         )
                         if success and trade:
-                            initial_stop = entry_px * (0.975 if side == "LONG" else 1.025)
+                            # Use per-coin trailing config for EXHAUSTION_FADE entries
+                            stop_config = self._trailing_stop_config
+                            is_exhaust_fade = (
+                                result.strategy_id == "EP2-CASCADE-SNIPER-V1"
+                                and self.policy_adapter.config.cascade_sniper_entry_mode == "EXHAUSTION_FADE"
+                            )
+                            if is_exhaust_fade:
+                                stop_config, initial_stop = self._get_exhaust_fade_stop_config(
+                                    result.symbol, entry_px, side
+                                )
+                            else:
+                                initial_stop = entry_px * (0.975 if side == "LONG" else 1.025)
                             self._trailing_stop_manager.register_trailing_stop(
                                 entry_order_id=trade.trade_id,
                                 symbol=result.symbol,
                                 direction=side,
                                 entry_price=entry_px,
                                 initial_stop_price=initial_stop,
-                                config=self._trailing_stop_config
+                                config=stop_config
                             )
                             existing_stop_symbols.add(result.symbol)
                             print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
@@ -2263,6 +2281,50 @@ class CollectorService:
             price_level=latest_price,
             timestamp=latest_ts
         )
+
+    def _get_exhaust_fade_stop_config(self, symbol: str, entry_px: float, side: str):
+        """Get per-coin trailing stop config for EXHAUSTION_FADE entries.
+
+        Returns (TrailingStopConfig, initial_stop_price).
+        Uses FIXED_DISTANCE mode with per-coin trail distance and hard SL.
+        Calibrated from TP/SL grid backtest (11 days, 3889 cascades).
+        """
+        from external_policy.ep2_strategy_cascade_sniper import (
+            EXHAUSTION_FADE_TRAIL_CONFIG, EXHAUSTION_FADE_DEFAULT_TRAIL
+        )
+        coin = symbol.replace('USDT', '').replace('USD', '')
+        trail_cfg = EXHAUSTION_FADE_TRAIL_CONFIG.get(coin, EXHAUSTION_FADE_DEFAULT_TRAIL)
+
+        sl_pct = trail_cfg['sl_bps'] / 10000.0    # e.g., 30bp = 0.003
+        trail_pct = trail_cfg['trail_bps'] / 10000.0  # e.g., 8bp = 0.0008
+
+        # Hard stop loss from entry
+        if side == "LONG":
+            initial_stop = entry_px * (1 - sl_pct)
+        else:
+            initial_stop = entry_px * (1 + sl_pct)
+
+        activation_pct = trail_cfg['activation_bps'] / 10000.0  # e.g., 15bp = 0.0015
+
+        config = TrailingStopConfig(
+            mode=TrailingMode.FIXED_DISTANCE,
+            trail_distance_pct=trail_pct,
+            # Activation: trail only starts once MFE exceeds this
+            # Before activation, the initial stop (hard SL at sl_bps) is the only protection
+            trail_activation_pct=activation_pct,
+            # Break-even: not used for exhaustion fade (activation handles it)
+            break_even_trigger_pct=1.0,  # Effectively disabled (100% profit never reached)
+            break_even_offset_pct=0.0,
+            # Minimal update gate for tight trailing
+            min_move_to_update_pct=0.0002,  # 0.02% = 2bp
+            min_move_atr_fraction=0.05,
+        )
+
+        print(f"EXHAUST_FADE STOP: {symbol} {side} @ ${entry_px:,.2f} "
+              f"SL={trail_cfg['sl_bps']}bp trail={trail_cfg['trail_bps']}bp "
+              f"act={trail_cfg['activation_bps']}bp initial_stop=${initial_stop:,.2f}")
+
+        return config, initial_stop
 
     def _update_trailing_stops(self, symbol: str, price: float):
         """Update trailing stops for symbol and check for triggers.

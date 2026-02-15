@@ -64,6 +64,12 @@ class TrailingStopConfig:
     orderflow_tighten_threshold: float = 0.38  # Adverse flow threshold (< this for LONG)
     orderflow_tighten_mult: float = 0.6        # Multiply ATR distance by this when adverse
 
+    # Activation threshold for FIXED_DISTANCE mode (optional).
+    # Trail only starts once MFE exceeds this percentage.
+    # Before activation, the initial stop (hard SL) is the only protection.
+    # 0.0 = trail from entry (default behavior)
+    trail_activation_pct: float = 0.0
+
     # Update settings
     min_move_to_update_pct: float = 0.002  # Only update stop if new level is 0.2% better
     min_move_atr_fraction: float = 0.05    # Update if move >= 5% of ATR (dynamic gate)
@@ -419,6 +425,15 @@ class TrailingStopManager:
             return None
 
         elif config.mode == TrailingMode.FIXED_DISTANCE:
+            # Activation gate: don't start trailing until MFE exceeds threshold
+            if config.trail_activation_pct > 0:
+                if state.direction == "LONG":
+                    mfe_pct = (state.highest_price - entry) / entry
+                else:
+                    mfe_pct = (entry - state.lowest_price) / entry
+                if mfe_pct < config.trail_activation_pct:
+                    return None  # Not activated yet — keep initial stop (hard SL)
+
             if state.direction == "LONG":
                 # Trail below highest price
                 new_stop = state.highest_price * (1 - config.trail_distance_pct)

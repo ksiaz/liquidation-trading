@@ -16,5 +16,5 @@ __all__ = [
     'LiquidationZScoreCalculator',
     'LiquidationBurstAggregator',
     'LiquidationBurst',
-    'LiquidationEvent'
+    'LiquidationEvent',
 ]

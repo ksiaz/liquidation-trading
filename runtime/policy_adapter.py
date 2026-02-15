@@ -59,6 +59,7 @@ from external_policy.ep2_strategy_cascade_sniper import (
     EntryMode as CascadeSniperEntryMode
 )
 from runtime.liquidations import LiquidationBurst
+from runtime.liquidations.rolling_volume_tracker import RollingFadeSignal
 
 # Directional context for kill-switch (via observation layer)
 from observation.types import TrendRegimeContext
@@ -87,7 +88,7 @@ class AdapterConfig:
 
     # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
     enable_cascade_sniper: bool = False  # Cascade sniper (liquidation proximity)
-    cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL", "CASCADE_MOMENTUM", or "EXHAUSTION_FADE"
+    cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL", "CASCADE_MOMENTUM", "EXHAUSTION_FADE", or "ROLLING_FADE"
 
 
 class PolicyAdapter:
@@ -140,7 +141,8 @@ class PolicyAdapter:
         hl_order_consumption: Optional[Any] = None,  # HL-derived order consumption (from taker fills)
         price_high: Optional[float] = None,  # 5-min rolling high for EFFCS impulse direction
         price_low: Optional[float] = None,  # 5-min rolling low for EFFCS impulse direction
-        capitulation_confidence: float = 0.0  # CapitulationTracker confidence for SLBRS
+        capitulation_confidence: float = 0.0,  # CapitulationTracker confidence for SLBRS
+        rolling_fade_signal: Optional[RollingFadeSignal] = None  # Rolling 30m liq spike signal
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -387,13 +389,15 @@ class PolicyAdapter:
                     proposals.append(proposal)
 
         # Phase 6: Cascade Sniper strategy (Hyperliquid proximity) with TREND KILL-SWITCH
-        if self.config.enable_cascade_sniper and (hl_proximity is not None or liquidation_burst is not None):
+        if self.config.enable_cascade_sniper and (hl_proximity is not None or liquidation_burst is not None or rolling_fade_signal is not None):
             # Determine entry mode from config
             entry_mode = CascadeSniperEntryMode.ABSORPTION_REVERSAL
             if self.config.cascade_sniper_entry_mode == "CASCADE_MOMENTUM":
                 entry_mode = CascadeSniperEntryMode.CASCADE_MOMENTUM
             elif self.config.cascade_sniper_entry_mode == "EXHAUSTION_FADE":
                 entry_mode = CascadeSniperEntryMode.EXHAUSTION_FADE
+            elif self.config.cascade_sniper_entry_mode == "ROLLING_FADE":
+                entry_mode = CascadeSniperEntryMode.ROLLING_FADE
 
             # Get liq_z from regime_metrics (if available) for cascade sniper override
             cascade_liq_z = regime_metrics.liquidation_zscore if regime_metrics is not None else None
@@ -409,7 +413,8 @@ class PolicyAdapter:
                 price_returns=price_returns,  # Gate B: Short-term price returns
                 trade_burst=primitives.get("trade_burst"),
                 liquidation_density=primitives.get("liquidation_density"),
-                liquidation_zscore=cascade_liq_z  # Aggregate liq signal for override
+                liquidation_zscore=cascade_liq_z,  # Aggregate liq signal for override
+                rolling_fade_signal=rolling_fade_signal  # Rolling 30m liq spike signal
             )
             if _DIAG_ENABLED:
                 if proposal:

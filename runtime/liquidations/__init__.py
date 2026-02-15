@@ -11,10 +11,13 @@ Constitutional Authority:
 
 from .zscore import LiquidationZScoreCalculator
 from .burst_aggregator import LiquidationBurstAggregator, LiquidationBurst, LiquidationEvent
+from .rolling_volume_tracker import RollingVolumeTracker, RollingFadeSignal
 
 __all__ = [
     'LiquidationZScoreCalculator',
     'LiquidationBurstAggregator',
     'LiquidationBurst',
     'LiquidationEvent',
+    'RollingVolumeTracker',
+    'RollingFadeSignal',
 ]

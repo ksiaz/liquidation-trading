@@ -44,6 +44,7 @@ from runtime.regime import RegimeState, RegimeMetrics, classify_regime
 from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
+from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.cascade import CapitulationTracker
 
 # Import Hyperliquid Integration
@@ -121,7 +122,7 @@ class CollectorService:
             enable_effcs=True,           # NEW: EFFCS strategy (EXPANSION regime)
             # Phase 6: Cascade Sniper (Hyperliquid proximity)
             enable_cascade_sniper=True,  # NEW: Cascade sniper (liquidation proximity)
-            cascade_sniper_entry_mode="EXHAUSTION_FADE"  # Fade post-liquidation overextension
+            cascade_sniper_entry_mode="ROLLING_FADE"  # Fade 30m rolling liq spikes (backtest: 91% WR)
         ))
         self.arbitrator = MandateArbitrator()
         # Fix: Enable position persistence to survive restarts
@@ -236,6 +237,9 @@ class CollectorService:
         # Exhaustion scorer DISABLED — backtest showed anti-predictive at 30s timing.
         # EXHAUSTION_FADE now enters at TRIGGERED (immediate) with counter-trend gate.
         self._exhaustion_scorer = None
+
+        # Rolling volume tracker for ROLLING_FADE entry mode
+        self._rolling_volume_tracker = RollingVolumeTracker()
 
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
@@ -1264,6 +1268,11 @@ class CollectorService:
                         )
                         cap_confidence = cap_metrics.confidence
 
+                    # Check for rolling fade signal (30m rolling liq spike)
+                    rolling_fade_signal = self._rolling_volume_tracker.check_for_signal(
+                        symbol, timestamp
+                    )
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -1281,7 +1290,8 @@ class CollectorService:
                         hl_order_consumption=None,  # Canonical OC now has initial_size
                         price_high=self._price_highs.get(symbol, current_price),
                         price_low=self._price_lows.get(symbol, current_price),
-                        capitulation_confidence=cap_confidence
+                        capitulation_confidence=cap_confidence,
+                        rolling_fade_signal=rolling_fade_signal
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1356,14 +1366,18 @@ class CollectorService:
                             policy_name=result.strategy_id
                         )
                         if success and trade:
-                            # Use per-coin trailing config for EXHAUSTION_FADE entries
+                            # Use custom trailing config for fade entries
                             stop_config = self._trailing_stop_config
-                            is_exhaust_fade = (
-                                result.strategy_id == "EP2-CASCADE-SNIPER-V1"
-                                and self.policy_adapter.config.cascade_sniper_entry_mode == "EXHAUSTION_FADE"
-                            )
+                            cascade_mode = self.policy_adapter.config.cascade_sniper_entry_mode
+                            is_cascade = result.strategy_id == "EP2-CASCADE-SNIPER-V1"
+                            is_exhaust_fade = is_cascade and cascade_mode == "EXHAUSTION_FADE"
+                            is_rolling_fade = is_cascade and cascade_mode == "ROLLING_FADE"
                             if is_exhaust_fade:
                                 stop_config, initial_stop = self._get_exhaust_fade_stop_config(
+                                    result.symbol, entry_px, side
+                                )
+                            elif is_rolling_fade:
+                                stop_config, initial_stop = self._get_rolling_fade_stop_config(
                                     result.symbol, entry_px, side
                                 )
                             else:
@@ -1773,6 +1787,11 @@ class CollectorService:
                 side=order_side,
                 price=price,
                 quantity=size
+            )
+
+            # 5b. Feed rolling volume tracker (30m window for ROLLING_FADE)
+            self._rolling_volume_tracker.add_event(
+                normalized_symbol, side, price, size, timestamp
             )
 
             # 6. Track activity for calculator pruning
@@ -2323,6 +2342,41 @@ class CollectorService:
         print(f"EXHAUST_FADE STOP: {symbol} {side} @ ${entry_px:,.2f} "
               f"SL={trail_cfg['sl_bps']}bp trail={trail_cfg['trail_bps']}bp "
               f"act={trail_cfg['activation_bps']}bp initial_stop=${initial_stop:,.2f}")
+
+        return config, initial_stop
+
+    def _get_rolling_fade_stop_config(self, symbol: str, entry_px: float, side: str):
+        """Get trailing stop config for ROLLING_FADE entries.
+
+        Returns (TrailingStopConfig, initial_stop_price).
+        Uses FIXED_DISTANCE mode: 0.5% activation, 0.20% trail, 0.50% hard SL.
+        Calibrated from backtest (11 days, 91% WR, +0.56% mean).
+        """
+        from external_policy.ep2_strategy_cascade_sniper import ROLLING_FADE_TRAIL_CONFIG
+        cfg = ROLLING_FADE_TRAIL_CONFIG
+        sl_pct = cfg['sl_pct']
+        trail_pct = cfg['trail_pct']
+        activation_pct = cfg['activation_pct']
+
+        # Hard stop loss from entry
+        if side == "LONG":
+            initial_stop = entry_px * (1 - sl_pct)
+        else:
+            initial_stop = entry_px * (1 + sl_pct)
+
+        config = TrailingStopConfig(
+            mode=TrailingMode.FIXED_DISTANCE,
+            trail_distance_pct=trail_pct,
+            trail_activation_pct=activation_pct,
+            break_even_trigger_pct=1.0,  # Disabled
+            break_even_offset_pct=0.0,
+            min_move_to_update_pct=0.0002,
+            min_move_atr_fraction=0.05,
+        )
+
+        print(f"ROLLING_FADE STOP: {symbol} {side} @ ${entry_px:,.2f} "
+              f"SL={sl_pct*100:.1f}% trail={trail_pct*100:.2f}% "
+              f"act={activation_pct*100:.1f}% initial_stop=${initial_stop:,.2f}")
 
         return config, initial_stop
 

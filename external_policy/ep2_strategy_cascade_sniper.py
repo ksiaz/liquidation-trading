@@ -49,6 +49,8 @@ from runtime.cascade import (
     CapitulationMetrics,
 )
 
+from runtime.liquidations.rolling_volume_tracker import RollingFadeSignal
+
 if TYPE_CHECKING:
     from observation.types import M4PrimitiveBundle
     from memory.m4_cascade_proximity import LiquidationCascadeProximity
@@ -218,6 +220,13 @@ EXHAUSTION_FADE_TRAIL_CONFIG = {
 }
 EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps": 30}
 
+# ROLLING_FADE trailing stop config (from backtest: 0.5% activate, 0.20% trail, 0.50% SL)
+ROLLING_FADE_TRAIL_CONFIG = {
+    "activation_pct": 0.005,   # 0.5% = 50 bps
+    "trail_pct": 0.002,        # 0.20% = 20 bps
+    "sl_pct": 0.005,           # 0.50% = 50 bps
+}
+
 
 @dataclass(frozen=True)
 class CascadeSniperConfig:
@@ -385,6 +394,7 @@ class EntryMode(Enum):
     ABSORPTION_REVERSAL = "ABSORPTION_REVERSAL"  # Enter on reversal (conservative)
     CASCADE_MOMENTUM = "CASCADE_MOMENTUM"        # Ride the cascade (aggressive)
     EXHAUSTION_FADE = "EXHAUSTION_FADE"          # Fade only after strong burst + absorption (selective)
+    ROLLING_FADE = "ROLLING_FADE"                # Fade 30m rolling liq spikes (no state machine)
 
 
 @dataclass(frozen=True)
@@ -991,6 +1001,9 @@ class CascadeStateMachine:
         elif entry_mode == EntryMode.EXHAUSTION_FADE:
             # Exhaustion fade enters at EXHAUSTED state — absorption is implicit
             return True
+        elif entry_mode == EntryMode.ROLLING_FADE:
+            # Rolling fade bypasses state machine entirely — no absorption check
+            return True
 
         return True
 
@@ -1584,7 +1597,8 @@ def generate_cascade_sniper_proposal(
     price_returns: Optional[Dict[str, Optional[float]]] = None,  # Gate B: {ret_1m, ret_3m}
     trade_burst=None,  # TradeBurst | None (B4 - cascade trading intensity)
     liquidation_density=None,  # LiquidationDensity | None (B3 - cluster quality)
-    liquidation_zscore: Optional[float] = None  # Z-score of liquidation rate (from regime metrics)
+    liquidation_zscore: Optional[float] = None,  # Z-score of liquidation rate (from regime metrics)
+    rolling_fade_signal: Optional[RollingFadeSignal] = None  # Rolling 30m liq spike signal
 ) -> Optional[StrategyProposal]:
     """
     Generate cascade sniper entry proposal WITH TREND KILL-SWITCH.
@@ -1639,12 +1653,14 @@ def generate_cascade_sniper_proposal(
     # Get state machine
     sm = _get_state_machine()
 
-    # Determine symbol from proximity or liquidation data
+    # Determine symbol from proximity, liquidation, or rolling fade data
     symbol = None
     if proximity:
         symbol = proximity.coin + "USDT"  # Convert "BTC" -> "BTCUSDT"
     elif liquidations:
         symbol = liquidations.symbol
+    elif rolling_fade_signal:
+        symbol = rolling_fade_signal.symbol
 
     if symbol is None:
         return None
@@ -1954,6 +1970,63 @@ def generate_cascade_sniper_proposal(
                     ),
                     timestamp=context.timestamp
                 )
+
+    elif entry_mode == EntryMode.ROLLING_FADE:
+        # ROLLING_FADE: Skip state machine entirely. Uses 30m rolling window spike detection.
+        # Backtest (11 days, 114M lines): z>=1.5, 30s confirm, activated trailing = 91% WR, +0.56% mean.
+        if rolling_fade_signal is not None:
+            entry_direction = rolling_fade_signal.fade_direction
+            coin = symbol.replace('USDT', '').replace('USD', '')
+
+            # Gate: Exclude coins where fading doesn't work
+            if coin in EXHAUSTION_FADE_EXCLUDED_COINS:
+                return None
+
+            # Counter-trend gate (same logic as EXHAUSTION_FADE)
+            ret_1m = price_returns.get('ret_1m') if price_returns else None
+            if ret_1m is not None:
+                # fade LONG (buy): want ret_1m > 0 (price was rising, then longs liquidated = counter-trend)
+                # fade SHORT (sell): want ret_1m < 0 (price was falling, then shorts liquidated = counter-trend)
+                if entry_direction == "LONG" and ret_1m <= 0 and abs(ret_1m) >= 0.0005:
+                    print(f"[ROLL FADE] {symbol}: LONG blocked — "
+                          f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
+                    return None
+                if entry_direction == "SHORT" and ret_1m >= 0 and abs(ret_1m) >= 0.0005:
+                    print(f"[ROLL FADE] {symbol}: SHORT blocked — "
+                          f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
+                    return None
+
+            # Entry quality filter (optional)
+            eq_scorer = _get_entry_quality_scorer()
+            if _config and _config.use_entry_quality_filter:
+                should_enter, eq_score = eq_scorer.get_entry_recommendation(
+                    symbol=symbol,
+                    intended_side=entry_direction,
+                    min_quality=_config.min_entry_quality,
+                    require_large_liq=_config.require_large_liquidations,
+                    trend_context=trend_context
+                )
+                if not should_enter:
+                    print(f"[EQ FILTER] {symbol}: {entry_direction} rolling fade blocked - {eq_score.reason}")
+                    return None
+            else:
+                eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
+
+            eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
+            ret_str = f"|ret1m={ret_1m*100:+.1f}%" if ret_1m is not None else ""
+
+            return StrategyProposal(
+                strategy_id="EP2-CASCADE-SNIPER-V1",
+                action_type="ENTRY",
+                direction=entry_direction,
+                confidence="ROLLING_FADE",
+                justification_ref=(
+                    f"ROLL_FADE|z={rolling_fade_signal.z_score:.1f}"
+                    f"|${rolling_fade_signal.spike_volume:.0f}"
+                    f"|{rolling_fade_signal.liq_count}liqs{ret_str}{eq_str}"
+                ),
+                timestamp=context.timestamp
+            )
 
     # No action warranted
     return None

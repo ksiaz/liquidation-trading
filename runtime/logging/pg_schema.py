@@ -1200,6 +1200,55 @@ def ensure_schema(conn):
     """)
 
     # =========================================================================
+    # Market State Snapshots (per-symbol market context)
+    # =========================================================================
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_snapshots (
+            id BIGSERIAL PRIMARY KEY,
+            ts DOUBLE PRECISION NOT NULL,
+            symbol TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            vwap DOUBLE PRECISION,
+            vwap_distance DOUBLE PRECISION,
+            vwap_z DOUBLE PRECISION,
+            atr_5m DOUBLE PRECISION,
+            atr_30m DOUBLE PRECISION,
+            atr_ratio DOUBLE PRECISION,
+            atr_5m_pct DOUBLE PRECISION,
+            orderflow_ratio DOUBLE PRECISION,
+            orderflow_fill_count INTEGER,
+            orderflow_neutralized BOOLEAN,
+            liq_z DOUBLE PRECISION,
+            rolling_liq_volume DOUBLE PRECISION,
+            rolling_liq_z DOUBLE PRECISION,
+            regime TEXT,
+            cascade_state TEXT,
+            proximity_count INTEGER,
+            proximity_usd_at_risk DOUBLE PRECISION,
+            closest_liq_pct DOUBLE PRECISION,
+            bid_depth_2pct DOUBLE PRECISION,
+            ask_depth_2pct DOUBLE PRECISION,
+            absorption_ratio_longs DOUBLE PRECISION,
+            absorption_ratio_shorts DOUBLE PRECISION,
+            cap_confidence DOUBLE PRECISION,
+            has_position BOOLEAN,
+            position_side TEXT,
+            feed_age_ms INTEGER,
+            raw_of_fills_60s INTEGER,
+            raw_liq_events_baseline INTEGER,
+            raw_liq_rate_1m DOUBLE PRECISION,
+            raw_burst_count INTEGER,
+            raw_burst_volume DOUBLE PRECISION,
+            raw_rolling_history_count INTEGER,
+            raw_rolling_warmed_up BOOLEAN,
+            raw_l2_age_ms INTEGER,
+            raw_cap_fills INTEGER
+        )
+    """)
+
+    # =========================================================================
     # Indexes (all tables)
     # =========================================================================
 
@@ -1318,7 +1367,22 @@ def ensure_schema(conn):
         ("idx_signals_symbol", "signals", "symbol"),
         ("idx_signals_status", "signals", "status"),
         ("idx_signals_timestamp", "signals", "timestamp"),
+        # market_snapshots
+        ("idx_ms_symbol_ts", "market_snapshots", "symbol, ts DESC"),
+        ("idx_ms_ts", "market_snapshots", "ts DESC"),
     ]
+
+    # Partial indexes for market_snapshots (events vs periodic)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ms_event_trigger_ts
+        ON market_snapshots (trigger, ts DESC)
+        WHERE trigger != 'PERIODIC'
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ms_periodic_ts
+        ON market_snapshots (ts)
+        WHERE trigger = 'PERIODIC'
+    """)
 
     for idx_name, table, columns in _indexes:
         cur.execute(

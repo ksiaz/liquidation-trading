@@ -335,6 +335,23 @@ class PgBufferedResearchDatabase:
                     conn.rollback()
                     cur = conn.cursor()
 
+            # market_snapshots: 48h for periodic, 30d for events
+            try:
+                cutoff_30d = time.time() - (30 * 24 * 3600)
+                cur.execute(
+                    "DELETE FROM market_snapshots WHERE trigger = 'PERIODIC' AND ts < %s",
+                    (cutoff_ts,)
+                )
+                total_deleted += cur.rowcount
+                cur.execute(
+                    "DELETE FROM market_snapshots WHERE trigger != 'PERIODIC' AND ts < %s",
+                    (cutoff_30d,)
+                )
+                total_deleted += cur.rowcount
+            except Exception:
+                conn.rollback()
+                cur = conn.cursor()
+
             # Child tables: delete by old cycle_ids
             try:
                 cur.execute(

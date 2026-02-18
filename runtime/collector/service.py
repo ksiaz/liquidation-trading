@@ -46,6 +46,8 @@ from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.cascade import CapitulationTracker
+from runtime.market_state.emitter import MarketStateEmitter
+from runtime.market_state.snapshot import SnapshotTrigger
 
 # Import Hyperliquid Integration
 try:
@@ -243,6 +245,9 @@ class CollectorService:
 
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
+
+        # Market state emitter (per-symbol snapshots for trade context + pipeline health)
+        self._market_state = MarketStateEmitter(self._execution_db)
 
         # Track current prices for regime calculation
         self._current_prices: Dict[str, float] = {}
@@ -1273,6 +1278,129 @@ class CollectorService:
                         symbol, timestamp
                     )
 
+                    # ── Market State Snapshot (periodic) ──
+                    # Emit per-symbol snapshot with derived values + raw input counters.
+                    # All data is already computed at this point in the loop.
+                    try:
+                        from external_policy.ep2_strategy_cascade_sniper import get_cascade_state
+                        _cascade_st = get_cascade_state(symbol)
+                        _cascade_str = _cascade_st.value if _cascade_st else None
+                    except Exception:
+                        _cascade_str = None
+
+                    # Proximity fields
+                    _prox_count = None
+                    _prox_usd = None
+                    _closest_pct = None
+                    if hl_proximity:
+                        _prox_count = hl_proximity.total_positions_at_risk
+                        _prox_usd = hl_proximity.total_value_at_risk
+                        if current_price and current_price > 0:
+                            # Closest liq distance as % of price
+                            closest = min(
+                                abs(hl_proximity.long_closest_liquidation - current_price) if hl_proximity.long_closest_liquidation else float('inf'),
+                                abs(hl_proximity.short_closest_liquidation - current_price) if hl_proximity.short_closest_liquidation else float('inf'),
+                            )
+                            if closest < float('inf'):
+                                _closest_pct = closest / current_price * 100
+
+                    # Absorption fields
+                    _bid_depth = None
+                    _ask_depth = None
+                    _abs_longs = None
+                    _abs_shorts = None
+                    if absorption:
+                        _bid_depth = absorption.bid_depth_2pct
+                        _ask_depth = absorption.ask_depth_2pct
+                        _abs_longs = absorption.absorption_ratio_longs if absorption.absorption_ratio_longs != float('inf') else None
+                        _abs_shorts = absorption.absorption_ratio_shorts if absorption.absorption_ratio_shorts != float('inf') else None
+
+                    # Raw input counters
+                    _feed_age = None
+                    _last_activity = self._calculator_last_activity.get(symbol)
+                    if _last_activity:
+                        _feed_age = int((timestamp - _last_activity) * 1000)
+
+                    _raw_of = regime_metrics.orderflow_fill_count if regime_metrics else None
+
+                    _raw_liq_baseline = None
+                    _raw_liq_rate = None
+                    _liq_calc = self._liquidation_calculators.get(symbol)
+                    if _liq_calc:
+                        _raw_liq_baseline = _liq_calc.get_event_count()
+                        _raw_liq_rate = _liq_calc.get_current_rate(timestamp)
+
+                    _raw_burst_count = None
+                    _raw_burst_vol = None
+                    if liquidation_burst:
+                        _raw_burst_count = liquidation_burst.liquidation_count
+                        _raw_burst_vol = liquidation_burst.total_volume
+
+                    _rolling_hist = self._rolling_volume_tracker.get_history_count(symbol)
+                    _rolling_warm = self._rolling_volume_tracker.is_warmed_up(symbol)
+
+                    _l2_age = None
+                    if self._hyperliquid_enabled and self._hyperliquid_collector and hasattr(self._hyperliquid_collector, '_client'):
+                        _l2_book = self._hyperliquid_collector._client.get_orderbook(coin)
+                        if _l2_book and 'timestamp' in _l2_book:
+                            _l2_age = int((timestamp - _l2_book['timestamp']) * 1000)
+
+                    _cap_fills = None
+                    if self._capitulation_tracker:
+                        _cm = self._capitulation_tracker.get_metrics(coin_for_returns, timestamp)
+                        _cap_fills = _cm.total_fills if hasattr(_cm, 'total_fills') else None
+
+                    # Position info
+                    _has_pos = self.ghost_tracker.has_open_position(symbol)
+                    _pos_side = None
+                    if _has_pos:
+                        _gp = self.ghost_tracker.get_open_position(symbol)
+                        _pos_side = _gp.side if _gp else None
+
+                    # Rolling liq volume/z
+                    _rolling_vol = self._rolling_volume_tracker.get_window_volume(symbol, timestamp)
+                    _rolling_z = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+
+                    self._market_state.emit(
+                        symbol=symbol,
+                        trigger=SnapshotTrigger.PERIODIC.value,
+                        timestamp=timestamp,
+                        price=current_price or 0,
+                        vwap=self._vwap_calculators[symbol].get_vwap() if symbol in self._vwap_calculators else None,
+                        vwap_distance=regime_metrics.vwap_distance if regime_metrics else None,
+                        vwap_z=regime_metrics.vwap_z if regime_metrics else None,
+                        atr_5m=regime_metrics.atr_5m if regime_metrics else None,
+                        atr_30m=regime_metrics.atr_30m if regime_metrics else None,
+                        orderflow_ratio=regime_metrics.orderflow_imbalance if regime_metrics else None,
+                        orderflow_fill_count=regime_metrics.orderflow_fill_count if regime_metrics else None,
+                        orderflow_neutralized=(regime_metrics.orderflow_fill_count or 0) < 15 if regime_metrics else False,
+                        liq_z=regime_metrics.liquidation_zscore if regime_metrics else None,
+                        rolling_liq_volume=_rolling_vol if _rolling_vol > 0 else None,
+                        rolling_liq_z=_rolling_z if _rolling_z != 0 else None,
+                        regime=regime_state.name if regime_state else None,
+                        cascade_state=_cascade_str,
+                        proximity_count=_prox_count,
+                        proximity_usd_at_risk=_prox_usd,
+                        closest_liq_pct=_closest_pct,
+                        bid_depth_2pct=_bid_depth,
+                        ask_depth_2pct=_ask_depth,
+                        absorption_ratio_longs=_abs_longs,
+                        absorption_ratio_shorts=_abs_shorts,
+                        cap_confidence=cap_confidence,
+                        has_position=_has_pos,
+                        position_side=_pos_side,
+                        feed_age_ms=_feed_age,
+                        raw_of_fills_60s=_raw_of,
+                        raw_liq_events_baseline=_raw_liq_baseline,
+                        raw_liq_rate_1m=_raw_liq_rate,
+                        raw_burst_count=_raw_burst_count,
+                        raw_burst_volume=_raw_burst_vol,
+                        raw_rolling_history_count=_rolling_hist,
+                        raw_rolling_warmed_up=_rolling_warm,
+                        raw_l2_age_ms=_l2_age,
+                        raw_cap_fills=_cap_fills,
+                    )
+
                     # Invoke PolicyAdapter for this symbol
                     mandates = self.policy_adapter.generate_mandates(
                         observation_snapshot=snapshot,
@@ -1392,6 +1520,32 @@ class CollectorService:
                             )
                             existing_stop_symbols.add(result.symbol)
                             print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
+                            # Emit ENTRY snapshot from latest ring buffer state
+                            _ms_cur = self._market_state.get_current(result.symbol)
+                            if _ms_cur:
+                                self._market_state.emit(
+                                    symbol=result.symbol,
+                                    trigger=SnapshotTrigger.ENTRY.value,
+                                    timestamp=result.timestamp,
+                                    price=entry_px,
+                                    vwap=_ms_cur.vwap, vwap_distance=_ms_cur.vwap_distance, vwap_z=_ms_cur.vwap_z,
+                                    atr_5m=_ms_cur.atr_5m, atr_30m=_ms_cur.atr_30m,
+                                    orderflow_ratio=_ms_cur.orderflow_ratio, orderflow_fill_count=_ms_cur.orderflow_fill_count,
+                                    orderflow_neutralized=_ms_cur.orderflow_neutralized,
+                                    liq_z=_ms_cur.liq_z, rolling_liq_volume=_ms_cur.rolling_liq_volume, rolling_liq_z=_ms_cur.rolling_liq_z,
+                                    regime=_ms_cur.regime, cascade_state=_ms_cur.cascade_state,
+                                    proximity_count=_ms_cur.proximity_count, proximity_usd_at_risk=_ms_cur.proximity_usd_at_risk,
+                                    closest_liq_pct=_ms_cur.closest_liq_pct,
+                                    bid_depth_2pct=_ms_cur.bid_depth_2pct, ask_depth_2pct=_ms_cur.ask_depth_2pct,
+                                    absorption_ratio_longs=_ms_cur.absorption_ratio_longs, absorption_ratio_shorts=_ms_cur.absorption_ratio_shorts,
+                                    cap_confidence=_ms_cur.cap_confidence,
+                                    has_position=True, position_side=side,
+                                    feed_age_ms=_ms_cur.feed_age_ms, raw_of_fills_60s=_ms_cur.raw_of_fills_60s,
+                                    raw_liq_events_baseline=_ms_cur.raw_liq_events_baseline, raw_liq_rate_1m=_ms_cur.raw_liq_rate_1m,
+                                    raw_burst_count=_ms_cur.raw_burst_count, raw_burst_volume=_ms_cur.raw_burst_volume,
+                                    raw_rolling_history_count=_ms_cur.raw_rolling_history_count, raw_rolling_warmed_up=_ms_cur.raw_rolling_warmed_up,
+                                    raw_l2_age_ms=_ms_cur.raw_l2_age_ms, raw_cap_fills=_ms_cur.raw_cap_fills,
+                                )
                         else:
                             print(f"ENTRY_REJECTED: {result.symbol} - {error}")
 
@@ -1409,6 +1563,32 @@ class CollectorService:
                         if ok and trade:
                             hold = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
                             print(f"EXIT: MANDATE {result.symbol} @ ${trade.price:,.2f} PNL=${trade.pnl:+.2f} Hold={hold}")
+                            # Emit EXIT snapshot
+                            _ms_cur = self._market_state.get_current(result.symbol)
+                            if _ms_cur:
+                                self._market_state.emit(
+                                    symbol=result.symbol,
+                                    trigger=SnapshotTrigger.EXIT.value,
+                                    timestamp=time.time(),
+                                    price=trade.price,
+                                    vwap=_ms_cur.vwap, vwap_distance=_ms_cur.vwap_distance, vwap_z=_ms_cur.vwap_z,
+                                    atr_5m=_ms_cur.atr_5m, atr_30m=_ms_cur.atr_30m,
+                                    orderflow_ratio=_ms_cur.orderflow_ratio, orderflow_fill_count=_ms_cur.orderflow_fill_count,
+                                    orderflow_neutralized=_ms_cur.orderflow_neutralized,
+                                    liq_z=_ms_cur.liq_z, rolling_liq_volume=_ms_cur.rolling_liq_volume, rolling_liq_z=_ms_cur.rolling_liq_z,
+                                    regime=_ms_cur.regime, cascade_state=_ms_cur.cascade_state,
+                                    proximity_count=_ms_cur.proximity_count, proximity_usd_at_risk=_ms_cur.proximity_usd_at_risk,
+                                    closest_liq_pct=_ms_cur.closest_liq_pct,
+                                    bid_depth_2pct=_ms_cur.bid_depth_2pct, ask_depth_2pct=_ms_cur.ask_depth_2pct,
+                                    absorption_ratio_longs=_ms_cur.absorption_ratio_longs, absorption_ratio_shorts=_ms_cur.absorption_ratio_shorts,
+                                    cap_confidence=_ms_cur.cap_confidence,
+                                    has_position=False, position_side=None,
+                                    feed_age_ms=_ms_cur.feed_age_ms, raw_of_fills_60s=_ms_cur.raw_of_fills_60s,
+                                    raw_liq_events_baseline=_ms_cur.raw_liq_events_baseline, raw_liq_rate_1m=_ms_cur.raw_liq_rate_1m,
+                                    raw_burst_count=_ms_cur.raw_burst_count, raw_burst_volume=_ms_cur.raw_burst_volume,
+                                    raw_rolling_history_count=_ms_cur.raw_rolling_history_count, raw_rolling_warmed_up=_ms_cur.raw_rolling_warmed_up,
+                                    raw_l2_age_ms=_ms_cur.raw_l2_age_ms, raw_cap_fills=_ms_cur.raw_cap_fills,
+                                )
                             self._force_position_flat(result.symbol)
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:

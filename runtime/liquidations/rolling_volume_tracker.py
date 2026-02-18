@@ -63,17 +63,20 @@ class RollingVolumeTracker:
     WINDOW = 1800              # 30m rolling window (seconds)
     Z_THRESHOLD = 1.5          # Min z-score to trigger spike detection
     CONFIRMATION_DELAY = 30.0  # Seconds after spike peak before entry
-    MIN_HISTORY = 100          # Min data points before z-score meaningful
+    MIN_HISTORY = 50           # Min data points before z-score meaningful (~8 min at 10s sampling)
     SPIKE_COOLDOWN = 900       # 15m between spikes per coin
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
+    MIN_SPIKE_VOLUME = 10_000  # Min $10K window volume to trigger (z-jump gate handles gradual accumulation)
+
+    MIN_Z_JUMP = 1.0           # Min z-score increase in one sample interval to trigger (prevents gradual accumulation)
 
     def __init__(self):
         # Per-coin event deques (rolling window)
         self._events: Dict[str, Deque[_LiqEvent]] = {}
         # Per-coin volume history for z-score (all-time, sampled)
         self._volume_history: Dict[str, Deque[float]] = {}
-        # Per-coin: was z above threshold last check? (for spike-start detection)
-        self._was_above: Dict[str, bool] = {}
+        # Per-coin: previous z-score (for jump detection)
+        self._prev_z: Dict[str, float] = {}
         # Per-coin: pending spike awaiting confirmation
         self._pending: Dict[str, _PendingSpike] = {}
         # Per-coin: last signal emission time (cooldown)
@@ -122,9 +125,24 @@ class RollingVolumeTracker:
         and start 30s confirmation timer. Signal emitted after confirmation delay.
         (We don't wait for z to drop — with a 30m window, that takes too long.)
 
+        Also periodically samples volume history so baseline builds up even during
+        quiet periods (zero-volume intervals create low mean/stddev baseline, making
+        actual bursts produce high z-scores).
+
         Returns:
             RollingFadeSignal if confirmed spike detected, None otherwise.
         """
+        # Periodic volume sampling — build baseline even when no events arrive.
+        # This prevents the chicken-and-egg problem where z-scores require history
+        # but history only builds when events arrive.
+        last_sample = self._last_sample_ts.get(symbol, 0)
+        if timestamp - last_sample >= 10.0:
+            window_vol_sample = self._get_window_volume(symbol, timestamp)
+            if symbol not in self._volume_history:
+                self._volume_history[symbol] = deque(maxlen=10000)
+            self._volume_history[symbol].append(window_vol_sample)
+            self._last_sample_ts[symbol] = timestamp
+
         # Check pending signal first (already detected spike, waiting for confirmation)
         pending = self._pending.get(symbol)
         if pending is not None:
@@ -148,30 +166,32 @@ class RollingVolumeTracker:
         window_vol = self._get_window_volume(symbol, timestamp)
         z = self._compute_zscore(symbol, window_vol)
 
-        if z >= self.Z_THRESHOLD:
-            was_above = self._was_above.get(symbol, False)
-            self._was_above[symbol] = True
+        # Track z-score jump (delta from previous sample)
+        prev_z = self._prev_z.get(symbol, 0.0)
+        z_jump = z - prev_z
+        self._prev_z[symbol] = z
 
-            if not was_above:
-                # Spike just started (z first crossed above threshold)
+        if (z >= self.Z_THRESHOLD
+                and window_vol >= self.MIN_SPIKE_VOLUME
+                and z_jump >= self.MIN_Z_JUMP):
+            # Spike detected: z above threshold with a sudden jump and real volume.
+            # MIN_Z_JUMP prevents gradual accumulation from triggering — only
+            # sudden bursts (z jumping by >= 1.0 in one sample interval) fire.
 
-                # Check cluster filter: how many coins are spiking concurrently?
-                concurrent_spikes = sum(1 for s, above in self._was_above.items() if above)
-                if concurrent_spikes > self.MAX_CLUSTER_COINS:
-                    # Too many coins spiking — broad market event, skip
-                    return None
+            # Check cluster filter: how many coins have pending spikes?
+            concurrent_spikes = sum(1 for p in self._pending.values() if not p.emitted)
+            if concurrent_spikes >= self.MAX_CLUSTER_COINS:
+                # Too many coins spiking — broad market event, skip
+                return None
 
-                # Build signal immediately at spike start, then wait for confirmation
-                signal = self._build_signal(symbol, timestamp, z, window_vol)
-                if signal is not None:
-                    self._pending[symbol] = _PendingSpike(signal=signal)
-                    print(f"[ROLL FADE] {symbol}: spike detected z={z:.2f} "
-                          f"vol=${window_vol:,.0f} — waiting {self.CONFIRMATION_DELAY}s")
-                    # Don't emit yet — wait for confirmation delay
-                    return None
-        else:
-            # Z below threshold — reset spike tracking
-            self._was_above[symbol] = False
+            # Build signal immediately at spike start, then wait for confirmation
+            signal = self._build_signal(symbol, timestamp, z, window_vol)
+            if signal is not None:
+                self._pending[symbol] = _PendingSpike(signal=signal)
+                print(f"[ROLL FADE] {symbol}: spike detected z={z:.2f} jump={z_jump:.2f} "
+                      f"vol=${window_vol:,.0f} — waiting {self.CONFIRMATION_DELAY}s")
+                # Don't emit yet — wait for confirmation delay
+                return None
 
         return None
 
@@ -253,6 +273,23 @@ class RollingVolumeTracker:
             confirmation_ts=spike_ts + self.CONFIRMATION_DELAY,
             fade_direction=fade_direction,
         )
+
+    def get_window_volume(self, symbol: str, timestamp: float) -> float:
+        """Public accessor for current window volume."""
+        return self._get_window_volume(symbol, timestamp)
+
+    def get_current_z(self, symbol: str, timestamp: float) -> float:
+        """Current z-score for a symbol."""
+        vol = self._get_window_volume(symbol, timestamp)
+        return self._compute_zscore(symbol, vol)
+
+    def get_history_count(self, symbol: str) -> int:
+        """Number of volume history samples for a symbol."""
+        return len(self._volume_history.get(symbol, []))
+
+    def is_warmed_up(self, symbol: str) -> bool:
+        """Whether enough history has accumulated for meaningful z-scores."""
+        return self.get_history_count(symbol) >= self.MIN_HISTORY
 
     def trim_windows(self, timestamp: float):
         """Trim old events from rolling windows. Call periodically."""

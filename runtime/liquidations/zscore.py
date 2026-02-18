@@ -182,6 +182,10 @@ class LiquidationZScoreCalculator:
 
         return stddev
 
+    def get_event_count(self) -> int:
+        """Number of events in baseline window."""
+        return len(self._events)
+
     def get_current_rate(self, current_timestamp: float) -> Optional[float]:
         """
         Get current liquidation rate (liquidations per minute).

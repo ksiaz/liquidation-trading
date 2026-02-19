@@ -1278,6 +1278,16 @@ class CollectorService:
                         symbol, timestamp
                     )
 
+                    # Feed freshness gate: block ROLLING_FADE when regime can't be computed.
+                    # Regime requires VWAP + ATR + orderflow + liq_z all non-None.
+                    # When the node is lagging or adapter is disconnected, these are None,
+                    # meaning the system has no context for stop sizing or direction.
+                    if rolling_fade_signal and regime_metrics is None:
+                        self._logger.debug(
+                            f"ROLLING_FADE blocked for {symbol}: regime_metrics unavailable"
+                        )
+                        rolling_fade_signal = None
+
                     # ── Market State Snapshot (periodic) ──
                     # Emit per-symbol snapshot with derived values + raw input counters.
                     # All data is already computed at this point in the loop.
@@ -1832,8 +1842,11 @@ class CollectorService:
             if normalized_symbol not in self._liquidation_calculators:
                 self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
 
-            # 4. Track last activity for pruning
-            self._calculator_last_activity[normalized_symbol] = timestamp
+            # 4. Track last activity for pruning (wall clock, not fill timestamp)
+            # Using time.time() so feed_age_ms reflects data flow health, not node lag.
+            # Previously used fill's block timestamp which conflated node lag (fills
+            # flowing with old timestamps) with adapter disconnect (no fills at all).
+            self._calculator_last_activity[normalized_symbol] = time.time()
 
             # 5. Update VWAP (needs price and volume)
             self._vwap_calculators[normalized_symbol].update(price, size, timestamp)
@@ -1974,8 +1987,8 @@ class CollectorService:
                 normalized_symbol, side, price, size, timestamp
             )
 
-            # 6. Track activity for calculator pruning
-            self._calculator_last_activity[normalized_symbol] = timestamp
+            # 6. Track activity for calculator pruning (wall clock, not fill timestamp)
+            self._calculator_last_activity[normalized_symbol] = time.time()
 
             # 6b. Buffer for governance M2 node creation (drained in regime loop)
             self._governance_event_buffer.append(('HL_LIQUIDATION', normalized_symbol, {

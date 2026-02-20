@@ -48,9 +48,8 @@ class _LiqEvent:
 
 @dataclass
 class _PendingSpike:
-    """A spike that has peaked but awaits confirmation delay."""
+    """A spike that was emitted — kept for cooldown enforcement."""
     signal: RollingFadeSignal
-    emitted: bool = False
 
 
 class RollingVolumeTracker:
@@ -62,7 +61,6 @@ class RollingVolumeTracker:
 
     WINDOW = 1800              # 30m rolling window (seconds)
     Z_THRESHOLD = 1.5          # Min z-score to trigger spike detection
-    CONFIRMATION_DELAY = 30.0  # Seconds after spike peak before entry
     MIN_HISTORY = 50           # Min data points before z-score meaningful (~8 min at 10s sampling)
     SPIKE_COOLDOWN = 900       # 15m between spikes per coin
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
@@ -75,8 +73,11 @@ class RollingVolumeTracker:
         self._events: Dict[str, Deque[_LiqEvent]] = {}
         # Per-coin volume history for z-score (all-time, sampled)
         self._volume_history: Dict[str, Deque[float]] = {}
-        # Per-coin: previous z-score (for jump detection)
-        self._prev_z: Dict[str, float] = {}
+        # Per-coin: z-score at last 10s sample (for jump detection)
+        # Updated only at sample boundaries — NOT every call.
+        # check_for_signal() runs at 5Hz but z_jump needs to measure
+        # the 10s delta, not the 200ms delta.
+        self._sampled_z: Dict[str, float] = {}
         # Per-coin: pending spike awaiting confirmation
         self._pending: Dict[str, _PendingSpike] = {}
         # Per-coin: last signal emission time (cooldown)
@@ -135,6 +136,7 @@ class RollingVolumeTracker:
         # Periodic volume sampling — build baseline even when no events arrive.
         # This prevents the chicken-and-egg problem where z-scores require history
         # but history only builds when events arrive.
+        just_sampled = False
         last_sample = self._last_sample_ts.get(symbol, 0)
         if timestamp - last_sample >= 10.0:
             window_vol_sample = self._get_window_volume(symbol, timestamp)
@@ -142,20 +144,16 @@ class RollingVolumeTracker:
                 self._volume_history[symbol] = deque(maxlen=10000)
             self._volume_history[symbol].append(window_vol_sample)
             self._last_sample_ts[symbol] = timestamp
+            just_sampled = True
 
-        # Check pending signal first (already detected spike, waiting for confirmation)
+        # Check pending signal — enforce cooldown then clean up
         pending = self._pending.get(symbol)
         if pending is not None:
-            if pending.emitted:
-                # Already emitted — don't emit again
-                return None
-            if timestamp >= pending.signal.confirmation_ts:
-                # Confirmation delay passed — emit signal
-                pending.emitted = True
-                self._last_signal_ts[symbol] = timestamp
-                return pending.signal
-            # Still waiting for confirmation
-            return None
+            if timestamp - pending.signal.spike_ts >= self.SPIKE_COOLDOWN:
+                del self._pending[symbol]
+                # Fall through to normal spike detection below
+            else:
+                return None  # Still in cooldown
 
         # Cooldown check
         last_signal = self._last_signal_ts.get(symbol, 0)
@@ -166,10 +164,14 @@ class RollingVolumeTracker:
         window_vol = self._get_window_volume(symbol, timestamp)
         z = self._compute_zscore(symbol, window_vol)
 
-        # Track z-score jump (delta from previous sample)
-        prev_z = self._prev_z.get(symbol, 0.0)
-        z_jump = z - prev_z
-        self._prev_z[symbol] = z
+        # Track z-score jump relative to last 10s SAMPLE, not last 200ms call.
+        # check_for_signal() runs at 5Hz but MIN_Z_JUMP is calibrated for 10s
+        # intervals. Updating prev_z every call made z_jump always < 1.0 because
+        # events trickle in one-by-one between 200ms calls.
+        sampled_z = self._sampled_z.get(symbol, 0.0)
+        z_jump = z - sampled_z
+        if just_sampled:
+            self._sampled_z[symbol] = z
 
         if (z >= self.Z_THRESHOLD
                 and window_vol >= self.MIN_SPIKE_VOLUME
@@ -178,20 +180,25 @@ class RollingVolumeTracker:
             # MIN_Z_JUMP prevents gradual accumulation from triggering — only
             # sudden bursts (z jumping by >= 1.0 in one sample interval) fire.
 
-            # Check cluster filter: how many coins have pending spikes?
-            concurrent_spikes = sum(1 for p in self._pending.values() if not p.emitted)
+            # Check cluster filter: how many coins spiked in the last 60s?
+            concurrent_spikes = sum(
+                1 for p in self._pending.values()
+                if timestamp - p.signal.spike_ts < 60
+            )
             if concurrent_spikes >= self.MAX_CLUSTER_COINS:
                 # Too many coins spiking — broad market event, skip
                 return None
 
-            # Build signal immediately at spike start, then wait for confirmation
+            # Build and emit signal immediately — every second of delay costs edge.
+            # (Original design waited 30s for "confirmation" but spikes are front-loaded:
+            #  the best fade price is at the moment of the liq burst, not 30s later.)
             signal = self._build_signal(symbol, timestamp, z, window_vol)
             if signal is not None:
                 self._pending[symbol] = _PendingSpike(signal=signal)
-                print(f"[ROLL FADE] {symbol}: spike detected z={z:.2f} jump={z_jump:.2f} "
-                      f"vol=${window_vol:,.0f} — waiting {self.CONFIRMATION_DELAY}s")
-                # Don't emit yet — wait for confirmation delay
-                return None
+                self._last_signal_ts[symbol] = timestamp
+                print(f"[ROLL FADE] {symbol}: spike z={z:.2f} jump={z_jump:.2f} "
+                      f"vol=${window_vol:,.0f} — ENTRY SIGNAL")
+                return signal
 
         return None
 
@@ -270,7 +277,7 @@ class RollingVolumeTracker:
             long_liq_volume=long_vol,
             liq_count=count,
             spike_ts=spike_ts,
-            confirmation_ts=spike_ts + self.CONFIRMATION_DELAY,
+            confirmation_ts=spike_ts,  # Emit immediately (no delay)
             fade_direction=fade_direction,
         )
 
@@ -297,8 +304,8 @@ class RollingVolumeTracker:
         for symbol, events in self._events.items():
             while events and events[0].timestamp < cutoff:
                 events.popleft()
-        # Clean up emitted pending signals
+        # Clean up expired pending signals
         for symbol in list(self._pending.keys()):
             p = self._pending[symbol]
-            if p.emitted and timestamp - p.signal.spike_ts > self.SPIKE_COOLDOWN:
+            if timestamp - p.signal.spike_ts > self.SPIKE_COOLDOWN:
                 del self._pending[symbol]

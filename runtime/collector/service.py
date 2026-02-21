@@ -227,8 +227,12 @@ class CollectorService:
         self._price_lows: Dict[str, float] = {}
         self._hl_reset_time: Dict[str, float] = {}
 
-        # Memory guard: track last calculator activity for pruning
+        # Memory guard: track last calculator activity for pruning (fills/liqs only)
         self._calculator_last_activity: Dict[str, float] = {}
+        # Feed health: track last ANY data event (price, fill, liq) per symbol.
+        # Used for feed_age_ms — unlike _calculator_last_activity which only
+        # tracks fills/liqs (for pruning), this updates on oracle prices too.
+        self._last_data_event_ts: Dict[str, float] = {}
         self._calculator_max_symbols = 500  # Limit symbols tracked
         self._calculator_inactive_sec = 600.0  # Prune after 10 min inactive
         self._calculators_pruned = 0
@@ -1349,11 +1353,14 @@ class CollectorService:
 
                     # Raw input counters
                     _feed_age = None
-                    _last_activity = self._calculator_last_activity.get(symbol)
-                    if _last_activity:
-                        _feed_age = int((timestamp - _last_activity) * 1000)
+                    _last_data = self._last_data_event_ts.get(symbol)
+                    if _last_data:
+                        _feed_age = int((timestamp - _last_data) * 1000)
 
-                    _raw_of = regime_metrics.orderflow_fill_count if regime_metrics else None
+                    # Independent raw counter: always 60s, even if derived
+                    # orderflow_fill_count uses 30s in non-node mode.
+                    _of_calc = self._orderflow_calculators.get(symbol)
+                    _raw_of = _of_calc.get_trade_count_60s() if _of_calc else None
 
                     _raw_liq_baseline = None
                     _raw_liq_rate = None
@@ -1468,6 +1475,9 @@ class CollectorService:
                     import traceback
                     traceback.print_exc()
                     # Continue to next symbol
+
+            # Flush batched market snapshots (one transaction for all symbols)
+            self._market_state.flush()
 
             # Data freshness gate: drop ENTRY mandates when breaker open
             if _data_breaker_open and all_mandates:
@@ -1809,6 +1819,9 @@ class CollectorService:
         # ATR candle state (dict mutation + float updates) must be single-threaded.
         self._atr_price_buffer.append((symbol, price, timestamp))
 
+        # Track feed health: oracle prices prove gRPC is alive even in quiet markets.
+        self._last_data_event_ts[symbol] = time.time()
+
         # Feed M1 observation system so latest_hl_prices is populated.
         # Without this, get_all_hl_prices() returns {} (symbols=0 bug).
         # Throttle to 1 per symbol per 5s (oracle arrives ~1/s × 20 symbols).
@@ -1858,11 +1871,9 @@ class CollectorService:
             if normalized_symbol not in self._liquidation_calculators:
                 self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
 
-            # 4. Track last activity for pruning (wall clock, not fill timestamp)
-            # Using time.time() so feed_age_ms reflects data flow health, not node lag.
-            # Previously used fill's block timestamp which conflated node lag (fills
-            # flowing with old timestamps) with adapter disconnect (no fills at all).
+            # 4. Track last activity for pruning + feed health (wall clock, not fill timestamp)
             self._calculator_last_activity[normalized_symbol] = time.time()
+            self._last_data_event_ts[normalized_symbol] = time.time()
 
             # 5. Update VWAP (needs price and volume)
             self._vwap_calculators[normalized_symbol].update(price, size, timestamp)
@@ -2003,8 +2014,9 @@ class CollectorService:
                 normalized_symbol, side, price, size, timestamp
             )
 
-            # 6. Track activity for calculator pruning (wall clock, not fill timestamp)
+            # 6. Track activity for calculator pruning + feed health
             self._calculator_last_activity[normalized_symbol] = time.time()
+            self._last_data_event_ts[normalized_symbol] = time.time()
 
             # 6b. Buffer for governance M2 node creation (drained in regime loop)
             self._governance_event_buffer.append(('HL_LIQUIDATION', normalized_symbol, {
@@ -2759,6 +2771,8 @@ class CollectorService:
             regime_metrics_for_log = None
 
             for symbol in snapshot.symbols_active:
+                if not symbol.endswith('USDT'):
+                    continue
                 if symbol in self._regime_states and symbol in self._regime_metrics:
                     regime_state_for_log = self._regime_states[symbol].name
                     metrics = self._regime_metrics[symbol]

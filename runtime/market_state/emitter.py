@@ -6,13 +6,17 @@ maintains per-coin ring buffers, and persists downsampled + event snapshots to P
 
 Thread safety: runs entirely on asyncio loop (same thread as regime loop).
 Ring buffer reads are O(1) deque operations.
+Persistence is batched: _persist() buffers, flush() commits all at once.
 """
 
+import logging
 import time
 from collections import deque
 from typing import Optional, Dict, List
 
 from runtime.market_state.snapshot import MarketSnapshot, SnapshotTrigger
+
+_log = logging.getLogger("MarketStateEmitter")
 
 
 class MarketStateEmitter:
@@ -29,6 +33,8 @@ class MarketStateEmitter:
         self._last_persist_ts: Dict[str, float] = {}
         # Per-coin previous snapshot (for event detection)
         self._prev: Dict[str, MarketSnapshot] = {}
+        # Batch persistence buffer — flushed once per regime cycle
+        self._persist_buffer: List[MarketSnapshot] = []
 
     def emit(
         self,
@@ -73,7 +79,7 @@ class MarketStateEmitter:
         raw_l2_age_ms: Optional[int] = None,
         raw_cap_fills: Optional[int] = None,
     ) -> MarketSnapshot:
-        """Build snapshot, append to ring buffer, persist if due."""
+        """Build snapshot, append to ring buffer, buffer for persistence if due."""
 
         snap = MarketSnapshot(
             timestamp=timestamp,
@@ -145,8 +151,16 @@ class MarketStateEmitter:
                 self._prev[symbol] = snap
                 return snap
 
-            # Liq spike
-            if snap.liq_z is not None and snap.liq_z >= 2.0 and (prev.liq_z is None or prev.liq_z < 2.0):
+            # Liq spike: classical z-score OR rolling z-score crossing threshold
+            liq_z_crossed = (
+                snap.liq_z is not None and snap.liq_z >= 2.0
+                and (prev.liq_z is None or prev.liq_z < 2.0)
+            )
+            rolling_z_crossed = (
+                snap.rolling_liq_z is not None and snap.rolling_liq_z >= 2.0
+                and (prev.rolling_liq_z is None or prev.rolling_liq_z < 2.0)
+            )
+            if liq_z_crossed or rolling_z_crossed:
                 snap = MarketSnapshot(**{
                     **snap.to_dict(),
                     'trigger': SnapshotTrigger.LIQ_SPIKE.value,
@@ -169,19 +183,32 @@ class MarketStateEmitter:
         return snap
 
     def _persist(self, snap: MarketSnapshot):
-        """Write snapshot to PG directly (bypasses BRD's bool→int coercion)."""
+        """Buffer snapshot for batch persistence (flushed by flush())."""
+        self._persist_buffer.append(snap)
+
+    def flush(self):
+        """Flush buffered snapshots to PG in one transaction.
+
+        Called once per regime cycle from service.py, after all symbols emitted.
+        Single conn + commit for the whole batch (~2-3 rows typically).
+        """
+        if not self._persist_buffer:
+            return
+        batch = self._persist_buffer
+        self._persist_buffer = []
         try:
             from runtime.logging.pg_pool import get_conn, put_conn
             conn = get_conn()
             try:
                 cur = conn.cursor()
-                cur.execute(MarketSnapshot.pg_insert_sql(), snap.to_pg_row())
+                sql = MarketSnapshot.pg_insert_sql()
+                for snap in batch:
+                    cur.execute(sql, snap.to_pg_row())
                 conn.commit()
             finally:
                 put_conn(conn)
         except Exception as e:
-            import logging
-            logging.getLogger("MarketStateEmitter").warning(f"Persist error: {e}")
+            _log.warning(f"Batch persist error ({len(batch)} rows): {e}")
 
     # ── Ring buffer reads ──
 

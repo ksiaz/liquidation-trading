@@ -3,13 +3,15 @@ Market State Queries
 
 Convenience functions for querying persisted market snapshots.
 All operate on the PG market_snapshots table via BRD.
+
+Note: read_sql returns List[tuple] (raw psycopg2 rows), not List[dict].
 """
 
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 
-def context_window(buffered_db, symbol: str, center_ts: float, window_sec: float = 30.0) -> List[dict]:
-    """Snapshots around a timestamp (±window_sec)."""
+def context_window(buffered_db, symbol: str, center_ts: float, window_sec: float = 30.0) -> List[tuple]:
+    """Snapshots around a timestamp (+-window_sec)."""
     sql = """
         SELECT * FROM market_snapshots
         WHERE symbol = %s AND ts BETWEEN %s AND %s
@@ -18,19 +20,23 @@ def context_window(buffered_db, symbol: str, center_ts: float, window_sec: float
     return buffered_db.read_sql(sql, (symbol, center_ts - window_sec, center_ts + window_sec))
 
 
-def trade_context(buffered_db, symbol: str, trade_ts: float) -> Optional[dict]:
-    """Nearest snapshot to a trade timestamp."""
+def trade_context(buffered_db, symbol: str, trade_ts: float) -> Optional[tuple]:
+    """Nearest snapshot to a trade timestamp (index-friendly).
+
+    Uses bounded range query (+-30s) to leverage (symbol, ts) index,
+    then sorts the small result set (~3-6 rows) by distance.
+    """
     sql = """
         SELECT * FROM market_snapshots
-        WHERE symbol = %s
+        WHERE symbol = %s AND ts BETWEEN %s AND %s
         ORDER BY ABS(ts - %s)
         LIMIT 1
     """
-    rows = buffered_db.read_sql(sql, (symbol, trade_ts))
+    rows = buffered_db.read_sql(sql, (symbol, trade_ts - 30, trade_ts + 30, trade_ts))
     return rows[0] if rows else None
 
 
-def event_snapshots(buffered_db, trigger: str, symbol: Optional[str] = None, limit: int = 50) -> List[dict]:
+def event_snapshots(buffered_db, trigger: str, symbol: Optional[str] = None, limit: int = 50) -> List[tuple]:
     """Recent event snapshots by trigger type."""
     if symbol:
         sql = """
@@ -48,7 +54,7 @@ def event_snapshots(buffered_db, trigger: str, symbol: Optional[str] = None, lim
         return buffered_db.read_sql(sql, (trigger, limit))
 
 
-def regime_distribution(buffered_db, symbol: str, hours: float = 24.0) -> List[dict]:
+def regime_distribution(buffered_db, symbol: str, hours: float = 24.0) -> List[tuple]:
     """Time spent in each regime (in seconds, assuming 10s sample interval)."""
     import time
     cutoff = time.time() - (hours * 3600)
@@ -62,7 +68,7 @@ def regime_distribution(buffered_db, symbol: str, hours: float = 24.0) -> List[d
     return buffered_db.read_sql(sql, (symbol, cutoff))
 
 
-def pipeline_faults(buffered_db, hours: float = 24.0) -> List[dict]:
+def pipeline_faults(buffered_db, hours: float = 24.0) -> List[tuple]:
     """Rows where raw counts suggest calculator faults."""
     import time
     cutoff = time.time() - (hours * 3600)

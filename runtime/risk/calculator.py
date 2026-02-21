@@ -115,7 +115,7 @@ class RiskCalculator:
                 continue
             
             if symbol not in mark_prices:
-                raise ValueError(f"Missing mark price for {symbol}")
+                continue  # Skip positions without mark price (e.g. startup before regime loop)
             
             exposure = abs(position.quantity * mark_prices[symbol])
             total_exposure += exposure

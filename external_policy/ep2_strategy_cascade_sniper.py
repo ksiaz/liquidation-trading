@@ -1996,21 +1996,13 @@ def generate_cascade_sniper_proposal(
                           f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
                     return None
 
-            # Entry quality filter (optional)
+            # Entry quality: score for logging but do NOT block.
+            # ROLLING_FADE's own signal quality (z-score, volume, confirmation delay)
+            # provides sufficient filtering. The EQ filter conflicts with ROLLING_FADE's
+            # counter-trend nature (it blocks buys during selloffs, which is exactly when
+            # we want to fade).
             eq_scorer = _get_entry_quality_scorer()
-            if _config and _config.use_entry_quality_filter:
-                should_enter, eq_score = eq_scorer.get_entry_recommendation(
-                    symbol=symbol,
-                    intended_side=entry_direction,
-                    min_quality=_config.min_entry_quality,
-                    require_large_liq=_config.require_large_liquidations,
-                    trend_context=trend_context
-                )
-                if not should_enter:
-                    print(f"[EQ FILTER] {symbol}: {entry_direction} rolling fade blocked - {eq_score.reason}")
-                    return None
-            else:
-                eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
+            eq_score = eq_scorer.score_entry(symbol, entry_direction, context.timestamp, trend_context)
 
             eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
             ret_str = f"|ret1m={ret_1m*100:+.1f}%" if ret_1m is not None else ""

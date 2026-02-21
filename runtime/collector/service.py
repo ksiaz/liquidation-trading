@@ -219,6 +219,9 @@ class CollectorService:
         # Bridges HL fills/liquidations from gRPC thread to governance (M2 nodes).
         from collections import deque as _deque
         self._governance_event_buffer: _deque = _deque(maxlen=10000)
+        # ATR price buffer: gRPC daemon threads append, regime loop drains.
+        # Avoids cross-thread writes to ATR candle state (dict mutation + float updates).
+        self._atr_price_buffer: _deque = _deque(maxlen=10000)
         # Rolling price high/low tracker (5-min window) for EFFCS impulse detection
         self._price_highs: Dict[str, float] = {}
         self._price_lows: Dict[str, float] = {}
@@ -901,6 +904,19 @@ class CollectorService:
                         self._logger.warning(f"Governance drain error ({event_type}/{symbol}): {e}")
                         continue  # Skip bad event, process remaining
 
+                # 0b. Drain ATR price buffer (oracle prices + fill prices from gRPC thread)
+                # ATR candle state is not thread-safe — all updates on asyncio thread.
+                while self._atr_price_buffer:
+                    try:
+                        atr_sym, atr_px, atr_ts = self._atr_price_buffer.popleft()
+                        atr_calc = self._atr_calculators.get(atr_sym)
+                        if not atr_calc:
+                            atr_calc = MultiTimeframeATR(period=3)
+                            self._atr_calculators[atr_sym] = atr_calc
+                        atr_calc.update_trade(atr_px, atr_ts)
+                    except Exception as e:
+                        self._logger.warning(f"ATR drain error: {e}")
+
                 # 1. Advance System Time
                 self._obs.advance_time(current_time)
 
@@ -1144,10 +1160,9 @@ class CollectorService:
 
                     # Get owning strategy for cross-strategy exit gating
                     position_strategy_id = None
-                    if position_state in (PositionState.OPEN, PositionState.ENTERING, PositionState.REDUCING):
-                        ghost_pos = self.ghost_tracker.get_position(symbol)
-                        if ghost_pos:
-                            position_strategy_id = ghost_pos.entry_policy
+                    ghost_pos = self.ghost_tracker.get_open_position(symbol)
+                    if ghost_pos:
+                        position_strategy_id = ghost_pos.entry_policy
 
                     # Extract active primitives BEFORE generating mandates
                     active_primitives = self._extract_active_primitive_names(symbol, snapshot)
@@ -1790,14 +1805,9 @@ class CollectorService:
         """
         symbol = hl_symbol + 'USDT'
 
-        # Feed ATR calculator with oracle prices (keeps ATR fresh between sparse fills).
-        # Create ATR if it doesn't exist yet — symbols with zero fills would never
-        # get an ATR calculator from _handle_hl_fill alone.
-        atr_calc = self._atr_calculators.get(symbol)
-        if not atr_calc:
-            atr_calc = MultiTimeframeATR(period=3)
-            self._atr_calculators[symbol] = atr_calc
-        atr_calc.update_trade(price, timestamp)
+        # Buffer ATR update for regime loop to drain (thread safety).
+        # ATR candle state (dict mutation + float updates) must be single-threaded.
+        self._atr_price_buffer.append((symbol, price, timestamp))
 
         # Feed M1 observation system so latest_hl_prices is populated.
         # Without this, get_all_hl_prices() returns {} (symbols=0 bug).
@@ -1857,8 +1867,8 @@ class CollectorService:
             # 5. Update VWAP (needs price and volume)
             self._vwap_calculators[normalized_symbol].update(price, size, timestamp)
 
-            # 6. Update ATR (needs price)
-            self._atr_calculators[normalized_symbol].update_trade(price, timestamp)
+            # 6. Buffer ATR update for regime loop to drain (thread safety)
+            self._atr_price_buffer.append((normalized_symbol, price, timestamp))
 
             # 7. Update Orderflow (needs is_buyer_maker and volume)
             # HL side: "B" = buyer is taker (lifted asks) = is_buyer_maker=False

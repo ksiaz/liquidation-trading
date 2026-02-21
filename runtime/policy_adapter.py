@@ -441,7 +441,7 @@ class PolicyAdapter:
 
         # Convert proposals to mandates (pure normalization)
         # F5: Pass current_price for quantity calculation
-        mandates = self._proposals_to_mandates(proposals, symbol, timestamp, current_price)
+        mandates = self._proposals_to_mandates(proposals, symbol, timestamp, current_price, position_strategy_id)
 
         # Only log when mandates are generated (not empty cycles)
         if len(mandates) > 0:
@@ -550,12 +550,17 @@ class PolicyAdapter:
         proposals: List[StrategyProposal],
         symbol: str,
         timestamp: float,
-        current_price: Optional[float] = None
+        current_price: Optional[float] = None,
+        position_strategy_id: Optional[str] = None
     ) -> List[Mandate]:
         """Convert strategy proposals to execution mandates.
 
         Pure normalization - no interpretation, no aggregation, no scoring.
         F5: Copies direction, strategy_id, and calculates quantity from proposal.
+
+        OWNERSHIP GATE: Strategy EXIT proposals are dropped if the open position
+        was opened by a different strategy. Risk monitor EXIT mandates bypass
+        this (they are injected directly in ExecutionController.process_cycle()).
 
         GRACE PERIOD: Blocks EXIT proposals within ENTRY_GRACE_PERIOD_SEC of entry
         to prevent immediate oscillation from zone/condition instability.
@@ -565,6 +570,7 @@ class PolicyAdapter:
             symbol: Symbol mandates apply to
             timestamp: Current timestamp
             current_price: Current market price (for quantity calculation)
+            position_strategy_id: Strategy that owns the current position (if any)
 
         Returns:
             List of Mandates
@@ -581,6 +587,14 @@ class PolicyAdapter:
 
             # F5: Extract strategy_id from proposal
             strategy_id = getattr(proposal, 'strategy_id', None)
+
+            # OWNERSHIP GATE: Block strategy EXIT for positions owned by other strategies.
+            # Each strategy has its own exit logic (trailing stops, invalidation) —
+            # cross-strategy exits cause conflicts (e.g. EFFCS liq_z exit vs
+            # CASCADE mean-reversion where liq_z dropping is the thesis working).
+            if mandate_type == MandateType.EXIT and position_strategy_id:
+                if strategy_id and strategy_id != position_strategy_id:
+                    continue
 
             # GRACE PERIOD: Block EXIT within grace period of ENTRY
             if mandate_type == MandateType.EXIT:

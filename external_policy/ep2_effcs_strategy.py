@@ -190,14 +190,8 @@ class EFFCSStrategy:
 
         # Rule 3: Check position state and generate appropriate action
         if position_state in (PositionState.ENTERING, PositionState.OPEN, PositionState.REDUCING):
-            # Ownership gate: only exit positions opened by EFFCS.
-            # Other strategies (CASCADE-SNIPER, SLBRS) have their own exit logic
-            # (trailing stops, invalidation). EFFCS exit conditions (liq_z < 2.0)
-            # conflict with mean-reversion strategies where liq_z dropping is expected.
-            if position_strategy_id and position_strategy_id != "EP2-EFFCS-V1":
-                return None
-
             # Position exists - check for exit conditions
+            # (Cross-strategy ownership gating is enforced centrally in PolicyAdapter)
             return self._check_exit(
                 symbol=symbol,
                 regime_state=regime_state,

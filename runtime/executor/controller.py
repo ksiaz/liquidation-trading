@@ -113,6 +113,9 @@ class ExecutionController:
         )
 
         # Combine strategy mandates with risk mandates
+        if risk_mandates:
+            for rm in risk_mandates:
+                print(f"[RISK-MANDATE] {rm.symbol}: {rm.type.name} authority={rm.authority}")
         all_mandates = mandates + risk_mandates
 
         # Step 2: Arbitrate mandates per symbol
@@ -332,6 +335,8 @@ class ExecutionController:
                     elif self._repository:
                         print(f"[STRATEGY_PERSIST] {symbol}: NO strategy_id on action (action.strategy_id={action.strategy_id})")
             elif state_action == StateAction.EXIT:
+                print(f"[EXEC-EXIT] {symbol}: executing EXIT from state={state_before} "
+                      f"strategy={action.strategy_id} mark={self._mark_prices.get(symbol)}")
                 new_position = self.state_machine.transition(symbol, state_action)
 
                 # For ghost trading: immediately confirm exit (CLOSING → FLAT)

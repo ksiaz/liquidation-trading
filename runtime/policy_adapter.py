@@ -142,7 +142,8 @@ class PolicyAdapter:
         price_high: Optional[float] = None,  # 5-min rolling high for EFFCS impulse direction
         price_low: Optional[float] = None,  # 5-min rolling low for EFFCS impulse direction
         capitulation_confidence: float = 0.0,  # CapitulationTracker confidence for SLBRS
-        rolling_fade_signal: Optional[RollingFadeSignal] = None  # Rolling 30m liq spike signal
+        rolling_fade_signal: Optional[RollingFadeSignal] = None,  # Rolling 30m liq spike signal
+        position_strategy_id: Optional[str] = None  # Owning strategy for cross-strategy exit gating
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -378,7 +379,8 @@ class PolicyAdapter:
                     permission=permission,
                     position_state=position_state,
                     trade_burst=primitives.get("trade_burst"),
-                    directional_continuity=primitives.get("directional_continuity")
+                    directional_continuity=primitives.get("directional_continuity"),
+                    position_strategy_id=position_strategy_id
                 )
                 if _DIAG_ENABLED:
                     if proposal:

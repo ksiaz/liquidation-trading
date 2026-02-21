@@ -1142,6 +1142,13 @@ class CollectorService:
                     position = self.executor.state_machine.get_position(symbol)
                     position_state = position.state if position else None
 
+                    # Get owning strategy for cross-strategy exit gating
+                    position_strategy_id = None
+                    if position_state in (PositionState.OPEN, PositionState.ENTERING, PositionState.REDUCING):
+                        ghost_pos = self.ghost_tracker.get_position(symbol)
+                        if ghost_pos:
+                            position_strategy_id = ghost_pos.entry_policy
+
                     # Extract active primitives BEFORE generating mandates
                     active_primitives = self._extract_active_primitive_names(symbol, snapshot)
 
@@ -1429,7 +1436,8 @@ class CollectorService:
                         price_high=self._price_highs.get(symbol, current_price),
                         price_low=self._price_lows.get(symbol, current_price),
                         capitulation_confidence=cap_confidence,
-                        rolling_fade_signal=rolling_fade_signal
+                        rolling_fade_signal=rolling_fade_signal,
+                        position_strategy_id=position_strategy_id
                     )
                     if mandates:
                         print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
@@ -1764,25 +1772,23 @@ class CollectorService:
         price: float,     # Oracle price
         timestamp: float  # Unix timestamp in seconds
     ):
-        """Handle HL oracle price — keep _mark_prices and ATR fresh.
+        """Handle HL oracle price — keep ATR fresh.
 
-        Oracle prices arrive every ~1s per symbol. This breaks the staleness
-        chain where _mark_prices was only updated in the regime loop (every 2s,
-        and only for symbols past the calculator warmup gate).
+        Oracle prices arrive every ~1s per symbol. Feeds ATR with continuous
+        price data so it reflects true volatility even when HL fills are sparse.
+        ATR aggregates prices into 5m/30m candles internally, so frequent
+        updates just give more accurate high/low/close.
 
-        Also feeds ATR with continuous price data so it reflects true volatility
-        even when HL fills are sparse. ATR aggregates prices into 5m/30m candles
-        internally, so frequent updates just give more accurate high/low/close.
+        Do NOT write to _mark_prices or _current_prices here. This callback
+        runs on a gRPC daemon thread — writing races with the asyncio event
+        loop (regime loop + mandate processing + risk monitor). When the node
+        is bootstrapping old blocks, the oracle price can be stale/wrong.
+        Stale _mark_prices causes false PnL calculations in the risk monitor,
+        triggering spurious MANDATE_EXIT (e.g. HYPE exited at $0.19 oracle
+        instead of $30 actual → 99% fake profit → take-profit EXIT).
+        The regime loop updates both dicts every ~200ms via _get_live_price().
         """
         symbol = hl_symbol + 'USDT'
-
-        # Do NOT write to _current_prices here. This callback runs on a gRPC
-        # daemon thread — writing to _current_prices races with the asyncio
-        # event loop (regime loop + mandate processing). When the node is
-        # bootstrapping old blocks, the oracle price can be stale/wrong,
-        # overwriting the correct WS mid that _get_live_price() provides.
-        # The regime loop updates _current_prices every 2s from _get_live_price().
-        self._mark_prices[symbol] = Decimal(str(price))
 
         # Feed ATR calculator with oracle prices (keeps ATR fresh between sparse fills).
         # Create ATR if it doesn't exist yet — symbols with zero fills would never

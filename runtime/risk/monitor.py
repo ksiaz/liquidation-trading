@@ -126,6 +126,9 @@ class RiskMonitor:
             
             # Check critical threshold (Section 6.2: Full Exit)
             if pos_risk.liquidation_distance < self.config.D_critical:
+                print(f"[RISK-EXIT] {symbol}: D_liq={pos_risk.liquidation_distance:.4f} < D_critical={self.config.D_critical} "
+                      f"mark={mark_prices[symbol]} entry={position.entry_price} dir={position.direction} "
+                      f"liq_px={pos_risk.liquidation_price} leverage={total_leverage:.6f}")
                 mandates.append(
                     Mandate(
                         symbol=symbol,
@@ -134,7 +137,7 @@ class RiskMonitor:
                         timestamp=timestamp
                     )
                 )
-            
+
             # Check minimum safe distance (Section 6.3: Partial Exit)
             elif pos_risk.liquidation_distance < self.config.D_min_safe:
                 mandates.append(
@@ -151,6 +154,8 @@ class RiskMonitor:
             if pnl_pct is not None:
                 # Stop-loss: position loss exceeds threshold
                 if pnl_pct < -self.config.stop_loss_pct:
+                    print(f"[RISK-EXIT] {symbol}: STOP_LOSS pnl={pnl_pct:.4f} < -{self.config.stop_loss_pct} "
+                          f"mark={mark_prices[symbol]} entry={position.entry_price} dir={position.direction}")
                     mandates.append(
                         Mandate(
                             symbol=symbol,
@@ -162,6 +167,8 @@ class RiskMonitor:
 
                 # Take-profit: position profit exceeds threshold
                 elif pnl_pct > self.config.take_profit_pct:
+                    print(f"[RISK-EXIT] {symbol}: TAKE_PROFIT pnl={pnl_pct:.4f} > {self.config.take_profit_pct} "
+                          f"mark={mark_prices[symbol]} entry={position.entry_price} dir={position.direction}")
                     mandates.append(
                         Mandate(
                             symbol=symbol,

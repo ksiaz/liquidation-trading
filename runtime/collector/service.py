@@ -222,6 +222,15 @@ class CollectorService:
         # ATR price buffer: gRPC daemon threads append, regime loop drains.
         # Avoids cross-thread writes to ATR candle state (dict mutation + float updates).
         self._atr_price_buffer: _deque = _deque(maxlen=10000)
+        # Fill event buffer: gRPC daemon threads append, regime loop drains.
+        # Avoids cross-thread writes to VWAP, orderflow, trailing stops, cascade organic.
+        self._fill_event_buffer: _deque = _deque(maxlen=50000)
+        # Liquidation event buffer: gRPC daemon threads append, regime loop drains.
+        # Avoids cross-thread writes to liq_calc, burst aggregator, rolling volume, cascade.
+        self._liq_event_buffer: _deque = _deque(maxlen=10000)
+        # Capitulation event buffer: gRPC daemon threads append, regime loop drains.
+        # Avoids cross-thread writes to capitulation tracker.
+        self._cap_event_buffer: _deque = _deque(maxlen=10000)
         # Rolling price high/low tracker (5-min window) for EFFCS impulse detection
         self._price_highs: Dict[str, float] = {}
         self._price_lows: Dict[str, float] = {}
@@ -920,6 +929,71 @@ class CollectorService:
                         atr_calc.update_trade(atr_px, atr_ts)
                     except Exception as e:
                         self._logger.warning(f"ATR drain error: {e}")
+
+                # 0c. Drain fill event buffer (VWAP, orderflow, trailing stops, cascade organic)
+                while self._fill_event_buffer:
+                    try:
+                        f_sym, f_side, f_px, f_sz, f_ts = self._fill_event_buffer.popleft()
+                        # Initialize calculators if needed (with memory guard)
+                        is_new = f_sym not in self._vwap_calculators
+                        if is_new and len(self._vwap_calculators) >= self._calculator_max_symbols:
+                            self.prune_stale_calculators()
+                        if f_sym not in self._vwap_calculators:
+                            self._vwap_calculators[f_sym] = VWAPCalculator()
+                        if f_sym not in self._orderflow_calculators:
+                            self._orderflow_calculators[f_sym] = MultiWindowOrderflow()
+                        # VWAP
+                        self._vwap_calculators[f_sym].update(f_px, f_sz, f_ts)
+                        # Orderflow: "B" = buyer is taker = NOT maker, "A" = seller is taker
+                        self._orderflow_calculators[f_sym].update(f_side == "A", f_sz, f_ts)
+                        # Trailing stops
+                        self._update_trailing_stops(f_sym, f_px)
+                        # Cascade organic flow
+                        try:
+                            from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
+                            record_organic_trade(f_sym, "BUY" if f_side == "B" else "SELL",
+                                                 f_px * f_sz, f_ts, price=f_px, size=f_sz)
+                        except ImportError:
+                            pass
+                    except Exception as e:
+                        self._logger.warning(f"Fill drain error: {e}")
+
+                # 0d. Drain liquidation event buffer (liq_calc, burst, rolling volume, cascade)
+                while self._liq_event_buffer:
+                    try:
+                        l_sym, l_side, l_px, l_sz, l_ts = self._liq_event_buffer.popleft()
+                        # Initialize calculator if needed
+                        if l_sym not in self._liquidation_calculators:
+                            self._liquidation_calculators[l_sym] = LiquidationZScoreCalculator()
+                        # Liq z-score (USD value)
+                        self._liquidation_calculators[l_sym].update(l_px * l_sz, l_ts)
+                        # Burst aggregator
+                        order_side = 'SELL' if l_side == 'LONG' else 'BUY'
+                        self._liquidation_burst_aggregator.add_event(
+                            timestamp=l_ts, symbol=l_sym, side=order_side,
+                            price=l_px, quantity=l_sz
+                        )
+                        # Rolling volume tracker
+                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, l_ts)
+                        # Cascade liq event
+                        try:
+                            from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
+                            record_liquidation_event(l_sym, order_side, l_px * l_sz, l_ts)
+                        except ImportError:
+                            pass
+                    except Exception as e:
+                        self._logger.warning(f"Liq drain error: {e}")
+
+                # 0e. Drain capitulation event buffer
+                while self._cap_event_buffer:
+                    try:
+                        c_sym, c_dir, c_pnl, c_pos, c_sz, c_ts = self._cap_event_buffer.popleft()
+                        self._capitulation_tracker.on_fill(
+                            symbol=c_sym, dir_type=c_dir, closed_pnl=c_pnl,
+                            start_position=c_pos, size=c_sz, timestamp=c_ts
+                        )
+                    except Exception as e:
+                        self._logger.warning(f"Cap drain error: {e}")
 
                 # 1. Advance System Time
                 self._obs.advance_time(current_time)
@@ -1873,41 +1947,13 @@ class CollectorService:
             # 1. Symbol normalization: HL emits "BTC", calculators use "BTCUSDT"
             normalized_symbol = f"{symbol}USDT"
 
-            # 2. Memory guard: check symbol limit before adding new
-            is_new_symbol = normalized_symbol not in self._vwap_calculators
-            if is_new_symbol and len(self._vwap_calculators) >= self._calculator_max_symbols:
-                self.prune_stale_calculators()
-
-            # 3. Initialize calculators for symbol if needed
-            if normalized_symbol not in self._vwap_calculators:
-                self._vwap_calculators[normalized_symbol] = VWAPCalculator()
-            if normalized_symbol not in self._atr_calculators:
-                self._atr_calculators[normalized_symbol] = MultiTimeframeATR(period=3)
-            if normalized_symbol not in self._orderflow_calculators:
-                self._orderflow_calculators[normalized_symbol] = MultiWindowOrderflow()
-            if normalized_symbol not in self._liquidation_calculators:
-                self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
-
-            # 4. Track last activity for pruning + feed health (wall clock, not fill timestamp)
+            # 2. Track last activity for pruning + feed health (wall clock)
+            # GIL-safe float assignments — OK to stay on daemon thread.
             self._calculator_last_activity[normalized_symbol] = time.time()
             self._last_data_event_ts[normalized_symbol] = time.time()
 
-            # 5. Update VWAP (needs price and volume)
-            self._vwap_calculators[normalized_symbol].update(price, size, timestamp)
-
-            # 6. Buffer ATR update for regime loop to drain (thread safety)
-            self._atr_price_buffer.append((normalized_symbol, price, timestamp))
-
-            # 7. Update Orderflow (needs is_buyer_maker and volume)
-            # HL side: "B" = buyer is taker (lifted asks) = is_buyer_maker=False
-            #          "A" = seller is taker (hit bids) = is_buyer_maker=True
-            is_buyer_maker = (side == "A")
-            self._orderflow_calculators[normalized_symbol].update(is_buyer_maker, size, timestamp)
-
-            # 8. Track rolling high/low (5-min window)
-            # Do NOT write to _current_prices here — this runs on a gRPC daemon
-            # thread and races with the asyncio event loop. The regime loop
-            # updates _current_prices every 2s from _get_live_price() (WS mid).
+            # 4. Track rolling high/low (5-min window)
+            # GIL-safe float max/min — OK to stay on daemon thread.
             now = time.time()
             if normalized_symbol not in self._hl_reset_time or now - self._hl_reset_time[normalized_symbol] >= 300:
                 self._hl_reset_time[normalized_symbol] = now
@@ -1917,32 +1963,24 @@ class CollectorService:
                 self._price_highs[normalized_symbol] = max(self._price_highs.get(normalized_symbol, price), price)
                 self._price_lows[normalized_symbol] = min(self._price_lows.get(normalized_symbol, price), price)
 
-            # 9. Accumulate fill for order consumption primitive
-            # HL side: "B" = buyer is taker (consumed asks), "A" = seller is taker (consumed bids)
+            # 5. Accumulate fill for order consumption primitive
+            # GIL-safe list append — OK to stay on daemon thread.
             side_consumed = "ask" if side == "B" else "bid"
             if normalized_symbol not in self._hl_fill_accumulator:
                 self._hl_fill_accumulator[normalized_symbol] = []
             self._hl_fill_accumulator[normalized_symbol].append((side_consumed, size, price, timestamp))
 
-            # 9b. Buffer for governance M2 node creation (drained in regime loop)
+            # 6. Buffer ALL calculator/strategy mutations for asyncio drain.
+            # VWAP, ATR, orderflow, trailing stops, cascade organic — all drained in regime loop.
+            self._fill_event_buffer.append((normalized_symbol, side, price, size, timestamp))
+            self._atr_price_buffer.append((normalized_symbol, price, timestamp))
+
+            # 7. Buffer governance M2 node creation (drained in regime loop)
             self._governance_event_buffer.append(('HL_FILL', normalized_symbol, {
                 'side': side, 'price': price, 'size': size,
                 'value_usd': price * size, 'timestamp': timestamp,
                 'timestamp_ms': int(timestamp * 1000),
             }))
-
-            # 10. Update trailing stops and check for triggers
-            self._update_trailing_stops(normalized_symbol, price)
-
-            # 11. Feed cascade sniper organic flow detector (non-liquidation fills)
-            try:
-                from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
-                trade_side = "BUY" if side == "B" else "SELL"
-                trade_value = price * size  # USD value
-                record_organic_trade(normalized_symbol, trade_side, trade_value, timestamp,
-                                     price=price, size=size)
-            except ImportError:
-                pass
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
@@ -1961,14 +1999,11 @@ class CollectorService:
                 return  # No direction data — skip
 
             timestamp = event.timestamp_ms / 1000.0
-            self._capitulation_tracker.on_fill(
-                symbol=event.symbol,
-                dir_type=event.dir,
-                closed_pnl=event.closed_pnl_float,
-                start_position=event.start_position_float,
-                size=event.size_float,
-                timestamp=timestamp,
-            )
+            # Buffer for asyncio drain — capitulation tracker has complex state
+            self._cap_event_buffer.append((
+                event.symbol, event.dir, event.closed_pnl_float,
+                event.start_position_float, event.size_float, timestamp
+            ))
         except Exception as e:
             print(f"HL_FILL_EXTENDED_ERROR: {e}", flush=True)
 
@@ -2003,52 +2038,20 @@ class CollectorService:
             if self._hl_liq_count <= 5 or self._hl_liq_count % 100 == 0:
                 self._logger.info(f'[HL_LIQ #{self._hl_liq_count}] {symbol} {side} ${liq_value:.0f}')
 
-            # 2. Initialize calculator for symbol if needed
-            if normalized_symbol not in self._liquidation_calculators:
-                self._liquidation_calculators[normalized_symbol] = LiquidationZScoreCalculator()
-
-            # 3. Update liquidation Z-score calculator (USD value, not base units)
-            # Base units (0.005 BTC) produce near-zero variance; USD ($480) gives
-            # meaningful magnitude differences between assets and time windows.
-            liq_usd = price * size
-            self._liquidation_calculators[normalized_symbol].update(liq_usd, timestamp)
-
-            # 4. Side mapping for burst aggregator: LONG -> SELL, SHORT -> BUY
-            # (HL side is position side, aggregator expects order side)
-            order_side = 'SELL' if side == 'LONG' else 'BUY'
-
-            # 5. Update liquidation burst aggregator
-            self._liquidation_burst_aggregator.add_event(
-                timestamp=timestamp,
-                symbol=normalized_symbol,
-                side=order_side,
-                price=price,
-                quantity=size
-            )
-
-            # 5b. Feed rolling volume tracker (30m window for ROLLING_FADE)
-            self._rolling_volume_tracker.add_event(
-                normalized_symbol, side, price, size, timestamp
-            )
-
-            # 6. Track activity for calculator pruning + feed health
+            # 2. Track activity for calculator pruning + feed health (GIL-safe)
             self._calculator_last_activity[normalized_symbol] = time.time()
             self._last_data_event_ts[normalized_symbol] = time.time()
 
-            # 6b. Buffer for governance M2 node creation (drained in regime loop)
+            # 3. Buffer ALL calculator/strategy mutations for asyncio drain.
+            # liq_calc, burst_aggregator, rolling_volume, cascade liq — all drained in regime loop.
+            self._liq_event_buffer.append((normalized_symbol, side, price, size, timestamp))
+
+            # 4. Buffer governance M2 node creation (drained in regime loop)
             self._governance_event_buffer.append(('HL_LIQUIDATION', normalized_symbol, {
                 'side': side, 'price': price,
                 'liquidated_size': size, 'value': price * size,
                 'timestamp': timestamp,
             }))
-
-            # 7. Feed cascade sniper organic flow detector
-            try:
-                from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
-                liq_value = price * size
-                record_liquidation_event(normalized_symbol, order_side, liq_value, timestamp)
-            except ImportError:
-                pass
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
@@ -2387,7 +2390,12 @@ class CollectorService:
             traceback.print_exc()
 
     def _force_position_flat(self, symbol: str):
-        """Set position to FLAT in positions table."""
+        """Set position to FLAT in positions table and executor state machine.
+
+        Called by trailing stop exits (ghost tracker path). Must sync both
+        the DB and the executor SM to prevent divergence — without this,
+        the SM stays OPEN after trailing stop, blocking re-entries.
+        """
         try:
             from runtime.logging.pg_pool import get_conn, put_conn
             pg_conn = get_conn()
@@ -2402,7 +2410,13 @@ class CollectorService:
             finally:
                 put_conn(pg_conn)
         except Exception as e:
-            print(f"WARN: _force_position_flat({symbol}) failed: {e}")
+            print(f"WARN: _force_position_flat({symbol}) DB failed: {e}")
+
+        # Sync executor state machine (prevents OPEN→blocked re-entry divergence)
+        try:
+            self.executor.state_machine.force_flat(symbol)
+        except Exception as e:
+            print(f"WARN: _force_position_flat({symbol}) SM sync failed: {e}")
 
     def _recovered_exit(self, symbol: str, price: float, entry_id: str,
                         direction: str, entry_price: float, exit_reason: str):

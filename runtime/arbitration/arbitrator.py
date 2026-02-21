@@ -97,14 +97,30 @@ class MandateArbitrator:
         """
         # Group by symbol (symbol-local - Theorem 5.1)
         by_symbol: Dict[str, Set[Mandate]] = {}
+        global_mandates: List[Mandate] = []  # symbol="*" applies to all
         for mandate in mandates:
-            if mandate.symbol not in by_symbol:
-                by_symbol[mandate.symbol] = set()
-            by_symbol[mandate.symbol].add(mandate)
-        
+            if mandate.symbol == "*":
+                global_mandates.append(mandate)
+            else:
+                if mandate.symbol not in by_symbol:
+                    by_symbol[mandate.symbol] = set()
+                by_symbol[mandate.symbol].add(mandate)
+
+        # Expand global mandates (e.g. BLOCK on "*") into every symbol group
+        if global_mandates:
+            for symbol in by_symbol:
+                for gm in global_mandates:
+                    # Create symbol-specific copy to satisfy single-symbol validation
+                    by_symbol[symbol].add(Mandate(
+                        symbol=symbol,
+                        type=gm.type,
+                        authority=gm.authority,
+                        timestamp=gm.timestamp,
+                    ))
+
         # Arbitrate each symbol independently (Theorem 5.1, 5.2)
         actions = {}
         for symbol, symbol_mandates in by_symbol.items():
             actions[symbol] = self.arbitrate(symbol_mandates)
-        
+
         return actions

@@ -10,6 +10,7 @@ Persistence: Open positions are persisted to PostgreSQL and restored on startup.
 This enables external queries for P&L and state reconciliation.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from decimal import Decimal
@@ -143,7 +144,7 @@ class GhostAccountState:
     initial_balance: float
     current_balance: float
     open_positions: Dict[str, GhostPosition] = field(default_factory=dict)
-    trade_history: List[GhostTrade] = field(default_factory=list)
+    trade_history: deque = field(default_factory=lambda: deque(maxlen=5000))
     total_realized_pnl: float = 0.0
     trade_count: int = 0
     winning_trades: int = 0
@@ -192,7 +193,7 @@ class GhostPositionTracker:
             initial_balance=initial_balance,
             current_balance=initial_balance
         )
-        self._position_lock = threading.Lock()  # Guards open/close against concurrent gRPC + asyncio
+        self._position_lock = threading.RLock()  # Reentrant: locked methods call other locked methods
         self._position_size_pct = position_size_pct
         self._buffered_db = buffered_db
         self._api_key = api_key
@@ -389,11 +390,13 @@ class GhostPositionTracker:
 
     def has_open_position(self, symbol: str) -> bool:
         """Check if position exists for symbol."""
-        return symbol in self._state.open_positions
+        with self._position_lock:
+            return symbol in self._state.open_positions
 
     def get_open_position(self, symbol: str) -> Optional[GhostPosition]:
         """Get open position for symbol or None."""
-        return self._state.open_positions.get(symbol)
+        with self._position_lock:
+            return self._state.open_positions.get(symbol)
 
     def calculate_unrealized_pnl(self, symbol: str, current_price: float) -> Optional[float]:
         """
@@ -406,7 +409,7 @@ class GhostPositionTracker:
         Returns:
             Unrealized PNL in USD or None if no position
         """
-        position = self.get_open_position(symbol)
+        position = self.get_open_position(symbol)  # Already locked
         if not position:
             return None
 
@@ -745,9 +748,13 @@ class GhostPositionTracker:
         Returns:
             Dict with account metrics
         """
+        # Snapshot positions under lock, compute PnL outside
+        with self._position_lock:
+            positions_snapshot = dict(self._state.open_positions)
+
         # Calculate total unrealized PNL
         total_unrealized = 0.0
-        for symbol, position in self._state.open_positions.items():
+        for symbol, position in positions_snapshot.items():
             try:
                 adapter = self._get_adapter(symbol)
                 snapshot = adapter.capture_snapshot()
@@ -785,11 +792,13 @@ class GhostPositionTracker:
 
     def get_trade_history(self) -> List[GhostTrade]:
         """Get full trade history."""
-        return self._state.trade_history.copy()
+        with self._position_lock:
+            return list(self._state.trade_history)
 
     def get_open_positions(self) -> Dict[str, GhostPosition]:
         """Get all open positions."""
-        return self._state.open_positions.copy()
+        with self._position_lock:
+            return self._state.open_positions.copy()
 
     def get_positions_with_pnl(self, price_getter=None) -> List[Dict]:
         """
@@ -805,8 +814,12 @@ class GhostPositionTracker:
         Returns:
             List of dicts with position data + unrealized_pnl field
         """
+        # Snapshot positions under lock, then compute PnL outside lock
+        with self._position_lock:
+            positions_snapshot = dict(self._state.open_positions)
+
         results = []
-        for symbol, pos in self._state.open_positions.items():
+        for symbol, pos in positions_snapshot.items():
             # Get current price
             current_price = None
             if price_getter:

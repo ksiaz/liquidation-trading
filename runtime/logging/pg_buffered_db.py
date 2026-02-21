@@ -40,8 +40,8 @@ class PgBufferedResearchDatabase:
         self._max_buffer_size = max_buffer_size
         self._enable_high_freq = enable_high_frequency_logs
 
-        # Write buffer
-        self._buffer = queue.Queue()
+        # Write buffer — bounded to prevent unbounded memory growth if PG lags
+        self._buffer = queue.Queue(maxsize=max_buffer_size * 10)
 
         # Local cycle ID counter — initialized from PG MAX(id)
         self._cycle_counter = self._init_cycle_counter()
@@ -179,8 +179,14 @@ class PgBufferedResearchDatabase:
             put_conn(conn)
 
     def _buffer_write(self, method_name: str, *args, **kwargs):
-        self._buffer.put((method_name, args, kwargs))
-        self._writes_buffered += 1
+        try:
+            self._buffer.put_nowait((method_name, args, kwargs))
+            self._writes_buffered += 1
+        except queue.Full:
+            self._writes_dropped = getattr(self, '_writes_dropped', 0) + 1
+            if self._writes_dropped % 100 == 1:
+                print(f"[PG-BRD] Buffer full, dropped {self._writes_dropped} writes",
+                      file=sys.stderr, flush=True)
 
     # =========================================================================
     # High-frequency logs (optional)
@@ -243,8 +249,14 @@ class PgBufferedResearchDatabase:
 
     def execute_sql(self, sql: str, params: tuple = ()):
         """Buffer raw SQL. Converts ? to %s automatically."""
-        self._buffer.put(('__raw_sql__', (sql, params), {}))
-        self._writes_buffered += 1
+        try:
+            self._buffer.put_nowait(('__raw_sql__', (sql, params), {}))
+            self._writes_buffered += 1
+        except queue.Full:
+            self._writes_dropped = getattr(self, '_writes_dropped', 0) + 1
+            if self._writes_dropped % 100 == 1:
+                print(f"[PG-BRD] Buffer full, dropped {self._writes_dropped} writes",
+                      file=sys.stderr, flush=True)
 
     def read_sql(self, sql: str, params: tuple = ()):
         """Execute read query on a SEPARATE pool connection. No lock needed."""
@@ -276,6 +288,30 @@ class PgBufferedResearchDatabase:
 
             cur = conn.cursor()
 
+            # Child tables FIRST: query old cycle_ids before deleting parent rows
+            try:
+                cur.execute(
+                    "SELECT id FROM execution_cycles WHERE timestamp < %s",
+                    (cutoff_ts,)
+                )
+                old_ids = [r[0] for r in cur.fetchall()]
+                if old_ids:
+                    for child in ['m2_nodes', 'primitive_values',
+                                  'policy_evaluations', 'mandates',
+                                  'arbitration_rounds']:
+                        try:
+                            cur.execute(
+                                f"DELETE FROM {child} WHERE cycle_id = ANY(%s)",
+                                (old_ids,)
+                            )
+                            total_deleted += cur.rowcount
+                        except Exception:
+                            conn.rollback()
+                            cur = conn.cursor()
+            except Exception:
+                conn.rollback()
+                cur = conn.cursor()
+
             # Tables with 'timestamp' column (float seconds)
             for table in [
                 'execution_cycles', 'liquidation_events', 'ohlc_candles',
@@ -288,7 +324,7 @@ class PgBufferedResearchDatabase:
                     total_deleted += cur.rowcount
                 except Exception:
                     conn.rollback()
-                    conn.cursor()  # Get fresh cursor after rollback
+                    cur = conn.cursor()
 
             # Tables with 'ts_ns' column (nanoseconds)
             for table in [
@@ -352,30 +388,6 @@ class PgBufferedResearchDatabase:
                 conn.rollback()
                 cur = conn.cursor()
 
-            # Child tables: delete by old cycle_ids
-            try:
-                cur.execute(
-                    "SELECT id FROM execution_cycles WHERE timestamp < %s",
-                    (cutoff_ts,)
-                )
-                old_ids = [r[0] for r in cur.fetchall()]
-                if old_ids:
-                    for child in ['m2_nodes', 'primitive_values',
-                                  'policy_evaluations', 'mandates',
-                                  'arbitration_rounds']:
-                        try:
-                            cur.execute(
-                                f"DELETE FROM {child} WHERE cycle_id = ANY(%s)",
-                                (old_ids,)
-                            )
-                            total_deleted += cur.rowcount
-                        except Exception:
-                            conn.rollback()
-                            cur = conn.cursor()
-            except Exception:
-                conn.rollback()
-                cur = conn.cursor()
-
             conn.commit()
             print(f"[PG-BRD] Pruned {total_deleted} rows (>{max_age_hours}h old)",
                   flush=True)
@@ -433,8 +445,10 @@ class PgBufferedResearchDatabase:
         return {
             'writes_buffered': self._writes_buffered,
             'writes_flushed': self._writes_flushed,
+            'writes_dropped': getattr(self, '_writes_dropped', 0),
             'flushes_count': self._flushes_count,
             'buffer_size': self._buffer.qsize(),
+            'buffer_maxsize': self._buffer.maxsize,
             'high_freq_enabled': self._enable_high_freq,
             'cycle_counter': self._cycle_counter,
         }

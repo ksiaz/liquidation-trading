@@ -165,7 +165,23 @@ class PositionStateMachine:
             if symbol not in self._positions:
                 self._positions[symbol] = Position.create_flat(symbol)
             return self._positions[symbol]
-    
+
+    def force_flat(self, symbol: str):
+        """Force position to FLAT (for external close paths like trailing stops).
+
+        Bypasses transition validation. Used when the ghost tracker closes a
+        position outside the mandate→arbitration→controller path.
+        Without this, the SM stays logically OPEN after a trailing stop exit,
+        blocking re-entries and causing wrong risk decisions.
+        """
+        with self._lock:
+            self._positions[symbol] = Position.create_flat(symbol)
+            if self._repository:
+                try:
+                    self._repository.save(self._positions[symbol])
+                except Exception:
+                    pass  # DB already updated by _force_position_flat
+
     def validate_entry(self, symbol: str) -> bool:
         """Validate ENTRY action (Theorem 3.1 - single position invariant).
 

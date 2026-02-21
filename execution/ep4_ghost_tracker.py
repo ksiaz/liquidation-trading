@@ -724,11 +724,12 @@ class GhostPositionTracker:
             self._persist_position_closed(symbol, fill_price, fill_timestamp, pnl)
             del self._state.open_positions[symbol]
         else:
-            # Partial close - update position (keep as OPEN in DB, qty not updated for simplicity)
+            # Partial close - update in-memory and DB qty
+            new_qty = position.quantity - quantity
             updated_position = GhostPosition(
                 symbol=position.symbol,
                 side=position.side,
-                quantity=position.quantity - quantity,
+                quantity=new_qty,
                 entry_price=position.entry_price,
                 entry_timestamp=position.entry_timestamp,
                 entry_order_id=position.entry_order_id,
@@ -738,6 +739,19 @@ class GhostPositionTracker:
                 entry_primitives=position.entry_primitives
             )
             self._state.open_positions[symbol] = updated_position
+            # Sync DB qty so restart loads correct size
+            try:
+                conn = get_conn()
+                try:
+                    conn.cursor().execute(
+                        "UPDATE ghost_positions SET qty = %s WHERE symbol = %s AND status = 'OPEN'",
+                        (new_qty, symbol)
+                    )
+                    conn.commit()
+                finally:
+                    put_conn(conn)
+            except Exception as e:
+                print(f"[GHOST] Partial reduce DB update failed: {e}", flush=True)
 
         return (True, None, trade)
 

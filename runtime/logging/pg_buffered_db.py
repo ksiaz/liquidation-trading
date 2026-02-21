@@ -225,7 +225,15 @@ class PgBufferedResearchDatabase:
     def log_cycle(self, *args, **kwargs):
         cycle_id = self._get_next_cycle_id()
         kwargs['_injected_cycle_id'] = cycle_id
-        self._buffer_write('log_cycle', *args, **kwargs)
+        # Cycle writes are low-frequency and critical (children reference cycle_id).
+        # Use blocking put (1s timeout) instead of non-blocking to prevent orphans.
+        try:
+            self._buffer.put(('log_cycle', args, kwargs), timeout=1.0)
+            self._writes_buffered += 1
+        except queue.Full:
+            self._writes_dropped = getattr(self, '_writes_dropped', 0) + 1
+            print(f"[PG-BRD] CRITICAL: log_cycle dropped (cycle_id={cycle_id})",
+                  file=sys.stderr, flush=True)
         return cycle_id
 
     def log_m2_nodes(self, *args, **kwargs):

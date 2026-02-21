@@ -196,12 +196,6 @@ class CollectorService:
         # Track execution log index to process new results
         self._last_execution_index = 0
 
-        # Reconcile ghost tracker with positions.db on startup
-        self._reconcile_positions_on_startup()
-
-        # Backfill missing exit rows in execution.db from ghost_positions DB
-        self._backfill_missing_exits()
-
         # Store latest cycle context for ghost tracker
         self._latest_cycle_id = None
         self._latest_snapshot = None
@@ -245,6 +239,10 @@ class CollectorService:
         self._calculator_max_symbols = 500  # Limit symbols tracked
         self._calculator_inactive_sec = 600.0  # Prune after 10 min inactive
         self._calculators_pruned = 0
+        # Deque overflow counters (detect silent data loss during bursts)
+        self._deque_overflows: Dict[str, int] = {
+            'fill': 0, 'liq': 0, 'cap': 0, 'atr': 0, 'governance': 0
+        }
 
         # Phase 6: Liquidation burst aggregator (for cascade sniper)
         self._liquidation_burst_aggregator = LiquidationBurstAggregator(
@@ -371,6 +369,11 @@ class CollectorService:
         self._diag_coins = TOP_10_SYMBOLS  # All symbols for diagnostics
         self._diag_interval = 5  # Log diagnostics every N cycles
         self._diag_cycle_count = 0
+
+        # Reconciliation MUST run after all init (_current_prices, _hyperliquid_collector,
+        # executor, etc.) so _get_live_price() works and SM can be synced.
+        self._reconcile_positions_on_startup()
+        self._backfill_missing_exits()
 
     def _restore_strategy_state(self):
         """Restore strategy state from persisted positions.
@@ -995,6 +998,23 @@ class CollectorService:
                     except Exception as e:
                         self._logger.warning(f"Cap drain error: {e}")
 
+                # 0f. Trim fill accumulator (prevents unbounded growth)
+                # Only keeps fills within 60s window. Trim every cycle is cheap
+                # (dict iteration + list comprehension, ~20 symbols).
+                _trim_cutoff = time.time() - 60.0
+                for _fa_sym in list(self._hl_fill_accumulator):
+                    fills = self._hl_fill_accumulator[_fa_sym]
+                    if fills and fills[0][3] < _trim_cutoff:  # [3] = timestamp
+                        self._hl_fill_accumulator[_fa_sym] = [
+                            f for f in fills if f[3] >= _trim_cutoff
+                        ]
+
+                # 0g. Log deque overflows (every ~60s)
+                _any_overflow = any(v > 0 for v in self._deque_overflows.values())
+                if _any_overflow and time.time() - getattr(self, '_last_overflow_log', 0) >= 60:
+                    self._last_overflow_log = time.time()
+                    print(f"[DEQUE_OVERFLOW] {self._deque_overflows}", flush=True)
+
                 # 1. Advance System Time
                 self._obs.advance_time(current_time)
 
@@ -1192,7 +1212,7 @@ class CollectorService:
                                 symbol=symbol,
                                 trigger=SnapshotTrigger.REGIME_CHANGE.value,
                                 timestamp=timestamp,
-                                price=current_price or 0,
+                                price=price,
                                 vwap=self._vwap_calculators[symbol].get_vwap() if symbol in self._vwap_calculators else None,
                                 vwap_distance=vwap_distance,
                                 vwap_z=vwap_z,
@@ -1972,6 +1992,8 @@ class CollectorService:
 
             # 6. Buffer ALL calculator/strategy mutations for asyncio drain.
             # VWAP, ATR, orderflow, trailing stops, cascade organic — all drained in regime loop.
+            if len(self._fill_event_buffer) == self._fill_event_buffer.maxlen:
+                self._deque_overflows['fill'] += 1
             self._fill_event_buffer.append((normalized_symbol, side, price, size, timestamp))
             self._atr_price_buffer.append((normalized_symbol, price, timestamp))
 
@@ -2000,6 +2022,8 @@ class CollectorService:
 
             timestamp = event.timestamp_ms / 1000.0
             # Buffer for asyncio drain — capitulation tracker has complex state
+            if len(self._cap_event_buffer) == self._cap_event_buffer.maxlen:
+                self._deque_overflows['cap'] += 1
             self._cap_event_buffer.append((
                 event.symbol, event.dir, event.closed_pnl_float,
                 event.start_position_float, event.size_float, timestamp
@@ -2044,6 +2068,8 @@ class CollectorService:
 
             # 3. Buffer ALL calculator/strategy mutations for asyncio drain.
             # liq_calc, burst_aggregator, rolling_volume, cascade liq — all drained in regime loop.
+            if len(self._liq_event_buffer) == self._liq_event_buffer.maxlen:
+                self._deque_overflows['liq'] += 1
             self._liq_event_buffer.append((normalized_symbol, side, price, size, timestamp))
 
             # 4. Buffer governance M2 node creation (drained in regime loop)
@@ -2232,6 +2258,8 @@ class CollectorService:
                                     pg2.commit()
                                 finally:
                                     put_conn(pg2)
+                                # Sync SM so it doesn't keep a phantom OPEN state
+                                self.executor.state_machine.force_flat(symbol)
                             except Exception as e2:
                                 print(f"RECONCILE: Failed to clear stale {symbol}: {e2}")
                             continue
@@ -2395,6 +2423,9 @@ class CollectorService:
         Called by trailing stop exits (ghost tracker path). Must sync both
         the DB and the executor SM to prevent divergence — without this,
         the SM stays OPEN after trailing stop, blocking re-entries.
+
+        DB update MUST succeed before SM sync. If DB fails, SM stays OPEN
+        so restart reconciliation can detect and fix the mismatch.
         """
         try:
             from runtime.logging.pg_pool import get_conn, put_conn
@@ -2410,9 +2441,12 @@ class CollectorService:
             finally:
                 put_conn(pg_conn)
         except Exception as e:
-            print(f"WARN: _force_position_flat({symbol}) DB failed: {e}")
+            # DB failed — do NOT force SM flat. SM stays OPEN so restart
+            # reconciliation can detect DB=OPEN and fix the mismatch.
+            print(f"WARN: _force_position_flat({symbol}) DB failed, skipping SM sync: {e}")
+            return
 
-        # Sync executor state machine (prevents OPEN→blocked re-entry divergence)
+        # DB succeeded — now safe to sync SM
         try:
             self.executor.state_machine.force_flat(symbol)
         except Exception as e:

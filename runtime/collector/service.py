@@ -1113,6 +1113,23 @@ class CollectorService:
                             )
                             self._prev_regime_states[symbol] = regime_state
                             self._regime_pending.pop(symbol, None)
+                            # Emit REGIME_CHANGE snapshot at exact transition moment
+                            self._market_state.emit(
+                                symbol=symbol,
+                                trigger=SnapshotTrigger.REGIME_CHANGE.value,
+                                timestamp=timestamp,
+                                price=current_price or 0,
+                                vwap=self._vwap_calculators[symbol].get_vwap() if symbol in self._vwap_calculators else None,
+                                vwap_distance=vwap_distance,
+                                vwap_z=vwap_z,
+                                atr_5m=atr_5m,
+                                atr_30m=atr_30m,
+                                orderflow_ratio=orderflow_imbalance,
+                                orderflow_fill_count=orderflow_fill_count,
+                                orderflow_neutralized=(orderflow_fill_count or 0) < 15,
+                                liq_z=liquidation_zscore,
+                                regime=regime_state.name,
+                            )
                         else:
                             # Not confirmed yet — keep previous regime
                             regime_state = prev_regime

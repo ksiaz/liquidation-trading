@@ -207,7 +207,7 @@ EXHAUSTION_FADE_DEFAULT_MIN_LIQ_COUNT = 3  # Alts: fewer liqs are still meaningf
 
 # Coins excluded from exhaustion/rolling fade (backtest: fading doesn't work — cascade continues)
 # XRP: 40% WR, ARB: 0% WR (3 trades all losers), TRX: too few events, ATOM: single trade loser
-EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "TRX", "ATOM", "ARB"}
+EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "SUI", "TRX", "ATOM", "ARB"}
 
 # Per-coin trailing stop config for exhaustion fade exits.
 # Activation-threshold trailing: price must move activation_bps in your favor,

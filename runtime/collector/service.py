@@ -2190,6 +2190,27 @@ class CollectorService:
         """
         return self._get_live_price(symbol)
 
+    def _fetch_reconcile_prices(self) -> dict:
+        """Fetch current mid prices via REST API for startup reconciliation.
+
+        Called before WS is connected, so we need a synchronous REST call.
+        Returns dict of coin -> mid price (e.g. {"BTC": 67500.0}).
+        """
+        try:
+            import requests as req
+            resp = req.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "allMids"},
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {coin: float(price) for coin, price in data.items()}
+        except Exception as e:
+            print(f"RECONCILE: Failed to fetch prices via REST: {e}")
+        return {}
+
     def _reconcile_positions_on_startup(self):
         """Reconcile ghost tracker with positions.db on startup.
 
@@ -2218,14 +2239,20 @@ class CollectorService:
 
             ghost_open = self.ghost_tracker.get_open_positions()
 
+            # Fetch live prices via REST for accurate reconciliation PnL
+            reconcile_prices = self._fetch_reconcile_prices()
+
             # Case 1: Ghost has position but controller is FLAT → stale ghost, close it
             for symbol in list(ghost_open.keys()):
                 if symbol not in controller_open:
-                    print(f"RECONCILE: Ghost position for {symbol} but controller is FLAT — closing stale ghost")
+                    coin = symbol.replace('USDT', '').replace('USD', '')
+                    exit_price = reconcile_prices.get(coin) or self._get_live_price(symbol) or ghost_open[symbol].entry_price
+                    print(f"RECONCILE: Ghost position for {symbol} but controller is FLAT — closing stale ghost "
+                          f"(entry={ghost_open[symbol].entry_price}, exit={exit_price})")
                     self.ghost_tracker.close_position(
                         symbol=symbol,
                         exit_reason="RECONCILE_STALE",
-                        exit_price=ghost_open[symbol].entry_price,  # flat PnL
+                        exit_price=exit_price,
                         timestamp=time.time()
                     )
 

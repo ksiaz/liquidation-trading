@@ -205,8 +205,9 @@ EXHAUSTION_FADE_MIN_LIQ_COUNT = {
 }
 EXHAUSTION_FADE_DEFAULT_MIN_LIQ_COUNT = 3  # Alts: fewer liqs are still meaningful
 
-# Coins excluded from exhaustion fade (backtest: fading doesn't work — cascade continues)
-EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "TON", "TRX", "OP", "ATOM"}
+# Coins excluded from exhaustion/rolling fade (backtest: fading doesn't work — cascade continues)
+# XRP: 40% WR, ARB: 0% WR (3 trades all losers), TRX: too few events, ATOM: single trade loser
+EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "TRX", "ATOM", "ARB"}
 
 # Per-coin trailing stop config for exhaustion fade exits.
 # Activation-threshold trailing: price must move activation_bps in your favor,
@@ -2013,7 +2014,7 @@ def generate_cascade_sniper_proposal(
                 direction=entry_direction,
                 confidence="ROLLING_FADE",
                 justification_ref=(
-                    f"ROLL_FADE|z={rolling_fade_signal.z_score:.1f}"
+                    f"ROLL_FADE|ratio={rolling_fade_signal.z_score:.1f}x"
                     f"|${rolling_fade_signal.spike_volume:.0f}"
                     f"|{rolling_fade_signal.liq_count}liqs{ret_str}{eq_str}"
                 ),

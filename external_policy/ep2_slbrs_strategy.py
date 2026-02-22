@@ -110,6 +110,8 @@ class FirstTestObservation:
     direction: str          # "LONG" or "SHORT" (from resting size)
     max_rejection: float = 0.0  # Max displacement in rejection direction
     beyond_block_since: Optional[float] = None  # When price first went beyond block
+    non_sideways_accumulated: float = 0.0  # Total non-SIDEWAYS time (subtracted from wall-clock)
+    last_regime_ts: float = 0.0            # Last time any processing happened (SIDEWAYS or not)
 
 
 # ==============================================================================
@@ -185,6 +187,10 @@ class SLBRSStrategy:
     # SIDEWAYS, invalidate immediately (faster than regime debounce).
     _INVALIDATION_ATR_RATIO = 0.95
 
+    # ── Regime grace period ────────────────────────────────────────
+    # Non-SIDEWAYS blip shorter than this preserves state machine progress.
+    # BTC flickers SIDEWAYS↔DISABLED every ~10s — 30s survives that.
+    _REGIME_GRACE_SEC = 30.0
 
     def __init__(self):
         """Initialize SLBRS strategy with empty state."""
@@ -207,6 +213,8 @@ class SLBRSStrategy:
         # Trade result tracking (Section 7)
         self._consecutive_losses: Dict[str, int] = {}
         self._trade_results: deque = deque(maxlen=20)
+        # Last SIDEWAYS timestamp per symbol (for regime grace period)
+        self._last_sideways_ts: Dict[str, float] = {}
 
     def _count_reject(self, gate_name: str):
         """Record gate rejection for frequency analysis."""
@@ -260,15 +268,25 @@ class SLBRSStrategy:
         # Rule 2: Regime gate - SLBRS only active in SIDEWAYS regime
         if regime_state is None or regime_state.regime != "SIDEWAYS_ACTIVE":
             self._sideways_streak[symbol] = 0
-            # Reset state machine — block thesis invalidated by regime change
-            if self._state.get(symbol) in (SLBRSState.FIRST_TEST_OBSERVED,
-                                           SLBRSState.REJECTION_CONFIRMED):
+            # Grace period: preserve state machine if SIDEWAYS was recent
+            current_state = self._state.get(symbol, SLBRSState.IDLE)
+            if current_state in (SLBRSState.FIRST_TEST_OBSERVED,
+                                 SLBRSState.REJECTION_CONFIRMED):
+                last_sw = self._last_sideways_ts.get(symbol, 0.0)
+                if last_sw > 0 and (context.timestamp - last_sw) <= self._REGIME_GRACE_SEC:
+                    # Within grace — preserve state, accumulate non-SIDEWAYS time
+                    ft = self._first_test.get(symbol)
+                    if ft is not None and ft.last_regime_ts > 0:
+                        ft.non_sideways_accumulated += (context.timestamp - ft.last_regime_ts)
+                        ft.last_regime_ts = context.timestamp
+                    return None
                 self._state[symbol] = SLBRSState.IDLE
                 self._first_test[symbol] = None
             return None
 
         # Track consecutive SIDEWAYS cycles for regime stability
         self._sideways_streak[symbol] = self._sideways_streak.get(symbol, 0) + 1
+        self._last_sideways_ts[symbol] = context.timestamp
 
         # Track position transitions
         was_open = symbol in self._open_symbols
@@ -457,14 +475,15 @@ class SLBRSStrategy:
                 print(f"[SLBRS-DIAG] {symbol}: oc_warmup={self._oc_seen.get(symbol, 0)}/{self.MIN_OC_OBSERVATIONS}")
             return None
 
-        # ATR gate: require real measured volatility
-        atr_width = regime_state.atr_5m
+        # ATR gate: use atr_30m (stable session measure) for pass/fail
         min_meaningful_atr = price * 0.001
-        if atr_width < min_meaningful_atr:
+        if regime_state.atr_30m < min_meaningful_atr:
             self._count_reject("atr_low")
             if _diag:
-                print(f"[SLBRS-DIAG] {symbol}: atr_low={atr_width:.4f}<{min_meaningful_atr:.4f}")
+                print(f"[SLBRS-DIAG] {symbol}: atr_low atr30={regime_state.atr_30m:.4f}<{min_meaningful_atr:.4f} (atr5={regime_state.atr_5m:.4f})")
             return None
+        # Sizing: floor atr_5m at 30% of atr_30m to prevent meaningless block widths
+        atr_width = max(regime_state.atr_5m, regime_state.atr_30m * 0.3)
 
         # Block detection gates
         if structural_persistence.total_persistence_duration < 120.0:
@@ -570,6 +589,8 @@ class SLBRSStrategy:
             test_price_impact=zone_penetration.penetration_depth,
             timestamp=context.timestamp,
             direction=direction,
+            non_sideways_accumulated=0.0,
+            last_regime_ts=context.timestamp,
         )
         self._state[symbol] = SLBRSState.FIRST_TEST_OBSERVED
 
@@ -597,11 +618,24 @@ class SLBRSStrategy:
             self._state[symbol] = SLBRSState.IDLE
             return None
 
-        elapsed = context.timestamp - first_test.timestamp
-        if elapsed > self._FIRST_TEST_TIMEOUT_SEC:
+        # Update regime tracking timestamp
+        first_test.last_regime_ts = context.timestamp
+
+        # Effective elapsed = wall-clock minus accumulated non-SIDEWAYS time
+        wall_elapsed = context.timestamp - first_test.timestamp
+        effective_elapsed = wall_elapsed - first_test.non_sideways_accumulated
+
+        if effective_elapsed > self._FIRST_TEST_TIMEOUT_SEC:
             self._state[symbol] = SLBRSState.IDLE
             self._first_test[symbol] = None
             self._count_reject("rejection_timeout")
+            return None
+
+        # Safety: 3× wall-clock cap prevents zombie observations
+        if wall_elapsed > self._FIRST_TEST_TIMEOUT_SEC * 3:
+            self._state[symbol] = SLBRSState.IDLE
+            self._first_test[symbol] = None
+            self._count_reject("wall_clock_timeout")
             return None
 
         # Displacement in rejection direction
@@ -645,7 +679,7 @@ class SLBRSStrategy:
                   f"displacement={first_test.max_rejection:.6f} "
                   f"current={rejection_disp:.6f} "
                   f"threshold={rejection_threshold:.6f} "
-                  f"elapsed={elapsed:.1f}s", flush=True)
+                  f"elapsed={effective_elapsed:.1f}s", flush=True)
 
         return None
 
@@ -671,11 +705,24 @@ class SLBRSStrategy:
             self._state[symbol] = SLBRSState.IDLE
             return None
 
-        elapsed = context.timestamp - first_test.timestamp
-        if elapsed > self._ENTRY_TIMEOUT_SEC:
+        # Update regime tracking timestamp
+        first_test.last_regime_ts = context.timestamp
+
+        # Effective elapsed = wall-clock minus accumulated non-SIDEWAYS time
+        wall_elapsed = context.timestamp - first_test.timestamp
+        effective_elapsed = wall_elapsed - first_test.non_sideways_accumulated
+
+        if effective_elapsed > self._ENTRY_TIMEOUT_SEC:
             self._state[symbol] = SLBRSState.IDLE
             self._first_test[symbol] = None
             self._count_reject("retest_timeout")
+            return None
+
+        # Safety: 3× wall-clock cap prevents zombie observations
+        if wall_elapsed > self._ENTRY_TIMEOUT_SEC * 3:
+            self._state[symbol] = SLBRSState.IDLE
+            self._first_test[symbol] = None
+            self._count_reject("wall_clock_timeout")
             return None
 
         # Price acceptance check (block broken during retest wait)

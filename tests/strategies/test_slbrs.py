@@ -110,11 +110,12 @@ class TestSLBRSStrategy:
             permission=self.permission, position_state=PositionState.FLAT
         )
 
-    def _do_rejection(self, symbol="BTCUSDT", price=50060.0, ts=1010.0):
+    def _do_rejection(self, symbol="BTCUSDT", price=50200.0, ts=1010.0):
         """Simulate price rejection: price bounces up (LONG direction).
 
-        Rejection threshold = max(50000*0.0008, 0.25*200) = max(40, 50) = 50.
-        Price 50060 gives displacement=60 > 50 → REJECTION_CONFIRMED.
+        Rejection threshold = max(50000*0.0025, 0.75*200) = max(125, 150) = 150.
+        Price 50200 gives displacement=200 > 150 → REJECTION_CONFIRMED.
+        Current check: 200 >= 150*0.5=75 → passes sustained bounce gate.
         """
         generate_slbrs_proposal(
             symbol=symbol, regime_state=self.regime_sideways,
@@ -179,6 +180,76 @@ class TestSLBRSStrategy:
             permission=self.permission, position_state=PositionState.FLAT
         )
         assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.IDLE
+
+    def test_regime_grace_period_preserves_state(self):
+        """Short non-SIDEWAYS blip (<30s) preserves state machine progress."""
+        self._warm_sideways_streak()
+        self._do_first_test(ts=1000.0)
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
+
+        # Brief regime change (5s later, within 30s grace)
+        regime_expansion = RegimeState(
+            regime="EXPANSION_ACTIVE", vwap_distance=200.0,
+            atr_5m=80.0, atr_30m=70.0
+        )
+        generate_slbrs_proposal(
+            symbol="BTCUSDT", regime_state=regime_expansion,
+            zone_penetration=None, resting_size=None,
+            order_consumption=None, structural_persistence=None,
+            price=50000.0, context=StrategyContext("blip", 1005.0),
+            permission=self.permission, position_state=PositionState.FLAT
+        )
+        # State preserved during grace period
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
+
+        # Return to SIDEWAYS — rejection should still work
+        self._do_rejection(ts=1010.0)
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.REJECTION_CONFIRMED
+
+    def test_regime_grace_non_sideways_time_excluded(self):
+        """Non-SIDEWAYS time during grace period doesn't count toward timeout."""
+        self._warm_sideways_streak()
+        self._do_first_test(ts=1000.0)
+
+        # 10s of SIDEWAYS
+        generate_slbrs_proposal(
+            symbol="BTCUSDT", regime_state=self.regime_sideways,
+            zone_penetration=None, resting_size=None,
+            order_consumption=None, structural_persistence=None,
+            price=50010.0,
+            context=StrategyContext("sw1", 1010.0),
+            permission=self.permission, position_state=PositionState.FLAT
+        )
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
+
+        # 25s of non-SIDEWAYS (within grace)
+        regime_off = RegimeState(
+            regime="EXPANSION_ACTIVE", vwap_distance=200.0,
+            atr_5m=80.0, atr_30m=70.0
+        )
+        generate_slbrs_proposal(
+            symbol="BTCUSDT", regime_state=regime_off,
+            zone_penetration=None, resting_size=None,
+            order_consumption=None, structural_persistence=None,
+            price=50010.0,
+            context=StrategyContext("off1", 1035.0),
+            permission=self.permission, position_state=PositionState.FLAT
+        )
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
+
+        # Back to SIDEWAYS at t=1040 (40s wall-clock, but only ~15s SIDEWAYS)
+        # With old code: 40s > 60s timeout? No. But even at t=1065 (65s):
+        # wall_elapsed=65, non_sideways=25, effective=40 < 60 → NOT timed out
+        generate_slbrs_proposal(
+            symbol="BTCUSDT", regime_state=self.regime_sideways,
+            zone_penetration=None, resting_size=None,
+            order_consumption=None, structural_persistence=None,
+            price=50010.0,
+            context=StrategyContext("sw2", 1065.0),
+            permission=self.permission, position_state=PositionState.FLAT
+        )
+        # 65s wall-clock but only 40s effective (25s deducted) → NOT timed out
+        assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
 
     def test_first_test_detection(self):
         """SLBRS detects and records first test with full data."""
@@ -403,29 +474,30 @@ class TestSLBRSStrategy:
         assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.IDLE
 
     def test_block_acceptance_resets_state(self):
-        """Price staying beyond block for >10s resets state (block broken)."""
+        """Price staying beyond block for >30s resets state (block broken)."""
         self._warm_sideways_streak()
         self._do_first_test(ts=1000.0)
-        # For LONG, "beyond" = price below block_edge
+        # For LONG, "beyond" = price below block_edge * (1 - 0.0015)
+        # 50000 * 0.9985 = 49925, so price must be < 49925
 
-        # Price drops below block edge
+        # Price drops well below block edge
         generate_slbrs_proposal(
             symbol="BTCUSDT", regime_state=self.regime_sideways,
             zone_penetration=None, resting_size=None,
             order_consumption=None, structural_persistence=None,
-            price=49980.0,  # Below block_edge (50000) by 20 > 50000*0.0003=15
+            price=49900.0,  # Below 49925 threshold
             context=StrategyContext("below1", 1002.0),
             permission=self.permission, position_state=PositionState.FLAT
         )
         assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.FIRST_TEST_OBSERVED
 
-        # Still below after 11 seconds → accepted through
+        # Still below after 31 seconds → accepted through (_ACCEPTANCE_TIMEOUT_SEC=30)
         generate_slbrs_proposal(
             symbol="BTCUSDT", regime_state=self.regime_sideways,
             zone_penetration=None, resting_size=None,
             order_consumption=None, structural_persistence=None,
-            price=49980.0,
-            context=StrategyContext("below2", 1013.0),
+            price=49900.0,
+            context=StrategyContext("below2", 1033.0),
             permission=self.permission, position_state=PositionState.FLAT
         )
         assert _slbrs_strategy._state["BTCUSDT"] == SLBRSState.IDLE
@@ -495,7 +567,7 @@ class TestSLBRSPartialDataRejection:
             symbol="BTCUSDT", regime_state=self.regime,
             zone_penetration=None, resting_size=None,
             order_consumption=None, structural_persistence=None,
-            price=50060.0,
+            price=50200.0,  # displacement=200 > threshold max(125, 150)=150
             context=StrategyContext("rejection", 1010.0),
             permission=self.permission, position_state=PositionState.FLAT
         )

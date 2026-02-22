@@ -67,6 +67,7 @@ class RollingVolumeTracker:
     RATIO_THRESHOLD = 10.0     # Burst rate must be 10x baseline rate
     MIN_BURST_EVENTS = 5       # Minimum events in burst window to trigger
     SPIKE_COOLDOWN = 900       # 15m between signals per coin
+    FAST_PATH_RATIO = 20.0     # Skip exhaustion gate when ratio >= 20x (massive spike)
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
 
     def __init__(self):
@@ -165,21 +166,27 @@ class RollingVolumeTracker:
         if ratio < self.RATIO_THRESHOLD:
             return None
 
+        # ── High-z fast path ──
+        # Massive spikes (>= 20x baseline) exhaust faster — skip exhaustion gate.
+        # 18-day backtest: +59.8% WR, +5.38 bps avg vs baseline +57.6% WR, +2.87 bps.
+        fast_path = ratio >= self.FAST_PATH_RATIO
+
         # ── Cascade exhaustion gate ──
         # Split burst window into halves. Only emit when rate is DECLINING
         # (second half has fewer events than first half = cascade peaked).
-        half_cutoff = timestamp - self.BURST_WINDOW / 2
         first_half = 0
         second_half = 0
-        for e in events:
-            if e.timestamp >= burst_cutoff:
-                if e.timestamp < half_cutoff:
-                    first_half += 1
-                else:
-                    second_half += 1
+        if not fast_path:
+            half_cutoff = timestamp - self.BURST_WINDOW / 2
+            for e in events:
+                if e.timestamp >= burst_cutoff:
+                    if e.timestamp < half_cutoff:
+                        first_half += 1
+                    else:
+                        second_half += 1
 
-        if second_half >= first_half:
-            return None  # Cascade still active or accelerating
+            if second_half >= first_half:
+                return None  # Cascade still active or accelerating
 
         # Check cluster filter: how many coins spiked in the last 60s?
         concurrent_spikes = sum(
@@ -196,9 +203,14 @@ class RollingVolumeTracker:
             self._last_signal_ts[symbol] = timestamp
             # Cap ratio display at 999 for readability
             ratio_str = f"{min(ratio, 999):.1f}"
-            print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
-                  f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
-                  f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
+            if fast_path:
+                print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
+                      f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
+                      f"— FAST PATH ENTRY (>={self.FAST_PATH_RATIO}x)")
+            else:
+                print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
+                      f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
+                      f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
             return signal
 
         return None

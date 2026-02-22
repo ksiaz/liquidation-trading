@@ -64,7 +64,12 @@ class RollingVolumeTracker:
     MIN_HISTORY = 50           # Min data points before z-score meaningful (~8 min at 10s sampling)
     SPIKE_COOLDOWN = 900       # 15m between spikes per coin
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
-    MIN_SPIKE_VOLUME = 10_000  # Min $10K window volume to trigger (z-jump gate handles gradual accumulation)
+
+    # Adaptive per-coin volume gate: max($1000, mean_volume * 3)
+    # Replaces fixed $10K threshold that blocked 9/20 coins on HL's thinner books.
+    # Z-score + z_jump gates handle signal quality; this gate prevents pure noise.
+    MIN_VOLUME_FLOOR = 1000    # Absolute minimum — below this, not enough momentum to fade
+    VOLUME_SPIKE_MULTIPLIER = 3  # Spike must be 3x the coin's mean 30m window volume
 
     MIN_Z_JUMP = 1.0           # Min z-score increase in one sample interval to trigger (prevents gradual accumulation)
 
@@ -173,8 +178,9 @@ class RollingVolumeTracker:
         if just_sampled:
             self._sampled_z[symbol] = z
 
+        min_vol = self._get_min_spike_volume(symbol)
         if (z >= self.Z_THRESHOLD
-                and window_vol >= self.MIN_SPIKE_VOLUME
+                and window_vol >= min_vol
                 and z_jump >= self.MIN_Z_JUMP):
             # Spike detected: z above threshold with a sudden jump and real volume.
             # MIN_Z_JUMP prevents gradual accumulation from triggering — only
@@ -190,17 +196,29 @@ class RollingVolumeTracker:
                 return None
 
             # Build and emit signal immediately — every second of delay costs edge.
-            # (Original design waited 30s for "confirmation" but spikes are front-loaded:
-            #  the best fade price is at the moment of the liq burst, not 30s later.)
             signal = self._build_signal(symbol, timestamp, z, window_vol)
             if signal is not None:
                 self._pending[symbol] = _PendingSpike(signal=signal)
                 self._last_signal_ts[symbol] = timestamp
                 print(f"[ROLL FADE] {symbol}: spike z={z:.2f} jump={z_jump:.2f} "
-                      f"vol=${window_vol:,.0f} — ENTRY SIGNAL")
+                      f"vol=${window_vol:,.0f} min=${min_vol:,.0f} — ENTRY SIGNAL")
                 return signal
 
         return None
+
+    def _get_min_spike_volume(self, symbol: str) -> float:
+        """Adaptive per-coin minimum spike volume.
+
+        Returns max(MIN_VOLUME_FLOOR, mean_volume * VOLUME_SPIKE_MULTIPLIER).
+        Coins with near-zero baseline get the $500 floor.
+        High-volume coins (BTC, ETH) naturally get higher thresholds.
+        """
+        history_deque = self._volume_history.get(symbol)
+        if not history_deque or len(history_deque) < self.MIN_HISTORY:
+            return self.MIN_VOLUME_FLOOR
+        history = list(history_deque)
+        mean = sum(history) / len(history)
+        return max(self.MIN_VOLUME_FLOOR, mean * self.VOLUME_SPIKE_MULTIPLIER)
 
     def _get_window_volume(self, symbol: str, timestamp: float) -> float:
         """Get total USD volume in the rolling window. Thread-safe via list() snapshot."""

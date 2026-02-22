@@ -228,6 +228,10 @@ ROLLING_FADE_TRAIL_CONFIG = {
     "sl_pct": 0.005,           # 0.50% = 50 bps
 }
 
+# Cascade fuel gate: block ROLLING_FADE when too many positions remain at risk
+ROLLING_FADE_FUEL_MIN_POSITIONS = 15   # Min positions at risk to block
+ROLLING_FADE_FUEL_MIN_VALUE = 500_000  # Min notional at risk ($) to block
+
 
 @dataclass(frozen=True)
 class CascadeSniperConfig:
@@ -1997,6 +2001,20 @@ def generate_cascade_sniper_proposal(
                           f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
                     return None
 
+            # Cascade fuel gate: block when many positions remain at risk on cascade side
+            if proximity is not None:
+                if entry_direction == "LONG":
+                    fuel_count = proximity.long_positions_count
+                    fuel_value = proximity.long_positions_value
+                else:
+                    fuel_count = proximity.short_positions_count
+                    fuel_value = proximity.short_positions_value
+
+                if fuel_count >= ROLLING_FADE_FUEL_MIN_POSITIONS and fuel_value >= ROLLING_FADE_FUEL_MIN_VALUE:
+                    print(f"[ROLL FADE] {symbol}: blocked — cascade fuel remaining "
+                          f"({fuel_count} positions, ${fuel_value:,.0f} at risk)")
+                    return None
+
             # Entry quality: score for logging but do NOT block.
             # ROLLING_FADE's own signal quality (z-score, volume, confirmation delay)
             # provides sufficient filtering. The EQ filter conflicts with ROLLING_FADE's
@@ -2008,6 +2026,13 @@ def generate_cascade_sniper_proposal(
             eq_str = f"|EQ:{eq_score.quality.value}:{eq_score.score:.2f}"
             ret_str = f"|ret1m={ret_1m*100:+.1f}%" if ret_1m is not None else ""
 
+            fuel_str = ""
+            if proximity is not None:
+                if entry_direction == "LONG":
+                    fuel_str = f"|fuel:{proximity.long_positions_count}pos/${proximity.long_positions_value:,.0f}"
+                else:
+                    fuel_str = f"|fuel:{proximity.short_positions_count}pos/${proximity.short_positions_value:,.0f}"
+
             return StrategyProposal(
                 strategy_id="EP2-CASCADE-SNIPER-V1",
                 action_type="ENTRY",
@@ -2016,7 +2041,7 @@ def generate_cascade_sniper_proposal(
                 justification_ref=(
                     f"ROLL_FADE|ratio={rolling_fade_signal.z_score:.1f}x"
                     f"|${rolling_fade_signal.spike_volume:.0f}"
-                    f"|{rolling_fade_signal.liq_count}liqs{ret_str}{eq_str}"
+                    f"|{rolling_fade_signal.liq_count}liqs{ret_str}{eq_str}{fuel_str}"
                 ),
                 timestamp=context.timestamp
             )

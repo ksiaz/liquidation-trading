@@ -37,7 +37,7 @@ class RollingFadeSignal:
     long_liq_volume: float     # Long liq volume in burst window
     liq_count: int             # Number of liquidation events in burst window
     spike_ts: float            # When burst detected
-    confirmation_ts: float     # Same as spike_ts (immediate entry)
+    confirmation_ts: float     # When exhaustion confirmed (cascade rate declining)
     fade_direction: str        # "LONG" or "SHORT"
 
 
@@ -103,11 +103,15 @@ class RollingVolumeTracker:
     ) -> Optional[RollingFadeSignal]:
         """Check for a burst-rate signal for a symbol.
 
-        Called from asyncio event loop. Returns signal immediately when
-        burst rate exceeds threshold.
+        Called from asyncio event loop. Returns signal when burst rate
+        exceeds threshold AND the cascade is declining (exhaustion gate).
+
+        The exhaustion gate splits the 30s burst window into two halves.
+        Signal only emits when the recent half has fewer events than the
+        older half, meaning the cascade has peaked and is subsiding.
 
         Returns:
-            RollingFadeSignal if burst detected, None otherwise.
+            RollingFadeSignal if burst detected and declining, None otherwise.
         """
         # Check pending signal — enforce cooldown then clean up
         pending = self._pending.get(symbol)
@@ -161,6 +165,22 @@ class RollingVolumeTracker:
         if ratio < self.RATIO_THRESHOLD:
             return None
 
+        # ── Cascade exhaustion gate ──
+        # Split burst window into halves. Only emit when rate is DECLINING
+        # (second half has fewer events than first half = cascade peaked).
+        half_cutoff = timestamp - self.BURST_WINDOW / 2
+        first_half = 0
+        second_half = 0
+        for e in events:
+            if e.timestamp >= burst_cutoff:
+                if e.timestamp < half_cutoff:
+                    first_half += 1
+                else:
+                    second_half += 1
+
+        if second_half >= first_half:
+            return None  # Cascade still active or accelerating
+
         # Check cluster filter: how many coins spiked in the last 60s?
         concurrent_spikes = sum(
             1 for p in self._pending.values()
@@ -177,7 +197,8 @@ class RollingVolumeTracker:
             # Cap ratio display at 999 for readability
             ratio_str = f"{min(ratio, 999):.1f}"
             print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
-                  f"ratio={ratio_str}x base={baseline_rate:.2f}/min — ENTRY SIGNAL")
+                  f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
+                  f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
             return signal
 
         return None

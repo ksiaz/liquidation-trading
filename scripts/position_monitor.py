@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -202,10 +203,91 @@ def start_price_stream():
     t.start()
 
 
+# ==============================================================================
+# WebSocket Mid Price Streamer (background thread)
+# ==============================================================================
+
+_ws_prices: Dict[str, float] = {}
+_ws_lock = threading.Lock()
+_ws_status: str = "INIT"  # INIT | CONNECTING | STREAMING | ERROR:<reason>
+
+WS_URL = "wss://api.hyperliquid.xyz/ws"
+WS_RECONNECT_DELAY = 5.0
+
+
+def _ws_price_stream():
+    """Background thread: subscribe to allMids for real-time mid prices."""
+    global _ws_status
+
+    try:
+        import websocket
+    except ImportError:
+        _ws_status = "ERROR:no_websocket_lib"
+        _log_grpc("websocket-client not installed, WS prices unavailable")
+        return
+
+    while True:
+        try:
+            _ws_status = "CONNECTING"
+            ws = websocket.create_connection(WS_URL, timeout=10)
+            # Subscribe to allMids
+            ws.send(json.dumps({
+                "method": "subscribe",
+                "subscription": {"type": "allMids"}
+            }))
+            _ws_status = "STREAMING"
+            _log_grpc("WS allMids connected")
+
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    break
+                try:
+                    data = json.loads(raw)
+                    if data.get('channel') == 'allMids':
+                        mids = data.get('data', {}).get('mids', {})
+                        with _ws_lock:
+                            for coin, price_str in mids.items():
+                                try:
+                                    _ws_prices[f"{coin}USDT"] = float(price_str)
+                                except (ValueError, TypeError):
+                                    pass
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            _ws_status = "ERROR:stream_ended"
+            ws.close()
+
+        except Exception as e:
+            _ws_status = f"ERROR:{type(e).__name__}"
+            now = time.time()
+            # Rate-limit error logging (reuse grpc pattern)
+            _log_grpc(f"WS error: {e}")
+
+        with _ws_lock:
+            _ws_prices.clear()
+        time.sleep(WS_RECONNECT_DELAY)
+
+
+def start_ws_price_stream():
+    """Start the background WebSocket mid price stream."""
+    t = threading.Thread(target=_ws_price_stream, daemon=True, name="ws-prices")
+    t.start()
+
+
 def get_live_prices(symbols: List[str]) -> Dict[str, float]:
-    """Get latest prices from gRPC stream."""
+    """Get latest prices — prefer WS mid prices, fall back to gRPC oracle."""
+    result = {}
     with _grpc_lock:
-        return {s: _grpc_prices[s] for s in symbols if s in _grpc_prices}
+        for s in symbols:
+            if s in _grpc_prices:
+                result[s] = _grpc_prices[s]
+    # Override with WS mid prices (more accurate, lower latency)
+    with _ws_lock:
+        for s in symbols:
+            if s in _ws_prices:
+                result[s] = _ws_prices[s]
+    return result
 
 
 def get_open_positions() -> List[dict]:
@@ -527,22 +609,28 @@ def print_header(balance: float = 1000.0):
     padding = WIDTH - len(title) - len(now) - 4
     print(f"{BOX_V}  {Colors.BOLD}{title}{Colors.RESET}{' ' * padding}{Colors.DIM}{now}{Colors.RESET}  {BOX_V}")
 
-    # Balance + gRPC status line
+    # Balance + price source status line
     bal_color = Colors.GREEN if balance >= 1000 else Colors.RED
-    n_prices = len(_grpc_prices)
-    status = _grpc_status
-    if status == "STREAMING":
-        grpc_disp = f"{Colors.GREEN}gRPC OK{Colors.RESET}"
-        grpc_plain = "gRPC OK"
-    elif status.startswith("ERROR"):
-        reason = status.split(":", 1)[1] if ":" in status else "unknown"
-        grpc_disp = f"{Colors.RED}ERROR:{reason}{Colors.RESET}"
-        grpc_plain = f"ERROR:{reason}"
+    n_ws = len(_ws_prices)
+    n_grpc = len(_grpc_prices)
+    ws_st = _ws_status
+    grpc_st = _grpc_status
+    if ws_st == "STREAMING" and n_ws > 0:
+        price_disp = f"{Colors.GREEN}WS mid{Colors.RESET}"
+        price_plain = "WS mid"
+    elif grpc_st == "STREAMING":
+        price_disp = f"{Colors.YELLOW}gRPC oracle{Colors.RESET}"
+        price_plain = "gRPC oracle"
+    elif grpc_st.startswith("ERROR"):
+        reason = grpc_st.split(":", 1)[1] if ":" in grpc_st else "unknown"
+        price_disp = f"{Colors.RED}ERROR:{reason}{Colors.RESET}"
+        price_plain = f"ERROR:{reason}"
     else:
-        grpc_disp = f"{Colors.YELLOW}{status}{Colors.RESET}"
-        grpc_plain = status
-    bal_line = f"  Account: {bal_color}{bal_str}{Colors.RESET}  |  {grpc_disp} ({n_prices} prices)"
-    bal_visible = len(f"  Account: {bal_str}  |  {grpc_plain} ({n_prices} prices)")
+        price_disp = f"{Colors.YELLOW}{grpc_st}{Colors.RESET}"
+        price_plain = grpc_st
+    n_total = max(n_ws, n_grpc)
+    bal_line = f"  Account: {bal_color}{bal_str}{Colors.RESET}  |  {price_disp} ({n_total} prices)"
+    bal_visible = len(f"  Account: {bal_str}  |  {price_plain} ({n_total} prices)")
     bal_padding = WIDTH - bal_visible - 2
     print(f"{BOX_V}{bal_line}{' ' * max(0, bal_padding)}{BOX_V}")
 
@@ -722,6 +810,7 @@ def main():
 
     print(f"{Colors.CYAN}Starting position monitor (Ctrl+C to exit)...{Colors.RESET}")
     start_price_stream()
+    start_ws_price_stream()
     # Wait until gRPC stream has prices (up to 5s)
     for _ in range(50):
         if _grpc_status == "STREAMING":

@@ -1102,9 +1102,9 @@ class CollectorService:
                     self._mark_prices[symbol] = Decimal(str(price))
                     self._current_prices[symbol] = price
 
-                    # Update trailing stops with oracle price every cycle
-                    # (HL fills are sparse — oracle price ensures stops trail on moves)
-                    self._update_trailing_stops(symbol, price)
+                    # NOTE: trailing stop update moved to after regime metrics computed
+                    # (context-aware trailing needs liq_z, cascade_state, vwap_distance)
+                    # Fill handler (line ~953) still provides price-only updates for stop-hit detection
 
                     # Log when HL oracle price is used (activation proof)
                     # Log first 5 cycles then every 50th to reduce noise
@@ -1236,13 +1236,31 @@ class CollectorService:
                     self._regime_states[symbol] = regime_state
                     self._regime_metrics[symbol] = regime_metrics
 
+                    # Context-aware trailing stop update (after all metrics computed)
+                    _cascade_st = None
+                    try:
+                        from external_policy.ep2_strategy_cascade_sniper import get_cascade_state
+                        _cs = get_cascade_state(symbol)
+                        _cascade_st = _cs.value if _cs else None
+                    except Exception:
+                        pass
+
+                    self._update_trailing_stops(
+                        symbol, price,
+                        liq_z=liquidation_zscore,
+                        cascade_state=_cascade_st,
+                        vwap_distance=vwap_distance,
+                        fill_count=orderflow_fill_count,
+                        atr_30m=atr_30m,
+                    )
+
                 except Exception as e:
                     # Don't fail cycle if regime classification fails
                     self._logger.warning(f"Regime classification error for {symbol}: {e}")
                     continue
 
             # Data freshness gate — block new entries when node/adapter stale
-            # Trailing stops already updated in regime loop above (~line 951)
+            # Trailing stops updated in regime loop above (with context) + fill handler (price-only)
             _data_breaker_open = False
             if self._data_breaker:
                 self._data_breaker.evaluate(self._node_bridge)
@@ -1670,7 +1688,8 @@ class CollectorService:
                                 direction=side,
                                 entry_price=entry_px,
                                 initial_stop_price=initial_stop,
-                                config=stop_config
+                                config=stop_config,
+                                entry_timestamp=time.time()
                             )
                             existing_stop_symbols.add(result.symbol)
                             print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
@@ -2693,10 +2712,15 @@ class CollectorService:
 
         return config, initial_stop
 
-    def _update_trailing_stops(self, symbol: str, price: float):
+    def _update_trailing_stops(self, symbol: str, price: float,
+                               liq_z=None, cascade_state=None,
+                               vwap_distance=None, fill_count=None,
+                               atr_30m=None):
         """Update trailing stops for symbol and check for triggers.
 
         Called on each price update. If a trailing stop is hit, closes the ghost position.
+        Context kwargs (liq_z, cascade_state, etc.) are passed from the regime loop;
+        fill handler calls pass only price (context defaults to None = no change).
         """
         try:
             # Get 5m ATR for this symbol (used by ATR_PROGRESSIVE mode)
@@ -2715,9 +2739,12 @@ class CollectorService:
                     else orderflow_calc.get_imbalance_30s()
                 )
 
-            # Update trailing stop manager with new price, ATR, and orderflow
+            # Update trailing stop manager with new price, ATR, orderflow, and context
             self._trailing_stop_manager.update_price(
-                symbol, price, atr=atr_value, orderflow_imbalance=orderflow
+                symbol, price, atr=atr_value, orderflow_imbalance=orderflow,
+                liq_z=liq_z, cascade_state=cascade_state,
+                vwap_distance=vwap_distance, fill_count=fill_count,
+                atr_30m=atr_30m
             )
 
             # Check if any stops are triggered (price crossed stop level)

@@ -104,6 +104,16 @@ class TrailingStopState:
     pending_stop_price: Optional[float] = None  # Price awaiting exchange ACK
     pending_update_ns: Optional[int] = None  # When pending update was requested
 
+    # Context-aware trailing (X4-A CONTEXT) — transient, repopulated from live data
+    entry_timestamp: float = 0.0              # time.time() at registration
+    last_liq_z: Optional[float] = None        # latest liq_z
+    last_cascade_state: Optional[str] = None  # CascadeState.value string
+    last_vwap_distance: Optional[float] = None
+    last_fill_count: Optional[int] = None
+    last_atr_30m: Optional[float] = None
+    cascade_quiet_since: Optional[float] = None  # when liq_z first dropped < 1.0
+    peak_liq_z: float = 0.0                   # highest liq_z seen during trade
+
     # Config
     config: TrailingStopConfig = field(default_factory=TrailingStopConfig)
 
@@ -124,6 +134,15 @@ class TrailingStopManager:
     Thread-safe.
     """
 
+    # Context-aware trailing stop constants
+    _CASCADE_ACTIVE_STATES = {"TRIGGERED", "ABSORBING"}
+    _LIQ_Z_ACTIVE = 1.0
+    _VWAP_CLOSE_PCT = 0.003
+    _THIN_BOOK_FILLS = 8
+    _CASCADE_QUIET_GRACE_SEC = 120
+    _PHASE2_WINDOW_SEC = 300
+    _BE_FORCE_SEC = 7200  # Force break-even after 2h regardless
+
     def __init__(
         self,
         logger: logging.Logger = None,
@@ -132,6 +151,7 @@ class TrailingStopManager:
         self._logger = logger or logging.getLogger(__name__)
         self._stops: Dict[str, TrailingStopState] = {}  # entry_order_id -> state
         self._lock = RLock()
+        self._context_log_times: Dict[str, float] = {}  # symbol -> last log time
 
         # P2: Persistence layer
         self._repository = repository
@@ -192,6 +212,7 @@ class TrailingStopManager:
                     break_even_triggered=p.break_even_triggered,
                     updates_count=p.updates_count,
                     current_atr=p.current_atr,
+                    entry_timestamp=p.created_at,  # Approximate from persistence
                     config=config
                 )
                 self._stops[entry_id] = state
@@ -268,7 +289,8 @@ class TrailingStopManager:
         direction: str,
         entry_price: float,
         initial_stop_price: float,
-        config: TrailingStopConfig = None
+        config: TrailingStopConfig = None,
+        entry_timestamp: float = None
     ):
         """Register a new trailing stop for a position.
 
@@ -279,6 +301,7 @@ class TrailingStopManager:
             entry_price: Entry fill price
             initial_stop_price: Initial stop loss price
             config: Trailing stop configuration
+            entry_timestamp: Time of entry (defaults to now)
         """
         config = config or TrailingStopConfig()
 
@@ -292,6 +315,7 @@ class TrailingStopManager:
             highest_price=entry_price,  # Always start at entry for MFE tracking
             lowest_price=entry_price,   # Always start at entry for MFE tracking
             last_update_ns=self._now_ns(),
+            entry_timestamp=entry_timestamp or time.time(),
             config=config
         )
 
@@ -323,7 +347,12 @@ class TrailingStopManager:
         )
 
     def update_price(self, symbol: str, price: float, atr: Optional[float] = None,
-                     orderflow_imbalance: Optional[float] = None):
+                     orderflow_imbalance: Optional[float] = None,
+                     liq_z: Optional[float] = None,
+                     cascade_state: Optional[str] = None,
+                     vwap_distance: Optional[float] = None,
+                     fill_count: Optional[int] = None,
+                     atr_30m: Optional[float] = None):
         """Update price and potentially trail stops.
 
         Args:
@@ -331,6 +360,11 @@ class TrailingStopManager:
             price: Current market price
             atr: Current ATR value (for ATR_MULTIPLE mode)
             orderflow_imbalance: Buy/sell imbalance (0-1, <0.5 = selling pressure)
+            liq_z: Current liquidation z-score
+            cascade_state: Current CascadeState value string
+            vwap_distance: VWAP distance ratio
+            fill_count: Orderflow fill count
+            atr_30m: 30-minute ATR value
         """
         with self._lock:
             for entry_id, state in list(self._stops.items()):
@@ -345,11 +379,57 @@ class TrailingStopManager:
                 if orderflow_imbalance is not None:
                     state.last_orderflow = orderflow_imbalance
 
+                # Update context fields if provided
+                if liq_z is not None:
+                    state.last_liq_z = liq_z
+                    state.peak_liq_z = max(state.peak_liq_z, liq_z)
+                    # Track cascade quiet transition
+                    if liq_z < self._LIQ_Z_ACTIVE:
+                        if state.cascade_quiet_since is None:
+                            state.cascade_quiet_since = time.time()
+                    else:
+                        state.cascade_quiet_since = None
+                if cascade_state is not None:
+                    state.last_cascade_state = cascade_state
+                if vwap_distance is not None:
+                    state.last_vwap_distance = vwap_distance
+                if fill_count is not None:
+                    state.last_fill_count = fill_count
+                if atr_30m is not None:
+                    state.last_atr_30m = atr_30m
+
                 # Update high/low watermark
                 if state.direction == "LONG":
                     state.highest_price = max(state.highest_price, price)
                 else:
                     state.lowest_price = min(state.lowest_price, price)
+
+                # Context logging (throttled 30s/symbol)
+                if (state.config.mode == TrailingMode.ATR_PROGRESSIVE and
+                        state.last_liq_z is not None):
+                    _now = time.time()
+                    _last_log = self._context_log_times.get(symbol, 0)
+                    _cascade_active = (
+                        (state.last_liq_z is not None and state.last_liq_z >= self._LIQ_Z_ACTIVE) or
+                        (state.last_cascade_state in self._CASCADE_ACTIVE_STATES)
+                    )
+                    _hold = _now - state.entry_timestamp if state.entry_timestamp > 0 else 0
+                    _be_suppressed = (
+                        _cascade_active and
+                        _hold < self._PHASE2_WINDOW_SEC and
+                        not state.break_even_triggered
+                    )
+                    if (_now - _last_log >= 30) and (_cascade_active or _be_suppressed or
+                            (state.last_vwap_distance is not None and abs(state.last_vwap_distance) < self._VWAP_CLOSE_PCT)):
+                        self._context_log_times[symbol] = _now
+                        _vwap_str = f"{state.last_vwap_distance:.4f}" if state.last_vwap_distance is not None else "N/A"
+                        self._logger.info(
+                            f"X4-A CONTEXT: {symbol} liq_z={state.last_liq_z:.2f} "
+                            f"cascade={state.last_cascade_state} "
+                            f"vwap_d={_vwap_str} "
+                            f"fills={state.last_fill_count} hold={_hold:.0f}s "
+                            f"be_suppressed={_be_suppressed}"
+                        )
 
                 # Calculate new stop price
                 new_stop = self._calculate_new_stop(state, price)
@@ -402,22 +482,42 @@ class TrailingStopManager:
         entry = state.entry_price
         current_stop = state.current_stop_price
 
+        # Context: determine if cascade is active (used for BE suppression + stop widening)
+        now = time.time()
+        hold_seconds = now - state.entry_timestamp if state.entry_timestamp > 0 else 0
+        _cascade_active = (
+            (state.last_liq_z is not None and state.last_liq_z >= self._LIQ_Z_ACTIVE) or
+            (state.last_cascade_state in self._CASCADE_ACTIVE_STATES)
+        )
+
         # Check break-even trigger first (applies to all modes)
         if not state.break_even_triggered:
             if state.direction == "LONG":
                 profit_pct = (current_price - entry) / entry
-                if profit_pct >= config.break_even_trigger_pct:
-                    state.break_even_triggered = True
-                    be_stop = entry * (1 + config.break_even_offset_pct)
-                    if be_stop > current_stop:
-                        return be_stop
-            else:  # SHORT
+            else:
                 profit_pct = (entry - current_price) / entry
-                if profit_pct >= config.break_even_trigger_pct:
+
+            if profit_pct >= config.break_even_trigger_pct:
+                # Suppress BE during active cascade in early trade (Phase 1/2 bounce-retrace)
+                be_suppressed = (
+                    _cascade_active and
+                    hold_seconds < self._PHASE2_WINDOW_SEC and
+                    config.mode == TrailingMode.ATR_PROGRESSIVE
+                )
+                # Safety: force BE after 2h regardless
+                if hold_seconds > self._BE_FORCE_SEC and profit_pct > 0:
+                    be_suppressed = False
+
+                if not be_suppressed:
                     state.break_even_triggered = True
-                    be_stop = entry * (1 - config.break_even_offset_pct)
-                    if be_stop < current_stop:
-                        return be_stop
+                    if state.direction == "LONG":
+                        be_stop = entry * (1 + config.break_even_offset_pct)
+                        if be_stop > current_stop:
+                            return be_stop
+                    else:  # SHORT
+                        be_stop = entry * (1 - config.break_even_offset_pct)
+                        if be_stop < current_stop:
+                            return be_stop
 
         # Mode-specific trailing
         if config.mode == TrailingMode.BREAK_EVEN_ONLY:
@@ -516,9 +616,49 @@ class TrailingStopManager:
                     raw_mult = config.atr_prog_phase1_end_mult - (k2 * progress)
                 else:
                     raw_mult = config.atr_prog_end_mult
-            atr_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, raw_mult))
+            base_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, raw_mult))
 
-            # Orderflow-aware tightening: adverse flow reduces multiplier
+            # Context-aware multiplier: widen/tighten based on live market state
+            context_mult = 1.0
+
+            if _cascade_active:
+                # Rule 1: Cascade active → widen stop (give bounce room)
+                context_mult = max(context_mult, 1.3)
+            elif (state.cascade_quiet_since is not None and
+                  hold_seconds < self._PHASE2_WINDOW_SEC):
+                # Rule 2: Cascade just quieted → linear ramp 1.3→1.0 over grace period
+                quiet_elapsed = now - state.cascade_quiet_since
+                if quiet_elapsed < self._CASCADE_QUIET_GRACE_SEC:
+                    ramp = 1.0 + 0.3 * (1.0 - quiet_elapsed / self._CASCADE_QUIET_GRACE_SEC)
+                    context_mult = max(context_mult, ramp)
+
+            # Rule 3: Favorable orderflow → widen slightly
+            if state.last_orderflow is not None:
+                of = state.last_orderflow
+                favorable = (
+                    (state.direction == "LONG" and of > 0.6) or
+                    (state.direction == "SHORT" and of < 0.4)
+                )
+                if favorable:
+                    context_mult = max(context_mult, 1.15)
+
+            # Rule 4: Thin book → widen (few fills = volatile gaps)
+            if (state.last_fill_count is not None and
+                    state.last_fill_count < self._THIN_BOOK_FILLS):
+                context_mult = max(context_mult, 1.2)
+
+            # Rule 5: Approaching VWAP (only when NOT cascade active) → tighten to lock
+            if (not _cascade_active and
+                    state.last_vwap_distance is not None and
+                    abs(state.last_vwap_distance) < self._VWAP_CLOSE_PCT and
+                    mfe_profit_pct > config.break_even_trigger_pct):
+                context_mult = min(context_mult, 0.8)
+
+            atr_mult = base_mult * context_mult
+            # Clamp to [end_mult, start_mult]
+            atr_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, atr_mult))
+
+            # Orderflow-aware tightening: adverse flow reduces multiplier (existing logic)
             if state.last_orderflow is not None:
                 of = state.last_orderflow
                 if state.direction == "LONG" and of < config.orderflow_tighten_threshold:
@@ -535,6 +675,11 @@ class TrailingStopManager:
             min_distance = entry * config.atr_prog_min_pct
             distance = max(atr_distance, min_distance)
 
+            # Profit lock ratio: reduce during active cascade to avoid locking in too early
+            lock_ratio = config.atr_prog_min_lock_ratio
+            if _cascade_active and hold_seconds < self._PHASE2_WINDOW_SEC:
+                lock_ratio = 0.20
+
             # Calculate stop from MFE (highest/lowest), not current price
             if state.direction == "LONG":
                 atr_stop = state.highest_price - distance
@@ -543,7 +688,7 @@ class TrailingStopManager:
                 # Without this, profit_lock at MFE=0 equals entry price, killing the position
                 new_stop = atr_stop
                 if mfe_profit_pct >= config.break_even_trigger_pct:
-                    locked_profit = mfe_profit_abs * config.atr_prog_min_lock_ratio
+                    locked_profit = mfe_profit_abs * lock_ratio
                     profit_lock_stop = entry + locked_profit
                     new_stop = max(atr_stop, profit_lock_stop)
 
@@ -559,7 +704,7 @@ class TrailingStopManager:
                 # Only engage profit-lock after meaningful MFE
                 new_stop = atr_stop
                 if mfe_profit_pct >= config.break_even_trigger_pct:
-                    locked_profit = mfe_profit_abs * config.atr_prog_min_lock_ratio
+                    locked_profit = mfe_profit_abs * lock_ratio
                     profit_lock_stop = entry - locked_profit
                     new_stop = min(atr_stop, profit_lock_stop)
 

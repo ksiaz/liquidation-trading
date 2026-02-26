@@ -257,6 +257,9 @@ class CollectorService:
         # Rolling volume tracker for ROLLING_FADE entry mode
         self._rolling_volume_tracker = RollingVolumeTracker()
 
+        # Per-symbol stop-loss cooldown: block re-entry after stop-out
+        self._stop_exit_timestamps: Dict[str, float] = {}
+
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
 
@@ -1442,6 +1445,20 @@ class CollectorService:
                             f"ROLLING_FADE blocked for {symbol}: regime_metrics unavailable"
                         )
                         rolling_fade_signal = None
+
+                    # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
+                    # after a stop-out. Prevents immediate re-entry into same thesis
+                    # (NEAR double-entry case: stopped in 45s, re-entered, stopped in 44s).
+                    _STOP_LOSS_COOLDOWN_SEC = 300
+                    _last_stop = self._stop_exit_timestamps.get(symbol, 0)
+                    if timestamp - _last_stop < _STOP_LOSS_COOLDOWN_SEC:
+                        if rolling_fade_signal:
+                            _ago = timestamp - _last_stop
+                            print(f"[STOP COOLDOWN] {symbol}: ROLLING_FADE blocked — "
+                                  f"stop-loss {_ago:.0f}s ago (cooldown {_STOP_LOSS_COOLDOWN_SEC}s)")
+                            rolling_fade_signal = None
+                        if liquidation_burst:
+                            liquidation_burst = None
 
                     # ── Market State Snapshot (periodic) ──
                     # Emit per-symbol snapshot with derived values + raw input counters.
@@ -2779,6 +2796,7 @@ class CollectorService:
                         exit_reason = "TRAILING_STOP_BE"
                     else:
                         exit_reason = "TRAILING_STOP_LOSS"
+                        self._stop_exit_timestamps[symbol] = time.time()
 
                     print(f"TRAILING: STOP HIT {symbol} @ ${price:,.2f} (stop was ${state.current_stop_price:,.2f})")
 

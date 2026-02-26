@@ -1987,6 +1987,16 @@ def generate_cascade_sniper_proposal(
             if coin in EXHAUSTION_FADE_EXCLUDED_COINS:
                 return None
 
+            # Gate: Minimum burst volume (reuse EXHAUSTION_FADE thresholds)
+            # Lost in f82673d rewrite — restored. Prevents dust signals ($135 WLD case).
+            min_burst = EXHAUSTION_FADE_MIN_BURST_BY_COIN.get(
+                coin, _config.exhaustion_fade_default_min_burst_value
+            )
+            if rolling_fade_signal.spike_volume < min_burst:
+                print(f"[ROLL FADE] {symbol}: blocked — burst volume "
+                      f"${rolling_fade_signal.spike_volume:.0f} < ${min_burst:.0f}")
+                return None
+
             # Counter-trend gate (same logic as EXHAUSTION_FADE)
             ret_1m = price_returns.get('ret_1m') if price_returns else None
             if ret_1m is not None:

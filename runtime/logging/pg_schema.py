@@ -52,7 +52,7 @@ def ensure_schema(conn):
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS m2_nodes (
-            id SERIAL PRIMARY KEY,
+            id BIGSERIAL PRIMARY KEY,
             cycle_id INTEGER NOT NULL,
             node_id TEXT NOT NULL,
             symbol TEXT NOT NULL,

@@ -320,6 +320,30 @@ class PgBufferedResearchDatabase:
                 conn.rollback()
                 cur = conn.cursor()
 
+            # Clean orphaned child rows (parent cycle already deleted in prior prune)
+            min_cycle_id = None
+            try:
+                cur.execute("SELECT min(id) FROM execution_cycles")
+                row = cur.fetchone()
+                min_cycle_id = row[0] if row and row[0] is not None else None
+            except Exception:
+                conn.rollback()
+                cur = conn.cursor()
+
+            if min_cycle_id is not None:
+                for child in ['m2_nodes', 'primitive_values',
+                              'policy_evaluations', 'mandates',
+                              'arbitration_rounds']:
+                    try:
+                        cur.execute(
+                            f"DELETE FROM {child} WHERE cycle_id < %s",
+                            (min_cycle_id,)
+                        )
+                        total_deleted += cur.rowcount
+                    except Exception:
+                        conn.rollback()
+                        cur = conn.cursor()
+
             # Tables with 'timestamp' column (float seconds)
             for table in [
                 'execution_cycles', 'liquidation_events', 'ohlc_candles',

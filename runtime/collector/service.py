@@ -994,20 +994,25 @@ class CollectorService:
                         # Initialize calculator if needed
                         if l_sym not in self._liquidation_calculators:
                             self._liquidation_calculators[l_sym] = LiquidationZScoreCalculator()
-                        # Liq z-score (USD value)
-                        self._liquidation_calculators[l_sym].update(l_px * l_sz, l_ts)
+                        # Liq z-score (USD value) — use wall clock so get_zscore(time.time())
+                        # window calculations align. Block timestamps lag during node catchup.
+                        self._liquidation_calculators[l_sym].update(l_px * l_sz, time.time())
                         # Burst aggregator
                         order_side = 'SELL' if l_side == 'LONG' else 'BUY'
                         self._liquidation_burst_aggregator.add_event(
-                            timestamp=l_ts, symbol=l_sym, side=order_side,
+                            timestamp=time.time(), symbol=l_sym, side=order_side,
                             price=l_px, quantity=l_sz
                         )
-                        # Rolling volume tracker
-                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, l_ts)
-                        # Cascade liq event
+                        # Rolling volume tracker — use wall clock, not block timestamp.
+                        # check_for_signal() compares against time.time(), so events must
+                        # use the same clock. During node lag, block timestamps are minutes
+                        # old → events fall outside the 30s burst window → zero signals.
+                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, time.time())
+                        # Cascade liq event — use wall clock for same reason as above
+                        _wall_ts = time.time()
                         try:
                             from external_policy.ep2_strategy_cascade_sniper import record_liquidation_event
-                            record_liquidation_event(l_sym, order_side, l_px * l_sz, l_ts)
+                            record_liquidation_event(l_sym, order_side, l_px * l_sz, _wall_ts)
                         except ImportError:
                             pass
                     except Exception as e:

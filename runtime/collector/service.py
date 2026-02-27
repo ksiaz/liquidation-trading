@@ -1295,6 +1295,7 @@ class CollectorService:
             # Collect mandates from all active symbols
             all_mandates = []
             mandate_primitives_map = {}  # Track primitives for each mandate
+            _entered_this_cycle = set()  # Prevent duplicate ENTRY mandates per symbol per cycle
 
             # DIAG: Print cycle summary when DIAG_MANDATE is set
             if os.environ.get('DIAG_MANDATE') and cycle_id and cycle_id % 5 == 0:
@@ -1631,7 +1632,18 @@ class CollectorService:
                         position_strategy_id=position_strategy_id
                     )
                     if mandates:
-                        print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
+                        # Filter out duplicate ENTRY mandates for same symbol in this cycle
+                        filtered = []
+                        for m in mandates:
+                            if m.type == MandateType.ENTRY and symbol in _entered_this_cycle:
+                                print(f"[DEDUP] {symbol}: dropped duplicate ENTRY in same cycle")
+                                continue
+                            if m.type == MandateType.ENTRY:
+                                _entered_this_cycle.add(symbol)
+                            filtered.append(m)
+                        mandates = filtered
+                        if mandates:
+                            print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
                         for m in mandates:
                             print(f"  Type: {m.type.name}, Authority: {m.authority}")
                             # Track primitives for this mandate
@@ -2736,12 +2748,15 @@ class CollectorService:
         else:
             initial_stop = entry_px * (1 + sl_pct)
 
+        be_trigger = cfg.get('break_even_trigger_pct', 1.0)
+        be_offset = cfg.get('break_even_offset_pct', 0.0)
+
         config = TrailingStopConfig(
             mode=TrailingMode.FIXED_DISTANCE,
             trail_distance_pct=trail_pct,
             trail_activation_pct=activation_pct,
-            break_even_trigger_pct=1.0,  # Disabled
-            break_even_offset_pct=0.0,
+            break_even_trigger_pct=be_trigger,
+            break_even_offset_pct=be_offset,
             min_move_to_update_pct=0.0002,
             min_move_atr_fraction=0.05,
         )

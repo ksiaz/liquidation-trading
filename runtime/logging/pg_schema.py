@@ -1389,5 +1389,16 @@ def ensure_schema(conn):
             f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}({columns})"
         )
 
+    # Unique constraint on ghost_trades.trade_id to prevent ID collisions.
+    # Deduplicate first (keep newest row per trade_id) in case of legacy data.
+    cur.execute("""
+        DELETE FROM ghost_trades
+        WHERE id NOT IN (SELECT MAX(id) FROM ghost_trades GROUP BY trade_id)
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trades_trade_id_unique
+        ON ghost_trades(trade_id)
+    """)
+
     conn.commit()
     print(f"[PG] Schema ensured: {len(_indexes)} indexes", flush=True)

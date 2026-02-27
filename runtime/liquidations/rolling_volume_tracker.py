@@ -201,6 +201,8 @@ class RollingVolumeTracker:
         # ── Cascade exhaustion gate ──
         # Split burst window into halves. Only emit when rate is DECLINING
         # (second half has fewer events than first half = cascade peaked).
+        # Require first_half >= 3 to avoid triggering on tiny bursts (e.g. 2→1).
+        # Require second_half > first_half * 0.5 (meaningful decline, not just 1 fewer).
         half_cutoff = timestamp - self.BURST_WINDOW / 2
         first_half = 0
         second_half = 0
@@ -211,8 +213,11 @@ class RollingVolumeTracker:
                 else:
                     second_half += 1
 
-        if second_half >= first_half:
-            return None  # Cascade still active or accelerating
+        if first_half < 3:
+            return None  # Too few events in first half — not a real burst
+
+        if second_half > first_half * 0.5:
+            return None  # Cascade still active (need >50% decline to confirm exhaustion)
 
         # Check cluster filter: how many coins spiked in the last 60s?
         concurrent_spikes = sum(

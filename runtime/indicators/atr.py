@@ -66,6 +66,13 @@ class ATRCalculator:
             # First sample - use high-low only
             tr = high - low
 
+        # Clamp TR to prevent corruption from bad ticks or data gaps.
+        # Max TR = max(5% of price, 3× current ATR). Prices near zero use 5% floor.
+        mid_price = (high + low) / 2 if (high + low) > 0 else close
+        if mid_price > 0:
+            tr_cap = max(mid_price * 0.05, (self._atr * 3) if self._atr else mid_price * 0.05)
+            tr = min(tr, tr_cap)
+
         # Update ATR using EMA
         if self._atr is None:
             # Initialize ATR with first TR
@@ -73,6 +80,10 @@ class ATRCalculator:
         else:
             # EMA update: ATR = α × TR + (1 - α) × ATR_prev
             self._atr = self.alpha * tr + (1 - self.alpha) * self._atr
+
+        # Clamp ATR at 10% of price — no asset moves 10% in a single candle normally
+        if mid_price > 0 and self._atr > mid_price * 0.10:
+            self._atr = mid_price * 0.10
 
         self._prev_close = close
         self._sample_count += 1

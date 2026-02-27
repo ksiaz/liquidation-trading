@@ -416,7 +416,8 @@ class PolicyAdapter:
                 trade_burst=primitives.get("trade_burst"),
                 liquidation_density=primitives.get("liquidation_density"),
                 liquidation_zscore=cascade_liq_z,  # Aggregate liq signal for override
-                rolling_fade_signal=rolling_fade_signal  # Rolling 30m liq spike signal
+                rolling_fade_signal=rolling_fade_signal,  # Rolling 30m liq spike signal
+                orderflow_imbalance=regime_metrics.orderflow_imbalance if regime_metrics is not None else None
             )
             if _DIAG_ENABLED:
                 if proposal:

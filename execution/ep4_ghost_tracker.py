@@ -310,7 +310,9 @@ class GhostPositionTracker:
             except Exception:
                 pass
 
-        return max_id + 1 if max_id > 0 else 1
+        # +101 safety margin: prevents ID collisions from concurrent flushes,
+        # out-of-order BRD writes, or race conditions during startup recovery
+        return max_id + 101 if max_id > 0 else 1
 
     def _normalize_to_base_symbol(self, symbol: str) -> str:
         """Normalize symbol to base format (BTCUSDT -> BTC).

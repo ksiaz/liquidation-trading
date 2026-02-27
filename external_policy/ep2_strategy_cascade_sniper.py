@@ -226,9 +226,11 @@ EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps":
 # Used during 75-100% WR era (Feb 17-21). Entry quality is what drives WR —
 # stop width is secondary. Keep tight stops to cap losses when entries are wrong.
 ROLLING_FADE_TRAIL_CONFIG = {
-    "activation_pct": 0.005,   # 0.50% = 50 bps
-    "trail_pct": 0.002,        # 0.20% = 20 bps
+    "activation_pct": 0.002,   # 0.20% = 20 bps (trail engages early)
+    "trail_pct": 0.0015,       # 0.15% = 15 bps (tighter trail)
     "sl_pct": 0.005,           # 0.50% = 50 bps
+    "break_even_trigger_pct": 0.003,  # 0.30% = 30 bps MFE triggers BE
+    "break_even_offset_pct": 0.0005,  # 0.05% = 5 bps above entry
 }
 
 # Cascade fuel gate: block ROLLING_FADE when too many positions remain at risk
@@ -1606,7 +1608,8 @@ def generate_cascade_sniper_proposal(
     trade_burst=None,  # TradeBurst | None (B4 - cascade trading intensity)
     liquidation_density=None,  # LiquidationDensity | None (B3 - cluster quality)
     liquidation_zscore: Optional[float] = None,  # Z-score of liquidation rate (from regime metrics)
-    rolling_fade_signal: Optional[RollingFadeSignal] = None  # Rolling 30m liq spike signal
+    rolling_fade_signal: Optional[RollingFadeSignal] = None,  # Rolling 30m liq spike signal
+    orderflow_imbalance: Optional[float] = None  # Taker buy ratio 0-1 (from regime_metrics)
 ) -> Optional[StrategyProposal]:
     """
     Generate cascade sniper entry proposal WITH TREND KILL-SWITCH.
@@ -2006,18 +2009,27 @@ def generate_cascade_sniper_proposal(
                       f"${rolling_fade_signal.spike_volume:.0f} < ${min_burst:.0f}")
                 return None
 
-            # Counter-trend gate (same logic as EXHAUSTION_FADE)
-            ret_1m = price_returns.get('ret_1m') if price_returns else None
-            if ret_1m is not None:
-                # fade LONG (buy): want ret_1m > 0 (price was rising, then longs liquidated = counter-trend)
-                # fade SHORT (sell): want ret_1m < 0 (price was falling, then shorts liquidated = counter-trend)
-                if entry_direction == "LONG" and ret_1m <= 0 and abs(ret_1m) >= 0.0005:
+            # Counter-trend gate: full Gate B (ret_1m + ret_3m + strict block on no data)
+            trend_ok, trend_reason = _check_trend_gate(
+                symbol, entry_direction, price_returns,
+                absorption_ratio=None,  # No absorption for ROLLING_FADE
+                cascade_value=rolling_fade_signal.spike_volume
+            )
+            if not trend_ok:
+                print(f"[ROLL FADE] {symbol}: {entry_direction} blocked — "
+                      f"trend gate: {trend_reason}")
+                return None
+
+            # Orderflow gate: block entry when dominant flow opposes fade direction
+            # LONG blocked if OF < 0.15 (heavy selling), SHORT blocked if OF > 0.85 (heavy buying)
+            if orderflow_imbalance is not None:
+                if entry_direction == "LONG" and orderflow_imbalance < 0.15:
                     print(f"[ROLL FADE] {symbol}: LONG blocked — "
-                          f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
+                          f"orderflow too bearish (OF={orderflow_imbalance:.2f} < 0.15)")
                     return None
-                if entry_direction == "SHORT" and ret_1m >= 0 and abs(ret_1m) >= 0.0005:
+                if entry_direction == "SHORT" and orderflow_imbalance > 0.85:
                     print(f"[ROLL FADE] {symbol}: SHORT blocked — "
-                          f"cascade is trend-following (ret_1m={ret_1m*100:+.2f}%)")
+                          f"orderflow too bullish (OF={orderflow_imbalance:.2f} > 0.85)")
                     return None
 
             # Cascade fuel gate: block when many positions remain at risk on cascade side

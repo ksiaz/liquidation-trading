@@ -207,7 +207,8 @@ EXHAUSTION_FADE_DEFAULT_MIN_LIQ_COUNT = 3  # Alts: fewer liqs are still meaningf
 
 # Coins excluded from exhaustion/rolling fade (backtest: fading doesn't work — cascade continues)
 # XRP: 40% WR, ARB: 0% WR (3 trades all losers), TRX: too few events, ATOM: single trade loser
-EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "SUI", "TRX", "ATOM", "ARB"}
+# OP: 0% WR in cascade (3 trades, all TRAILING_STOP_LOSS)
+EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "SUI", "TRX", "ATOM", "ARB", "OP"}
 
 # Per-coin trailing stop config for exhaustion fade exits.
 # Activation-threshold trailing: price must move activation_bps in your favor,
@@ -221,9 +222,11 @@ EXHAUSTION_FADE_TRAIL_CONFIG = {
 }
 EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps": 30}
 
-# ROLLING_FADE trailing stop config (from backtest: 0.5% activate, 0.20% trail, 0.50% SL)
+# ROLLING_FADE trailing stop config
+# Used during 75-100% WR era (Feb 17-21). Entry quality is what drives WR —
+# stop width is secondary. Keep tight stops to cap losses when entries are wrong.
 ROLLING_FADE_TRAIL_CONFIG = {
-    "activation_pct": 0.005,   # 0.5% = 50 bps
+    "activation_pct": 0.005,   # 0.50% = 50 bps
     "trail_pct": 0.002,        # 0.20% = 20 bps
     "sl_pct": 0.005,           # 0.50% = 50 bps
 }
@@ -1987,8 +1990,14 @@ def generate_cascade_sniper_proposal(
             if coin in EXHAUSTION_FADE_EXCLUDED_COINS:
                 return None
 
+            # Gate: Minimum liquidation count (quality filter — same as EXHAUSTION_FADE)
+            min_liqs = EXHAUSTION_FADE_MIN_LIQ_COUNT.get(coin, EXHAUSTION_FADE_DEFAULT_MIN_LIQ_COUNT)
+            if rolling_fade_signal.liq_count < min_liqs:
+                print(f"[ROLL FADE] {symbol}: blocked — liq count "
+                      f"{rolling_fade_signal.liq_count} < {min_liqs}")
+                return None
+
             # Gate: Minimum burst volume (reuse EXHAUSTION_FADE thresholds)
-            # Lost in f82673d rewrite — restored. Prevents dust signals ($135 WLD case).
             min_burst = EXHAUSTION_FADE_MIN_BURST_BY_COIN.get(
                 coin, _config.exhaustion_fade_default_min_burst_value
             )

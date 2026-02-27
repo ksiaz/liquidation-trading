@@ -135,6 +135,9 @@ class CollectorService:
         # This enables EXIT signals for positions opened in previous sessions
         self._restore_strategy_state()
 
+        # Rebuild SLBRS kill-switch from trade history (persists across restarts)
+        self._rebuild_slbrs_state()
+
         # Track mark prices for execution (updated from HL oracle in regime loop)
         self._mark_prices: Dict[str, Decimal] = {}
 
@@ -412,6 +415,26 @@ class CollectorService:
 
         except Exception as e:
             self._logger.warning(f"Failed to restore strategy state: {e}")
+
+    def _rebuild_slbrs_state(self):
+        """Rebuild SLBRS kill-switch from ghost_trades history."""
+        try:
+            rows = self._execution_db.read_sql(
+                """
+                SELECT e.symbol, g.pnl
+                FROM ghost_trades g
+                JOIN ghost_trades e ON g.entry_trade_id = e.trade_id AND e.is_entry = 1
+                WHERE g.is_entry = 0 AND e.winning_policy_name = 'EP2-SLBRS-V1'
+                ORDER BY g.id ASC
+                """
+            )
+            if rows:
+                from external_policy.ep2_slbrs_strategy import _slbrs_strategy
+                _slbrs_strategy.rebuild_from_history(rows)
+            else:
+                print("[SLBRS] No historical trades to rebuild kill-switch from")
+        except Exception as e:
+            print(f"[SLBRS] Failed to rebuild kill-switch state: {e}")
 
     def prune_stale_calculators(self, max_age_sec: float = None) -> int:
         """

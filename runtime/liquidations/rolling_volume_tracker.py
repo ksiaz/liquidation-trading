@@ -67,8 +67,18 @@ class RollingVolumeTracker:
     RATIO_THRESHOLD = 10.0     # Burst rate must be 10x baseline rate
     MIN_BURST_EVENTS = 5       # Minimum events in burst window to trigger
     SPIKE_COOLDOWN = 900       # 15m between signals per coin
-    FAST_PATH_RATIO = 20.0     # Skip exhaustion gate when ratio >= 20x (massive spike)
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
+
+    # Warmup: need enough baseline data for rate comparison to be meaningful.
+    # Without this, 5 events vs near-zero baseline → infinite ratio → triggers.
+    # Old z-score system had MIN_HISTORY=50 (~8 min). 30 events at 1/min = ~30 min.
+    MIN_BASELINE_EVENTS = 30
+
+    # Burst concentration: events must be clustered, not spread evenly over 30s.
+    # Old system had MIN_Z_JUMP=1.0 which required sudden z-score jump.
+    # New equivalent: >=60% of burst events must fall within any 10s sub-window.
+    CONCENTRATION_WINDOW = 10  # Sub-window size for concentration check
+    CONCENTRATION_RATIO = 0.6  # Fraction of events that must be in densest sub-window
 
     def __init__(self):
         # Per-coin event deques (baseline window retention)
@@ -150,6 +160,12 @@ class RollingVolumeTracker:
         if burst_count < self.MIN_BURST_EVENTS:
             return None
 
+        # Warmup: need enough baseline history for rate comparison to be meaningful.
+        # Without this, 5 events in 30s vs 2 events in 60min → huge ratio from noise.
+        baseline_only = baseline_count - burst_count  # Events outside burst window
+        if baseline_only < self.MIN_BASELINE_EVENTS:
+            return None
+
         # Compute rates (events per minute)
         baseline_minutes = self.BASELINE_WINDOW / 60.0
         burst_minutes = self.BURST_WINDOW / 60.0
@@ -166,27 +182,37 @@ class RollingVolumeTracker:
         if ratio < self.RATIO_THRESHOLD:
             return None
 
-        # ── High-z fast path ──
-        # Massive spikes (>= 20x baseline) exhaust faster — skip exhaustion gate.
-        # 18-day backtest: +59.8% WR, +5.38 bps avg vs baseline +57.6% WR, +2.87 bps.
-        fast_path = ratio >= self.FAST_PATH_RATIO
+        # ── Burst concentration gate ──
+        # Events must be clustered (true burst), not spread evenly over 30s.
+        # Find the densest CONCENTRATION_WINDOW sub-window within the burst.
+        # Require CONCENTRATION_RATIO of events in that sub-window.
+        # This replaces the old MIN_Z_JUMP=1.0 which detected sudden spikes.
+        burst_events_ts = [e.timestamp for e in events if e.timestamp >= burst_cutoff]
+        min_concentrated = max(3, int(burst_count * self.CONCENTRATION_RATIO + 0.5))
+        best_in_subwindow = 0
+        for i, t in enumerate(burst_events_ts):
+            sub_end = t + self.CONCENTRATION_WINDOW
+            count_in_sub = sum(1 for t2 in burst_events_ts[i:] if t2 <= sub_end)
+            if count_in_sub > best_in_subwindow:
+                best_in_subwindow = count_in_sub
+        if best_in_subwindow < min_concentrated:
+            return None  # Events spread too evenly — not a real burst
 
         # ── Cascade exhaustion gate ──
         # Split burst window into halves. Only emit when rate is DECLINING
         # (second half has fewer events than first half = cascade peaked).
+        half_cutoff = timestamp - self.BURST_WINDOW / 2
         first_half = 0
         second_half = 0
-        if not fast_path:
-            half_cutoff = timestamp - self.BURST_WINDOW / 2
-            for e in events:
-                if e.timestamp >= burst_cutoff:
-                    if e.timestamp < half_cutoff:
-                        first_half += 1
-                    else:
-                        second_half += 1
+        for e in events:
+            if e.timestamp >= burst_cutoff:
+                if e.timestamp < half_cutoff:
+                    first_half += 1
+                else:
+                    second_half += 1
 
-            if second_half >= first_half:
-                return None  # Cascade still active or accelerating
+        if second_half >= first_half:
+            return None  # Cascade still active or accelerating
 
         # Check cluster filter: how many coins spiked in the last 60s?
         concurrent_spikes = sum(
@@ -201,16 +227,11 @@ class RollingVolumeTracker:
         if signal is not None:
             self._pending[symbol] = _PendingSpike(signal=signal)
             self._last_signal_ts[symbol] = timestamp
-            # Cap ratio display at 999 for readability
             ratio_str = f"{min(ratio, 999):.1f}"
-            if fast_path:
-                print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
-                      f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
-                      f"— FAST PATH ENTRY (>={self.FAST_PATH_RATIO}x)")
-            else:
-                print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
-                      f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
-                      f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
+            print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
+                  f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
+                  f"concentrated={best_in_subwindow}/{burst_count} "
+                  f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
             return signal
 
         return None
@@ -303,8 +324,8 @@ class RollingVolumeTracker:
         return len(self._events.get(symbol, []))
 
     def is_warmed_up(self, symbol: str) -> bool:
-        """Whether any events have been seen (no warmup blocker)."""
-        return len(self._events.get(symbol, [])) >= 1
+        """Whether enough baseline history exists for meaningful comparisons."""
+        return len(self._events.get(symbol, [])) >= self.MIN_BASELINE_EVENTS
 
     def trim_windows(self, timestamp: float):
         """Trim old events from rolling windows. Call periodically."""

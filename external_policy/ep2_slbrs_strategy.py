@@ -179,6 +179,7 @@ class SLBRSStrategy:
 
     # ── Section 7: Fail-safes ───────────────────────────────────────
     _MAX_CONSECUTIVE_LOSSES = 3      # Hard kill per symbol (raised from 2: with wider thresholds, allow more attempts)
+    _MAX_GLOBAL_CONSECUTIVE_LOSSES = 5  # Hard kill across all symbols
     _MIN_WINRATE = 0.35              # Structural failure threshold
     _WINRATE_SAMPLE_SIZE = 20        # Sample window for winrate check
 
@@ -212,6 +213,7 @@ class SLBRSStrategy:
         self._position_info: Dict[str, dict] = {}   # Set when position first OPEN
         # Trade result tracking (Section 7)
         self._consecutive_losses: Dict[str, int] = {}
+        self._global_consecutive_losses: int = 0
         self._trade_results: deque = deque(maxlen=20)
         # Last SIDEWAYS timestamp per symbol (for regime grace period)
         self._last_sideways_ts: Dict[str, float] = {}
@@ -364,11 +366,43 @@ class SLBRSStrategy:
 
         if is_win:
             self._consecutive_losses[symbol] = 0
+            self._global_consecutive_losses = 0
         else:
             self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
+            self._global_consecutive_losses += 1
 
         self._trade_results.append(is_win)
         self._last_exit_ts[symbol] = timestamp
+
+    def rebuild_from_history(self, exit_rows):
+        """Rebuild kill-switch state from ghost_trades exit rows.
+
+        Called at startup to persist kill-switch across restarts.
+
+        Args:
+            exit_rows: List of (symbol, pnl) tuples, ordered oldest->newest.
+        """
+        self._consecutive_losses.clear()
+        self._global_consecutive_losses = 0
+        self._trade_results.clear()
+
+        for symbol, pnl in exit_rows:
+            is_win = pnl is not None and pnl > 0
+            if is_win:
+                self._consecutive_losses[symbol] = 0
+                self._global_consecutive_losses = 0
+            else:
+                self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
+                self._global_consecutive_losses += 1
+            self._trade_results.append(is_win)
+
+        if exit_rows:
+            total = len(exit_rows)
+            wins = sum(1 for _, p in exit_rows if p and p > 0)
+            per_sym = {s: c for s, c in self._consecutive_losses.items() if c > 0}
+            print(f"[SLBRS] Rebuilt kill-switch from {total} trades: "
+                  f"{wins}W/{total-wins}L, global_consec={self._global_consecutive_losses}, "
+                  f"per_sym={per_sym}")
 
     def _check_entry(
         self,
@@ -542,11 +576,18 @@ class SLBRSStrategy:
                 print(f"[SLBRS-DIAG] {symbol}: cooldown={context.timestamp - last_exit:.0f}s<{self._COOLDOWN_SEC:.0f}s")
             return None
 
-        # Hard kill: consecutive losses (Section 7)
+        # Hard kill: consecutive losses per symbol (Section 7)
         if self._consecutive_losses.get(symbol, 0) >= self._MAX_CONSECUTIVE_LOSSES:
             self._count_reject("consecutive_losses")
             if _diag:
                 print(f"[SLBRS-DIAG] {symbol}: consecutive_losses={self._consecutive_losses[symbol]}>={self._MAX_CONSECUTIVE_LOSSES}")
+            return None
+
+        # Hard kill: global consecutive losses across all symbols (Section 7)
+        if self._global_consecutive_losses >= self._MAX_GLOBAL_CONSECUTIVE_LOSSES:
+            self._count_reject("global_consecutive_losses")
+            if _diag:
+                print(f"[SLBRS-DIAG] {symbol}: global_consecutive_losses={self._global_consecutive_losses}>={self._MAX_GLOBAL_CONSECUTIVE_LOSSES}")
             return None
 
         # Structural failure: winrate check (Section 7)

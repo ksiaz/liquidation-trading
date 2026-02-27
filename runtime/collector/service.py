@@ -120,7 +120,7 @@ class CollectorService:
             enable_geometry=False,       # DISABLED: 10% win rate, zones from fill-only data lack L2 confirmation
             enable_orderbook_test=False,  # Test policy (disabled)
             # Phase 5: Enable regime-gated strategies
-            enable_slbrs=True,           # NEW: SLBRS strategy (SIDEWAYS regime)
+            enable_slbrs=False,          # DISABLED: 26% win rate, net negative PnL across 200+ trades
             enable_effcs=True,           # NEW: EFFCS strategy (EXPANSION regime)
             # Phase 6: Cascade Sniper (Hyperliquid proximity)
             enable_cascade_sniper=True,  # NEW: Cascade sniper (liquidation proximity)

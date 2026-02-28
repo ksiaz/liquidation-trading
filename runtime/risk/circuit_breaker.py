@@ -237,10 +237,16 @@ class DataFreshnessBreaker(CircuitBreaker):
             # Never received any fills after startup grace — fill stream may be dead
             return "no fills ever received"
 
-        if last_price > 0 and (now - last_price) > self._PRICE_STALE_SEC:
-            return f"no prices for {now - last_price:.0f}s"
-        elif last_price == 0 and (now - self._created_at) > self._PRICE_STALE_SEC:
-            return "no prices ever received"
+        # Only check price staleness if fills are also stale.
+        # Prices come from replica_cmds (oracle) which may not exist on all nodes.
+        # Fills prove the node is alive — if fills flow, price absence is not fatal
+        # (WS allMids provides prices independently).
+        fills_healthy = last_fill > 0 and (now - last_fill) <= self._FILL_STALE_SEC
+        if not fills_healthy:
+            if last_price > 0 and (now - last_price) > self._PRICE_STALE_SEC:
+                return f"no prices for {now - last_price:.0f}s"
+            elif last_price == 0 and (now - self._created_at) > self._PRICE_STALE_SEC:
+                return "no prices ever received"
 
         return None
 

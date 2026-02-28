@@ -17,6 +17,7 @@ from decimal import Decimal
 from datetime import datetime
 import json
 import os
+import time
 import threading
 
 import psycopg2.extras
@@ -756,6 +757,106 @@ class GhostPositionTracker:
                 print(f"[GHOST] Partial reduce DB update failed: {e}", flush=True)
 
         return (True, None, trade)
+
+    def add_to_position(
+        self,
+        *,
+        symbol: str,
+        add_quantity: float,
+        add_price: float,
+        timestamp: float = None,
+        dca_level: int = None
+    ) -> tuple:
+        """Add to existing position (DCA). Thread-safe.
+
+        Computes new weighted average entry, updates position in-memory and DB,
+        logs DCA add as entry trade linked to original position.
+
+        Args:
+            symbol: Trading symbol
+            add_quantity: Quantity to add
+            add_price: Price of the DCA add
+            timestamp: Optional timestamp (defaults to now)
+            dca_level: DCA level (1, 2, 3...)
+
+        Returns:
+            (success, error, trade, new_avg_entry)
+        """
+        with self._position_lock:
+            return self._add_to_position_locked(
+                symbol=symbol, add_quantity=add_quantity, add_price=add_price,
+                timestamp=timestamp, dca_level=dca_level
+            )
+
+    def _add_to_position_locked(self, *, symbol, add_quantity, add_price,
+                                 timestamp, dca_level):
+        position = self._state.open_positions.get(symbol)
+        if not position:
+            return (False, f"No open position for {symbol}", None, None)
+
+        ts = timestamp or time.time()
+
+        # Compute new weighted average entry
+        old_qty = position.quantity
+        old_entry = position.entry_price
+        new_qty = old_qty + add_quantity
+        new_avg = (old_qty * old_entry + add_quantity * add_price) / new_qty
+
+        # Create updated position (frozen dataclass → new instance)
+        updated = GhostPosition(
+            symbol=position.symbol,
+            side=position.side,
+            quantity=new_qty,
+            entry_price=new_avg,
+            entry_timestamp=position.entry_timestamp,  # Keep original entry time
+            entry_order_id=position.entry_order_id,
+            entry_trade_id=position.entry_trade_id,  # Keep original entry trade ID
+            entry_cycle_id=position.entry_cycle_id,
+            entry_policy=position.entry_policy,
+            entry_primitives=position.entry_primitives
+        )
+        self._state.open_positions[symbol] = updated
+
+        # Update DB: qty and entry_price
+        try:
+            conn = get_conn()
+            try:
+                conn.cursor().execute(
+                    "UPDATE ghost_positions SET qty = %s, entry_price = %s "
+                    "WHERE symbol = %s AND status = 'OPEN'",
+                    (new_qty, new_avg, symbol)
+                )
+                conn.commit()
+            finally:
+                put_conn(conn)
+        except Exception as e:
+            print(f"[GHOST] DCA DB update failed: {e}", flush=True)
+
+        # Log DCA add as entry trade linked to original position
+        level_str = f"L{dca_level}" if dca_level is not None else "L?"
+        order_side = "BUY" if position.side == "LONG" else "SELL"
+        trade = GhostTrade(
+            trade_id=self._generate_trade_id(),
+            symbol=symbol,
+            side=order_side,
+            quantity=add_quantity,
+            price=add_price,
+            timestamp=ts,
+            position_side=position.side,
+            is_entry=True,
+            pnl=None,
+            account_balance_after=self._state.current_balance,
+            entry_trade_id=position.entry_trade_id,  # Link to original entry
+            winning_policy=position.entry_policy,
+            concurrent_positions=len(self._state.open_positions),
+            exit_reason=f"DCA_ADD_{level_str}"
+        )
+
+        self._state.trade_history.append(trade)
+        self._state.trade_count += 1
+        self._log_trade_to_db(trade)
+
+        return (True, None, trade, new_avg)
 
     def get_account_summary(self) -> Dict:
         """

@@ -134,8 +134,24 @@ class ExecutionController:
                 )
                 continue  # Skip NO_ACTION
 
-            # Step 3a: Validate ENTRY actions against risk constraints
-            if action.type == ActionType.ENTRY:
+            # Step 3a: DCA_ADD bypasses R13 risk validation (controlled averaging)
+            # Lightweight validation: only check quantity exists
+            if action.type == ActionType.DCA_ADD:
+                if action.quantity is None or action.quantity <= 0:
+                    self._execution_log.append(ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=self.state_machine.get_position(symbol).state,
+                        state_after=self.state_machine.get_position(symbol).state,
+                        timestamp=time.time(),
+                        error="DCA_ADD rejected - missing/invalid quantity"
+                    ))
+                    actions_rejected += 1
+                    continue
+
+            # Step 3b: Validate ENTRY actions against risk constraints
+            elif action.type == ActionType.ENTRY:
                 # F5: Require real parameters - reject placeholder/missing values
                 if action.quantity is None or action.quantity <= 0:
                     # DIAGNOSTIC: ENTRY rejected due to missing quantity
@@ -261,8 +277,31 @@ class ExecutionController:
         
         # Execute action → trigger state transition
         try:
+            # DCA_ADD: no state transition — position stays OPEN
+            if action.type == ActionType.DCA_ADD:
+                if state_before != PositionState.OPEN:
+                    return ExecutionResult(
+                        symbol=symbol,
+                        action=action.type,
+                        success=False,
+                        state_before=state_before,
+                        state_after=state_before,
+                        timestamp=timestamp,
+                        error=f"DCA_ADD requires OPEN state, got {state_before}",
+                    )
+                return ExecutionResult(
+                    symbol=symbol,
+                    action=action.type,
+                    success=True,
+                    state_before=state_before,
+                    state_after=PositionState.OPEN,  # No change
+                    timestamp=timestamp,
+                    error=None,
+                    strategy_id=action.strategy_id,
+                )
+
             state_action = self._map_action_to_state_action(action.type)
-            
+
             # For now, just trigger the state transition
             # In real implementation, would submit exchange orders here
             if state_action == StateAction.ENTRY:
@@ -429,7 +468,7 @@ class ExecutionController:
         valid_actions = {
             PositionState.FLAT: {ActionType.ENTRY, ActionType.HOLD},
             PositionState.ENTERING: set(),  # Awaiting exchange response
-            PositionState.OPEN: {ActionType.EXIT, ActionType.REDUCE, ActionType.HOLD},
+            PositionState.OPEN: {ActionType.EXIT, ActionType.REDUCE, ActionType.HOLD, ActionType.DCA_ADD},
             PositionState.REDUCING: set(),  # Awaiting exchange response
             PositionState.CLOSING: set(),   # Awaiting exchange response
         }

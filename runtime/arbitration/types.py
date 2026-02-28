@@ -17,13 +17,15 @@ if TYPE_CHECKING:
 
 class MandateType(Enum):
     """Mandate types with authority hierarchy.
-    
+
     Higher enum value = higher priority (Theorem 2.2).
+    DCA_ADD uses value 15 (unique, priority set by arbitrator iteration order).
     """
     EXIT = 5      # Highest: Safety (liquidation avoidance)
     BLOCK = 4     # Risk constraint violation
     REDUCE = 3    # Exposure management
     ENTRY = 2     # Opportunity
+    DCA_ADD = 15  # Add to existing position (cascade sniper DCA)
     HOLD = 1      # No change (lowest)
 
 
@@ -32,6 +34,7 @@ class ActionType(Enum):
     ENTRY = "ENTRY"
     EXIT = "EXIT"
     REDUCE = "REDUCE"
+    DCA_ADD = "DCA_ADD"
     HOLD = "HOLD"
     NO_ACTION = "NO_ACTION"
 
@@ -104,6 +107,7 @@ class Action:
             MandateType.ENTRY: ActionType.ENTRY,
             MandateType.EXIT: ActionType.EXIT,
             MandateType.REDUCE: ActionType.REDUCE,
+            MandateType.DCA_ADD: ActionType.DCA_ADD,
             MandateType.HOLD: ActionType.HOLD,
             MandateType.BLOCK: ActionType.NO_ACTION,  # BLOCK is not actionable
         }

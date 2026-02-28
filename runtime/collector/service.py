@@ -24,7 +24,7 @@ from observation.types import ObservationSnapshot, ObservationStatus
 # Import M6 components (Phase 8)
 from runtime.policy_adapter import PolicyAdapter, AdapterConfig
 from runtime.arbitration.arbitrator import MandateArbitrator
-from runtime.arbitration.types import MandateType
+from runtime.arbitration.types import MandateType, Mandate
 from runtime.executor.controller import ExecutionController
 from runtime.risk.types import RiskConfig, AccountState
 from runtime.logging.pg_buffered_db import PgBufferedResearchDatabase
@@ -45,6 +45,7 @@ from runtime.indicators import VWAPCalculator, MultiTimeframeATR
 from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
+from runtime.liquidations.liquidity_map import LiquidityMap
 from runtime.cascade import CapitulationTracker
 from runtime.market_state.emitter import MarketStateEmitter
 from runtime.market_state.snapshot import SnapshotTrigger
@@ -83,6 +84,32 @@ from runtime.validation import (
     StopHuntDetector,
     LiquidityType
 )
+
+from dataclasses import dataclass
+
+
+@dataclass
+class DCAConfig:
+    """Configuration for DCA (Dollar Cost Averaging) on cascade sniper positions."""
+    enabled: bool = True
+    max_levels: int = 2              # Default 2 adds (configurable up to 3)
+    spacing_bps: float = 15          # Add when 15bp below avg_entry
+    min_interval_sec: float = 15     # Min 15s between adds
+    min_liq_events: int = 3          # >=3 liq events in 60s window ("active" mode)
+    liq_window_sec: float = 60       # Window for counting liq events
+    add_fractions: tuple = (0.25, 0.375, 0.375)  # Sizing relative to initial qty
+    max_position_pct: float = 0.10   # 10% max total position
+
+
+@dataclass
+class DCAState:
+    """Tracks DCA state for a single position."""
+    level: int                    # 0 = initial only, 1+ = adds done
+    last_add_ts: float            # Wall clock of last add
+    initial_quantity: float       # First entry qty (for sizing adds)
+    initial_entry_price: float    # First entry price
+    strategy_id: str
+
 
 # Constants - Trading symbols (must match run_paper_trade.py)
 TOP_10_SYMBOLS = [
@@ -259,6 +286,13 @@ class CollectorService:
 
         # Rolling volume tracker for ROLLING_FADE entry mode
         self._rolling_volume_tracker = RollingVolumeTracker()
+
+        # DCA (Dollar Cost Averaging) for cascade sniper positions
+        self._dca_config = DCAConfig()
+        self._dca_states: Dict[str, DCAState] = {}  # symbol → DCA state
+
+        # L2 liquidity memory map (gravity zones for TP targeting)
+        self._liquidity_map = LiquidityMap()
 
         # Per-symbol stop-loss cooldown: block re-entry after stop-out
         self._stop_exit_timestamps: Dict[str, float] = {}
@@ -493,6 +527,72 @@ class CollectorService:
             if ws_mid and ws_mid > 0:
                 return ws_mid
         return self._current_prices.get(symbol)
+
+    def _generate_dca_mandates(self, symbols, timestamp, existing_mandates):
+        """Check open cascade positions for DCA eligibility.
+
+        Returns list of DCA_ADD mandates for positions that meet all gates:
+        - Cascade sniper position only
+        - Below max DCA levels
+        - Price dropped by spacing_bps from avg entry
+        - Min interval between adds
+        - Active cascade quality gate (>=3 liq events in 60s)
+        - Total notional within max_position_pct
+        """
+        if not self._dca_config.enabled:
+            return []
+
+        dca_mandates = []
+        for symbol in symbols:
+            position = self.ghost_tracker.get_open_position(symbol)
+            if not position:
+                continue
+            # Only cascade sniper
+            if position.entry_policy != "EP2-CASCADE-SNIPER-V1":
+                continue
+            # Check DCA state
+            dca = self._dca_states.get(symbol)
+            if not dca or dca.level >= self._dca_config.max_levels:
+                continue
+            # No DCA if EXIT mandate already present for this symbol
+            if any(m.symbol == symbol and m.type == MandateType.EXIT for m in existing_mandates):
+                continue
+            # Price drop check
+            price = self._get_live_price(symbol)
+            if not price:
+                continue
+            if position.side == "LONG":
+                drop_bps = (position.entry_price - price) / position.entry_price * 10000
+            else:  # SHORT
+                drop_bps = (price - position.entry_price) / position.entry_price * 10000
+            if drop_bps < self._dca_config.spacing_bps:
+                continue
+            # Time gate
+            if time.time() - dca.last_add_ts < self._dca_config.min_interval_sec:
+                continue
+            # Cascade quality gate: active mode
+            liq_count = self._rolling_volume_tracker.get_event_count_in_window(
+                symbol, time.time(), self._dca_config.liq_window_sec)
+            if liq_count < self._dca_config.min_liq_events:
+                continue
+            # Sizing
+            idx = min(dca.level, len(self._dca_config.add_fractions) - 1)
+            add_fraction = self._dca_config.add_fractions[idx]
+            add_qty = dca.initial_quantity * add_fraction
+            # Max position check
+            new_notional = (position.quantity + add_qty) * price
+            max_notional = self.ghost_tracker._state.current_balance * self._dca_config.max_position_pct
+            if new_notional > max_notional:
+                continue
+            # Emit DCA_ADD mandate
+            dca_mandates.append(Mandate(
+                symbol=symbol, type=MandateType.DCA_ADD,
+                authority=1.0, timestamp=time.time(),
+                direction=position.side, strategy_id=position.entry_policy,
+                quantity=Decimal(str(add_qty)), entry_price=Decimal(str(price))
+            ))
+
+        return dca_mandates
 
     def get_calculator_metrics(self) -> dict:
         """Get calculator memory metrics."""
@@ -1470,9 +1570,7 @@ class CollectorService:
                     # When the node is lagging or adapter is disconnected, these are None,
                     # meaning the system has no context for stop sizing or direction.
                     if rolling_fade_signal and regime_metrics is None:
-                        self._logger.debug(
-                            f"ROLLING_FADE blocked for {symbol}: regime_metrics unavailable"
-                        )
+                        print(f"[ROLL FADE] {symbol}: blocked — regime_metrics unavailable")
                         rolling_fade_signal = None
 
                     # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
@@ -1665,14 +1763,21 @@ class CollectorService:
             # Flush batched market snapshots (one transaction for all symbols)
             self._market_state.flush()
 
-            # Data freshness gate: drop ENTRY mandates when breaker open
+            # Generate DCA mandates for open cascade sniper positions
+            dca_mandates = self._generate_dca_mandates(
+                snapshot.symbols_active, timestamp, all_mandates)
+            if dca_mandates:
+                all_mandates.extend(dca_mandates)
+
+            # Data freshness gate: drop ENTRY and DCA_ADD mandates when breaker open
             if _data_breaker_open and all_mandates:
                 before = len(all_mandates)
-                all_mandates = [m for m in all_mandates if m.type != MandateType.ENTRY]
+                all_mandates = [m for m in all_mandates
+                                if m.type not in (MandateType.ENTRY, MandateType.DCA_ADD)]
                 dropped = before - len(all_mandates)
                 if dropped:
                     self._logger.warning(
-                        f"Data breaker open: dropped {dropped} ENTRY mandate(s), "
+                        f"Data breaker open: dropped {dropped} ENTRY/DCA mandate(s), "
                         f"kept {len(all_mandates)} EXIT/REDUCE"
                     )
 
@@ -1750,6 +1855,12 @@ class CollectorService:
                             )
                             existing_stop_symbols.add(result.symbol)
                             print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
+                            # Initialize DCA state for cascade sniper entries
+                            if is_cascade:
+                                self._dca_states[result.symbol] = DCAState(
+                                    level=0, last_add_ts=time.time(),
+                                    initial_quantity=qty, initial_entry_price=entry_px,
+                                    strategy_id=result.strategy_id)
                             # Emit ENTRY snapshot from latest ring buffer state
                             _ms_cur = self._market_state.get_current(result.symbol)
                             if _ms_cur:
@@ -1778,6 +1889,38 @@ class CollectorService:
                                 )
                         else:
                             print(f"ENTRY_REJECTED: {result.symbol} - {error}")
+
+                # --- DCA_ADD: add to existing cascade sniper position ---
+                elif result.action.name == "DCA_ADD":
+                    position = self.ghost_tracker.get_open_position(result.symbol)
+                    dca = self._dca_states.get(result.symbol)
+                    if position and dca:
+                        add_price = self._get_live_price(result.symbol)
+                        if add_price:
+                            idx = min(dca.level, len(self._dca_config.add_fractions) - 1)
+                            add_fraction = self._dca_config.add_fractions[idx]
+                            add_qty = dca.initial_quantity * add_fraction
+
+                            ok, err, trade, new_avg = self.ghost_tracker.add_to_position(
+                                symbol=result.symbol, add_quantity=add_qty,
+                                add_price=add_price, timestamp=time.time(),
+                                dca_level=dca.level + 1)
+
+                            if ok and new_avg:
+                                # Update trailing stop with new avg entry
+                                side = position.side
+                                new_initial_stop = new_avg * (0.975 if side == "LONG" else 1.025)
+                                self._trailing_stop_manager.update_entry_price(
+                                    result.symbol, new_avg, add_price, new_initial_stop)
+                                # Update DCA state
+                                dca.level += 1
+                                dca.last_add_ts = time.time()
+                                total_qty = position.quantity + add_qty
+                                print(f"DCA_ADD: {result.symbol} L{dca.level} "
+                                      f"+{add_qty:.4f} @ ${add_price:,.2f} "
+                                      f"avg=${new_avg:,.2f} total_qty={total_qty:.4f}")
+                            else:
+                                print(f"DCA_ADD_FAILED: {result.symbol} - {err}")
 
                 # --- EXIT: close ghost position (must stay in sync with controller) ---
                 elif result.action.name == "EXIT":
@@ -1820,6 +1963,7 @@ class CollectorService:
                                     raw_l2_age_ms=_ms_cur.raw_l2_age_ms, raw_cap_fills=_ms_cur.raw_cap_fills,
                                 )
                             self._force_position_flat(result.symbol)
+                            self._dca_states.pop(result.symbol, None)
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
@@ -1827,6 +1971,7 @@ class CollectorService:
                             # Fallback: force position flat even if ghost tracker write failed
                             print(f"EXIT_FAILED: {result.symbol} ghost close error: {err}")
                             self._force_position_flat(result.symbol)
+                            self._dca_states.pop(result.symbol, None)
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
@@ -2203,6 +2348,9 @@ class CollectorService:
                 record_orderbook_update(symbol, bids, asks, ts)
             except ImportError:
                 pass
+
+            # Feed liquidity memory map (samples at 5s intervals internally)
+            self._liquidity_map.on_orderbook_update(coin, bids, asks, ts)
         except Exception as e:
             self._logger.warning(f"HL orderbook ingestion error for {orderbook.get('coin', '?')}: {e}")
 
@@ -2855,6 +3003,7 @@ class CollectorService:
                         hold_str = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
                         print(f"EXIT: {symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: {pnl_str}, Hold: {hold_str}, Reason: {exit_reason}")
                         self._force_position_flat(symbol)
+                        self._dca_states.pop(symbol, None)
                     else:
                         recovered = self._recovered_exit(
                             symbol=symbol,
@@ -2864,7 +3013,9 @@ class CollectorService:
                             entry_price=state.entry_price,
                             exit_reason=exit_reason
                         )
-                        if not recovered:
+                        if recovered:
+                            self._dca_states.pop(symbol, None)
+                        else:
                             print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
 
                     # Unregister ALL stops for this symbol after exit (prevents duplicate exits)

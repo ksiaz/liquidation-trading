@@ -346,6 +346,49 @@ class TrailingStopManager:
             f"mode={config.mode.value}"
         )
 
+    def update_entry_price(self, symbol: str, new_entry_price: float,
+                           current_price: float, new_initial_stop: float = None):
+        """Update entry price after DCA add. Resets MFE tracking.
+
+        Prevents stale MFE from immediately triggering trail after avg-down.
+
+        Args:
+            symbol: Trading symbol
+            new_entry_price: New weighted average entry price
+            current_price: Current market price
+            new_initial_stop: Optional new initial stop price
+        """
+        with self._lock:
+            for entry_id, state in self._stops.items():
+                if state.symbol != symbol:
+                    continue
+
+                old_entry = state.entry_price
+                state.entry_price = new_entry_price
+
+                if new_initial_stop is not None:
+                    state.initial_stop_price = new_initial_stop
+                    # Reset stop to new initial — DCA avg-down means old trail may be
+                    # above new entry price which would cause immediate stop-out
+                    state.current_stop_price = new_initial_stop
+
+                # Reset MFE tracking to current price
+                if state.direction == "LONG":
+                    state.highest_price = current_price
+                else:
+                    state.lowest_price = current_price
+
+                # Reset break-even (new avg entry changes the BE level)
+                state.break_even_triggered = False
+
+                self._logger.info(
+                    f"X4-A DCA: {symbol} entry {old_entry:.2f} -> {new_entry_price:.2f} "
+                    f"MFE reset to {current_price:.2f} stop={state.current_stop_price:.2f}"
+                )
+
+                # Persist updated state
+                self._persist_state(state)
+
     def update_price(self, symbol: str, price: float, atr: Optional[float] = None,
                      orderflow_imbalance: Optional[float] = None,
                      liq_z: Optional[float] = None,

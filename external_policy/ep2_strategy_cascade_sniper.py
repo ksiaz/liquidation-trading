@@ -2009,16 +2009,25 @@ def generate_cascade_sniper_proposal(
                       f"${rolling_fade_signal.spike_volume:.0f} < ${min_burst:.0f}")
                 return None
 
-            # Counter-trend gate: full Gate B (ret_1m + ret_3m + strict block on no data)
-            trend_ok, trend_reason = _check_trend_gate(
-                symbol, entry_direction, price_returns,
-                absorption_ratio=None,  # No absorption for ROLLING_FADE
-                cascade_value=rolling_fade_signal.spike_volume
-            )
-            if not trend_ok:
-                print(f"[ROLL FADE] {symbol}: {entry_direction} blocked — "
-                      f"trend gate: {trend_reason}")
-                return None
+            # Counter-trend gate: check ret_1m and ret_3m but allow entry when no data.
+            # Gate B's strict no-data block requires absorption (which ROLLING_FADE lacks).
+            # The burst signal itself is sufficient evidence — don't block on missing prices.
+            ret_1m = price_returns.get('ret_1m') if price_returns else None
+            ret_3m = price_returns.get('ret_3m') if price_returns else None
+            if entry_direction == "LONG":
+                if (ret_1m is not None and ret_1m <= -0.0015) or \
+                   (ret_3m is not None and ret_3m <= -0.0030):
+                    print(f"[ROLL FADE] {symbol}: LONG blocked — "
+                          f"counter-trend (ret_1m={ret_1m*100 if ret_1m else 0:+.2f}% "
+                          f"ret_3m={ret_3m*100 if ret_3m else 0:+.2f}%)")
+                    return None
+            elif entry_direction == "SHORT":
+                if (ret_1m is not None and ret_1m >= 0.0015) or \
+                   (ret_3m is not None and ret_3m >= 0.0030):
+                    print(f"[ROLL FADE] {symbol}: SHORT blocked — "
+                          f"counter-trend (ret_1m={ret_1m*100 if ret_1m else 0:+.2f}% "
+                          f"ret_3m={ret_3m*100 if ret_3m else 0:+.2f}%)")
+                    return None
 
             # Orderflow gate: block entry when dominant flow opposes fade direction
             # LONG blocked if OF < 0.15 (heavy selling), SHORT blocked if OF > 0.85 (heavy buying)

@@ -1619,13 +1619,16 @@ class CollectorService:
                     # Regime requires VWAP + ATR + orderflow + liq_z all non-None.
                     # When the node is lagging or adapter is disconnected, these are None,
                     # meaning the system has no context for stop sizing or direction.
+                    # Hard block: confirm (consume) signal — no point deferring without regime.
                     if rolling_fade_signal and regime_metrics is None:
                         print(f"[ROLL FADE] {symbol}: blocked — regime_metrics unavailable")
+                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
                     # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
                     # after a stop-out. Prevents immediate re-entry into same thesis
                     # (NEAR double-entry case: stopped in 45s, re-entered, stopped in 44s).
+                    # Hard block: confirm (consume) signal — same thesis already failed.
                     _STOP_LOSS_COOLDOWN_SEC = 300
                     _last_stop = self._stop_exit_timestamps.get(symbol, 0)
                     if timestamp - _last_stop < _STOP_LOSS_COOLDOWN_SEC:
@@ -1633,6 +1636,7 @@ class CollectorService:
                             _ago = timestamp - _last_stop
                             print(f"[STOP COOLDOWN] {symbol}: ROLLING_FADE blocked — "
                                   f"stop-loss {_ago:.0f}s ago (cooldown {_STOP_LOSS_COOLDOWN_SEC}s)")
+                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                             rolling_fade_signal = None
                         if liquidation_burst:
                             liquidation_burst = None
@@ -1803,6 +1807,20 @@ class CollectorService:
                             mandate_primitives_map[id(m)] = active_primitives
                             # Phase E: Record mandate for stability observation
                             stability_observer.record_mandate(m)
+
+                    # Rolling fade signal lifecycle:
+                    # - Mandate generated → confirm (starts 15m cooldown)
+                    # - No mandate, fuel gate deferred → keep alive for retry
+                    # - No mandate, other gate blocked → confirm (consume, free slot)
+                    #   (excluded coin, min liqs, min volume, position open)
+                    if rolling_fade_signal:
+                        if mandates:
+                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                        else:
+                            from external_policy.ep2_strategy_cascade_sniper import is_fuel_gate_deferred
+                            if not is_fuel_gate_deferred(symbol):
+                                self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+
                     all_mandates.extend(mandates)
                 except Exception as e:
                     self._logger.warning(f"Policy generation exception for {symbol}: {e}")
@@ -1812,6 +1830,9 @@ class CollectorService:
 
             # Flush batched market snapshots (one transaction for all symbols)
             self._market_state.flush()
+
+            # Trim rolling volume tracker windows (baseline events + confirmed pending)
+            self._rolling_volume_tracker.trim_windows(timestamp)
 
             # Generate DCA mandates for open cascade sniper positions
             dca_mandates = self._generate_dca_mandates(

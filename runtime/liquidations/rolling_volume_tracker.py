@@ -52,8 +52,16 @@ class _LiqEvent:
 
 @dataclass
 class _PendingSpike:
-    """A spike that was emitted — kept for cooldown enforcement."""
+    """A spike that was detected — kept for deferral and cooldown.
+
+    confirmed=False: signal detected but not yet acted on by strategy.
+                     Returned on each check_for_signal() call for re-evaluation
+                     (e.g., fuel gate may pass once positions deplete).
+    confirmed=True:  strategy accepted or hard-gate consumed the signal.
+                     Full SPIKE_COOLDOWN enforced before next signal.
+    """
     signal: RollingFadeSignal
+    confirmed: bool = False
 
 
 class RollingVolumeTracker:
@@ -122,13 +130,20 @@ class RollingVolumeTracker:
         Returns:
             RollingFadeSignal if burst detected and declining, None otherwise.
         """
-        # Check pending signal — enforce cooldown then clean up
+        # Check pending signal — handle deferral (unconfirmed) vs cooldown (confirmed)
         pending = self._pending.get(symbol)
         if pending is not None:
-            if timestamp - pending.signal.spike_ts >= self.SPIKE_COOLDOWN:
-                del self._pending[symbol]
+            if pending.confirmed:
+                # Confirmed: hard-gate consumed or strategy accepted → enforce cooldown
+                if timestamp - pending.signal.spike_ts >= self.SPIKE_COOLDOWN:
+                    del self._pending[symbol]
+                else:
+                    return None  # Still in cooldown
             else:
-                return None  # Still in cooldown
+                # Unconfirmed: signal detected but not yet used — re-emit for retry.
+                # Fuel gate decides when to enter (when positions deplete = exhaustion).
+                # Signal stays alive indefinitely — cascade fuel IS the timing gate.
+                return pending.signal
 
         last_signal = self._last_signal_ts.get(symbol, 0)
         if timestamp - last_signal < self.SPIKE_COOLDOWN:
@@ -213,10 +228,12 @@ class RollingVolumeTracker:
             return None
 
         # Emit signal immediately — wide trailing stop handles price overshoot
+        # Signal is unconfirmed: stays pending for re-evaluation until strategy
+        # confirms (via confirm_signal) or signal goes stale (SIGNAL_STALENESS).
         signal = self._build_signal(symbol, timestamp, ratio, events, burst_cutoff)
         if signal is not None:
-            self._pending[symbol] = _PendingSpike(signal=signal)
-            self._last_signal_ts[symbol] = timestamp
+            self._pending[symbol] = _PendingSpike(signal=signal, confirmed=False)
+            # NOTE: _last_signal_ts NOT set here — only on confirm_signal()
             ratio_str = f"{min(ratio, 999):.1f}"
             print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
                   f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
@@ -225,6 +242,20 @@ class RollingVolumeTracker:
             return signal
 
         return None
+
+    def confirm_signal(self, symbol: str, timestamp: float):
+        """Mark a signal as consumed — starts the full cooldown timer.
+
+        Called by service.py when:
+        - Strategy accepted the signal (generated a mandate)
+        - A hard gate consumed the signal (regime unavailable, stop cooldown)
+
+        NOT called when fuel gate defers — signal stays unconfirmed for retry.
+        """
+        pending = self._pending.get(symbol)
+        if pending is not None and not pending.confirmed:
+            pending.confirmed = True
+            self._last_signal_ts[symbol] = timestamp
 
     def _min_baseline_for_ratio(self, ratio: float) -> int:
         """Adaptive baseline minimum — strong signals need less context.
@@ -348,8 +379,9 @@ class RollingVolumeTracker:
         for symbol, events in self._events.items():
             while events and events[0].timestamp < cutoff:
                 events.popleft()
-        # Clean up expired pending signals
+        # Clean up confirmed pending signals past cooldown.
+        # Unconfirmed signals stay alive — fuel gate decides timing.
         for symbol in list(self._pending.keys()):
             p = self._pending[symbol]
-            if timestamp - p.signal.spike_ts > self.SPIKE_COOLDOWN:
+            if p.confirmed and timestamp - p.signal.spike_ts > self.SPIKE_COOLDOWN:
                 del self._pending[symbol]

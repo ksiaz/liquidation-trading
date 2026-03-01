@@ -560,6 +560,10 @@ class CascadeStateMachine:
         # Gate B override flag: True when structural/fast pivot confirmed
         self._structural_pivot: Dict[str, bool] = {}
 
+        # Fuel gate: per-symbol deferral flag and log rate-limiting
+        self._fuel_gate_deferred: Dict[str, bool] = {}
+        self._fuel_gate_last_log: Dict[str, float] = {}
+
     def update(
         self,
         symbol: str,
@@ -1651,6 +1655,15 @@ def generate_cascade_sniper_proposal(
     Returns:
         StrategyProposal if conditions warrant entry, None otherwise
     """
+    # Get state machine early — needed for fuel gate flag reset below.
+    sm = _get_state_machine()
+
+    # Clear fuel gate deferral flag for any symbol we can identify.
+    # Only the fuel gate re-sets it True. Must happen before any early return
+    # (position/warmup/permission) to prevent stale True from leaking.
+    if rolling_fade_signal is not None:
+        sm._fuel_gate_deferred[rolling_fade_signal.symbol] = False
+
     # Rule 1: M6 DENIED -> no proposal
     if permission.result == "DENIED":
         return None
@@ -1660,9 +1673,6 @@ def generate_cascade_sniper_proposal(
         # For now, exit logic is handled by other strategies
         # Cascade sniper is entry-focused
         return None
-
-    # Get state machine
-    sm = _get_state_machine()
 
     # Determine symbol from proximity, liquidation, or rolling fade data
     symbol = None
@@ -2016,7 +2026,9 @@ def generate_cascade_sniper_proposal(
             # SOL 2026-02-28: BTC/ETH blocked by these gates while all coins bounced 2%+.
             ret_1m = price_returns.get('ret_1m') if price_returns else None
 
-            # Cascade fuel gate: block when many positions remain at risk on cascade side
+            # Cascade fuel gate: DEFER when many positions remain at risk on cascade side.
+            # Signal stays alive in rolling_volume_tracker for retry each cycle.
+            # Entry triggers when positions deplete (= exhaustion point = ideal timing).
             if proximity is not None:
                 if entry_direction == "LONG":
                     fuel_count = proximity.long_positions_count
@@ -2026,8 +2038,17 @@ def generate_cascade_sniper_proposal(
                     fuel_value = proximity.short_positions_value
 
                 if fuel_count >= ROLLING_FADE_FUEL_MIN_POSITIONS and fuel_value >= ROLLING_FADE_FUEL_MIN_VALUE:
-                    print(f"[ROLL FADE] {symbol}: blocked — cascade fuel remaining "
-                          f"({fuel_count} positions, ${fuel_value:,.0f} at risk)")
+                    sm._fuel_gate_deferred[symbol] = True
+                    # Rate-limit log: signal retries every 200ms, log once per 30s
+                    _fuel_log_key = f"fuel_{symbol}"
+                    _now = context.timestamp
+                    _last = sm._fuel_gate_last_log.get(_fuel_log_key, 0)
+                    if _now - _last >= 30:
+                        sm._fuel_gate_last_log[_fuel_log_key] = _now
+                        _age = _now - rolling_fade_signal.spike_ts
+                        print(f"[ROLL FADE] {symbol}: deferred — cascade fuel remaining "
+                              f"({fuel_count} positions, ${fuel_value:,.0f} at risk, "
+                              f"signal age {_age:.0f}s)")
                     return None
 
             # Entry quality: score for logging but do NOT block.
@@ -2069,6 +2090,16 @@ def get_cascade_state(symbol: str) -> CascadeState:
     """Get current cascade state for a symbol (for monitoring)."""
     sm = _get_state_machine()
     return sm.get_state(symbol)
+
+
+def is_fuel_gate_deferred(symbol: str) -> bool:
+    """Check if fuel gate deferred the ROLLING_FADE signal for this symbol.
+
+    True = fuel gate is timing the entry (signal should stay alive).
+    False = an immutable gate blocked, or no evaluation happened (consume signal).
+    """
+    sm = _get_state_machine()
+    return sm._fuel_gate_deferred.get(symbol, False)
 
 
 def get_primed_symbols() -> List[str]:

@@ -127,23 +127,22 @@ class RollingVolumeTracker:
         Emits immediately when burst exhaustion detected (liq events declining).
         No artificial delay — wide trailing stop handles price momentum overshoot.
 
+        When an unconfirmed pending signal exists (fuel gate deferring), the full
+        detection logic still runs. If a new qualifying burst is found, the pending
+        is replaced with the fresh signal. Otherwise the old pending is returned
+        for continued fuel gate retry.
+
         Returns:
-            RollingFadeSignal if burst detected and declining, None otherwise.
+            RollingFadeSignal if burst detected/pending, None if cooldown or no data.
         """
-        # Check pending signal — handle deferral (unconfirmed) vs cooldown (confirmed)
+        # Check confirmed signal — enforce cooldown
         pending = self._pending.get(symbol)
-        if pending is not None:
-            if pending.confirmed:
-                # Confirmed: hard-gate consumed or strategy accepted → enforce cooldown
-                if timestamp - pending.signal.spike_ts >= self.SPIKE_COOLDOWN:
-                    del self._pending[symbol]
-                else:
-                    return None  # Still in cooldown
+        if pending is not None and pending.confirmed:
+            if timestamp - pending.signal.spike_ts >= self.SPIKE_COOLDOWN:
+                del self._pending[symbol]
+                pending = None  # Clear local ref — expired, don't re-emit
             else:
-                # Unconfirmed: signal detected but not yet used — re-emit for retry.
-                # Fuel gate decides when to enter (when positions deplete = exhaustion).
-                # Signal stays alive indefinitely — cascade fuel IS the timing gate.
-                return pending.signal
+                return None  # Still in cooldown
 
         last_signal = self._last_signal_ts.get(symbol, 0)
         if timestamp - last_signal < self.SPIKE_COOLDOWN:
@@ -152,7 +151,7 @@ class RollingVolumeTracker:
         # Get events snapshot (thread-safe)
         events_deque = self._events.get(symbol)
         if not events_deque:
-            return None
+            return pending.signal if pending else None
         events = list(events_deque)
 
         baseline_cutoff = timestamp - self.BASELINE_WINDOW
@@ -168,7 +167,7 @@ class RollingVolumeTracker:
                     burst_count += 1
 
         if burst_count < self.MIN_BURST_EVENTS:
-            return None
+            return pending.signal if pending else None
 
         # Compute rates (before baseline gate — ratio determines adaptive minimum)
         baseline_minutes = self.BASELINE_WINDOW / 60.0
@@ -182,13 +181,13 @@ class RollingVolumeTracker:
             ratio = float('inf')
 
         if ratio < self.RATIO_THRESHOLD:
-            return None
+            return pending.signal if pending else None
 
         # Warmup: adaptive baseline minimum (strong signals need less context)
         baseline_only = baseline_count - burst_count
         min_baseline = self._min_baseline_for_ratio(ratio)
         if baseline_only < min_baseline:
-            return None
+            return pending.signal if pending else None
 
         # ── Burst concentration gate ──
         burst_events_ts = [e.timestamp for e in events if e.timestamp >= burst_cutoff]
@@ -200,7 +199,7 @@ class RollingVolumeTracker:
             if count_in_sub > best_in_subwindow:
                 best_in_subwindow = count_in_sub
         if best_in_subwindow < min_concentrated:
-            return None  # Events spread too evenly — not a real burst
+            return pending.signal if pending else None
 
         # ── Cascade exhaustion gate ──
         half_cutoff = timestamp - self.BURST_WINDOW / 2
@@ -214,10 +213,10 @@ class RollingVolumeTracker:
                     second_half += 1
 
         if first_half < 3:
-            return None  # Too few events in first half
+            return pending.signal if pending else None
 
         if second_half > first_half * 0.5:
-            return None  # Cascade still active
+            return pending.signal if pending else None
 
         # Check cluster filter
         concurrent_spikes = sum(
@@ -225,23 +224,31 @@ class RollingVolumeTracker:
             if timestamp - p.signal.spike_ts < 60
         )
         if concurrent_spikes >= self.MAX_CLUSTER_COINS:
-            return None
+            return pending.signal if pending else None
 
-        # Emit signal immediately — wide trailing stop handles price overshoot
-        # Signal is unconfirmed: stays pending for re-evaluation until strategy
-        # confirms (via confirm_signal) or signal goes stale (SIGNAL_STALENESS).
+        # New qualifying burst found — create/replace pending signal.
+        # If an unconfirmed pending existed, the new burst provides a fresher
+        # entry point (updated spike_ts, current burst metrics).
         signal = self._build_signal(symbol, timestamp, ratio, events, burst_cutoff)
         if signal is not None:
+            # Only log on first detection or when replacing a genuinely stale
+            # pending (>30s old). The same burst re-qualifying every 200ms cycle
+            # while fuel gate defers is expected — don't spam the log.
+            _is_new = pending is None
+            _is_stale_replace = (pending is not None and
+                                 timestamp - pending.signal.spike_ts > 30)
             self._pending[symbol] = _PendingSpike(signal=signal, confirmed=False)
             # NOTE: _last_signal_ts NOT set here — only on confirm_signal()
-            ratio_str = f"{min(ratio, 999):.1f}"
-            print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
-                  f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
-                  f"concentrated={best_in_subwindow}/{burst_count} "
-                  f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL")
+            if _is_new or _is_stale_replace:
+                ratio_str = f"{min(ratio, 999):.1f}"
+                _replaced = " (REPLACED stale)" if pending else ""
+                print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
+                      f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
+                      f"concentrated={best_in_subwindow}/{burst_count} "
+                      f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL{_replaced}")
             return signal
 
-        return None
+        return pending.signal if pending else None
 
     def confirm_signal(self, symbol: str, timestamp: float):
         """Mark a signal as consumed — starts the full cooldown timer.

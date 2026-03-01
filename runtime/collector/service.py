@@ -1625,6 +1625,26 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
+                    # Cascade fuel gate: DEFER while liquidations still flowing.
+                    # The burst signal fires when liq rate is declining (exhaustion gate).
+                    # The fuel gate waits until liq events actually stop — confirming the
+                    # cascade is truly over before entering. Checks 60s window: if >3 events
+                    # remain, defer. Signal stays alive in tracker for retry each cycle.
+                    _FUEL_GATE_MAX_LIQS_60S = 3
+                    if rolling_fade_signal:
+                        _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
+                            symbol, timestamp, window_sec=60.0)
+                        if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
+                            # Rate-limited log (once per 30s per symbol)
+                            _fuel_key = f"_fuel_log_{symbol}"
+                            _fuel_last = getattr(self, _fuel_key, 0)
+                            if timestamp - _fuel_last >= 30:
+                                setattr(self, _fuel_key, timestamp)
+                                _age = timestamp - rolling_fade_signal.spike_ts
+                                print(f"[ROLL FADE] {symbol}: deferred — cascade still active "
+                                      f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s)")
+                            rolling_fade_signal = None  # Defer — don't confirm, stays alive
+
                     # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
                     # after a stop-out. Prevents immediate re-entry into same thesis
                     # (NEAR double-entry case: stopped in 45s, re-entered, stopped in 44s).
@@ -1808,18 +1828,10 @@ class CollectorService:
                             # Phase E: Record mandate for stability observation
                             stability_observer.record_mandate(m)
 
-                    # Rolling fade signal lifecycle:
-                    # - Mandate generated → confirm (starts 15m cooldown)
-                    # - No mandate, fuel gate deferred → keep alive for retry
-                    # - No mandate, other gate blocked → confirm (consume, free slot)
-                    #   (excluded coin, min liqs, min volume, position open)
+                    # Rolling fade signal lifecycle: confirm on evaluation (starts 15m cooldown).
+                    # The rolling tracker detects new bursts independently via check_for_signal.
                     if rolling_fade_signal:
-                        if mandates:
-                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
-                        else:
-                            from external_policy.ep2_strategy_cascade_sniper import is_fuel_gate_deferred
-                            if not is_fuel_gate_deferred(symbol):
-                                self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
 
                     all_mandates.extend(mandates)
                 except Exception as e:

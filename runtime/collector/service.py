@@ -46,6 +46,7 @@ from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.liquidations.liquidity_map import LiquidityMap
+from runtime.whale.tracker import WhaleFillTracker
 from runtime.cascade import CapitulationTracker
 from runtime.market_state.emitter import MarketStateEmitter
 from runtime.market_state.snapshot import SnapshotTrigger
@@ -282,6 +283,9 @@ class CollectorService:
         # Capitulation event buffer: gRPC daemon threads append, regime loop drains.
         # Avoids cross-thread writes to capitulation tracker.
         self._cap_event_buffer: _deque = _deque(maxlen=10000)
+        # Whale fill event buffer: gRPC daemon threads append, regime loop drains.
+        # Avoids cross-thread writes to whale tracker's per-wallet state.
+        self._whale_event_buffer: _deque = _deque(maxlen=50000)
         # Rolling price high/low tracker (5-min window) for EFFCS impulse detection
         self._price_highs: Dict[str, float] = {}
         self._price_lows: Dict[str, float] = {}
@@ -298,7 +302,7 @@ class CollectorService:
         self._calculators_pruned = 0
         # Deque overflow counters (detect silent data loss during bursts)
         self._deque_overflows: Dict[str, int] = {
-            'fill': 0, 'liq': 0, 'cap': 0, 'atr': 0, 'governance': 0
+            'fill': 0, 'liq': 0, 'cap': 0, 'atr': 0, 'governance': 0, 'whale': 0
         }
 
         # Phase 6: Liquidation burst aggregator (for cascade sniper)
@@ -330,6 +334,9 @@ class CollectorService:
 
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
+
+        # Whale fill tracker (per-wallet aggregation for manipulation detection)
+        self._whale_tracker = WhaleFillTracker()
 
         # Market state emitter (per-symbol snapshots for trade context + pipeline health)
         self._market_state = MarketStateEmitter(self._execution_db)
@@ -1162,7 +1169,15 @@ class CollectorService:
                     except Exception as e:
                         self._logger.warning(f"Cap drain error: {e}")
 
-                # 0f. Trim fill accumulator (prevents unbounded growth)
+                # 0f. Drain whale fill event buffer
+                while self._whale_event_buffer:
+                    try:
+                        w_event = self._whale_event_buffer.popleft()
+                        self._whale_tracker.on_fill(w_event)
+                    except Exception as e:
+                        self._logger.warning(f"Whale drain error: {e}")
+
+                # 0g. Trim fill accumulator (prevents unbounded growth)
                 # Only keeps fills within 60s window. Trim every cycle is cheap
                 # (dict iteration + list comprehension, ~20 symbols).
                 _trim_cutoff = time.time() - 60.0
@@ -1173,7 +1188,7 @@ class CollectorService:
                             f for f in fills if f[3] >= _trim_cutoff
                         ]
 
-                # 0g. Log deque overflows (every ~60s)
+                # 0h. Log deque overflows (every ~60s)
                 _any_overflow = any(v > 0 for v in self._deque_overflows.values())
                 if _any_overflow and time.time() - getattr(self, '_last_overflow_log', 0) >= 60:
                     self._last_overflow_log = time.time()
@@ -1625,6 +1640,16 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
+                    # Adapter health gate: block ROLLING_FADE when gRPC adapter is unhealthy.
+                    # Liq events arrive via gRPC. When adapter is STALE/LAGGING, events are
+                    # catchup batches from old blocks — wall-clock timestamped to look like
+                    # bursts but actually stale data from a different price regime. This caused
+                    # a LONG entry at a price peak (ETH 2026-03-01 11:14).
+                    if rolling_fade_signal and not self._node_bridge.is_healthy:
+                        print(f"[ROLL FADE] {symbol}: blocked — adapter unhealthy")
+                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                        rolling_fade_signal = None
+
                     # Cascade fuel gate: DEFER while liquidations still flowing.
                     # The burst signal fires when liq rate is declining (exhaustion gate).
                     # The fuel gate waits until liq events actually stop — confirming the
@@ -1645,6 +1670,19 @@ class CollectorService:
                                       f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s)")
                             rolling_fade_signal = None  # Defer — don't confirm, stays alive
 
+                    # Check for whale dump signal (per-wallet accumulation + dump)
+                    whale_signal = self._whale_tracker.check_for_signal(symbol, timestamp)
+
+                    # Gate whale signal: same freshness/health gates as rolling fade
+                    if whale_signal and regime_metrics is None:
+                        print(f"[WHALE FADE] {symbol}: blocked — regime_metrics unavailable")
+                        self._whale_tracker.confirm_signal(symbol, timestamp)
+                        whale_signal = None
+                    if whale_signal and not self._node_bridge.is_healthy:
+                        print(f"[WHALE FADE] {symbol}: blocked — adapter unhealthy")
+                        self._whale_tracker.confirm_signal(symbol, timestamp)
+                        whale_signal = None
+
                     # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
                     # after a stop-out. Prevents immediate re-entry into same thesis
                     # (NEAR double-entry case: stopped in 45s, re-entered, stopped in 44s).
@@ -1658,6 +1696,12 @@ class CollectorService:
                                   f"stop-loss {_ago:.0f}s ago (cooldown {_STOP_LOSS_COOLDOWN_SEC}s)")
                             self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                             rolling_fade_signal = None
+                        if whale_signal:
+                            _ago = timestamp - _last_stop
+                            print(f"[STOP COOLDOWN] {symbol}: WHALE_FADE blocked — "
+                                  f"stop-loss {_ago:.0f}s ago (cooldown {_STOP_LOSS_COOLDOWN_SEC}s)")
+                            self._whale_tracker.confirm_signal(symbol, timestamp)
+                            whale_signal = None
                         if liquidation_burst:
                             liquidation_burst = None
 
@@ -1806,7 +1850,8 @@ class CollectorService:
                         price_low=self._price_lows.get(symbol, current_price),
                         capitulation_confidence=cap_confidence,
                         rolling_fade_signal=rolling_fade_signal,
-                        position_strategy_id=position_strategy_id
+                        position_strategy_id=position_strategy_id,
+                        whale_signal=whale_signal
                     )
                     if mandates:
                         # Filter out duplicate ENTRY mandates for same symbol in this cycle
@@ -1833,6 +1878,18 @@ class CollectorService:
                     if rolling_fade_signal:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
 
+                    # Whale fade signal lifecycle: only confirm when a whale fade mandate
+                    # was actually selected OR a hard gate already consumed it above.
+                    # Without this check, warmup gate (120s), position-open gate, and
+                    # regime DISABLED gate in PolicyAdapter silently discard the proposal
+                    # but the signal gets consumed anyway — losing valid signals.
+                    if whale_signal:
+                        _whale_mandate_emitted = any(
+                            m.strategy_id == "EP2-WHALE-FADE-V1" for m in mandates
+                        )
+                        if _whale_mandate_emitted:
+                            self._whale_tracker.confirm_signal(symbol, timestamp)
+
                     all_mandates.extend(mandates)
                 except Exception as e:
                     self._logger.warning(f"Policy generation exception for {symbol}: {e}")
@@ -1845,6 +1902,9 @@ class CollectorService:
 
             # Trim rolling volume tracker windows (baseline events + confirmed pending)
             self._rolling_volume_tracker.trim_windows(timestamp)
+
+            # Trim whale tracker windows (inactive wallets + old fills)
+            self._whale_tracker.trim_windows(timestamp)
 
             # Generate DCA mandates for open cascade sniper positions
             dca_mandates = self._generate_dca_mandates(
@@ -1917,12 +1977,17 @@ class CollectorService:
                             is_cascade = result.strategy_id == "EP2-CASCADE-SNIPER-V1"
                             is_exhaust_fade = is_cascade and cascade_mode == "EXHAUSTION_FADE"
                             is_rolling_fade = is_cascade and cascade_mode == "ROLLING_FADE"
+                            is_whale_fade = result.strategy_id == "EP2-WHALE-FADE-V1"
                             if is_exhaust_fade:
                                 stop_config, initial_stop = self._get_exhaust_fade_stop_config(
                                     result.symbol, entry_px, side
                                 )
                             elif is_rolling_fade:
                                 stop_config, initial_stop = self._get_rolling_fade_stop_config(
+                                    result.symbol, entry_px, side
+                                )
+                            elif is_whale_fade:
+                                stop_config, initial_stop = self._get_whale_fade_stop_config(
                                     result.symbol, entry_px, side
                                 )
                             else:
@@ -2351,6 +2416,13 @@ class CollectorService:
                 event.symbol, event.dir, event.closed_pnl_float,
                 event.start_position_float, event.size_float, timestamp
             ))
+
+            # Buffer for whale tracker — pre-filter on value >= $10k
+            value_usd = float(event.value_usd) if hasattr(event, 'value_usd') and event.value_usd else 0.0
+            if value_usd >= 10_000:
+                if len(self._whale_event_buffer) == self._whale_event_buffer.maxlen:
+                    self._deque_overflows['whale'] += 1
+                self._whale_event_buffer.append(event)
         except Exception as e:
             print(f"HL_FILL_EXTENDED_ERROR: {e}", flush=True)
 
@@ -3015,6 +3087,37 @@ class CollectorService:
         )
 
         print(f"ROLLING_FADE STOP: {symbol} {side} @ ${entry_px:,.2f} "
+              f"SL={sl_pct*100:.1f}% trail={trail_pct*100:.2f}% "
+              f"act={activation_pct*100:.1f}% initial_stop=${initial_stop:,.2f}")
+
+        return config, initial_stop
+
+    def _get_whale_fade_stop_config(self, symbol: str, entry_px: float, side: str):
+        """Get trailing stop config for WHALE_FADE entries.
+
+        Returns (TrailingStopConfig, initial_stop_price).
+        Uses FIXED_DISTANCE mode: 50bp SL, 30bp trail, 60bp activation.
+        """
+        sl_pct = 0.005       # 50bp hard stop
+        trail_pct = 0.003    # 30bp trail distance
+        activation_pct = 0.006  # 60bp activation
+
+        if side == "LONG":
+            initial_stop = entry_px * (1 - sl_pct)
+        else:
+            initial_stop = entry_px * (1 + sl_pct)
+
+        config = TrailingStopConfig(
+            mode=TrailingMode.FIXED_DISTANCE,
+            trail_distance_pct=trail_pct,
+            trail_activation_pct=activation_pct,
+            break_even_trigger_pct=1.0,
+            break_even_offset_pct=0.0,
+            min_move_to_update_pct=0.0002,
+            min_move_atr_fraction=0.05,
+        )
+
+        print(f"WHALE_FADE STOP: {symbol} {side} @ ${entry_px:,.2f} "
               f"SL={sl_pct*100:.1f}% trail={trail_pct*100:.2f}% "
               f"act={activation_pct*100:.1f}% initial_stop=${initial_stop:,.2f}")
 

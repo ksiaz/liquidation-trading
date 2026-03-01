@@ -60,6 +60,8 @@ from external_policy.ep2_strategy_cascade_sniper import (
 )
 from runtime.liquidations import LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingFadeSignal
+from external_policy.ep2_strategy_whale_fade import generate_whale_fade_proposal
+from runtime.whale.tracker import WhaleDumpSignal
 
 # Directional context for kill-switch (via observation layer)
 from observation.types import TrendRegimeContext
@@ -89,6 +91,9 @@ class AdapterConfig:
     # Phase 6: Cascade Sniper strategy (Hyperliquid proximity)
     enable_cascade_sniper: bool = False  # Cascade sniper (liquidation proximity)
     cascade_sniper_entry_mode: str = "ABSORPTION_REVERSAL"  # "ABSORPTION_REVERSAL", "CASCADE_MOMENTUM", "EXHAUSTION_FADE", or "ROLLING_FADE"
+
+    # Whale fade strategy: detect whale accumulation + dump manipulation
+    enable_whale_fade: bool = False
 
 
 class PolicyAdapter:
@@ -143,7 +148,8 @@ class PolicyAdapter:
         price_low: Optional[float] = None,  # 5-min rolling low for EFFCS impulse direction
         capitulation_confidence: float = 0.0,  # CapitulationTracker confidence for SLBRS
         rolling_fade_signal: Optional[RollingFadeSignal] = None,  # Rolling 30m liq spike signal
-        position_strategy_id: Optional[str] = None  # Owning strategy for cross-strategy exit gating
+        position_strategy_id: Optional[str] = None,  # Owning strategy for cross-strategy exit gating
+        whale_signal: Optional[WhaleDumpSignal] = None  # Whale accumulation + dump signal
     ) -> List[Mandate]:
         """Generate mandates from observation for a single symbol.
 
@@ -439,6 +445,25 @@ class PolicyAdapter:
             )
             if _DIAG_ENABLED:
                 print(f"  [cascade] SKIPPED - no proximity or burst data")
+
+        # Whale Fade strategy: detect whale accumulation + dump manipulation
+        if self.config.enable_whale_fade and whale_signal is not None:
+            proposal = generate_whale_fade_proposal(
+                symbol=symbol,
+                whale_signal=whale_signal,
+                regime_metrics=regime_metrics,
+                context=context,
+                permission=permission,
+                position_state=position_state,
+                regime_state=regime_state,
+            )
+            if _DIAG_ENABLED:
+                if proposal:
+                    print(f"  [whale_fade] → {proposal.action_type} ({proposal.confidence})")
+                else:
+                    print(f"  [whale_fade] → None (conf={whale_signal.confidence:.2f})")
+            if proposal:
+                proposals.append(proposal)
 
         # Convert proposals to mandates (pure normalization)
         # F5: Pass current_price for quantity calculation

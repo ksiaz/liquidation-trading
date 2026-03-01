@@ -4,7 +4,9 @@ import time
 from dataclasses import dataclass
 from runtime.whale.tracker import (
     WhaleFillTracker,
+    WhaleAccumulation,
     _WalletFill,
+    _CoinThresholds,
     MIN_FILL_VALUE_USD,
     MIN_ACCUMULATION_FILLS,
     MIN_ACCUMULATION_VOLUME,
@@ -13,6 +15,12 @@ from runtime.whale.tracker import (
     MAX_TRACKED_WALLETS,
     ACCUMULATION_WINDOW,
     DUMP_WINDOW,
+    THRESHOLD_MIN_FILLS,
+    THRESHOLD_CACHE_SEC,
+    ACCUMULATION_P90_MULT,
+    DUMP_P90_MULT,
+    MIN_ACCUMULATION_FLOOR,
+    MIN_DUMP_FLOOR,
 )
 
 
@@ -465,3 +473,140 @@ class TestStaleAccumulationCleanup:
         tracker.trim_windows(now)
 
         assert "0xevict" not in tracker._symbol_wallets.get("BTCUSDT", set())
+
+
+class TestPerCoinThresholds:
+    """Test adaptive per-coin threshold calibration."""
+
+    def _seed_fill_distribution(self, tracker, symbol="BTC", n=100, values=None):
+        """Seed fill value distribution with n fills."""
+        if values is None:
+            values = [20_000 + i * 1000 for i in range(n)]
+        for v in values:
+            price = 66000.0
+            size = v / price
+            tracker.on_fill(_make_fill(
+                wallet=f"0xstats_{hash(v) % 10000:04x}",
+                symbol=symbol, price=price, size=size,
+                dir_type="Open Long", ts_sec=time.time(),
+            ))
+
+    def test_warmup_uses_global_defaults(self):
+        """With < THRESHOLD_MIN_FILLS, falls back to global constants."""
+        tracker = WhaleFillTracker()
+        now = time.time()
+        # Seed only 10 fills (below THRESHOLD_MIN_FILLS=50)
+        self._seed_fill_distribution(tracker, n=10)
+
+        thresholds = tracker._get_coin_thresholds("BTCUSDT", now)
+        assert thresholds.min_accumulation_volume == MIN_ACCUMULATION_VOLUME
+        assert thresholds.min_dump_volume == MIN_DUMP_VOLUME
+
+    def test_btc_like_thresholds(self):
+        """BTC-like fills (p90 ≈ $200k) → thresholds near global defaults."""
+        tracker = WhaleFillTracker()
+        now = time.time()
+        # BTC fill distribution: $10k–$400k, p90 ≈ $370k
+        values = [10_000 + i * 4000 for i in range(100)]
+        self._seed_fill_distribution(tracker, values=values)
+
+        thresholds = tracker._get_coin_thresholds("BTCUSDT", now)
+        # p90 ≈ $370k → accumulation = max($100k, $370k * 3) = $1.11M
+        # p90 ≈ $370k → dump = max($200k, $370k * 6) = $2.22M
+        assert thresholds.min_accumulation_volume > MIN_ACCUMULATION_VOLUME
+        assert thresholds.min_dump_volume > MIN_DUMP_VOLUME
+
+    def test_small_coin_lower_thresholds(self):
+        """Small-coin fills (p90 ≈ $20k) → lower thresholds capped at floor."""
+        tracker = WhaleFillTracker()
+        now = time.time()
+        # FARTCOIN fill distribution: $1k–$30k, p90 ≈ $28k
+        values = [1_000 + i * 300 for i in range(100)]
+        self._seed_fill_distribution(tracker, symbol="FARTCOIN", values=values)
+
+        thresholds = tracker._get_coin_thresholds("FARTCOINUSDT", now)
+        # p90 ≈ $28k → accumulation = max($100k, $28k * 3) = $100k (floor)
+        # p90 ≈ $28k → dump = max($200k, $28k * 6) = $200k (floor)
+        assert thresholds.min_accumulation_volume == MIN_ACCUMULATION_FLOOR
+        assert thresholds.min_dump_volume == MIN_DUMP_FLOOR
+        # Both well below global defaults
+        assert thresholds.min_accumulation_volume < MIN_ACCUMULATION_VOLUME
+        assert thresholds.min_dump_volume < MIN_DUMP_VOLUME
+
+    def test_accumulation_scales_with_coin(self):
+        """Small-coin accumulation of $150k is detected (would fail with global $500k)."""
+        tracker = WhaleFillTracker()
+        now = time.time()
+
+        # Calibrate FARTCOIN with small fills → low thresholds
+        values = [2_000 + i * 300 for i in range(60)]
+        self._seed_fill_distribution(tracker, symbol="FARTCOIN", values=values)
+
+        # Whale accumulates $150k on FARTCOIN (4 fills × ~$37.5k, with price impact)
+        whale = "0xfart_whale"
+        for i in range(4):
+            ts = now - 400 + i * 100
+            px = 0.50 + i * 0.005  # Rising price → price impact
+            tracker.on_fill(_make_fill(
+                wallet=whale, symbol="FARTCOIN", price=px, size=75_000,
+                dir_type="Open Long", ts_sec=ts,
+            ))
+
+        # Dump $500k (above per-coin min_dump_volume floor but below global $1M)
+        tracker.on_fill(_make_fill(
+            wallet=whale, symbol="FARTCOIN", price=0.50, size=1_000_000,
+            dir_type="Close Long", closed_pnl=-20_000, ts_sec=now - 2,
+        ))
+
+        signal = tracker.check_for_signal("FARTCOINUSDT", now)
+        # With global thresholds ($500k acc, $1M dump) this would fail.
+        # With per-coin thresholds ($100k floor acc, $200k floor dump) it should pass.
+        assert signal is not None
+        assert signal.fade_direction == "LONG"
+
+    def test_confidence_tiers_scale_with_coin(self):
+        """Confidence scoring scales with per-coin dump threshold."""
+        tracker = WhaleFillTracker()
+
+        # Small coin: min_dump_volume = $200k (floor)
+        small_thresholds = _CoinThresholds(
+            min_accumulation_volume=100_000, min_dump_volume=200_000)
+        # BTC: min_dump_volume = $1.2M
+        btc_thresholds = _CoinThresholds(
+            min_accumulation_volume=600_000, min_dump_volume=1_200_000)
+
+        acc = WhaleAccumulation(
+            wallet="0x", symbol="X", direction="LONG",
+            total_volume_usd=500_000, fill_count=5, duration_sec=400,
+            price_start=100, price_end=102, price_impact_bps=20)
+
+        # $400k dump on small coin → base * 2 tier → +0.2
+        small_score = tracker._score_confidence(400_000, acc, -10_000, 1.0, small_thresholds)
+        # $2.4M dump on BTC → base * 2 tier → +0.2
+        btc_score = tracker._score_confidence(2_400_000, acc, -60_000, 1.0, btc_thresholds)
+
+        # Both should get the same volume tier boost (0.2) — verify they're close
+        # (not exactly equal because PnL tiers also scale)
+        assert abs(small_score - btc_score) <= 0.15
+
+    def test_threshold_cache_invalidation(self):
+        """Thresholds recompute after THRESHOLD_CACHE_SEC."""
+        tracker = WhaleFillTracker()
+        now = time.time()
+
+        # Seed enough fills for calibration
+        values = [5_000 + i * 500 for i in range(60)]
+        self._seed_fill_distribution(tracker, symbol="ETH", values=values)
+
+        t1 = tracker._get_coin_thresholds("ETHUSDT", now)
+        # Same timestamp → cached
+        t2 = tracker._get_coin_thresholds("ETHUSDT", now + 10)
+        assert t1.min_accumulation_volume == t2.min_accumulation_volume
+
+        # Add very different fills to shift distribution
+        big_values = [500_000 + i * 10_000 for i in range(60)]
+        self._seed_fill_distribution(tracker, symbol="ETH", values=big_values)
+
+        # After cache expiry → recomputed with new data
+        t3 = tracker._get_coin_thresholds("ETHUSDT", now + THRESHOLD_CACHE_SEC + 1)
+        assert t3.min_accumulation_volume > t1.min_accumulation_volume

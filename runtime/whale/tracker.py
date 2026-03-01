@@ -63,13 +63,29 @@ MAX_TRACKED_WALLETS = 500            # LRU eviction when exceeded
 WALLET_INACTIVE_SEC = 1800           # Prune wallets with no fills in 30 min
 ACCUMULATION_WINDOW = 600            # 10 min accumulation window
 MIN_ACCUMULATION_FILLS = 3           # Minimum fills for accumulation
-MIN_ACCUMULATION_VOLUME = 500_000    # $500k minimum volume
+MIN_ACCUMULATION_VOLUME = 500_000    # $500k — global fallback (used when < THRESHOLD_MIN_FILLS)
 MIN_SAME_DIRECTION_PCT = 0.80        # 80% same direction
 DUMP_WINDOW = 30                     # 30s dump window
-MIN_DUMP_VOLUME = 1_000_000          # $1M minimum dump volume
+MIN_DUMP_VOLUME = 1_000_000          # $1M — global fallback (used when < THRESHOLD_MIN_FILLS)
 DUMP_FILL_SIZE_MULTIPLIER = 2.0      # Dump fill ≥ 2× avg accumulation fill
 SIGNAL_COOLDOWN = 900                # 15 min cooldown per coin
 MIN_CONFIDENCE = 0.5                 # Minimum confidence for signal
+
+# Per-coin adaptive threshold calibration
+THRESHOLD_MIN_FILLS = 50             # Need ≥50 fills to calibrate per-coin thresholds
+THRESHOLD_CACHE_SEC = 60             # Recompute thresholds every 60s
+ACCUMULATION_P90_MULT = 3.0          # Accumulation threshold = 3× p90 fill value
+DUMP_P90_MULT = 6.0                  # Dump threshold = 6× p90 fill value
+MIN_ACCUMULATION_FLOOR = 100_000     # Never below $100k regardless of coin
+MIN_DUMP_FLOOR = 200_000             # Never below $200k regardless of coin
+FILL_STATS_MIN_VALUE = 1_000         # Track fills ≥ $1k for distribution (lower than MIN_FILL_VALUE_USD)
+
+
+@dataclass
+class _CoinThresholds:
+    """Per-coin volume thresholds derived from observed fill distribution."""
+    min_accumulation_volume: float
+    min_dump_volume: float
 
 
 # ── Direction Helpers (matches HL dir format, same logic as capitulation.py) ──
@@ -128,6 +144,10 @@ class WhaleFillTracker:
         self._wallet_last_seen: Dict[str, float] = {}
         # Per-symbol wallet index: symbol → set(wallet) — avoids full wallet scan
         self._symbol_wallets: Dict[str, set] = {}
+        # Per-symbol fill value distribution for adaptive thresholds (all fills ≥ $1k)
+        self._symbol_fill_values: Dict[str, Deque[float]] = {}
+        # Threshold cache: symbol → (wall_ts, _CoinThresholds)
+        self._threshold_cache: Dict[str, tuple] = {}
 
     def on_fill(self, event) -> None:
         """Ingest a FillEvent. Called from gRPC daemon thread.
@@ -137,6 +157,15 @@ class WhaleFillTracker:
         """
         try:
             value_usd = float(event.value_usd) if event.value_usd else 0.0
+
+            # Track fill value distribution for per-coin threshold calibration.
+            # Uses lower floor ($1k) than MIN_FILL_VALUE_USD to capture full distribution.
+            symbol_raw = f"{event.symbol}USDT" if not event.symbol.endswith("USDT") else event.symbol
+            if value_usd >= FILL_STATS_MIN_VALUE:
+                if symbol_raw not in self._symbol_fill_values:
+                    self._symbol_fill_values[symbol_raw] = deque(maxlen=500)
+                self._symbol_fill_values[symbol_raw].append(value_usd)
+
             if value_usd < MIN_FILL_VALUE_USD:
                 return
 
@@ -147,7 +176,7 @@ class WhaleFillTracker:
             if not wallet:
                 return
 
-            symbol = f"{event.symbol}USDT" if not event.symbol.endswith("USDT") else event.symbol
+            symbol = symbol_raw
             price = float(event.price) if event.price else 0.0
             size = float(event.size) if event.size else 0.0
             closed_pnl = float(event.closed_pnl) if event.closed_pnl else 0.0
@@ -203,6 +232,9 @@ class WhaleFillTracker:
         if timestamp - last_ts < SIGNAL_COOLDOWN:
             return None
 
+        # Per-coin adaptive thresholds (p90-based or global fallback during warmup)
+        thresholds = self._get_coin_thresholds(symbol, timestamp)
+
         # Scan only wallets with fills for this symbol (via index)
         best_signal: Optional[WhaleDumpSignal] = None
         candidate_wallets = list(self._symbol_wallets.get(symbol, set()))
@@ -219,7 +251,7 @@ class WhaleFillTracker:
                 continue
 
             # Detect accumulation
-            accumulation = self._detect_accumulation(wallet, symbol, fills, timestamp)
+            accumulation = self._detect_accumulation(wallet, symbol, fills, timestamp, thresholds)
             if accumulation:
                 # Store active accumulation
                 if symbol not in self._active_accumulations:
@@ -235,7 +267,7 @@ class WhaleFillTracker:
                         continue
 
                     acc_fills = list(self._wallet_fills[acc_wallet][symbol])
-                    dump = self._detect_dump(acc_wallet, symbol, acc_fills, acc, timestamp)
+                    dump = self._detect_dump(acc_wallet, symbol, acc_fills, acc, timestamp, thresholds)
                     if dump and (best_signal is None or dump.confidence > best_signal.confidence):
                         best_signal = dump
 
@@ -287,16 +319,52 @@ class WhaleFillTracker:
             if not self._active_accumulations.get(sym):
                 self._active_accumulations.pop(sym, None)
 
+        # Clear threshold cache for symbols with no active wallets
+        for sym in list(self._threshold_cache):
+            if sym not in self._symbol_wallets or not self._symbol_wallets[sym]:
+                self._threshold_cache.pop(sym, None)
+
+    # ── Per-Coin Threshold Calibration ──────────────────────────────
+
+    def _get_coin_thresholds(self, symbol: str, timestamp: float) -> _CoinThresholds:
+        """Compute adaptive thresholds from observed fill value distribution.
+
+        Uses p90 fill value × multipliers. Falls back to global constants
+        when fewer than THRESHOLD_MIN_FILLS observed for this coin.
+        """
+        cached = self._threshold_cache.get(symbol)
+        if cached and timestamp - cached[0] < THRESHOLD_CACHE_SEC:
+            return cached[1]
+
+        values = list(self._symbol_fill_values.get(symbol, []))  # thread-safe snapshot
+        if len(values) < THRESHOLD_MIN_FILLS:
+            result = _CoinThresholds(
+                min_accumulation_volume=MIN_ACCUMULATION_VOLUME,
+                min_dump_volume=MIN_DUMP_VOLUME,
+            )
+        else:
+            values.sort()
+            p90_idx = int(len(values) * 0.90)
+            p90 = values[p90_idx]
+            result = _CoinThresholds(
+                min_accumulation_volume=max(MIN_ACCUMULATION_FLOOR, p90 * ACCUMULATION_P90_MULT),
+                min_dump_volume=max(MIN_DUMP_FLOOR, p90 * DUMP_P90_MULT),
+            )
+
+        self._threshold_cache[symbol] = (timestamp, result)
+        return result
+
     # ── Internal Detection ───────────────────────────────────────────
 
     def _detect_accumulation(
-        self, wallet: str, symbol: str, fills: list, timestamp: float
+        self, wallet: str, symbol: str, fills: list, timestamp: float,
+        thresholds: _CoinThresholds,
     ) -> Optional[WhaleAccumulation]:
         """Detect accumulation pattern in recent fills for a wallet+symbol.
 
         Requirements:
         - ≥3 fills within ACCUMULATION_WINDOW (10 min)
-        - ≥$500k total volume
+        - ≥ per-coin min_accumulation_volume (from observed fill distribution)
         - ≥80% same direction (Open Long or Open Short)
         """
         cutoff = timestamp - ACCUMULATION_WINDOW
@@ -311,7 +379,7 @@ class WhaleFillTracker:
             return None
 
         total_volume = sum(f.value_usd for f in open_fills)
-        if total_volume < MIN_ACCUMULATION_VOLUME:
+        if total_volume < thresholds.min_accumulation_volume:
             return None
 
         # Count direction from explicit opens only
@@ -351,13 +419,13 @@ class WhaleFillTracker:
 
     def _detect_dump(
         self, wallet: str, symbol: str, fills: list, accumulation: WhaleAccumulation,
-        timestamp: float
+        timestamp: float, thresholds: _CoinThresholds,
     ) -> Optional[WhaleDumpSignal]:
         """Detect dump reversal from a wallet with active accumulation.
 
         Requirements:
         - Within DUMP_WINDOW (30s)
-        - ≥$1M dump volume
+        - ≥ per-coin min_dump_volume (from observed fill distribution)
         - Fill size ≥ 2× avg accumulation fill
         - Direction reversal: Close*/flip that reduces accumulated position
         - closed_pnl is a confidence factor (not hard gate)
@@ -381,7 +449,7 @@ class WhaleFillTracker:
             return None
 
         dump_volume = sum(f.value_usd for f in dump_fills)
-        if dump_volume < MIN_DUMP_VOLUME:
+        if dump_volume < thresholds.min_dump_volume:
             return None
 
         # Check fill size multiplier
@@ -403,9 +471,9 @@ class WhaleFillTracker:
         else:
             fade_direction = "SHORT"
 
-        # Confidence scoring
+        # Confidence scoring (tiers scaled per-coin)
         confidence = self._score_confidence(
-            dump_volume, accumulation, total_pnl, dump_duration
+            dump_volume, accumulation, total_pnl, dump_duration, thresholds
         )
         if confidence < MIN_CONFIDENCE:
             return None
@@ -423,28 +491,35 @@ class WhaleFillTracker:
 
     def _score_confidence(
         self, dump_volume: float, accumulation: WhaleAccumulation,
-        closed_pnl: float, dump_duration: float
+        closed_pnl: float, dump_duration: float,
+        thresholds: _CoinThresholds,
     ) -> float:
-        """Score confidence 0.0–1.0 for whale dump signal."""
+        """Score confidence 0.0–1.0 for whale dump signal.
+
+        Volume and PnL tiers scale with per-coin thresholds so that
+        a $400k dump on FARTCOIN gets the same boost as a $2M dump on BTC.
+        """
         score = 0.0
 
-        # Dump volume tiers
-        if dump_volume >= 5_000_000:
+        # Dump volume tiers — scaled to per-coin min_dump_volume
+        base = thresholds.min_dump_volume
+        if dump_volume >= base * 5:
             score += 0.3
-        elif dump_volume >= 2_000_000:
+        elif dump_volume >= base * 2:
             score += 0.2
-        elif dump_volume >= 1_000_000:
-            score += 0.1
+        else:
+            score += 0.1  # Already passed min_dump_volume gate
 
         # Accumulation duration (longer = more deliberate)
         if accumulation.duration_sec >= 300:
             score += 0.2
 
-        # Closed PnL magnitude — graduated boost (not hard gate).
-        # Near-breakeven closes are still valid dumps, just less confident.
-        if abs(closed_pnl) >= 50_000:
+        # Closed PnL magnitude — graduated boost, scaled to per-coin dump threshold.
+        # pnl_base = 5% of dump threshold (BTC: ~$60k, FARTCOIN: ~$10k)
+        pnl_base = base * 0.05
+        if abs(closed_pnl) >= pnl_base * 5:
             score += 0.2
-        elif abs(closed_pnl) >= 10_000:
+        elif abs(closed_pnl) >= pnl_base:
             score += 0.1
         elif closed_pnl != 0:
             score += 0.05

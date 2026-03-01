@@ -704,7 +704,7 @@ class GhostPositionTracker:
             spread_bps=spread_bps,
             concurrent_positions=len(self._state.open_positions),
             holding_duration_sec=holding_duration,
-            exit_reason=exit_reason if not is_partial else "PARTIAL_REDUCE"
+            exit_reason=exit_reason if not is_partial else f"PARTIAL_{exit_reason}"
         )
 
         self._state.trade_history.append(trade)

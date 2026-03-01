@@ -1,8 +1,8 @@
 """
 Ghost Exchange Adapter - Live Market Execution v1.0
 
-Real Binance Futures APIs with ZERO actual orders.
-Simulated matching based on real order book.
+Simulated matching based on real order book (HL L2 data).
+ZERO actual orders placed.
 
 Authority: System v1.0 Freeze, Ghost Execution Correction
 """
@@ -11,10 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List
 from enum import Enum
 import time
-import hmac
-import hashlib
 import requests
-from urllib.parse import urlencode
 
 
 # ==============================================================================
@@ -43,10 +40,7 @@ class NormalizedOrderbook:
     """
     Exchange-agnostic orderbook representation.
 
-    Can be populated from:
-    - Hyperliquid L2 book (preferred)
-    - Binance depth endpoint (fallback)
-    - Any other exchange
+    Populated from Hyperliquid L2 book.
 
     Levels are (price, quantity) tuples sorted by price.
     """
@@ -105,18 +99,6 @@ class NormalizedOrderbook:
             source="HL_WS"
         )
 
-    @classmethod
-    def from_binance_depth(cls, depth: Dict, symbol: str) -> 'NormalizedOrderbook':
-        """Convert Binance depth response to normalized format."""
-        bids = tuple((float(p), float(q)) for p, q in depth.get('bids', []))
-        asks = tuple((float(p), float(q)) for p, q in depth.get('asks', []))
-        return cls(
-            symbol=symbol,
-            timestamp=time.time(),
-            bids=bids,
-            asks=asks,
-            source="BINANCE"
-        )
 
 
 @dataclass(frozen=True)
@@ -159,97 +141,52 @@ class GhostExecutionResult:
 
 
 # ==============================================================================
-# Binance API Client (Read-Only)
+# HL Asset Metadata
 # ==============================================================================
 
-class BinanceAPIClient:
-    """
-    Binance Futures API client.
-    READ-ONLY operations only.
-    """
-    
-    BASE_URL = "https://fapi.binance.com"
-    
-    def __init__(self, *, api_key: Optional[str] = None):
-        """
-        Initialize Binance API client.
-        
-        Args:
-            api_key: Optional API key for rate limit benefits (read-only)
-        """
-        self._api_key = api_key
-        self._session = requests.Session()
-        if api_key:
-            self._session.headers.update({"X-MBX-APIKEY": api_key})
-    
-    def get_exchange_info(self, *, symbol: str) -> Dict:
-        """
-        Get exchange trading rules for symbol.
-        
-        Args:
-            symbol: Trading symbol (e.g. BTCUSDT)
-        
-        Returns:
-            Exchange info dict with filters
-        
-        Raises:
-            requests.HTTPError: If API call fails
-        """
-        url = f"{self.BASE_URL}/fapi/v1/exchangeInfo"
-        params = {"symbol": symbol}
-        
-        response = self._session.get(url, params=params)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Extract symbol info
-        for sym in data.get("symbols", []):
-            if sym["symbol"] == symbol:
-                return sym
-        
-        raise ValueError(f"Symbol {symbol} not found in exchange info")
-    
-    def get_order_book(self, *, symbol: str, limit: int = 20) -> Dict:
-        """
-        Get current order book depth.
-        
-        Args:
-            symbol: Trading symbol
-            limit: Depth limit (5, 10, 20, 50, 100, 500, 1000)
-        
-        Returns:
-            Order book dict with bids/asks
-        
-        Raises:
-            requests.HTTPError: If API call fails
-        """
-        url = f"{self.BASE_URL}/fapi/v1/depth"
-        params = {"symbol": symbol, "limit": limit}
-        
-        response = self._session.get(url, params=params)
-        response.raise_for_status()
-        
-        return response.json()
-    
-    def get_ticker_price(self, *, symbol: str) -> float:
-        """
-        Get current ticker price.
-        
-        Args:
-            symbol: Trading symbol
-        
-        Returns:
-            Current price
-        """
-        url = f"{self.BASE_URL}/fapi/v1/ticker/price"
-        params = {"symbol": symbol}
-        
-        response = self._session.get(url, params=params)
-        response.raise_for_status()
-        
-        data = response.json()
-        return float(data["price"])
+# Cache HL meta globally — one fetch per process, all adapters share it
+_HL_META_CACHE: Optional[Dict] = None
+
+
+def _fetch_hl_meta() -> Dict[str, int]:
+    """Fetch szDecimals for all HL perp assets. Cached per process."""
+    global _HL_META_CACHE
+    if _HL_META_CACHE is not None:
+        return _HL_META_CACHE
+
+    resp = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={"type": "meta"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    result = {}
+    for asset in data.get("universe", []):
+        name = asset.get("name", "")
+        if name:
+            result[name] = int(asset.get("szDecimals", 0))
+
+    _HL_META_CACHE = result
+    return result
+
+
+def _hl_filters_for_coin(coin: str) -> Dict:
+    """Build ghost adapter filters from HL asset metadata."""
+    meta = _fetch_hl_meta()
+    sz_decimals = meta.get(coin, 2)  # default 2 decimals
+    step_size = 10 ** (-sz_decimals)
+
+    return {
+        "tick_size": 0.0001,       # HL uses sig-fig pricing, permissive default
+        "min_price": 0.0001,
+        "max_price": 100000000.0,
+        "step_size": step_size,
+        "min_qty": step_size,
+        "max_qty": 100000000.0,
+        "min_notional": 10.0,      # HL minimum ~$10
+    }
 
 
 # ==============================================================================
@@ -259,15 +196,13 @@ class BinanceAPIClient:
 class GhostExchangeAdapter:
     """
     Ghost execution adapter for live market data.
-    
-    Uses real Binance APIs to:
-    - Fetch order book
-    - Validate exchange constraints
-    - Simulate order matching
-    
+
+    Uses HL L2 orderbook for fill simulation.
+    Validates constraints from HL asset metadata (szDecimals).
+
     NEVER places actual orders.
     """
-    
+
     def __init__(
         self,
         *,
@@ -277,83 +212,48 @@ class GhostExchangeAdapter:
     ):
         """
         Initialize ghost exchange adapter.
-        
+
         Args:
-            symbol: Trading symbol
-            api_key: Optional read-only API key
+            symbol: Trading symbol (USDT format, e.g. BTCUSDT)
+            api_key: Unused, kept for interface compatibility
             execution_mode: GHOST_LIVE or GHOST_SNAPSHOT
         """
         self._symbol = symbol
         self._execution_mode = execution_mode
-        self._api_client = BinanceAPIClient(api_key=api_key)
-        
-        # Fetch and cache exchange info
-        self._exchange_info = self._api_client.get_exchange_info(symbol=symbol)
-        self._filters = self._parse_filters(self._exchange_info)
-        
+
+        # Get filters from HL asset metadata (szDecimals)
+        coin = symbol.replace("USDT", "")
+        self._filters = _hl_filters_for_coin(coin)
+        self._exchange_info = {"symbol": symbol}
+
         # For snapshot mode
         self._current_snapshot: Optional[OrderBookSnapshot] = None
-    
-    def _parse_filters(self, exchange_info: Dict) -> Dict:
-        """Parse exchange filters into usable format."""
-        filters = {}
-        for f in exchange_info.get("filters", []):
-            filter_type = f["filterType"]
-            if filter_type == "PRICE_FILTER":
-                filters["tick_size"] = float(f["tickSize"])
-                filters["min_price"] = float(f["minPrice"])
-                filters["max_price"] = float(f["maxPrice"])
-            elif filter_type == "LOT_SIZE":
-                filters["step_size"] = float(f["stepSize"])
-                filters["min_qty"] = float(f["minQty"])
-                filters["max_qty"] = float(f["maxQty"])
-            elif filter_type == "MIN_NOTIONAL":
-                filters["min_notional"] = float(f["notional"])
-        
-        return filters
     
     def capture_snapshot(
         self,
         orderbook: Optional[NormalizedOrderbook] = None
     ) -> OrderBookSnapshot:
         """
-        Capture current order book snapshot.
+        Capture current order book snapshot from HL L2 data.
 
         Args:
-            orderbook: Optional normalized orderbook (from HL or other source).
-                      If provided, uses this instead of fetching from Binance.
+            orderbook: Normalized orderbook from HL L2 WebSocket.
 
         Returns:
             OrderBookSnapshot
         """
-        timestamp = time.time()
-
-        if orderbook is not None:
-            # Use injected orderbook (preferred path - no Binance call)
-            bids = orderbook.bids
-            asks = orderbook.asks
-            best_bid = orderbook.best_bid
-            best_ask = orderbook.best_ask
-            spread = orderbook.spread
-            timestamp = orderbook.timestamp
-        else:
-            # Fallback: fetch from Binance (backward compatibility)
-            ob_data = self._api_client.get_order_book(symbol=self._symbol, limit=20)
-            bids = tuple((float(p), float(q)) for p, q in ob_data["bids"])
-            asks = tuple((float(p), float(q)) for p, q in ob_data["asks"])
-            best_bid = bids[0][0] if bids else 0.0
-            best_ask = asks[0][0] if asks else 0.0
-            spread = best_ask - best_bid if (best_bid and best_ask) else 0.0
+        if orderbook is None:
+            raise RuntimeError(f"No orderbook provided for {self._symbol}")
 
         snapshot = OrderBookSnapshot(
-            snapshot_id=f"{self._symbol}_{int(timestamp * 1000)}",
-            timestamp=timestamp,
+            snapshot_id=f"{self._symbol}_{int(orderbook.timestamp * 1000)}",
+            timestamp=orderbook.timestamp,
             symbol=self._symbol,
-            bids=bids,
-            asks=asks,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            spread=spread
+            bids=orderbook.bids,
+            asks=orderbook.asks,
+            best_bid=orderbook.best_bid,
+            best_ask=orderbook.best_ask,
+            spread=orderbook.spread
         )
 
         if self._execution_mode == ExecutionMode.GHOST_SNAPSHOT:
@@ -378,8 +278,7 @@ class GhostExchangeAdapter:
             order_type: MARKET or LIMIT
             quantity: Order quantity
             price: Limit price (required for LIMIT orders)
-            orderbook: Optional normalized orderbook (from HL or other source).
-                      If provided, uses this instead of fetching from Binance.
+            orderbook: Normalized orderbook from HL L2 WebSocket.
 
         Returns:
             GhostExecutionResult with simulation outcome

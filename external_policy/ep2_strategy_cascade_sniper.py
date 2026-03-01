@@ -223,14 +223,14 @@ EXHAUSTION_FADE_TRAIL_CONFIG = {
 EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps": 30}
 
 # ROLLING_FADE trailing stop config
-# Used during 75-100% WR era (Feb 17-21). Entry quality is what drives WR —
-# stop width is secondary. Keep tight stops to cap losses when entries are wrong.
+# SOL 2026-02-28: tight trail (20bp activation, 15bp trail) exited at +$0.15
+# on a 2.6% move. Trail activated too early, then tiny pullback triggered exit.
+# Wide trail: let the trade run, accept overshoot (50bp SL survives momentum).
+# Cascade bounces are 1-3% — need room to hold through initial volatility.
 ROLLING_FADE_TRAIL_CONFIG = {
-    "activation_pct": 0.002,   # 0.20% = 20 bps (trail engages early)
-    "trail_pct": 0.0015,       # 0.15% = 15 bps (tighter trail)
-    "sl_pct": 0.005,           # 0.50% = 50 bps
-    "break_even_trigger_pct": 0.003,  # 0.30% = 30 bps MFE triggers BE
-    "break_even_offset_pct": 0.0005,  # 0.05% = 5 bps above entry
+    "activation_pct": 0.008,   # 0.80% = 80 bps (let trade develop before trailing)
+    "trail_pct": 0.004,        # 0.40% = 40 bps (give room for bounce volatility)
+    "sl_pct": 0.005,           # 0.50% = 50 bps (unchanged — caps loss on bad entries)
 }
 
 # Cascade fuel gate: block ROLLING_FADE when too many positions remain at risk
@@ -2009,37 +2009,12 @@ def generate_cascade_sniper_proposal(
                       f"${rolling_fade_signal.spike_volume:.0f} < ${min_burst:.0f}")
                 return None
 
-            # Counter-trend gate: check ret_1m and ret_3m but allow entry when no data.
-            # Gate B's strict no-data block requires absorption (which ROLLING_FADE lacks).
-            # The burst signal itself is sufficient evidence — don't block on missing prices.
+            # Counter-trend and orderflow gates REMOVED for ROLLING_FADE.
+            # During a cascade, ret_1m is negative (crash) and OF is selling —
+            # that's the SETUP, not a reason to block. The burst signal (10x+ ratio,
+            # concentration, exhaustion) + 60s confirmation delay is sufficient evidence.
+            # SOL 2026-02-28: BTC/ETH blocked by these gates while all coins bounced 2%+.
             ret_1m = price_returns.get('ret_1m') if price_returns else None
-            ret_3m = price_returns.get('ret_3m') if price_returns else None
-            if entry_direction == "LONG":
-                if (ret_1m is not None and ret_1m <= -0.0015) or \
-                   (ret_3m is not None and ret_3m <= -0.0030):
-                    print(f"[ROLL FADE] {symbol}: LONG blocked — "
-                          f"counter-trend (ret_1m={ret_1m*100 if ret_1m else 0:+.2f}% "
-                          f"ret_3m={ret_3m*100 if ret_3m else 0:+.2f}%)")
-                    return None
-            elif entry_direction == "SHORT":
-                if (ret_1m is not None and ret_1m >= 0.0015) or \
-                   (ret_3m is not None and ret_3m >= 0.0030):
-                    print(f"[ROLL FADE] {symbol}: SHORT blocked — "
-                          f"counter-trend (ret_1m={ret_1m*100 if ret_1m else 0:+.2f}% "
-                          f"ret_3m={ret_3m*100 if ret_3m else 0:+.2f}%)")
-                    return None
-
-            # Orderflow gate: block entry when dominant flow opposes fade direction
-            # LONG blocked if OF < 0.15 (heavy selling), SHORT blocked if OF > 0.85 (heavy buying)
-            if orderflow_imbalance is not None:
-                if entry_direction == "LONG" and orderflow_imbalance < 0.15:
-                    print(f"[ROLL FADE] {symbol}: LONG blocked — "
-                          f"orderflow too bearish (OF={orderflow_imbalance:.2f} < 0.15)")
-                    return None
-                if entry_direction == "SHORT" and orderflow_imbalance > 0.85:
-                    print(f"[ROLL FADE] {symbol}: SHORT blocked — "
-                          f"orderflow too bullish (OF={orderflow_imbalance:.2f} > 0.85)")
-                    return None
 
             # Cascade fuel gate: block when many positions remain at risk on cascade side
             if proximity is not None:

@@ -196,10 +196,10 @@ def prune_stale_log_files(max_age_hours: int = 72) -> int:
 # Symbols to trade - 15 highest volume coins (must exist in HL asset map)
 # Include both Binance format (BTCUSDT) and HL format (BTC) for cross-exchange support
 BINANCE_SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
-    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'SUIUSDT', 'NEARUSDT',
-    'LTCUSDT', 'ATOMUSDT', 'AAVEUSDT', 'APTUSDT', 'ARBUSDT',
-    'BNBUSDT', 'OPUSDT', 'TRXUSDT', 'WLDUSDT', 'TONUSDT',
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'kPEPEUSDT', 'DOGEUSDT',
+    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'PENDLEUSDT', 'NEARUSDT',
+    'LTCUSDT', 'ADAUSDT', 'AAVEUSDT', 'APTUSDT', 'SEIUSDT',
+    'BNBUSDT', 'INJUSDT', 'FARTCOINUSDT', 'WLDUSDT', 'TONUSDT',
 ]
 HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
 # Only USDT-suffixed symbols for observation — short-form HL symbols have no M1 data

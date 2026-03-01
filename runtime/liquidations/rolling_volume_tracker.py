@@ -155,12 +155,7 @@ class RollingVolumeTracker:
         if burst_count < self.MIN_BURST_EVENTS:
             return None
 
-        # Warmup: need enough baseline history
-        baseline_only = baseline_count - burst_count
-        if baseline_only < self.MIN_BASELINE_EVENTS:
-            return None
-
-        # Compute rates
+        # Compute rates (before baseline gate — ratio determines adaptive minimum)
         baseline_minutes = self.BASELINE_WINDOW / 60.0
         burst_minutes = self.BURST_WINDOW / 60.0
         baseline_rate = baseline_count / baseline_minutes
@@ -172,6 +167,12 @@ class RollingVolumeTracker:
             ratio = float('inf')
 
         if ratio < self.RATIO_THRESHOLD:
+            return None
+
+        # Warmup: adaptive baseline minimum (strong signals need less context)
+        baseline_only = baseline_count - burst_count
+        min_baseline = self._min_baseline_for_ratio(ratio)
+        if baseline_only < min_baseline:
             return None
 
         # ── Burst concentration gate ──
@@ -224,6 +225,18 @@ class RollingVolumeTracker:
             return signal
 
         return None
+
+    def _min_baseline_for_ratio(self, ratio: float) -> int:
+        """Adaptive baseline minimum — strong signals need less context.
+
+        BTC/ETH/SOL have bursty liq patterns (long gaps then floods).
+        A 50x burst ratio is overwhelming evidence even with sparse baseline.
+        """
+        if ratio >= 50:
+            return 5
+        if ratio >= 20:
+            return 10
+        return 20
 
     def _build_signal(
         self,

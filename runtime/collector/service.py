@@ -89,6 +89,33 @@ from dataclasses import dataclass
 
 
 @dataclass
+class GravityTPConfig:
+    """Configuration for L2 gravity-zone partial take-profit."""
+    enabled: bool = True
+    min_gravity: float = 10_000     # Zone gravity threshold (avg_usd * persistence)
+    min_distance_bps: float = 30    # Min 30bp from entry — avoid noise
+    max_distance_bps: float = 300   # Max 300bp (3%) — don't target unrealistic levels
+    reduce_fraction: float = 0.50   # Close 50% at TP zone
+    require_warmup: bool = True     # Only target if map has 5min+ data
+
+
+@dataclass
+class GravityTPTarget:
+    """Active partial TP target from L2 gravity zone."""
+    symbol: str
+    target_price: float           # Zone center price
+    zone_low: float               # Zone band_low
+    zone_high: float              # Zone band_high
+    reduce_fraction: float        # Fraction to close (0.5)
+    entry_price: float            # Entry price at time of targeting
+    side: str                     # LONG or SHORT
+    zone_gravity: float           # For logging
+    zone_persistence: float       # For logging
+    set_at: float                 # Wall clock when target set
+    fired: bool = False           # True after partial TP executed
+
+
+@dataclass
 class DCAConfig:
     """Configuration for DCA (Dollar Cost Averaging) on cascade sniper positions."""
     enabled: bool = True
@@ -113,10 +140,10 @@ class DCAState:
 
 # Constants - Trading symbols (must match run_paper_trade.py)
 TOP_10_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-    "AVAXUSDT", "LINKUSDT", "HYPEUSDT", "SUIUSDT", "NEARUSDT",
-    "LTCUSDT", "ATOMUSDT", "AAVEUSDT", "APTUSDT", "ARBUSDT",
-    "BNBUSDT", "OPUSDT", "TRXUSDT", "WLDUSDT", "TONUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "kPEPEUSDT", "DOGEUSDT",
+    "AVAXUSDT", "LINKUSDT", "HYPEUSDT", "PENDLEUSDT", "NEARUSDT",
+    "LTCUSDT", "ADAUSDT", "AAVEUSDT", "APTUSDT", "SEIUSDT",
+    "BNBUSDT", "INJUSDT", "FARTCOINUSDT", "WLDUSDT", "TONUSDT",
 ]
 
 class CollectorService:
@@ -290,6 +317,10 @@ class CollectorService:
         # DCA (Dollar Cost Averaging) for cascade sniper positions
         self._dca_config = DCAConfig()
         self._dca_states: Dict[str, DCAState] = {}  # symbol → DCA state
+
+        # Gravity TP: partial take-profit at L2 orderbook resistance/support zones
+        self._gravity_tp_config = GravityTPConfig()
+        self._gravity_tp_targets: Dict[str, GravityTPTarget] = {}  # symbol → target
 
         # L2 liquidity memory map (gravity zones for TP targeting)
         self._liquidity_map = LiquidityMap()
@@ -1077,6 +1108,8 @@ class CollectorService:
                         self._orderflow_calculators[f_sym].update(f_side == "A", f_sz, f_ts)
                         # Trailing stops
                         self._update_trailing_stops(f_sym, f_px)
+                        # Gravity TP on fill-driven price updates
+                        self._check_gravity_tp_targets(f_sym, f_px)
                         # Cascade organic flow
                         try:
                             from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
@@ -1384,6 +1417,23 @@ class CollectorService:
                         fill_count=orderflow_fill_count,
                         atr_30m=atr_30m,
                     )
+
+                    # Gravity TP: partial close at L2 orderbook resistance/support zones
+                    # Compute target for recovered positions that don't have one yet
+                    if symbol not in self._gravity_tp_targets:
+                        ghost_pos = self.ghost_tracker.get_open_position(symbol)
+                        if ghost_pos:
+                            tp_target = self._compute_gravity_tp_target(symbol, ghost_pos.entry_price, ghost_pos.side)
+                            if tp_target:
+                                self._gravity_tp_targets[symbol] = tp_target
+                                self._logger.info(
+                                    f"GRAVITY_TP_SET: {symbol} {ghost_pos.side} (recovered) "
+                                    f"target=${tp_target.target_price:,.2f} "
+                                    f"gravity={tp_target.zone_gravity:.0f} "
+                                    f"persist={tp_target.zone_persistence:.0%} "
+                                    f"distance={(abs(tp_target.target_price - ghost_pos.entry_price) / ghost_pos.entry_price * 10000):.0f}bp"
+                                )
+                    self._check_gravity_tp_targets(symbol, price)
 
                 except Exception as e:
                     # Don't fail cycle if regime classification fails
@@ -1861,6 +1911,15 @@ class CollectorService:
                                     level=0, last_add_ts=time.time(),
                                     initial_quantity=qty, initial_entry_price=entry_px,
                                     strategy_id=result.strategy_id)
+                                # Gravity TP: target nearest L2 resistance/support zone
+                                tp_target = self._compute_gravity_tp_target(result.symbol, entry_px, side)
+                                if tp_target:
+                                    self._gravity_tp_targets[result.symbol] = tp_target
+                                    print(f"GRAVITY_TP_SET: {result.symbol} {side} target=${tp_target.target_price:,.2f} "
+                                          f"gravity={tp_target.zone_gravity:.0f} persist={tp_target.zone_persistence:.0%} "
+                                          f"distance={(abs(tp_target.target_price - entry_px) / entry_px * 10000):.0f}bp")
+                                else:
+                                    self._gravity_tp_targets.pop(result.symbol, None)
                             # Emit ENTRY snapshot from latest ring buffer state
                             _ms_cur = self._market_state.get_current(result.symbol)
                             if _ms_cur:
@@ -1919,6 +1978,14 @@ class CollectorService:
                                 print(f"DCA_ADD: {result.symbol} L{dca.level} "
                                       f"+{add_qty:.4f} @ ${add_price:,.2f} "
                                       f"avg=${new_avg:,.2f} total_qty={total_qty:.4f}")
+                                # Recompute gravity TP from new avg entry
+                                tp_target = self._compute_gravity_tp_target(result.symbol, new_avg, position.side)
+                                if tp_target:
+                                    self._gravity_tp_targets[result.symbol] = tp_target
+                                    print(f"GRAVITY_TP_RECOMPUTE: {result.symbol} new_avg=${new_avg:,.2f} "
+                                          f"new_target=${tp_target.target_price:,.2f}")
+                                else:
+                                    self._gravity_tp_targets.pop(result.symbol, None)
                             else:
                                 print(f"DCA_ADD_FAILED: {result.symbol} - {err}")
 
@@ -1964,6 +2031,7 @@ class CollectorService:
                                 )
                             self._force_position_flat(result.symbol)
                             self._dca_states.pop(result.symbol, None)
+                            self._gravity_tp_targets.pop(result.symbol, None)
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
@@ -1972,6 +2040,7 @@ class CollectorService:
                             print(f"EXIT_FAILED: {result.symbol} ghost close error: {err}")
                             self._force_position_flat(result.symbol)
                             self._dca_states.pop(result.symbol, None)
+                            self._gravity_tp_targets.pop(result.symbol, None)
                             for stop_id, stop_state in list(self._trailing_stop_manager.get_all_stops().items()):
                                 if stop_state.symbol == result.symbol:
                                     self._trailing_stop_manager.unregister_stop(stop_id)
@@ -2303,8 +2372,6 @@ class CollectorService:
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL liquidation callback error: {e}")
-
-    _hl_depth_logged_coins: set = set()  # Track which coins we've logged
 
     async def _handle_hl_orderbook(self, orderbook: Dict):
         """Feed HL L2 orderbook to observation layer as DEPTH event.
@@ -2920,6 +2987,108 @@ class CollectorService:
 
         return config, initial_stop
 
+    # ── Gravity TP (L2 orderbook partial take-profit) ────────────────
+
+    def _compute_gravity_tp_target(self, symbol: str, entry_price: float, side: str) -> 'Optional[GravityTPTarget]':
+        """Compute partial TP target from L2 gravity zones.
+
+        LONG: find nearest significant ask zone above entry (resistance -> TP)
+        SHORT: find nearest significant bid zone below entry (support -> TP)
+        """
+        cfg = self._gravity_tp_config
+        if not cfg.enabled:
+            return None
+
+        coin = symbol.replace('USDT', '').replace('USD', '')
+
+        warmed = self._liquidity_map.is_warmed_up(coin)
+        if cfg.require_warmup and not warmed:
+            return None
+
+        if side == "LONG":
+            zones = self._liquidity_map.get_zones_above(coin, entry_price, min_gravity=cfg.min_gravity)
+            zones.sort(key=lambda z: z.center_price)
+        else:
+            zones = self._liquidity_map.get_zones_below(coin, entry_price, min_gravity=cfg.min_gravity)
+            zones.sort(key=lambda z: z.center_price, reverse=True)
+
+        for zone in zones:
+            distance_bps = abs(zone.center_price - entry_price) / entry_price * 10_000
+            if distance_bps < cfg.min_distance_bps:
+                continue
+            if distance_bps > cfg.max_distance_bps:
+                break
+
+            return GravityTPTarget(
+                symbol=symbol,
+                target_price=zone.center_price,
+                zone_low=zone.band_low,
+                zone_high=zone.band_high,
+                reduce_fraction=cfg.reduce_fraction,
+                entry_price=entry_price,
+                side=side,
+                zone_gravity=zone.gravity,
+                zone_persistence=zone.persistence,
+                set_at=time.time(),
+            )
+
+        return None
+
+    def _check_gravity_tp_targets(self, symbol: str, price: float):
+        """Check if price has reached gravity TP zone. Executes partial close."""
+        target = self._gravity_tp_targets.get(symbol)
+        if not target or target.fired:
+            return
+
+        reached = False
+        if target.side == "LONG" and price >= target.zone_low:
+            reached = True
+        elif target.side == "SHORT" and price <= target.zone_high:
+            reached = True
+
+        if not reached:
+            return
+
+        position = self.ghost_tracker.get_open_position(symbol)
+        if not position:
+            self._gravity_tp_targets.pop(symbol, None)
+            return
+
+        reduce_qty = position.quantity * target.reduce_fraction
+        if reduce_qty <= 0:
+            return
+
+        ok, err, trade = self.ghost_tracker.close_position(
+            symbol=symbol,
+            quantity=reduce_qty,
+            exit_reason="GRAVITY_TP",
+            exit_price=price,
+            timestamp=time.time()
+        )
+
+        if ok and trade:
+            target.fired = True
+            pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+            remaining = position.quantity - reduce_qty
+            print(f"GRAVITY_TP: {symbol} {target.side} closed {reduce_qty:.4f} @ ${price:,.2f} "
+                  f"PnL={pnl_str} zone_gravity={target.zone_gravity:.0f} "
+                  f"persist={target.zone_persistence:.0%} remaining={remaining:.4f}")
+
+            # Move trailing stop to break-even — remaining half must not lose money
+            for stop_id, state in self._trailing_stop_manager.get_all_stops().items():
+                if state.symbol == symbol:
+                    be_price = state.entry_price
+                    old_stop = state.current_stop_price
+                    if target.side == "LONG" and old_stop < be_price:
+                        state.current_stop_price = be_price
+                        state.break_even_triggered = True
+                        print(f"GRAVITY_TP_BE: {symbol} stop moved {old_stop:,.2f} → {be_price:,.2f} (break-even)")
+                    elif target.side == "SHORT" and old_stop > be_price:
+                        state.current_stop_price = be_price
+                        state.break_even_triggered = True
+                        print(f"GRAVITY_TP_BE: {symbol} stop moved {old_stop:,.2f} → {be_price:,.2f} (break-even)")
+                    break
+
     def _update_trailing_stops(self, symbol: str, price: float,
                                liq_z=None, cascade_state=None,
                                vwap_distance=None, fill_count=None,
@@ -3004,6 +3173,7 @@ class CollectorService:
                         print(f"EXIT: {symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, PNL: {pnl_str}, Hold: {hold_str}, Reason: {exit_reason}")
                         self._force_position_flat(symbol)
                         self._dca_states.pop(symbol, None)
+                        self._gravity_tp_targets.pop(symbol, None)
                     else:
                         recovered = self._recovered_exit(
                             symbol=symbol,
@@ -3015,6 +3185,7 @@ class CollectorService:
                         )
                         if recovered:
                             self._dca_states.pop(symbol, None)
+                            self._gravity_tp_targets.pop(symbol, None)
                         else:
                             print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
 

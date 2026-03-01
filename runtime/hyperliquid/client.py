@@ -425,12 +425,12 @@ class HyperliquidClient:
     # L2 orderbook coins — split across two WS connections (max ~10 per connection).
     # Subscribing >10 l2Book channels on one connection causes IncompleteReadError.
     L2_COINS_PRIMARY = [
-        "BTC", "ETH", "SOL", "XRP", "DOGE",
-        "HYPE", "SUI", "LINK", "AVAX", "LTC",
+        "BTC", "ETH", "SOL", "kPEPE", "DOGE",
+        "HYPE", "ADA", "LINK", "AVAX", "LTC",
     ]
     L2_COINS_OVERFLOW = [
-        "NEAR", "ATOM", "AAVE", "APT", "ARB",
-        "BNB", "OP", "TRX", "WLD", "TON",
+        "NEAR", "FARTCOIN", "AAVE", "APT", "SEI",
+        "BNB", "INJ", "PENDLE", "WLD", "TON",
     ]
 
     async def _subscribe_orderbooks(self, ws, coins: list = None):

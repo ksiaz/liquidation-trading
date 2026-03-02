@@ -120,12 +120,12 @@ class GravityTPTarget:
 class DCAConfig:
     """Configuration for DCA (Dollar Cost Averaging) on cascade sniper positions."""
     enabled: bool = True
-    max_levels: int = 2              # Default 2 adds (configurable up to 3)
-    spacing_bps: float = 15          # Add when 15bp below avg_entry
+    max_levels: int = 4              # 4 adds across 100bp drawdown
+    spacing_bps: float = 25          # Add every 25bp below avg_entry (25, 50, 75, 100bp)
     min_interval_sec: float = 15     # Min 15s between adds
     min_liq_events: int = 3          # >=3 liq events in 60s window ("active" mode)
     liq_window_sec: float = 60       # Window for counting liq events
-    add_fractions: tuple = (0.25, 0.375, 0.375)  # Sizing relative to initial qty
+    add_fractions: tuple = (0.25, 0.25, 0.25, 0.25)  # Equal sizing per level
     max_position_pct: float = 0.10   # 10% max total position
 
 
@@ -3148,23 +3148,32 @@ class CollectorService:
             zones = self._liquidity_map.get_zones_below(coin, entry_price, min_gravity=cfg.min_gravity)
             zones.sort(key=lambda z: z.center_price, reverse=True)
 
+        # Pick the strongest zone (highest gravity) in the distance window,
+        # not the nearest. The strongest zone is where the most limit orders
+        # rest — that's the real resistance/support level.
+        best_zone = None
+        best_gravity = 0.0
         for zone in zones:
             distance_bps = abs(zone.center_price - entry_price) / entry_price * 10_000
             if distance_bps < cfg.min_distance_bps:
                 continue
             if distance_bps > cfg.max_distance_bps:
                 break
+            if zone.gravity > best_gravity:
+                best_gravity = zone.gravity
+                best_zone = zone
 
+        if best_zone:
             return GravityTPTarget(
                 symbol=symbol,
-                target_price=zone.center_price,
-                zone_low=zone.band_low,
-                zone_high=zone.band_high,
+                target_price=best_zone.center_price,
+                zone_low=best_zone.band_low,
+                zone_high=best_zone.band_high,
                 reduce_fraction=cfg.reduce_fraction,
                 entry_price=entry_price,
                 side=side,
-                zone_gravity=zone.gravity,
-                zone_persistence=zone.persistence,
+                zone_gravity=best_zone.gravity,
+                zone_persistence=best_zone.persistence,
                 set_at=time.time(),
             )
 

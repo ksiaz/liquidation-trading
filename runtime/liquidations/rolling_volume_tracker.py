@@ -245,7 +245,9 @@ class RollingVolumeTracker:
                 print(f"[ROLL FADE] {symbol}: burst {burst_count}evts in {self.BURST_WINDOW}s "
                       f"ratio={ratio_str}x base={baseline_rate:.2f}/min "
                       f"concentrated={best_in_subwindow}/{burst_count} "
-                      f"(declining: {first_half}→{second_half}) — ENTRY SIGNAL{_replaced}")
+                      f"(declining: {first_half}→{second_half}) "
+                      f"L=${signal.long_liq_volume:,.0f} S=${signal.short_liq_volume:,.0f} "
+                      f"→ fade {signal.fade_direction} — ENTRY SIGNAL{_replaced}")
             return signal
 
         return pending.signal if pending else None

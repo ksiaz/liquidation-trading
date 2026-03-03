@@ -1640,16 +1640,6 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
-                    # Adapter health gate: block ROLLING_FADE when gRPC adapter is unhealthy.
-                    # Liq events arrive via gRPC. When adapter is STALE/LAGGING, events are
-                    # catchup batches from old blocks — wall-clock timestamped to look like
-                    # bursts but actually stale data from a different price regime. This caused
-                    # a LONG entry at a price peak (ETH 2026-03-01 11:14).
-                    if rolling_fade_signal and not self._node_bridge.is_healthy:
-                        print(f"[ROLL FADE] {symbol}: blocked — adapter unhealthy")
-                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
-                        rolling_fade_signal = None
-
                     # Cascade fuel gate: DEFER while liquidations still flowing.
                     # The burst signal fires when liq rate is declining (exhaustion gate).
                     # The fuel gate waits until liq events actually stop — confirming the
@@ -1678,11 +1668,6 @@ class CollectorService:
                         print(f"[WHALE FADE] {symbol}: blocked — regime_metrics unavailable")
                         self._whale_tracker.confirm_signal(symbol, timestamp)
                         whale_signal = None
-                    if whale_signal and not self._node_bridge.is_healthy:
-                        print(f"[WHALE FADE] {symbol}: blocked — adapter unhealthy")
-                        self._whale_tracker.confirm_signal(symbol, timestamp)
-                        whale_signal = None
-
                     # Per-symbol stop-loss cooldown: block ALL cascade entries for 5m
                     # after a stop-out. Prevents immediate re-entry into same thesis
                     # (NEAR double-entry case: stopped in 45s, re-entered, stopped in 44s).

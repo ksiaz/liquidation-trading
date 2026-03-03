@@ -290,6 +290,10 @@ class CollectorService:
         self._price_highs: Dict[str, float] = {}
         self._price_lows: Dict[str, float] = {}
         self._hl_reset_time: Dict[str, float] = {}
+        # Pre-cascade trend filter: rolling price history per symbol.
+        # Stores (wall_ts, price) tuples. Used to check 5-min trend with 1-min buffer
+        # before allowing cascade fade entries. ~2 samples/sec × 400s = 800 entries max.
+        self._price_history: Dict[str, _deque] = {}
 
         # Memory guard: track last calculator activity for pruning (fills/liqs only)
         self._calculator_last_activity: Dict[str, float] = {}
@@ -1281,6 +1285,11 @@ class CollectorService:
                     self._mark_prices[symbol] = Decimal(str(price))
                     self._current_prices[symbol] = price
 
+                    # Record price for pre-cascade trend filter
+                    if symbol not in self._price_history:
+                        self._price_history[symbol] = _deque(maxlen=800)
+                    self._price_history[symbol].append((timestamp, price))
+
                     # NOTE: trailing stop update moved to after regime metrics computed
                     # (context-aware trailing needs liq_z, cascade_state, vwap_distance)
                     # Fill handler (line ~953) still provides price-only updates for stop-hit detection
@@ -1659,6 +1668,39 @@ class CollectorService:
                                 print(f"[ROLL FADE] {symbol}: deferred — cascade still active "
                                       f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s)")
                             rolling_fade_signal = None  # Defer — don't confirm, stays alive
+
+                    # Pre-cascade trend filter: check if the 5-min trend (with 1-min
+                    # buffer to exclude the cascade itself) opposes the fade direction.
+                    # If price was already moving in the cascade direction before it hit,
+                    # the cascade is accelerating an existing trend, not creating a
+                    # dislocation. Skip — these don't revert reliably.
+                    # Defer (don't confirm) — trend may change on next evaluation.
+                    _TREND_LOOKBACK = 360  # 6 min ago (5 min window + 1 min buffer)
+                    _TREND_BUFFER = 60     # 1 min ago (buffer strips out cascade)
+                    if rolling_fade_signal:
+                        _ph = self._price_history.get(symbol)
+                        if _ph and len(_ph) > 10:
+                            _hist = list(_ph)  # thread-safe snapshot
+                            _t_start = timestamp - _TREND_LOOKBACK
+                            _t_end = timestamp - _TREND_BUFFER
+                            _px_start = None
+                            _px_end = None
+                            for _ts, _px in _hist:
+                                if _px_start is None and _ts >= _t_start:
+                                    _px_start = _px
+                                if _ts <= _t_end:
+                                    _px_end = _px
+                            if _px_start and _px_end and _px_start > 0:
+                                _trend_pct = (_px_end - _px_start) / _px_start * 100
+                                _fade_dir = rolling_fade_signal.fade_direction
+                                # BUY fade needs pre-trend DOWN, SELL fade needs pre-trend UP
+                                _opposed = ((_fade_dir == "LONG" and _trend_pct > 0) or
+                                            (_fade_dir == "SHORT" and _trend_pct < 0))
+                                if _opposed:
+                                    print(f"[ROLL FADE] {symbol}: blocked — pre-cascade trend "
+                                          f"opposes fade ({_trend_pct:+.3f}% vs fade "
+                                          f"{_fade_dir})")
+                                    rolling_fade_signal = None  # Defer — don't confirm
 
                     # Check for whale dump signal (per-wallet accumulation + dump)
                     whale_signal = self._whale_tracker.check_for_signal(symbol, timestamp)

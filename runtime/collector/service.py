@@ -1287,7 +1287,7 @@ class CollectorService:
 
                     # Record price for pre-cascade trend filter
                     if symbol not in self._price_history:
-                        self._price_history[symbol] = _deque(maxlen=800)
+                        self._price_history[symbol] = deque(maxlen=800)
                     self._price_history[symbol].append((timestamp, price))
 
                     # NOTE: trailing stop update moved to after regime metrics computed

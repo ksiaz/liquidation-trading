@@ -230,7 +230,7 @@ EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps":
 ROLLING_FADE_TRAIL_CONFIG = {
     "activation_pct": 0.008,           # 0.80% = 80 bps (let trade develop before trailing)
     "trail_pct": 0.004,                # 0.40% = 40 bps (give room for bounce volatility)
-    "sl_pct": 0.020,                   # 2.00% = 200 bps (wide SL — give DCA room to work)
+    "sl_pct": 0.005,                   # 0.50% = 50 bps
     "break_even_trigger_pct": 0.004,   # 0.40% = 40 bps (move SL to BE once +0.4% reached)
     "break_even_offset_pct": 0.0,      # exact entry price (no offset)
 }

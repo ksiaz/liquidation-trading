@@ -1158,11 +1158,12 @@ class CollectorService:
                             timestamp=time.time(), symbol=l_sym, side=order_side,
                             price=l_px, quantity=l_sz
                         )
-                        # Rolling volume tracker — use wall clock, not block timestamp.
-                        # check_for_signal() compares against time.time(), so events must
-                        # use the same clock. During node lag, block timestamps are minutes
-                        # old → events fall outside the 30s burst window → zero signals.
-                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, time.time())
+                        # Rolling volume tracker — use BLOCK timestamp, not wall clock.
+                        # When node lags, batch of stale fills arrive with time.time() →
+                        # all land in 30s burst window → artificial spike → false signals.
+                        # Block timestamp puts events where they chronologically belong —
+                        # stale events fall outside the burst window naturally.
+                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, l_ts)
                         # Cascade liq event — use wall clock for same reason as above
                         _wall_ts = time.time()
                         try:
@@ -1679,6 +1680,12 @@ class CollectorService:
                                 print(f"[ROLL FADE] {symbol}: deferred — cascade still active "
                                       f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s)")
                             rolling_fade_signal = None  # Defer — don't confirm, stays alive
+
+                    # Position guard: don't generate ENTRY when position already open.
+                    # DCA handles adds for open positions — ENTRY would win arbitration
+                    # (higher authority) but fail execution, silently killing the DCA mandate.
+                    if rolling_fade_signal and self.ghost_tracker.has_open_position(symbol):
+                        rolling_fade_signal = None  # Defer — don't confirm, DCA handles it
 
                     # Pre-cascade trend filter: check if the 5-min trend (with 1-min
                     # buffer to exclude the cascade itself) opposes the fade direction.

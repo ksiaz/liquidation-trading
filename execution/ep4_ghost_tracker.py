@@ -1046,7 +1046,7 @@ class GhostPositionTracker:
                     trade.price,
                     trade.timestamp,
                     trade.position_side,
-                    trade.is_entry,
+                    int(trade.is_entry),
                     trade.pnl,
                     trade.account_balance_after,
                     trade.entry_cycle_id,

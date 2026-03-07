@@ -3324,6 +3324,62 @@ class CollectorService:
                 rolling_z=_rolling_z
             )
 
+            # ── Cascade continuation kill ──
+            # Adverse liquidations still firing after 2-min grace → instant exit.
+            # LONG + LONG liqs (forced sells, price down) = adverse.
+            # SHORT + SHORT liqs (forced buys, price up) = adverse.
+            _CASCADE_KILL_Z = 20.0
+            _CASCADE_KILL_GRACE = 120
+            _cascade_killed = False
+            if _rolling_z >= _CASCADE_KILL_Z:
+                _liq_side = self._rolling_volume_tracker.get_burst_dominant_side(
+                    symbol, time.time()
+                )
+                for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
+                    if state.symbol != symbol:
+                        continue
+                    if not self.ghost_tracker.has_open_position(symbol):
+                        self._trailing_stop_manager.unregister_stop(entry_id)
+                        continue
+                    _hold = time.time() - state.entry_timestamp if state.entry_timestamp > 0 else 0
+                    if (_hold >= _CASCADE_KILL_GRACE and
+                            _liq_side is not None and
+                            _liq_side == state.direction):
+                        print(f"[CASCADE-KILL] {symbol}: rolling_z={_rolling_z:.1f} "
+                              f"hold={_hold:.0f}s liq_side={_liq_side} "
+                              f"pos={state.direction} → INSTANT EXIT")
+                        success, error, trade = self.ghost_tracker.close_position(
+                            symbol=symbol,
+                            exit_reason="CASCADE_CONTINUATION_KILL",
+                            exit_price=price,
+                            timestamp=time.time()
+                        )
+                        if success and trade:
+                            pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+                            hold_str = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
+                            print(f"EXIT: {symbol} CASCADE_KILL @ ${price:,.2f}, "
+                                  f"PNL: {pnl_str}, Hold: {hold_str}")
+                            self._force_position_flat(symbol)
+                            self._dca_states.pop(symbol, None)
+                            self._gravity_tp_targets.pop(symbol, None)
+                        else:
+                            self._recovered_exit(
+                                symbol=symbol, price=price, entry_id=entry_id,
+                                direction=state.direction,
+                                entry_price=state.entry_price,
+                                exit_reason="CASCADE_CONTINUATION_KILL"
+                            )
+                            self._dca_states.pop(symbol, None)
+                            self._gravity_tp_targets.pop(symbol, None)
+                        for sid, sstate in self._trailing_stop_manager.get_all_stops().items():
+                            if sstate.symbol == symbol:
+                                self._trailing_stop_manager.unregister_stop(sid)
+                        _cascade_killed = True
+                        break
+
+            if _cascade_killed:
+                return
+
             # Check if any stops are triggered (price crossed stop level)
             # Use list() snapshot — we may unregister during iteration
             for entry_id, state in self._trailing_stop_manager.get_all_stops().items():

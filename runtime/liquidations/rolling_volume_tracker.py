@@ -333,6 +333,33 @@ class RollingVolumeTracker:
             fade_direction=fade_direction,
         )
 
+    def get_burst_dominant_side(self, symbol: str, timestamp: float) -> Optional[str]:
+        """Dominant liquidation side in burst window (30s).
+
+        Returns "LONG" or "SHORT" based on which side has more USD volume.
+        None if no events in burst window.
+
+        Thread-safe: list() snapshot of deque before iterating.
+        """
+        events_deque = self._events.get(symbol)
+        if not events_deque:
+            return None
+        events = list(events_deque)
+        cutoff = timestamp - self.BURST_WINDOW
+
+        long_vol = 0.0
+        short_vol = 0.0
+        for e in events:
+            if e.timestamp >= cutoff:
+                if e.side == "LONG":
+                    long_vol += e.usd_value
+                else:
+                    short_vol += e.usd_value
+
+        if long_vol == 0 and short_vol == 0:
+            return None
+        return "LONG" if long_vol >= short_vol else "SHORT"
+
     def get_window_volume(self, symbol: str, timestamp: float) -> float:
         """Total USD volume in burst window (30s)."""
         events_deque = self._events.get(symbol)

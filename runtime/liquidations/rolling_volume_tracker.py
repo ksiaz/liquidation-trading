@@ -186,7 +186,16 @@ class RollingVolumeTracker:
         # Warmup: adaptive baseline minimum (strong signals need less context)
         baseline_only = baseline_count - burst_count
         min_baseline = self._min_baseline_for_ratio(ratio)
-        if baseline_only < min_baseline:
+
+        # Cold-start bypass: no pre-burst history but overwhelming burst evidence.
+        # 0 events → 15+ in 30s is definitionally extreme regardless of context.
+        # Higher burst threshold (3× normal) compensates for missing baseline.
+        _cold_start_bypass = (
+            baseline_only == 0
+            and burst_count >= self.MIN_BURST_EVENTS * 3
+        )
+
+        if baseline_only < min_baseline and not _cold_start_bypass:
             return pending.signal if pending else None
 
         # ── Burst concentration gate ──

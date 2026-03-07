@@ -113,6 +113,8 @@ class TrailingStopState:
     last_atr_30m: Optional[float] = None
     cascade_quiet_since: Optional[float] = None  # when liq_z first dropped < 1.0
     peak_liq_z: float = 0.0                   # highest liq_z seen during trade
+    last_adverse_l2: Optional[float] = None   # Adverse L2 gravity near price
+    last_rolling_z: Optional[float] = None    # Rolling burst rate ratio
 
     # Config
     config: TrailingStopConfig = field(default_factory=TrailingStopConfig)
@@ -142,6 +144,8 @@ class TrailingStopManager:
     _CASCADE_QUIET_GRACE_SEC = 120
     _PHASE2_WINDOW_SEC = 300
     _BE_FORCE_SEC = 7200  # Force break-even after 2h regardless
+    _CASCADE_CONTINUE_Z = 20.0      # Rolling z threshold for "cascade continuing"
+    _CASCADE_CONTINUE_GRACE = 120   # 2-min grace before circuit breaker active
 
     def __init__(
         self,
@@ -395,7 +399,9 @@ class TrailingStopManager:
                      cascade_state: Optional[str] = None,
                      vwap_distance: Optional[float] = None,
                      fill_count: Optional[int] = None,
-                     atr_30m: Optional[float] = None):
+                     atr_30m: Optional[float] = None,
+                     adverse_l2_gravity: Optional[float] = None,
+                     rolling_z: Optional[float] = None):
         """Update price and potentially trail stops.
 
         Args:
@@ -440,6 +446,10 @@ class TrailingStopManager:
                     state.last_fill_count = fill_count
                 if atr_30m is not None:
                     state.last_atr_30m = atr_30m
+                if adverse_l2_gravity is not None:
+                    state.last_adverse_l2 = adverse_l2_gravity
+                if rolling_z is not None:
+                    state.last_rolling_z = rolling_z
 
                 # Update high/low watermark
                 if state.direction == "LONG":
@@ -466,11 +476,14 @@ class TrailingStopManager:
                             (state.last_vwap_distance is not None and abs(state.last_vwap_distance) < self._VWAP_CLOSE_PCT)):
                         self._context_log_times[symbol] = _now
                         _vwap_str = f"{state.last_vwap_distance:.4f}" if state.last_vwap_distance is not None else "N/A"
+                        _l2_str = f"{state.last_adverse_l2:,.0f}" if state.last_adverse_l2 is not None else "N/A"
+                        _rz_str = f"{state.last_rolling_z:.1f}" if state.last_rolling_z is not None else "N/A"
                         self._logger.info(
                             f"X4-A CONTEXT: {symbol} liq_z={state.last_liq_z:.2f} "
                             f"cascade={state.last_cascade_state} "
                             f"vwap_d={_vwap_str} "
                             f"fills={state.last_fill_count} hold={_hold:.0f}s "
+                            f"l2_adv={_l2_str} rolling_z={_rz_str} "
                             f"be_suppressed={_be_suppressed}"
                         )
 
@@ -533,6 +546,14 @@ class TrailingStopManager:
             (state.last_cascade_state in self._CASCADE_ACTIVE_STATES)
         )
 
+        # Cascade continuation: rolling_z still elevated after grace period
+        # = cascade didn't exhaust, it's a trend step not mean-reversion
+        _cascade_continuing = (
+            state.last_rolling_z is not None and
+            state.last_rolling_z >= self._CASCADE_CONTINUE_Z and
+            hold_seconds >= self._CASCADE_CONTINUE_GRACE
+        )
+
         # Check break-even trigger first (applies to all modes)
         if not state.break_even_triggered:
             if state.direction == "LONG":
@@ -549,6 +570,9 @@ class TrailingStopManager:
                 )
                 # Safety: force BE after 2h regardless
                 if hold_seconds > self._BE_FORCE_SEC and profit_pct > 0:
+                    be_suppressed = False
+                # Cascade continuation → force BE (override suppression)
+                if _cascade_continuing:
                     be_suppressed = False
 
                 if not be_suppressed:
@@ -701,6 +725,10 @@ class TrailingStopManager:
             # Clamp to [end_mult, start_mult]
             atr_mult = max(config.atr_prog_end_mult, min(config.atr_prog_start_mult, atr_mult))
 
+            # Cascade continuation → slam to minimum ATR distance
+            if _cascade_continuing:
+                atr_mult = config.atr_prog_end_mult
+
             # Orderflow-aware tightening: adverse flow reduces multiplier (existing logic)
             if state.last_orderflow is not None:
                 of = state.last_orderflow
@@ -711,6 +739,13 @@ class TrailingStopManager:
                     # Buying pressure against SHORT — tighten stop
                     atr_mult *= config.orderflow_tighten_mult
                 # Re-clamp after orderflow adjustment
+                atr_mult = max(config.atr_prog_end_mult, atr_mult)
+
+            # Rule: Adverse trade volume near price → tighten stop
+            # Concentrated sell (for LONG) or buy (for SHORT) volume within 30bps
+            # signals institutional conviction against the position.
+            if state.last_adverse_l2 is not None and state.last_adverse_l2 > 500_000:
+                atr_mult *= 0.7
                 atr_mult = max(config.atr_prog_end_mult, atr_mult)
 
             # Calculate ATR-based distance with floor protection

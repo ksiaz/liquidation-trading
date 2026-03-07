@@ -152,6 +152,14 @@ class RiskMonitor:
             # Check PnL-based stop-loss and take-profit (factual thresholds)
             pnl_pct = self._calculate_pnl_pct(position, mark_prices[symbol])
             if pnl_pct is not None:
+                # Sanity check: >50% loss means the mark price is garbage
+                # (stale oracle during startup, wrong symbol mapping, etc.)
+                # Skip risk action — trailing stop handles legitimate exits.
+                if pnl_pct < -0.50:
+                    print(f"[RISK-SKIP] {symbol}: mark={mark_prices[symbol]} entry={position.entry_price} "
+                          f"pnl={pnl_pct:.4f} — mark price likely garbage, skipping", flush=True)
+                    continue
+
                 # Stop-loss: position loss exceeds threshold
                 if pnl_pct < -self.config.stop_loss_pct:
                     print(f"[RISK-EXIT] {symbol}: STOP_LOSS pnl={pnl_pct:.4f} < -{self.config.stop_loss_pct} "

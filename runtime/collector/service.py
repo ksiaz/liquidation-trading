@@ -46,6 +46,7 @@ from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.liquidations.liquidity_map import LiquidityMap
+from runtime.liquidations.trade_volume_map import TradeVolumeMap
 from runtime.whale.tracker import WhaleFillTracker
 from runtime.cascade import CapitulationTracker
 from runtime.market_state.emitter import MarketStateEmitter
@@ -332,6 +333,9 @@ class CollectorService:
 
         # L2 liquidity memory map (gravity zones for TP targeting)
         self._liquidity_map = LiquidityMap()
+
+        # Trade-based volume profile (adverse volume for trailing stop tightening)
+        self._trade_volume_map = TradeVolumeMap()
 
         # Per-symbol stop-loss cooldown: block re-entry after stop-out
         self._stop_exit_timestamps: Dict[str, float] = {}
@@ -1117,6 +1121,13 @@ class CollectorService:
                         self._vwap_calculators[f_sym].update(f_px, f_sz, f_ts)
                         # Orderflow: "B" = buyer is taker = NOT maker, "A" = seller is taker
                         self._orderflow_calculators[f_sym].update(f_side == "A", f_sz, f_ts)
+                        # Trade volume profile (adverse volume for trailing stop)
+                        self._trade_volume_map.add_fill(
+                            coin=f_sym.replace("USDT", ""),
+                            side="buy" if f_side == "B" else "sell",
+                            price=f_px, size_usd=f_px * f_sz,
+                            timestamp=time.time()
+                        )
                         # Trailing stops
                         self._update_trailing_stops(f_sym, f_px)
                         # Gravity TP on fill-driven price updates
@@ -1929,6 +1940,9 @@ class CollectorService:
 
             # Trim rolling volume tracker windows (baseline events + confirmed pending)
             self._rolling_volume_tracker.trim_windows(timestamp)
+
+            # Trim trade volume map (old fills outside 30m window)
+            self._trade_volume_map.trim_windows(timestamp)
 
             # Trim whale tracker windows (inactive wallets + old fills)
             self._whale_tracker.trim_windows(timestamp)
@@ -3288,12 +3302,26 @@ class CollectorService:
                     else orderflow_calc.get_imbalance_30s()
                 )
 
+            # Trade-based adverse volume for trailing stop tightening
+            adverse_l2_gravity = None
+            _coin = symbol.replace("USDT", "")
+            if self._trade_volume_map.is_warmed_up(_coin):
+                _gp = self.ghost_tracker.get_open_position(symbol)
+                if _gp and price > 0:
+                    adverse_l2_gravity = self._trade_volume_map.get_adverse_volume(
+                        _coin, price, _gp.side, range_bps=30
+                    )
+
+            # Rolling z for cascade continuation circuit breaker
+            _rolling_z = self._rolling_volume_tracker.get_current_z(symbol, time.time())
+
             # Update trailing stop manager with new price, ATR, orderflow, and context
             self._trailing_stop_manager.update_price(
                 symbol, price, atr=atr_value, orderflow_imbalance=orderflow,
                 liq_z=liq_z, cascade_state=cascade_state,
                 vwap_distance=vwap_distance, fill_count=fill_count,
-                atr_30m=atr_30m
+                atr_30m=atr_30m, adverse_l2_gravity=adverse_l2_gravity,
+                rolling_z=_rolling_z
             )
 
             # Check if any stops are triggered (price crossed stop level)

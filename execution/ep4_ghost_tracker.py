@@ -1016,86 +1016,85 @@ class GhostPositionTracker:
         return trade_id
 
     def _log_trade_to_db(self, trade: GhostTrade) -> bool:
-        """Buffer trade write via BufferedResearchDatabase. Never blocks.
+        """Write trade directly to PostgreSQL. Critical for monitor visibility.
+
+        Uses direct PG connection (not BRD buffer) to ensure trades are
+        immediately visible in the terminal monitor and survive restarts.
 
         Returns:
-            True if buffered successfully, False on error or no DB.
+            True if written successfully, False on error.
         """
-        if not self._buffered_db:
-            diag.record_skip(
-                component="GhostTracker",
-                function="_log_trade_to_db",
-                reason_code=ReasonCode.GT_NO_DB_CONNECTION,
-                symbol=trade.symbol,
-                context={"trade_id": trade.trade_id}
-            )
-            return False
-
         try:
-            # INSERT ghost_trades row
-            self._buffered_db.execute_sql('''
-                INSERT INTO ghost_trades (
-                    trade_id, cycle_id, symbol, side, quantity, price,
-                    timestamp, position_side, is_entry, pnl, account_balance_after,
-                    entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
-                    active_primitives, spread_bps, concurrent_positions,
-                    holding_duration_sec, exit_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                trade.trade_id,
-                trade.cycle_id,
-                trade.symbol,
-                trade.side,
-                trade.quantity,
-                trade.price,
-                trade.timestamp,
-                trade.position_side,
-                trade.is_entry,
-                trade.pnl,
-                trade.account_balance_after,
-                trade.entry_cycle_id,
-                trade.exit_cycle_id,
-                trade.entry_trade_id,
-                trade.winning_policy,
-                trade.active_primitives,
-                trade.spread_bps,
-                trade.concurrent_positions,
-                trade.holding_duration_sec,
-                trade.exit_reason
-            ))
-
-            # UPDATE policy_outcomes with ghost trade results (only for exits)
-            if not trade.is_entry and trade.entry_cycle_id is not None:
-                self._buffered_db.execute_sql('''
-                    UPDATE policy_outcomes
-                    SET ghost_trade_id = ?,
-                        realized_pnl = ?,
-                        holding_duration_sec = ?,
-                        exit_reason = ?
-                    WHERE cycle_id = ?
-                      AND symbol = ?
-                      AND executed_action = 'ENTRY'
-                      AND ghost_trade_id IS NULL
-                    LIMIT 1
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                # INSERT ghost_trades row
+                cur.execute('''
+                    INSERT INTO ghost_trades (
+                        trade_id, cycle_id, symbol, side, quantity, price,
+                        timestamp, position_side, is_entry, pnl, account_balance_after,
+                        entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
+                        active_primitives, spread_bps, concurrent_positions,
+                        holding_duration_sec, exit_reason
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
-                    int(trade.trade_id.split('_')[1]),
+                    trade.trade_id,
+                    trade.cycle_id,
+                    trade.symbol,
+                    trade.side,
+                    trade.quantity,
+                    trade.price,
+                    trade.timestamp,
+                    trade.position_side,
+                    trade.is_entry,
                     trade.pnl,
-                    trade.holding_duration_sec,
-                    trade.exit_reason,
+                    trade.account_balance_after,
                     trade.entry_cycle_id,
-                    trade.symbol
+                    trade.exit_cycle_id,
+                    trade.entry_trade_id,
+                    trade.winning_policy,
+                    trade.active_primitives,
+                    trade.spread_bps,
+                    trade.concurrent_positions,
+                    trade.holding_duration_sec,
+                    trade.exit_reason
                 ))
+
+                # UPDATE policy_outcomes with ghost trade results (only for exits)
+                if not trade.is_entry and trade.entry_cycle_id is not None:
+                    cur.execute('''
+                        UPDATE policy_outcomes
+                        SET ghost_trade_id = %s,
+                            realized_pnl = %s,
+                            holding_duration_sec = %s,
+                            exit_reason = %s
+                        WHERE cycle_id = %s
+                          AND symbol = %s
+                          AND executed_action = 'ENTRY'
+                          AND ghost_trade_id IS NULL
+                    ''', (
+                        int(trade.trade_id.split('_')[1]),
+                        trade.pnl,
+                        trade.holding_duration_sec,
+                        trade.exit_reason,
+                        trade.entry_cycle_id,
+                        trade.symbol
+                    ))
+
+                conn.commit()
+            finally:
+                put_conn(conn)
 
             if not trade.is_entry:
                 print(
-                    f"[GHOST-WRITER] Buffered exit {trade.trade_id} {trade.symbol} "
+                    f"[GHOST-WRITER] Persisted exit {trade.trade_id} {trade.symbol} "
                     f"pnl={trade.pnl:+.2f}",
                     flush=True
                 )
 
             return True
         except Exception as e:
-            print(f"[GHOST] Failed to buffer trade {trade.trade_id}: {e}", flush=True)
+            print(f"[GHOST] Failed to persist trade {trade.trade_id}: {e}", flush=True)
             diag.record_skip(
                 component="GhostTracker",
                 function="_log_trade_to_db",

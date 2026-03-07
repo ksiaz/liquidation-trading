@@ -352,7 +352,7 @@ def get_open_positions() -> List[dict]:
                     cur.execute('''
                         SELECT winning_policy_name FROM ghost_trades
                         WHERE symbol = %s AND is_entry = 1
-                        ORDER BY id DESC LIMIT 1
+                        ORDER BY timestamp DESC LIMIT 1
                     ''', (pos['symbol'],))
                     row = cur.fetchone()
                     if row and row[0]:
@@ -421,11 +421,11 @@ def get_recent_exits(limit: int = 10) -> List[dict]:
             SELECT e.symbol, e.side, e.quantity, e.price, e.timestamp, e.pnl,
                    e.holding_duration_sec, e.exit_reason,
                    (SELECT winning_policy_name FROM ghost_trades
-                    WHERE symbol = e.symbol AND is_entry = 1 AND id < e.id
-                    ORDER BY id DESC LIMIT 1) as strategy
+                    WHERE symbol = e.symbol AND is_entry = 1 AND timestamp <= e.timestamp
+                    ORDER BY timestamp DESC LIMIT 1) as strategy
             FROM ghost_trades e
             WHERE e.is_entry = 0
-            ORDER BY e.id DESC
+            ORDER BY e.timestamp DESC
             LIMIT %s
         ''', (limit,))
         for row in cur.fetchall():
@@ -486,7 +486,7 @@ def get_account_balance() -> float:
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute('SELECT account_balance_after FROM ghost_trades ORDER BY id DESC LIMIT 1')
+        cur.execute('SELECT account_balance_after FROM ghost_trades ORDER BY timestamp DESC LIMIT 1')
         row = cur.fetchone()
         if row and row[0]:
             return float(row[0])

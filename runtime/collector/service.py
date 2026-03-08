@@ -1668,25 +1668,23 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
-                    # Cascade fuel gate: DEFER while liquidations still flowing.
-                    # The burst signal fires when liq rate is declining (exhaustion gate).
-                    # The fuel gate waits until liq events actually stop — confirming the
-                    # cascade is truly over before entering. Checks 60s window: if >3 events
-                    # remain, defer. Signal stays alive in tracker for retry each cycle.
+                    # Cascade fuel gate: split entry while liquidations still flowing.
+                    # Full size when liqs ≤ 3 (cascade exhausted). Half size when > 3
+                    # (early entry during active cascade — DCA fills remaining 50%).
                     _FUEL_GATE_MAX_LIQS_60S = 3
                     if rolling_fade_signal:
                         _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
                             symbol, timestamp, window_sec=60.0)
                         if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
+                            rolling_fade_signal.early_entry = True
                             # Rate-limited log (once per 30s per symbol)
                             _fuel_key = f"_fuel_log_{symbol}"
                             _fuel_last = getattr(self, _fuel_key, 0)
                             if timestamp - _fuel_last >= 30:
                                 setattr(self, _fuel_key, timestamp)
                                 _age = timestamp - rolling_fade_signal.spike_ts
-                                print(f"[ROLL FADE] {symbol}: deferred — cascade still active "
-                                      f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s)")
-                            rolling_fade_signal = None  # Defer — don't confirm, stays alive
+                                print(f"[ROLL FADE] {symbol}: EARLY entry — cascade still active "
+                                      f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s, half size)")
 
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration
@@ -1916,6 +1914,14 @@ class CollectorService:
                                 _entered_this_cycle.add(symbol)
                             filtered.append(m)
                         mandates = filtered
+                        # Split entry: halve quantity for early entries (cascade still active)
+                        if rolling_fade_signal and rolling_fade_signal.early_entry:
+                            for m in mandates:
+                                if m.type == MandateType.ENTRY and m.quantity and m.entry_price:
+                                    m.quantity = m.quantity / 2
+                                    print(f"[SPLIT ENTRY] {symbol}: half size "
+                                          f"${float(m.quantity * m.entry_price):,.0f} "
+                                          f"(early entry during active cascade)")
                         if mandates:
                             print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
                         for m in mandates:

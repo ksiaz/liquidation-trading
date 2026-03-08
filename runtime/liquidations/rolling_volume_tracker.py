@@ -40,7 +40,6 @@ class RollingFadeSignal:
     spike_ts: float            # When burst detected
     confirmation_ts: float     # When exhaustion confirmed (cascade rate declining)
     fade_direction: str        # "LONG" or "SHORT"
-    early_entry: bool = False  # True = half size (fuel gate still active)
 
 
 @dataclass

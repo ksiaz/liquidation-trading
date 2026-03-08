@@ -121,12 +121,12 @@ class GravityTPTarget:
 class DCAConfig:
     """Configuration for DCA (Dollar Cost Averaging) on cascade sniper positions."""
     enabled: bool = True
-    max_levels: int = 4              # 4 adds across 100bp drawdown
-    spacing_bps: float = 25          # Add every 25bp below avg_entry (25, 50, 75, 100bp)
+    max_levels: int = 8              # 8 adds at 5bp spacing (40bp total range)
+    spacing_bps: float = 5           # Add every 5bp below avg_entry
     min_interval_sec: float = 15     # Min 15s between adds
     min_liq_events: int = 3          # >=3 liq events in 60s window ("active" mode)
     liq_window_sec: float = 60       # Window for counting liq events
-    add_fractions: tuple = (0.25, 0.25, 0.25, 0.25)  # Equal sizing per level
+    add_fractions: tuple = (0.0625,) * 8  # Each add = 6.25% of initial ($6.25 per level)
     max_position_pct: float = 0.10   # 10% max total position
 
 
@@ -1668,24 +1668,6 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
-                    # Cascade fuel gate: split entry while liquidations still flowing.
-                    # Full size when liqs ≤ 3 (cascade exhausted). Half size when > 3
-                    # (early entry during active cascade — DCA fills remaining 50%).
-                    _FUEL_GATE_MAX_LIQS_60S = 3
-                    if rolling_fade_signal:
-                        _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
-                            symbol, timestamp, window_sec=60.0)
-                        if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
-                            rolling_fade_signal.early_entry = True
-                            # Rate-limited log (once per 30s per symbol)
-                            _fuel_key = f"_fuel_log_{symbol}"
-                            _fuel_last = getattr(self, _fuel_key, 0)
-                            if timestamp - _fuel_last >= 30:
-                                setattr(self, _fuel_key, timestamp)
-                                _age = timestamp - rolling_fade_signal.spike_ts
-                                print(f"[ROLL FADE] {symbol}: EARLY entry — cascade still active "
-                                      f"({_recent_liqs} liqs in 60s, signal age {_age:.0f}s, half size)")
-
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration
                     # (higher authority) but fail execution, silently killing the DCA mandate.
@@ -1914,14 +1896,6 @@ class CollectorService:
                                 _entered_this_cycle.add(symbol)
                             filtered.append(m)
                         mandates = filtered
-                        # Split entry: halve quantity for early entries (cascade still active)
-                        if rolling_fade_signal and rolling_fade_signal.early_entry:
-                            for m in mandates:
-                                if m.type == MandateType.ENTRY and m.quantity and m.entry_price:
-                                    m.quantity = m.quantity / 2
-                                    print(f"[SPLIT ENTRY] {symbol}: half size "
-                                          f"${float(m.quantity * m.entry_price):,.0f} "
-                                          f"(early entry during active cascade)")
                         if mandates:
                             print(f"✓ MANDATE GENERATED: {symbol} - {len(mandates)} mandate(s)")
                         for m in mandates:

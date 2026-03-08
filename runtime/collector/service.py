@@ -1146,6 +1146,7 @@ class CollectorService:
                 while self._liq_event_buffer:
                     try:
                         l_sym, l_side, l_px, l_sz, l_ts = self._liq_event_buffer.popleft()
+                        _lag = time.time() - l_ts
                         # Initialize calculator if needed
                         if l_sym not in self._liquidation_calculators:
                             self._liquidation_calculators[l_sym] = LiquidationZScoreCalculator()
@@ -1158,12 +1159,18 @@ class CollectorService:
                             timestamp=time.time(), symbol=l_sym, side=order_side,
                             price=l_px, quantity=l_sz
                         )
-                        # Rolling volume tracker — use BLOCK timestamp, not wall clock.
-                        # When node lags, batch of stale fills arrive with time.time() →
-                        # all land in 30s burst window → artificial spike → false signals.
-                        # Block timestamp puts events where they chronologically belong —
-                        # stale events fall outside the burst window naturally.
-                        self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, l_ts)
+                        # Rolling volume tracker — drop stale events.
+                        # During node lag, fills arrive with block timestamps 30s+ old.
+                        # Stamping with time.time() fakes a fresh burst → false signals.
+                        # If the event is older than the burst window, it's dead data.
+                        if _lag <= 30:
+                            self._rolling_volume_tracker.add_event(l_sym, l_side, l_px, l_sz, time.time())
+                        else:
+                            if not hasattr(self, '_stale_liq_drops'):
+                                self._stale_liq_drops = 0
+                            self._stale_liq_drops += 1
+                            if self._stale_liq_drops <= 5 or self._stale_liq_drops % 100 == 0:
+                                print(f"[LIQ-STALE] {l_sym} dropped: block_age={_lag:.0f}s (total dropped: {self._stale_liq_drops})", flush=True)
                         # Cascade liq event — use wall clock for same reason as above
                         _wall_ts = time.time()
                         try:

@@ -1668,6 +1668,12 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
+                    # DO NOT add trend/direction/orderflow gates for ROLLING_FADE here.
+                    # Cascades by definition move price in the cascade direction before
+                    # the burst fires — any pre-trend filter blocks 99.9% of signals.
+                    # The burst detector's own quality gates (ratio, concentration,
+                    # exhaustion) are sufficient. See commit e4c3664.
+
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration
                     # (higher authority) but fail execution, silently killing the DCA mandate.

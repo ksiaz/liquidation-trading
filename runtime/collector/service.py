@@ -1674,6 +1674,25 @@ class CollectorService:
                     # The burst detector's own quality gates (ratio, concentration,
                     # exhaustion) are sufficient. See commit e4c3664.
 
+                    # Fuel gate: defer entry while liquidations still flowing.
+                    # Burst detector catches the spike, but cascade may still be active.
+                    # Wait for liq rate to drop before entering — ideal entry is AFTER
+                    # cascade exhausts, not during. Signal stays pending (not confirmed)
+                    # so it re-emits each cycle until liqs subside.
+                    _FUEL_GATE_MAX_LIQS_60S = 3
+                    if rolling_fade_signal:
+                        _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
+                            symbol, timestamp, window_sec=60.0)
+                        if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
+                            # Defer — don't confirm, signal stays pending for retry
+                            _fuel_key = f"_fuel_log_{symbol}"
+                            _fuel_last = getattr(self, _fuel_key, 0)
+                            if timestamp - _fuel_last >= 30:
+                                setattr(self, _fuel_key, timestamp)
+                                print(f"[FUEL GATE] {symbol}: deferring — {_recent_liqs} liqs "
+                                      f"in 60s (>{_FUEL_GATE_MAX_LIQS_60S}), cascade still active")
+                            rolling_fade_signal = None
+
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration
                     # (higher authority) but fail execution, silently killing the DCA mandate.

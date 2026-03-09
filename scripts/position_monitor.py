@@ -422,20 +422,24 @@ def get_recent_exits(limit: int = 10) -> List[dict]:
                    e.holding_duration_sec, e.exit_reason,
                    (SELECT winning_policy_name FROM ghost_trades
                     WHERE symbol = e.symbol AND is_entry = 1 AND timestamp <= e.timestamp
-                    ORDER BY timestamp DESC LIMIT 1) as strategy
+                    ORDER BY timestamp DESC LIMIT 1) as strategy,
+                   (SELECT price FROM ghost_trades
+                    WHERE trade_id = e.entry_trade_id AND is_entry = 1
+                    LIMIT 1) as entry_price
             FROM ghost_trades e
             WHERE e.is_entry = 0
             ORDER BY e.timestamp DESC
             LIMIT %s
         ''', (limit,))
         for row in cur.fetchall():
-            symbol, side, qty, price, ts, pnl, hold, exit_reason, strategy = row
+            symbol, side, qty, price, ts, pnl, hold, exit_reason, strategy, entry_price = row
             direction = 'SHORT' if side == 'BUY' else 'LONG'
             exits.append({
                 'symbol': symbol,
                 'direction': direction,
                 'quantity': qty,
                 'exit_price': price,
+                'entry_price': entry_price,
                 'timestamp': ts,
                 'pnl': pnl or 0,
                 'hold_sec': hold or 0,
@@ -770,13 +774,21 @@ def print_exits(exits: List[dict]):
             pnl = ex['pnl']
             hold_min = int(ex['hold_sec'] / 60) if ex['hold_sec'] else 0
             strategy = ex.get('strategy')
+            entry_px = ex.get('entry_price')
+            exit_px = ex.get('exit_price')
 
             dir_str = format_direction(direction)
             pnl_str = format_pnl(pnl)
             strat_str = format_strategy(strategy)
+            entry_str = format_price(entry_px) if entry_px else '?'
+            exit_str = format_price(exit_px) if exit_px else '?'
+            px_str = f"{entry_str}→{exit_str}"
 
-            line = f"  {ts}  {symbol:<10} {dir_str}  {pnl_str}  ({hold_min}m)  {strat_str}"
-            visible_len = len(f"  {ts}  {symbol:<10} SHORT  +$0.00  ({hold_min}m)  GEOMETRY")
+            line = f"  {ts}  {symbol:<10} {dir_str}  {px_str:<19} {pnl_str}  ({hold_min}m)  {strat_str}"
+            # Estimate visible length (ANSI codes in dir_str/pnl_str don't count)
+            dir_plain = "SHORT" if direction == "SHORT" else "LONG "
+            pnl_plain = f"+${abs(pnl):.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            visible_len = len(f"  {ts}  {symbol:<10} {dir_plain}  {px_str:<19} {pnl_plain}  ({hold_min}m)  GEOMETRY")
             padding = WIDTH - visible_len - 2
             print(f"{BOX_V}{line}{' ' * max(0, padding)}{BOX_V}")
 

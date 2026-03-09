@@ -423,9 +423,14 @@ def get_recent_exits(limit: int = 10) -> List[dict]:
                    (SELECT winning_policy_name FROM ghost_trades
                     WHERE symbol = e.symbol AND is_entry = 1 AND timestamp <= e.timestamp
                     ORDER BY timestamp DESC LIMIT 1) as strategy,
-                   (SELECT price FROM ghost_trades
-                    WHERE trade_id = e.entry_trade_id AND is_entry = 1
-                    LIMIT 1) as entry_price
+                   COALESCE(
+                       (SELECT price FROM ghost_trades
+                        WHERE trade_id = e.entry_trade_id AND is_entry = 1
+                        LIMIT 1),
+                       (SELECT price FROM ghost_trades
+                        WHERE symbol = e.symbol AND is_entry = 1 AND timestamp <= e.timestamp
+                        ORDER BY timestamp DESC LIMIT 1)
+                   ) as entry_price
             FROM ghost_trades e
             WHERE e.is_entry = 0
             ORDER BY e.timestamp DESC

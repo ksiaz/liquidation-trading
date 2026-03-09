@@ -1455,6 +1455,22 @@ class CollectorService:
                         atr_30m=atr_30m,
                     )
 
+                    # Recovery: register trailing stop for ghost positions surviving restart
+                    existing_stop_symbols = {s.symbol for s in self._trailing_stop_manager.get_all_stops().values()}
+                    if symbol not in existing_stop_symbols:
+                        ghost_pos = self.ghost_tracker.get_open_position(symbol)
+                        if ghost_pos:
+                            ep = ghost_pos.entry_price
+                            side = ghost_pos.side
+                            initial_stop = ep * (0.975 if side == "LONG" else 1.025)
+                            self._trailing_stop_manager.register_trailing_stop(
+                                entry_order_id=f"RECOVERED_{symbol}",
+                                symbol=symbol, direction=side,
+                                entry_price=ep, initial_stop_price=initial_stop,
+                                entry_timestamp=ghost_pos.entry_timestamp or time.time()
+                            )
+                            print(f"RECONCILE: Registered trailing stop for recovered {symbol} {side} @ {ep:,.2f}")
+
                     # Gravity TP: partial close at L2 orderbook resistance/support zones
                     # Compute target for recovered positions that don't have one yet
                     if symbol not in self._gravity_tp_targets:
@@ -2659,13 +2675,39 @@ class CollectorService:
             # Fetch live prices via REST for accurate reconciliation PnL
             reconcile_prices = self._fetch_reconcile_prices()
 
-            # Case 1: Ghost has position but controller is FLAT → stale ghost, close it
+            # Case 1: Ghost has position but controller is FLAT
+            # Young positions (<2h) survive restart — recovery logic in regime loop
+            # will re-register trailing stops and gravity TP targets.
+            _RECONCILE_MAX_AGE = 7200  # 2 hours
+            now = time.time()
             for symbol in list(ghost_open.keys()):
                 if symbol not in controller_open:
+                    pos = ghost_open[symbol]
+                    age = now - pos.entry_timestamp if pos.entry_timestamp else _RECONCILE_MAX_AGE + 1
+                    if age < _RECONCILE_MAX_AGE:
+                        print(f"RECONCILE: {symbol} ghost position age={age:.0f}s (<{_RECONCILE_MAX_AGE}s) — "
+                              f"keeping alive for recovery (entry={pos.entry_price})")
+                        # Sync controller state machine to OPEN so DCA_ADD works
+                        from runtime.position.types import Position, PositionState, Direction
+                        direction = Direction.LONG if pos.side == "LONG" else Direction.SHORT
+                        self.executor.state_machine._positions[symbol] = Position(
+                            symbol=symbol, state=PositionState.OPEN,
+                            direction=direction, quantity=Decimal(str(pos.quantity)),
+                            entry_price=Decimal(str(pos.entry_price))
+                        )
+                        # Restore DCA state
+                        if pos.entry_policy == "EP2-CASCADE-SNIPER-V1":
+                            self._dca_states[symbol] = DCAState(
+                                level=0, last_add_ts=0,
+                                initial_quantity=pos.quantity,
+                                initial_entry_price=pos.entry_price,
+                                strategy_id=pos.entry_policy)
+                        print(f"RECONCILE: Synced controller OPEN + DCA for {symbol}")
+                        continue
                     coin = symbol.replace('USDT', '').replace('USD', '')
-                    exit_price = reconcile_prices.get(coin) or self._get_live_price(symbol) or ghost_open[symbol].entry_price
+                    exit_price = reconcile_prices.get(coin) or self._get_live_price(symbol) or pos.entry_price
                     print(f"RECONCILE: Ghost position for {symbol} but controller is FLAT — closing stale ghost "
-                          f"(entry={ghost_open[symbol].entry_price}, exit={exit_price})")
+                          f"(entry={pos.entry_price}, exit={exit_price}, age={age:.0f}s)")
                     self.ghost_tracker.close_position(
                         symbol=symbol,
                         exit_reason="RECONCILE_STALE",

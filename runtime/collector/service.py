@@ -123,9 +123,8 @@ class DCAConfig:
     enabled: bool = True
     max_levels: int = 8              # 8 adds at 5bp spacing (40bp total range)
     spacing_bps: float = 5           # Add every 5bp below avg_entry
-    min_interval_sec: float = 15     # Min 15s between adds
-    min_liq_events: int = 3          # >=3 liq events in 60s window ("active" mode)
-    liq_window_sec: float = 60       # Window for counting liq events
+    # No interval or cascade gate — DCA levels are pre-computed limit orders
+    # that fill as soon as price touches them.
     add_fractions: tuple = (0.0625,) * 8  # Each add = 6.25% of initial ($6.25 per level)
     max_position_pct: float = 0.10   # 10% max total position
 
@@ -134,7 +133,7 @@ class DCAConfig:
 class DCAState:
     """Tracks DCA state for a single position."""
     level: int                    # 0 = initial only, 1+ = adds done
-    last_add_ts: float            # Wall clock of last add
+    last_add_ts: float            # Wall clock of last add (legacy, unused)
     initial_quantity: float       # First entry qty (for sizing adds)
     initial_entry_price: float    # First entry price
     strategy_id: str
@@ -603,23 +602,18 @@ class CollectorService:
             # No DCA if EXIT mandate already present for this symbol
             if any(m.symbol == symbol and m.type == MandateType.EXIT for m in existing_mandates):
                 continue
-            # Price drop check
+            # Fixed limit order levels from initial entry price.
+            # Level 1 = initial - 5bp, level 2 = initial - 10bp, etc.
             price = self._get_live_price(symbol)
             if not price:
                 continue
+            next_level = dca.level + 1  # 1-indexed: first add at 1×spacing
+            required_bps = next_level * self._dca_config.spacing_bps
             if position.side == "LONG":
-                drop_bps = (position.entry_price - price) / position.entry_price * 10000
-            else:  # SHORT
-                drop_bps = (price - position.entry_price) / position.entry_price * 10000
-            if drop_bps < self._dca_config.spacing_bps:
-                continue
-            # Time gate
-            if time.time() - dca.last_add_ts < self._dca_config.min_interval_sec:
-                continue
-            # Cascade quality gate: active mode
-            liq_count = self._rolling_volume_tracker.get_event_count_in_window(
-                symbol, time.time(), self._dca_config.liq_window_sec)
-            if liq_count < self._dca_config.min_liq_events:
+                drop_bps = (dca.initial_entry_price - price) / dca.initial_entry_price * 10000
+            else:
+                drop_bps = (price - dca.initial_entry_price) / dca.initial_entry_price * 10000
+            if drop_bps < required_bps:
                 continue
             # Sizing
             idx = min(dca.level, len(self._dca_config.add_fractions) - 1)
@@ -3246,19 +3240,25 @@ class CollectorService:
                   f"PnL={pnl_str} zone_gravity={target.zone_gravity:.0f} "
                   f"persist={target.zone_persistence:.0%} remaining={remaining:.4f}")
 
-            # Move trailing stop to break-even — remaining half must not lose money
+            # Move trailing stop to entry + 15bp profit floor.
+            # BE (0bp) wastes the trailing half — 13/35 trades give back all profit.
+            # +15bp floor: pure improvement, no runners affected (all exit >40bp).
+            _GRAV_TP_STOP_FLOOR_BPS = 15
             for stop_id, state in self._trailing_stop_manager.get_all_stops().items():
                 if state.symbol == symbol:
-                    be_price = state.entry_price
+                    if target.side == "LONG":
+                        floor_price = state.entry_price * (1 + _GRAV_TP_STOP_FLOOR_BPS / 10_000)
+                    else:
+                        floor_price = state.entry_price * (1 - _GRAV_TP_STOP_FLOOR_BPS / 10_000)
                     old_stop = state.current_stop_price
-                    if target.side == "LONG" and old_stop < be_price:
-                        state.current_stop_price = be_price
+                    if target.side == "LONG" and old_stop < floor_price:
+                        state.current_stop_price = floor_price
                         state.break_even_triggered = True
-                        print(f"GRAVITY_TP_BE: {symbol} stop moved {old_stop:,.2f} → {be_price:,.2f} (break-even)")
-                    elif target.side == "SHORT" and old_stop > be_price:
-                        state.current_stop_price = be_price
+                        print(f"GRAVITY_TP_FLOOR: {symbol} stop moved {old_stop:,.2f} → {floor_price:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp)")
+                    elif target.side == "SHORT" and old_stop > floor_price:
+                        state.current_stop_price = floor_price
                         state.break_even_triggered = True
-                        print(f"GRAVITY_TP_BE: {symbol} stop moved {old_stop:,.2f} → {be_price:,.2f} (break-even)")
+                        print(f"GRAVITY_TP_FLOOR: {symbol} stop moved {old_stop:,.2f} → {floor_price:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp)")
                     break
 
     def _update_trailing_stops(self, symbol: str, price: float,

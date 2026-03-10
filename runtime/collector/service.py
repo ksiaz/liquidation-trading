@@ -126,7 +126,7 @@ class DCAConfig:
     # No interval or cascade gate — DCA levels are pre-computed limit orders
     # that fill as soon as price touches them.
     add_fractions: tuple = (0.0625,) * 8  # Each add = 6.25% of initial ($6.25 per level)
-    max_position_pct: float = 0.10   # 10% max total position
+    max_position_pct: float = 0.16   # 16% max total position (headroom for 1.5× base + adverse price)
 
 
 @dataclass
@@ -1685,16 +1685,15 @@ class CollectorService:
                     # exhaustion) are sufficient. See commit e4c3664.
 
                     # Fuel gate: defer entry while liquidations still flowing.
-                    # Burst detector catches the spike, but cascade may still be active.
-                    # Wait for liq rate to drop before entering — ideal entry is AFTER
-                    # cascade exhausts, not during. Signal stays pending (not confirmed)
-                    # so it re-emits each cycle until liqs subside.
+                    # Two checks: (1) liq events in 60s window, (2) price still
+                    # moving in cascade direction. Liqs may stop but momentum persists
+                    # — entering while price still moving is too early.
                     _FUEL_GATE_MAX_LIQS_60S = 3
                     if rolling_fade_signal:
                         _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
                             symbol, timestamp, window_sec=60.0)
                         if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
-                            # Defer — don't confirm, signal stays pending for retry
+                            # Phase 1: liqs still flowing — defer
                             _fuel_key = f"_fuel_log_{symbol}"
                             _fuel_last = getattr(self, _fuel_key, 0)
                             if timestamp - _fuel_last >= 30:
@@ -1702,6 +1701,50 @@ class CollectorService:
                                 print(f"[FUEL GATE] {symbol}: deferring — {_recent_liqs} liqs "
                                       f"in 60s (>{_FUEL_GATE_MAX_LIQS_60S}), cascade still active")
                             rolling_fade_signal = None
+
+                    # Fuel gate phase 2: current price momentum check.
+                    # After liqs stop, cascade's price effect persists. Check if price
+                    # is STILL moving in cascade direction RIGHT NOW (last 5s).
+                    # Snaps open instantly when price flattens or reverses.
+                    # CRITICAL: if no price data in window, DEFER (not pass). Stale/missing
+                    # price data means we can't confirm momentum dissipated — safer to wait.
+                    _FUEL_MOMENTUM_BPS = 2  # Defer if >2bp move in cascade dir over 5s
+                    _FUEL_MOMENTUM_WINDOW = 5  # seconds — short = reactive
+                    _MIN_PRICE_SAMPLES = 2   # Need ≥2 points to measure direction
+                    if rolling_fade_signal:
+                        _price_deq = self._price_history.get(symbol)
+                        _prices_snap = list(_price_deq) if _price_deq else []
+                        _p_cutoff = timestamp - _FUEL_MOMENTUM_WINDOW
+                        _recent_p = [(t, p) for t, p in _prices_snap if t >= _p_cutoff]
+                        if len(_recent_p) < _MIN_PRICE_SAMPLES:
+                            # No recent price data — can't confirm momentum gone, defer
+                            _fuel_key2 = f"_fuel_mom_log_{symbol}"
+                            _fuel_last2 = getattr(self, _fuel_key2, 0)
+                            if timestamp - _fuel_last2 >= 30:
+                                setattr(self, _fuel_key2, timestamp)
+                                print(f"[FUEL GATE] {symbol}: deferring — only "
+                                      f"{len(_recent_p)} price samples in {_FUEL_MOMENTUM_WINDOW}s, "
+                                      f"cannot confirm momentum dissipated")
+                            rolling_fade_signal = None
+                        else:
+                            _p_first = _recent_p[0][1]
+                            _p_last = _recent_p[-1][1]
+                            _move_bps = (_p_last - _p_first) / _p_first * 10000
+                            # SHORT fade = cascade pushed price UP → defer if still rising
+                            # LONG fade = cascade pushed price DOWN → defer if still falling
+                            _cascade_dir_move = (
+                                (rolling_fade_signal.fade_direction == "SHORT" and _move_bps > _FUEL_MOMENTUM_BPS) or
+                                (rolling_fade_signal.fade_direction == "LONG" and _move_bps < -_FUEL_MOMENTUM_BPS)
+                            )
+                            if _cascade_dir_move:
+                                _fuel_key2 = f"_fuel_mom_log_{symbol}"
+                                _fuel_last2 = getattr(self, _fuel_key2, 0)
+                                if timestamp - _fuel_last2 >= 30:
+                                    setattr(self, _fuel_key2, timestamp)
+                                    print(f"[FUEL GATE] {symbol}: deferring — price "
+                                          f"{_move_bps:+.1f}bp in {_FUEL_MOMENTUM_WINDOW}s, "
+                                          f"still moving in cascade direction")
+                                rolling_fade_signal = None
 
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration

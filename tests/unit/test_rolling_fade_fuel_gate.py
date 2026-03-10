@@ -179,3 +179,105 @@ class TestPendingSignalLifecycle:
         """Confirming a symbol with no pending signal does nothing."""
         t = RollingVolumeTracker()
         t.confirm_signal("BTCUSDT", time.time())  # should not raise
+
+
+# -- Fuel gate phase 2: price momentum logic --
+
+class TestFuelGateMomentum:
+    """Test the price momentum deferral logic (phase 2 of fuel gate).
+
+    The actual check lives inline in service.py, but we test the
+    direction logic here to prevent regressions.
+    """
+
+    _FUEL_MOMENTUM_BPS = 2
+    _FUEL_MOMENTUM_WINDOW = 5
+
+    @staticmethod
+    def _should_defer(fade_direction: str, prices: list[tuple[float, float]],
+                      timestamp: float, window: float = 5, threshold_bps: float = 2) -> bool:
+        """Reproduce the fuel gate momentum check from service.py.
+
+        CRITICAL: insufficient data → DEFER (True), not pass.
+        Can't confirm momentum dissipated without price data.
+        """
+        cutoff = timestamp - window
+        recent = [(t, p) for t, p in prices if t >= cutoff]
+        if len(recent) < 2:
+            return True  # No data = defer (safe default)
+        p_first = recent[0][1]
+        p_last = recent[-1][1]
+        move_bps = (p_last - p_first) / p_first * 10000
+        return (
+            (fade_direction == "SHORT" and move_bps > threshold_bps) or
+            (fade_direction == "LONG" and move_bps < -threshold_bps)
+        )
+
+    def test_short_fade_defers_on_rising_price(self):
+        """SHORT fade (short liq cascade pushed price up) defers while rising."""
+        now = time.time()
+        # Price rose ~5bp in 5s (30 at 60000 = 5bp)
+        prices = [(now - 4, 60000), (now - 2, 60015), (now, 60030)]
+        assert self._should_defer("SHORT", prices, now)
+
+    def test_short_fade_passes_on_flat_price(self):
+        """SHORT fade passes when price stopped rising."""
+        now = time.time()
+        prices = [(now - 4, 60000), (now - 2, 60001), (now, 60001)]
+        assert not self._should_defer("SHORT", prices, now)
+
+    def test_short_fade_passes_on_falling_price(self):
+        """SHORT fade passes when price reversing (our desired direction)."""
+        now = time.time()
+        prices = [(now - 4, 60000), (now - 2, 59998), (now, 59995)]
+        assert not self._should_defer("SHORT", prices, now)
+
+    def test_long_fade_defers_on_falling_price(self):
+        """LONG fade (long liq cascade pushed price down) defers while falling."""
+        now = time.time()
+        # Price fell ~5bp in 5s
+        prices = [(now - 4, 60000), (now - 2, 59985), (now, 59970)]
+        assert self._should_defer("LONG", prices, now)
+
+    def test_long_fade_passes_on_flat_price(self):
+        """LONG fade passes when price stopped falling."""
+        now = time.time()
+        prices = [(now - 4, 60000), (now - 2, 59999), (now, 59999)]
+        assert not self._should_defer("LONG", prices, now)
+
+    def test_long_fade_passes_on_rising_price(self):
+        """LONG fade passes when price reversing (our desired direction)."""
+        now = time.time()
+        prices = [(now - 4, 60000), (now - 2, 60015), (now, 60030)]
+        assert not self._should_defer("LONG", prices, now)
+
+    def test_insufficient_data_defers(self):
+        """With <2 price points in window, DEFER — can't confirm momentum gone."""
+        now = time.time()
+        prices = [(now - 3, 60000)]
+        assert self._should_defer("SHORT", prices, now)
+
+    def test_empty_price_history_defers(self):
+        """No price data at all → defer."""
+        now = time.time()
+        assert self._should_defer("SHORT", [], now)
+
+    def test_stale_prices_only_defers(self):
+        """All prices older than 5s window → defer (same as no data)."""
+        now = time.time()
+        prices = [(now - 20, 60000), (now - 10, 60030)]
+        assert self._should_defer("LONG", prices, now)
+
+    def test_old_prices_excluded(self):
+        """Prices outside the 5s window are ignored."""
+        now = time.time()
+        # Big move happened 10s ago, recent price flat
+        prices = [(now - 10, 59000), (now - 3, 60000), (now, 60001)]
+        assert not self._should_defer("SHORT", prices, now)
+
+    def test_exactly_at_threshold(self):
+        """Move of exactly 2bp should NOT defer (> not >=)."""
+        now = time.time()
+        # Exactly 2bp rise: 60000 * 2/10000 = 12
+        prices = [(now - 3, 60000), (now, 60012)]
+        assert not self._should_defer("SHORT", prices, now)

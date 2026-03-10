@@ -2774,6 +2774,19 @@ class CollectorService:
                     else:
                         print(f"RECONCILE: Failed to register {symbol}: {error}")
 
+            # Ensure DCA state exists for ALL open cascade positions.
+            # DCA state is in-memory only — lost on restart. The Case 1 recovery
+            # above only handles ghost-without-controller. This covers all cases.
+            for symbol, pos in ghost_open.items():
+                if pos.entry_policy == "EP2-CASCADE-SNIPER-V1" and symbol not in self._dca_states:
+                    self._dca_states[symbol] = DCAState(
+                        level=0, last_add_ts=0,
+                        initial_quantity=pos.quantity,
+                        initial_entry_price=pos.entry_price,
+                        strategy_id=pos.entry_policy)
+                    print(f"RECONCILE: Restored DCA state for {symbol} "
+                          f"(qty={pos.quantity:.6f}, entry=${pos.entry_price:,.2f})")
+
             # Case 3: Stale trailing stops for positions that no longer exist
             all_open_symbols = set(controller_open.keys()) | set(ghost_open.keys())
             stale_stops = []

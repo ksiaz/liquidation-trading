@@ -46,6 +46,7 @@ from runtime.orderflow import MultiWindowOrderflow
 from runtime.liquidations import LiquidationZScoreCalculator, LiquidationBurstAggregator, LiquidationBurst
 from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.liquidations.liquidity_map import LiquidityMap
+from runtime.liquidations.gravity_observer import GravityObserver
 from runtime.liquidations.trade_volume_map import TradeVolumeMap
 from runtime.whale.tracker import WhaleFillTracker
 from runtime.cascade import CapitulationTracker
@@ -332,6 +333,7 @@ class CollectorService:
 
         # L2 liquidity memory map (gravity zones for TP targeting)
         self._liquidity_map = LiquidityMap()
+        self._gravity_observer = GravityObserver()
 
         # Trade-based volume profile (adverse volume for trailing stop tightening)
         self._trade_volume_map = TradeVolumeMap()
@@ -708,22 +710,19 @@ class CollectorService:
                     entry_price = float(pos.entry_price)
                     direction = pos.direction.value if hasattr(pos.direction, 'value') else str(pos.direction)
 
-                    # Set initial stop at 2% from entry
-                    if direction == "LONG":
-                        initial_stop = entry_price * 0.98
-                    else:
-                        initial_stop = entry_price * 1.02
-
-                    # Use symbol as trade_id for recovered positions
+                    # Use ROLLING_FADE config for recovered positions
+                    stop_config, initial_stop = self._get_rolling_fade_stop_config(
+                        pos.symbol, entry_price, direction
+                    )
                     self._trailing_stop_manager.register_trailing_stop(
                         entry_order_id=f"RECOVERED_{pos.symbol}",
                         symbol=pos.symbol,
                         direction=direction,
                         entry_price=entry_price,
                         initial_stop_price=initial_stop,
-                        config=self._trailing_stop_config
+                        config=stop_config
                     )
-                    self._logger.info(f"  {pos.symbol}: registered trailing stop @ ${initial_stop:,.2f}")
+                    self._logger.info(f"  {pos.symbol}: registered trailing stop @ ${initial_stop:,.2f} (ROLLING_FADE config)")
 
             # Also register trailing stops from ghost_positions (may have additional positions)
             try:
@@ -743,20 +742,18 @@ class CollectorService:
                         if entry <= 0:
                             continue
 
-                        if direction == "LONG":
-                            initial_stop = entry * 0.98
-                        else:
-                            initial_stop = entry * 1.02
-
+                        stop_config, initial_stop = self._get_rolling_fade_stop_config(
+                            symbol, entry, direction
+                        )
                         self._trailing_stop_manager.register_trailing_stop(
                             entry_order_id=f"RECOVERED_{symbol}",
                             symbol=symbol,
                             direction=direction,
                             entry_price=entry,
                             initial_stop_price=initial_stop,
-                            config=self._trailing_stop_config
+                            config=stop_config
                         )
-                        self._logger.info(f"  {symbol}: registered ghost trailing stop @ ${initial_stop:,.2f}")
+                        self._logger.info(f"  {symbol}: registered ghost trailing stop @ ${initial_stop:,.2f} (ROLLING_FADE config)")
                 finally:
                     put_conn(pg_conn)
             except Exception as ghost_err:
@@ -1122,10 +1119,10 @@ class CollectorService:
                             price=f_px, size_usd=f_px * f_sz,
                             timestamp=time.time()
                         )
-                        # Trailing stops
-                        self._update_trailing_stops(f_sym, f_px)
-                        # Gravity TP on fill-driven price updates
-                        self._check_gravity_tp_targets(f_sym, f_px)
+                        # NOTE: trailing stops and gravity TP are NOT checked here.
+                        # Fill prices can be stale or off-market (gRPC node lag,
+                        # off-market trades). Trailing stop triggers and gravity TP
+                        # only run in the regime loop with validated WS allMids price.
                         # Cascade organic flow
                         try:
                             from external_policy.ep2_strategy_cascade_sniper import record_organic_trade
@@ -1456,20 +1453,24 @@ class CollectorService:
                     )
 
                     # Recovery: register trailing stop for ghost positions surviving restart
+                    # Uses ROLLING_FADE config (strategy-specific) instead of generic defaults.
                     existing_stop_symbols = {s.symbol for s in self._trailing_stop_manager.get_all_stops().values()}
                     if symbol not in existing_stop_symbols:
                         ghost_pos = self.ghost_tracker.get_open_position(symbol)
                         if ghost_pos:
                             ep = ghost_pos.entry_price
                             side = ghost_pos.side
-                            initial_stop = ep * (0.975 if side == "LONG" else 1.025)
+                            stop_config, initial_stop = self._get_rolling_fade_stop_config(
+                                symbol, ep, side
+                            )
                             self._trailing_stop_manager.register_trailing_stop(
                                 entry_order_id=f"RECOVERED_{symbol}",
                                 symbol=symbol, direction=side,
                                 entry_price=ep, initial_stop_price=initial_stop,
-                                entry_timestamp=ghost_pos.entry_timestamp or time.time()
+                                entry_timestamp=ghost_pos.entry_timestamp or time.time(),
+                                config=stop_config
                             )
-                            print(f"RECONCILE: Registered trailing stop for recovered {symbol} {side} @ {ep:,.2f}")
+                            print(f"RECONCILE: Registered trailing stop for recovered {symbol} {side} @ {ep:,.2f} (ROLLING_FADE config)")
 
                     # Gravity TP: partial close at L2 orderbook resistance/support zones
                     # Compute target for recovered positions that don't have one yet
@@ -1488,10 +1489,25 @@ class CollectorService:
                                 )
                     self._check_gravity_tp_targets(symbol, price)
 
+                    # Gravity zone observer — passive data collection
+                    _grav_obs_event = self._gravity_observer.get_active_event(hl_symbol)
+                    if _grav_obs_event and not _grav_obs_event.cascade_active:
+                        _grav_obs_event.cascade_active = bool(
+                            self.ghost_tracker.get_open_position(symbol)
+                        )
+                    self._gravity_observer.on_price_update(
+                        hl_symbol, price, timestamp,
+                        self._liquidity_map,
+                        self._orderflow_calculators.get(symbol),
+                    )
+
                 except Exception as e:
                     # Don't fail cycle if regime classification fails
                     self._logger.warning(f"Regime classification error for {symbol}: {e}")
                     continue
+
+            # Flush gravity observer events to DB
+            self._gravity_observer.flush_to_db()
 
             # Data freshness gate — block new entries when node/adapter stale
             # Trailing stops updated in regime loop above (with context) + fill handler (price-only)
@@ -1950,10 +1966,15 @@ class CollectorService:
                             # Phase E: Record mandate for stability observation
                             stability_observer.record_mandate(m)
 
-                    # Rolling fade signal lifecycle: confirm on evaluation (starts 15m cooldown).
-                    # The rolling tracker detects new bursts independently via check_for_signal.
+                    # Rolling fade signal lifecycle: only confirm when a mandate was actually
+                    # emitted. Without this, arbitration blocking or data freshness gates
+                    # silently discard the mandate but consume the signal — losing valid entries.
                     if rolling_fade_signal:
-                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                        _rf_mandate_emitted = any(
+                            m.strategy_id == "EP2-CASCADE-SNIPER-V1" for m in mandates
+                        )
+                        if _rf_mandate_emitted:
+                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
 
                     # Whale fade signal lifecycle: only confirm when a whale fade mandate
                     # was actually selected OR a hard gate already consumed it above.
@@ -2715,6 +2736,18 @@ class CollectorService:
 
             ghost_open = self.ghost_tracker.get_open_positions()
 
+            # Fetch raw DB rows for DCA level restoration
+            try:
+                _pg = get_conn()
+                try:
+                    _cur = _pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                    _cur.execute("SELECT * FROM ghost_positions WHERE status = 'OPEN'")
+                    ghost_open_raw = {r['symbol']: dict(r) for r in _cur.fetchall()}
+                finally:
+                    put_conn(_pg)
+            except Exception:
+                ghost_open_raw = {}
+
             # Fetch live prices via REST for accurate reconciliation PnL
             reconcile_prices = self._fetch_reconcile_prices()
 
@@ -2738,12 +2771,14 @@ class CollectorService:
                             direction=direction, quantity=Decimal(str(pos.quantity)),
                             entry_price=Decimal(str(pos.entry_price))
                         )
-                        # Restore DCA state
+                        # Restore DCA state (level + initial_entry_price persisted in DB)
                         if pos.entry_policy == "EP2-CASCADE-SNIPER-V1":
+                            _db_dca_level = ghost_open_raw.get(symbol, {}).get('dca_level', 0) or 0
+                            _db_initial_px = ghost_open_raw.get(symbol, {}).get('initial_entry_price') or pos.entry_price
                             self._dca_states[symbol] = DCAState(
-                                level=0, last_add_ts=0,
-                                initial_quantity=pos.quantity,
-                                initial_entry_price=pos.entry_price,
+                                level=_db_dca_level, last_add_ts=0,
+                                initial_quantity=pos.quantity / (1 + _db_dca_level * 0.0625) if _db_dca_level > 0 else pos.quantity,
+                                initial_entry_price=_db_initial_px,
                                 strategy_id=pos.entry_policy)
                         print(f"RECONCILE: Synced controller OPEN + DCA for {symbol}")
                         continue
@@ -2818,17 +2853,18 @@ class CollectorService:
                         print(f"RECONCILE: Failed to register {symbol}: {error}")
 
             # Ensure DCA state exists for ALL open cascade positions.
-            # DCA state is in-memory only — lost on restart. The Case 1 recovery
-            # above only handles ghost-without-controller. This covers all cases.
+            # DCA level + initial_entry_price persisted in ghost_positions.
             for symbol, pos in ghost_open.items():
                 if pos.entry_policy == "EP2-CASCADE-SNIPER-V1" and symbol not in self._dca_states:
+                    _db_dca_level = ghost_open_raw.get(symbol, {}).get('dca_level', 0) or 0
+                    _db_initial_px = ghost_open_raw.get(symbol, {}).get('initial_entry_price') or pos.entry_price
                     self._dca_states[symbol] = DCAState(
-                        level=0, last_add_ts=0,
-                        initial_quantity=pos.quantity,
-                        initial_entry_price=pos.entry_price,
+                        level=_db_dca_level, last_add_ts=0,
+                        initial_quantity=pos.quantity / (1 + _db_dca_level * 0.0625) if _db_dca_level > 0 else pos.quantity,
+                        initial_entry_price=_db_initial_px,
                         strategy_id=pos.entry_policy)
                     print(f"RECONCILE: Restored DCA state for {symbol} "
-                          f"(qty={pos.quantity:.6f}, entry=${pos.entry_price:,.2f})")
+                          f"(level={_db_dca_level}, qty={pos.quantity:.6f}, entry=${pos.entry_price:,.2f})")
 
             # Case 3: Stale trailing stops for positions that no longer exist
             all_open_symbols = set(controller_open.keys()) | set(ghost_open.keys())
@@ -3409,16 +3445,23 @@ class CollectorService:
             )
 
             # ── Cascade continuation kill ──
-            # Adverse liquidations still firing after 2-min grace → instant exit.
+            # Adverse liquidations still firing → exit.
             # LONG + LONG liqs (forced sells, price down) = adverse.
             # SHORT + SHORT liqs (forced buys, price up) = adverse.
-            # BUT: only kill if DCA is exhausted (all levels filled). While DCA
-            # has room, let it absorb the adverse move — that's what it's for.
+            # Cascade positions with DCA: skip kill while DCA has room to absorb.
+            # Once DCA exhausted, kill fast (10s grace). Non-cascade positions
+            # (no DCA state) use the original 120s grace.
             _CASCADE_KILL_Z = 20.0
-            _CASCADE_KILL_GRACE = 10  # DCA already exhausted — no reason to wait
             _cascade_killed = False
             _dca = self._dca_states.get(symbol)
-            _dca_exhausted = _dca is None or _dca.level >= self._dca_config.max_levels
+            if _dca is not None:
+                # Cascade position — only kill when DCA exhausted
+                _dca_exhausted = _dca.level >= self._dca_config.max_levels
+                _CASCADE_KILL_GRACE = 10
+            else:
+                # Non-cascade position — original behavior
+                _dca_exhausted = True
+                _CASCADE_KILL_GRACE = 120
             if _rolling_z >= _CASCADE_KILL_Z and _dca_exhausted:
                 _liq_side = self._rolling_volume_tracker.get_burst_dominant_side(
                     symbol, time.time()

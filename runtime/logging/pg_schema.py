@@ -1389,6 +1389,14 @@ def ensure_schema(conn):
             f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}({columns})"
         )
 
+    # Schema migrations — idempotent column additions
+    cur.execute("""
+        ALTER TABLE ghost_positions ADD COLUMN IF NOT EXISTS dca_level SMALLINT DEFAULT 0
+    """)
+    cur.execute("""
+        ALTER TABLE ghost_positions ADD COLUMN IF NOT EXISTS initial_entry_price DOUBLE PRECISION
+    """)
+
     # Unique constraint on ghost_trades.trade_id to prevent ID collisions.
     # Deduplicate first (keep newest row per trade_id) in case of legacy data.
     cur.execute("""
@@ -1398,6 +1406,67 @@ def ensure_schema(conn):
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trades_trade_id_unique
         ON ghost_trades(trade_id)
+    """)
+
+    # ── Gravity Zone Observer (research data collection) ─────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gravity_zone_events (
+            id BIGSERIAL PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            arrival_ts DOUBLE PRECISION NOT NULL,
+
+            zone_center DOUBLE PRECISION NOT NULL,
+            zone_low DOUBLE PRECISION NOT NULL,
+            zone_high DOUBLE PRECISION NOT NULL,
+            zone_side TEXT NOT NULL,
+            zone_gravity DOUBLE PRECISION NOT NULL,
+            zone_persistence DOUBLE PRECISION NOT NULL,
+            zone_size_initial DOUBLE PRECISION NOT NULL,
+
+            arrival_price DOUBLE PRECISION NOT NULL,
+            approach_direction TEXT NOT NULL,
+            of_imbalance_arrival DOUBLE PRECISION,
+            of_fills_arrival INTEGER,
+
+            dest_zones_above TEXT,
+            dest_zones_below TEXT,
+            path_gravity_above DOUBLE PRECISION,
+            path_gravity_below DOUBLE PRECISION,
+            cascade_active SMALLINT DEFAULT 0,
+
+            dwell_duration_s DOUBLE PRECISION,
+            zone_size_samples TEXT,
+            size_ratio DOUBLE PRECISION,
+            min_size_ratio DOUBLE PRECISION,
+            of_imbalance_exit DOUBLE PRECISION,
+            of_fills_exit INTEGER,
+
+            exit_price DOUBLE PRECISION,
+            exit_direction TEXT,
+            reversal SMALLINT,
+            mfe_30s DOUBLE PRECISION,
+            mfe_60s DOUBLE PRECISION,
+            mfe_120s DOUBLE PRECISION,
+            mae_30s DOUBLE PRECISION,
+            mae_60s DOUBLE PRECISION,
+            mae_120s DOUBLE PRECISION,
+            destination_reached TEXT,
+            destination_gravity DOUBLE PRECISION,
+            destination_time_s DOUBLE PRECISION,
+            breached SMALLINT,
+
+            finalized SMALLINT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_gravity_zone_events_coin_ts
+        ON gravity_zone_events(coin, arrival_ts)
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gravity_zone_events_event_id
+        ON gravity_zone_events(event_id)
     """)
 
     conn.commit()

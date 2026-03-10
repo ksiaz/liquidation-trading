@@ -3412,10 +3412,14 @@ class CollectorService:
             # Adverse liquidations still firing after 2-min grace → instant exit.
             # LONG + LONG liqs (forced sells, price down) = adverse.
             # SHORT + SHORT liqs (forced buys, price up) = adverse.
+            # BUT: only kill if DCA is exhausted (all levels filled). While DCA
+            # has room, let it absorb the adverse move — that's what it's for.
             _CASCADE_KILL_Z = 20.0
-            _CASCADE_KILL_GRACE = 120
+            _CASCADE_KILL_GRACE = 10  # DCA already exhausted — no reason to wait
             _cascade_killed = False
-            if _rolling_z >= _CASCADE_KILL_Z:
+            _dca = self._dca_states.get(symbol)
+            _dca_exhausted = _dca is None or _dca.level >= self._dca_config.max_levels
+            if _rolling_z >= _CASCADE_KILL_Z and _dca_exhausted:
                 _liq_side = self._rolling_volume_tracker.get_burst_dominant_side(
                     symbol, time.time()
                 )
@@ -3431,7 +3435,8 @@ class CollectorService:
                             _liq_side == state.direction):
                         print(f"[CASCADE-KILL] {symbol}: rolling_z={_rolling_z:.1f} "
                               f"hold={_hold:.0f}s liq_side={_liq_side} "
-                              f"pos={state.direction} → INSTANT EXIT")
+                              f"pos={state.direction} dca={_dca.level if _dca else 'none'}"
+                              f"/{self._dca_config.max_levels} → INSTANT EXIT")
                         success, error, trade = self.ghost_tracker.close_position(
                             symbol=symbol,
                             exit_reason="CASCADE_CONTINUATION_KILL",

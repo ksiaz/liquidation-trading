@@ -330,6 +330,7 @@ class CollectorService:
         # Gravity TP: partial take-profit at L2 orderbook resistance/support zones
         self._gravity_tp_config = GravityTPConfig()
         self._gravity_tp_targets: Dict[str, GravityTPTarget] = {}  # symbol → target
+        self._gravity_tp_fired_symbols: set = set()  # symbols where gravity TP already fired (survives restart)
 
         # L2 liquidity memory map (gravity zones for TP targeting)
         self._liquidity_map = LiquidityMap()
@@ -1474,20 +1475,44 @@ class CollectorService:
                             print(f"RECONCILE: Registered trailing stop for recovered {symbol} {side} @ {ep:,.2f} (ROLLING_FADE config)")
 
                     # Gravity TP: partial close at L2 orderbook resistance/support zones
-                    # Compute target for recovered positions that don't have one yet
+                    # Compute target for recovered positions that don't have one yet.
+                    # Skip if gravity TP already fired pre-restart (detected during reconcile
+                    # via ghost_trades DB query). Apply the +15bp stop floor instead.
                     if symbol not in self._gravity_tp_targets:
-                        ghost_pos = self.ghost_tracker.get_open_position(symbol)
-                        if ghost_pos:
-                            tp_target = self._compute_gravity_tp_target(symbol, ghost_pos.entry_price, ghost_pos.side)
-                            if tp_target:
-                                self._gravity_tp_targets[symbol] = tp_target
-                                self._logger.info(
-                                    f"GRAVITY_TP_SET: {symbol} {ghost_pos.side} (recovered) "
-                                    f"target=${tp_target.target_price:,.2f} "
-                                    f"gravity={tp_target.zone_gravity:.0f} "
-                                    f"persist={tp_target.zone_persistence:.0%} "
-                                    f"distance={(abs(tp_target.target_price - ghost_pos.entry_price) / ghost_pos.entry_price * 10000):.0f}bp"
-                                )
+                        if symbol in self._gravity_tp_fired_symbols:
+                            # Gravity TP already took partial — apply stop floor once
+                            self._gravity_tp_fired_symbols.discard(symbol)
+                            _GRAV_TP_STOP_FLOOR_BPS = 15
+                            for _sid, _st in self._trailing_stop_manager.get_all_stops().items():
+                                if _st.symbol == symbol:
+                                    if _st.direction == "LONG":
+                                        _floor = _st.entry_price * (1 + _GRAV_TP_STOP_FLOOR_BPS / 10_000)
+                                        if _st.current_stop_price < _floor:
+                                            _old = _st.current_stop_price
+                                            _st.current_stop_price = _floor
+                                            _st.break_even_triggered = True
+                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_floor:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp, partial already fired)")
+                                    else:
+                                        _floor = _st.entry_price * (1 - _GRAV_TP_STOP_FLOOR_BPS / 10_000)
+                                        if _st.current_stop_price > _floor:
+                                            _old = _st.current_stop_price
+                                            _st.current_stop_price = _floor
+                                            _st.break_even_triggered = True
+                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_floor:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp, partial already fired)")
+                                    break
+                        else:
+                            ghost_pos = self.ghost_tracker.get_open_position(symbol)
+                            if ghost_pos:
+                                tp_target = self._compute_gravity_tp_target(symbol, ghost_pos.entry_price, ghost_pos.side)
+                                if tp_target:
+                                    self._gravity_tp_targets[symbol] = tp_target
+                                    self._logger.info(
+                                        f"GRAVITY_TP_SET: {symbol} {ghost_pos.side} (recovered) "
+                                        f"target=${tp_target.target_price:,.2f} "
+                                        f"gravity={tp_target.zone_gravity:.0f} "
+                                        f"persist={tp_target.zone_persistence:.0%} "
+                                        f"distance={(abs(tp_target.target_price - ghost_pos.entry_price) / ghost_pos.entry_price * 10000):.0f}bp"
+                                    )
                     self._check_gravity_tp_targets(symbol, price)
 
                     # Gravity zone observer — passive data collection
@@ -2971,6 +2996,30 @@ class CollectorService:
                         strategy_id=pos.entry_policy)
                     print(f"RECONCILE: Restored DCA state for {symbol} "
                           f"(level={_db_dca_level}, qty={pos.quantity:.6f}, entry=${pos.entry_price:,.2f})")
+
+            # Check if gravity TP already fired for any open positions (partial close).
+            # Must run for ALL open positions, not just Case 1 (ghost-only mismatch).
+            # On 2nd+ restart, controller is already OPEN so Case 1 doesn't trigger.
+            for symbol, pos in ghost_open.items():
+                if pos.entry_policy == "EP2-CASCADE-SNIPER-V1":
+                    try:
+                        _pg3 = get_conn()
+                        try:
+                            _cur3 = _pg3.cursor()
+                            _cur3.execute(
+                                "SELECT COUNT(*) FROM ghost_trades "
+                                "WHERE symbol = %s AND exit_reason = 'PARTIAL_GRAVITY_TP' "
+                                "AND timestamp > %s",
+                                (symbol, pos.entry_timestamp or 0)
+                            )
+                            _gtp_count = _cur3.fetchone()[0]
+                            if _gtp_count > 0:
+                                self._gravity_tp_fired_symbols.add(symbol)
+                                print(f"RECONCILE: {symbol} gravity TP already fired ({_gtp_count} partials) — will apply stop floor on first tick")
+                        finally:
+                            put_conn(_pg3)
+                    except Exception as _e:
+                        print(f"RECONCILE: {symbol} gravity TP check failed: {_e}")
 
             # Case 3: Stale trailing stops for positions that no longer exist
             all_open_symbols = set(controller_open.keys()) | set(ghost_open.keys())

@@ -116,6 +116,13 @@ class TrailingStopState:
     last_adverse_l2: Optional[float] = None   # Adverse L2 gravity near price
     last_rolling_z: Optional[float] = None    # Rolling burst rate ratio
 
+    # Time-delayed watermark ratchet — prevents wicks from permanently ratcheting stop.
+    # A new high must persist for RATCHET_DELAY_SEC before becoming the official watermark.
+    _candidate_high: Optional[float] = None   # Candidate new high (LONG)
+    _candidate_high_ts: float = 0.0           # When candidate was first seen
+    _candidate_low: Optional[float] = None    # Candidate new low (SHORT)
+    _candidate_low_ts: float = 0.0            # When candidate was first seen
+
     # Config
     config: TrailingStopConfig = field(default_factory=TrailingStopConfig)
 
@@ -146,6 +153,7 @@ class TrailingStopManager:
     _BE_FORCE_SEC = 7200  # Force break-even after 2h regardless
     _CASCADE_CONTINUE_Z = 20.0      # Rolling z threshold for "cascade continuing"
     _CASCADE_CONTINUE_GRACE = 120   # 2-min grace before circuit breaker active
+    _RATCHET_DELAY_SEC = 5          # New high must persist 5s before becoming watermark
 
     def __init__(
         self,
@@ -199,6 +207,8 @@ class TrailingStopManager:
                     # Orderflow tightening
                     orderflow_tighten_threshold=config_dict.get('orderflow_tighten_threshold', 0.38),
                     orderflow_tighten_mult=config_dict.get('orderflow_tighten_mult', 0.6),
+                    # Activation gate
+                    trail_activation_pct=config_dict.get('trail_activation_pct', 0.0),
                     # Update settings
                     min_move_to_update_pct=config_dict.get('min_move_to_update_pct', 0.002),
                     min_move_atr_fraction=config_dict.get('min_move_atr_fraction', 0.05),
@@ -253,6 +263,8 @@ class TrailingStopManager:
                 # Orderflow tightening
                 'orderflow_tighten_threshold': state.config.orderflow_tighten_threshold,
                 'orderflow_tighten_mult': state.config.orderflow_tighten_mult,
+                # Activation gate
+                'trail_activation_pct': state.config.trail_activation_pct,
                 # Update settings
                 'min_move_to_update_pct': state.config.min_move_to_update_pct,
                 'min_move_atr_fraction': state.config.min_move_atr_fraction,
@@ -379,8 +391,10 @@ class TrailingStopManager:
                 # Reset MFE tracking to current price
                 if state.direction == "LONG":
                     state.highest_price = current_price
+                    state._candidate_high = None
                 else:
                     state.lowest_price = current_price
+                    state._candidate_low = None
 
                 # Reset break-even (new avg entry changes the BE level)
                 state.break_even_triggered = False
@@ -451,11 +465,39 @@ class TrailingStopManager:
                 if rolling_z is not None:
                     state.last_rolling_z = rolling_z
 
-                # Update high/low watermark
+                # Update high/low watermark with time-delayed ratchet.
+                # A new extreme must persist for _RATCHET_DELAY_SEC before
+                # becoming the official watermark. Prevents wicks from
+                # permanently ratcheting the trailing stop.
+                _now_wm = time.time()
                 if state.direction == "LONG":
-                    state.highest_price = max(state.highest_price, price)
+                    if price > state.highest_price:
+                        if state._candidate_high is None or price > state._candidate_high:
+                            state._candidate_high = price
+                            state._candidate_high_ts = _now_wm
+                        elif _now_wm - state._candidate_high_ts >= self._RATCHET_DELAY_SEC:
+                            state.highest_price = state._candidate_high
+                            state._candidate_high = None
+                    else:
+                        # Price retreated below current high — keep candidate alive
+                        # (it may still be confirmed if delay hasn't elapsed)
+                        if (state._candidate_high is not None and
+                                _now_wm - state._candidate_high_ts >= self._RATCHET_DELAY_SEC):
+                            state.highest_price = state._candidate_high
+                            state._candidate_high = None
                 else:
-                    state.lowest_price = min(state.lowest_price, price)
+                    if price < state.lowest_price:
+                        if state._candidate_low is None or price < state._candidate_low:
+                            state._candidate_low = price
+                            state._candidate_low_ts = _now_wm
+                        elif _now_wm - state._candidate_low_ts >= self._RATCHET_DELAY_SEC:
+                            state.lowest_price = state._candidate_low
+                            state._candidate_low = None
+                    else:
+                        if (state._candidate_low is not None and
+                                _now_wm - state._candidate_low_ts >= self._RATCHET_DELAY_SEC):
+                            state.lowest_price = state._candidate_low
+                            state._candidate_low = None
 
                 # Context logging (throttled 30s/symbol)
                 if (state.config.mode == TrailingMode.ATR_PROGRESSIVE and

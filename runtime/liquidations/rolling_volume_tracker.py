@@ -62,6 +62,7 @@ class _PendingSpike:
     """
     signal: RollingFadeSignal
     confirmed: bool = False
+    first_detected_ts: float = 0.0  # Original creation time (survives stale_replace)
 
 
 class RollingVolumeTracker:
@@ -76,8 +77,10 @@ class RollingVolumeTracker:
     BASELINE_WINDOW = 3600     # 60m baseline rate window
     RATIO_THRESHOLD = 10.0     # Burst rate must be 10x baseline rate
     MIN_BURST_EVENTS = 5       # Minimum events in burst window to trigger
-    SPIKE_COOLDOWN = 900       # 15m between signals per coin
+    SPIKE_COOLDOWN = 0         # No cooldown — burst quality gates handle signal filtering
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
+    MAX_PENDING_AGE = 60       # Pending signal expires after 60s — prevents stale
+                               # signals from being consumed after cascade pauses briefly
 
     # Warmup: need enough baseline data for rate comparison to be meaningful.
     # Without this, 5 events vs near-zero baseline → infinite ratio → triggers.
@@ -147,6 +150,19 @@ class RollingVolumeTracker:
         last_signal = self._last_signal_ts.get(symbol, 0)
         if timestamp - last_signal < self.SPIKE_COOLDOWN:
             return None
+
+        # Expire stale pending signals. Uses first_detected_ts (original creation
+        # time) NOT spike_ts (which gets refreshed by stale_replace). This prevents
+        # sustained cascades from keeping the signal alive indefinitely via z-decay
+        # refreshes. A cascade that's been active for >60s is too dangerous to fade.
+        if pending is not None and not pending.confirmed:
+            _origin_ts = pending.first_detected_ts or pending.signal.spike_ts
+            age = timestamp - _origin_ts
+            if age >= self.MAX_PENDING_AGE:
+                print(f"[ROLL FADE] {symbol}: expiring stale pending signal "
+                      f"(age={age:.0f}s >= {self.MAX_PENDING_AGE}s)")
+                del self._pending[symbol]
+                pending = None
 
         # Get events snapshot (thread-safe)
         events_deque = self._events.get(symbol)
@@ -246,7 +262,12 @@ class RollingVolumeTracker:
             _is_new = pending is None
             _is_stale_replace = (pending is not None and
                                  timestamp - pending.signal.spike_ts > 30)
-            self._pending[symbol] = _PendingSpike(signal=signal, confirmed=False)
+            # Preserve first_detected_ts on replacement — stale_replace updates
+            # the signal metrics but the age clock keeps ticking from original detection.
+            _origin = timestamp if _is_new else (pending.first_detected_ts or pending.signal.spike_ts)
+            self._pending[symbol] = _PendingSpike(
+                signal=signal, confirmed=False, first_detected_ts=_origin
+            )
             # NOTE: _last_signal_ts NOT set here — only on confirm_signal()
             if _is_new or _is_stale_replace:
                 ratio_str = f"{min(ratio, 999):.1f}"

@@ -58,8 +58,8 @@ def _insert_position_pg(pos: dict) -> None:
     conn = get_conn()
     try:
         conn.cursor().execute("""
-            INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id, zone_context)
-            VALUES (%(trade_id)s, %(symbol)s, %(side)s, %(qty)s, %(entry_price)s, %(entry_time)s, 'OPEN', %(entry_reason)s, %(strategy_id)s, %(zone_context)s)
+            INSERT INTO ghost_positions (trade_id, symbol, side, qty, entry_price, entry_time, status, entry_reason, strategy_id, zone_context, initial_entry_price)
+            VALUES (%(trade_id)s, %(symbol)s, %(side)s, %(qty)s, %(entry_price)s, %(entry_time)s, 'OPEN', %(entry_reason)s, %(strategy_id)s, %(zone_context)s, %(entry_price)s)
         """, pos)
         conn.commit()
     finally:
@@ -822,9 +822,9 @@ class GhostPositionTracker:
             conn = get_conn()
             try:
                 conn.cursor().execute(
-                    "UPDATE ghost_positions SET qty = %s, entry_price = %s "
+                    "UPDATE ghost_positions SET qty = %s, entry_price = %s, dca_level = %s "
                     "WHERE symbol = %s AND status = 'OPEN'",
-                    (new_qty, new_avg, symbol)
+                    (new_qty, new_avg, dca_level, symbol)
                 )
                 conn.commit()
             finally:

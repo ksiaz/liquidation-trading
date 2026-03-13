@@ -43,9 +43,19 @@ class AdapterServer:
         # Checkpoint manager
         self._checkpoint_mgr = CheckpointManager(checkpoint_path)
 
+        # Focus symbols for fill pre-filter (HL coin names, no USDT suffix).
+        # Skips JSON parsing for irrelevant symbols (~80% of lines during
+        # high volume). Liquidation fills always pass regardless of symbol.
+        self._focus_symbols = {
+            "BTC", "ETH", "SOL", "kPEPE", "DOGE",
+            "AVAX", "LINK", "HYPE", "PENDLE", "NEAR",
+            "LTC", "ADA", "AAVE", "APT", "SEI",
+            "BNB", "INJ", "FARTCOIN", "WLD", "TON",
+        }
+
         # File readers
         self._price_reader = PriceReader(self._data_path)
-        self._fill_reader = FillReader(self._data_path)
+        self._fill_reader = FillReader(self._data_path, focus_symbols=self._focus_symbols)
 
         # gRPC server
         self._grpc_server = GRPCServer(port=grpc_port)

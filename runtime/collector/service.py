@@ -1296,8 +1296,9 @@ class CollectorService:
                     self._current_prices[symbol] = price
 
                     # Record price for pre-cascade trend filter
+                    # 4500 = 900s (15min) × 5Hz — matches _COUNTER_TREND_WINDOW
                     if symbol not in self._price_history:
-                        self._price_history[symbol] = deque(maxlen=800)
+                        self._price_history[symbol] = deque(maxlen=4500)
                     self._price_history[symbol].append((timestamp, price))
 
                     # NOTE: trailing stop update moved to after regime metrics computed
@@ -1694,16 +1695,87 @@ class CollectorService:
                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                         rolling_fade_signal = None
 
-                    # DO NOT add trend/direction/orderflow gates for ROLLING_FADE here.
+                    # DO NOT add hard trend/direction/orderflow gates for ROLLING_FADE here.
                     # Cascades by definition move price in the cascade direction before
                     # the burst fires — any pre-trend filter blocks 99.9% of signals.
                     # The burst detector's own quality gates (ratio, concentration,
                     # exhaustion) are sufficient. See commit e4c3664.
+                    #
+                    # EXCEPTION: asymmetric confidence gate below raises the bar for
+                    # counter-trend entries (doesn't hard-block, just requires stronger
+                    # burst). Counter-trend fades during sustained moves are the #1
+                    # loss source (5/5 losses on 2026-03-11 were SHORT fades in uptrend).
+
+                    # Asymmetric confidence: counter-trend entries need stronger burst.
+                    # Uses 15-min price return to detect sustained directional moves.
+                    # Counter-trend = fading SHORT during rising price (or LONG during falling).
+                    # These require 2x the normal burst ratio to compensate for trend headwind.
+                    #
+                    # Data analysis (2026-03-13, 364 trades): SHORT and LONG fades perform
+                    # similarly. SHORT CCK losses are small ($12 over 25 trades) and recent
+                    # entries are well-timed (8/13 had profitable MFE window, killed by 2nd
+                    # cascade wave). Asymmetric treatment (3x mult, 150bp cap) was NET
+                    # NEGATIVE: blocked $2.57 winners, saved only $2.33 losers. Reverted
+                    # to symmetric 2x. The real fix is faster cascade continuation exit.
+                    _COUNTER_TREND_WINDOW = 900  # 15 min lookback
+                    _COUNTER_TREND_RETURN_BPS = 30  # 30bp move = "trending"
+                    _COUNTER_TREND_RATIO_MULT = 2.0  # 2x normal ratio threshold
+                    if rolling_fade_signal:
+                        _price_deq = self._price_history.get(symbol)
+                        _prices_snap = list(_price_deq) if _price_deq else []
+                        _trend_cutoff = timestamp - _COUNTER_TREND_WINDOW
+                        _trend_prices = [(t, p) for t, p in _prices_snap if t >= _trend_cutoff]
+                        if len(_trend_prices) >= 10:
+                            _trend_start_price = _trend_prices[0][1]
+                            _trend_end_price = _trend_prices[-1][1]
+                            _trend_return_bps = (_trend_end_price - _trend_start_price) / _trend_start_price * 10000
+                            # Counter-trend: SHORT fade during rising price, LONG fade during falling
+                            _is_counter = False
+                            if rolling_fade_signal.fade_direction == "SHORT" and _trend_return_bps > _COUNTER_TREND_RETURN_BPS:
+                                _is_counter = True
+                            elif rolling_fade_signal.fade_direction == "LONG" and _trend_return_bps < -_COUNTER_TREND_RETURN_BPS:
+                                _is_counter = True
+
+                            if _is_counter:
+                                _required_ratio = self._rolling_volume_tracker.RATIO_THRESHOLD * _COUNTER_TREND_RATIO_MULT
+                                if rolling_fade_signal.z_score < _required_ratio:
+                                    print(f"[COUNTER-TREND GATE] {symbol}: blocking "
+                                          f"{rolling_fade_signal.fade_direction} fade — "
+                                          f"15m trend {_trend_return_bps:+.1f}bp, "
+                                          f"burst ratio {rolling_fade_signal.z_score:.1f}x "
+                                          f"< required {_required_ratio:.0f}x")
+                                    self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                    rolling_fade_signal = None
+
+                    # Minimum burst volume gate: high ratio + low volume = noise.
+                    # A 22x burst ratio with $39k in BTC liqs is a statistical artifact
+                    # from a quiet baseline, not a structural cascade. Real BTC cascades
+                    # involve $50k+ in forced liquidation volume.
+                    _MIN_BURST_VOLUME = {
+                        "BTCUSDT": 50_000,
+                        "ETHUSDT": 15_000,
+                        "SOLUSDT": 8_000,
+                    }
+                    _DEFAULT_MIN_BURST_VOLUME = 5_000
+                    if rolling_fade_signal:
+                        _vol_floor = _MIN_BURST_VOLUME.get(symbol, _DEFAULT_MIN_BURST_VOLUME)
+                        if rolling_fade_signal.spike_volume < _vol_floor:
+                            print(f"[VOLUME GATE] {symbol}: blocking — "
+                                  f"burst volume ${rolling_fade_signal.spike_volume:,.0f} "
+                                  f"< ${_vol_floor:,.0f} min "
+                                  f"(ratio {rolling_fade_signal.z_score:.1f}x, "
+                                  f"{rolling_fade_signal.liq_count} events)")
+                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                            rolling_fade_signal = None
 
                     # Fuel gate: defer entry while liquidations still flowing.
-                    # Two checks: (1) liq events in 60s window, (2) price still
-                    # moving in cascade direction. Liqs may stop but momentum persists
+                    # Three checks: (1) liq events in 60s window, (2) price still
+                    # moving in cascade direction, (3) price has bounced from
+                    # cascade extreme. Liqs may stop but momentum persists
                     # — entering while price still moving is too early.
+                    # Phase 3 (bounce check) catches the case where liqs age out
+                    # of the 60s window simultaneously but price is still at the
+                    # cascade low with no reversal.
                     _FUEL_GATE_MAX_LIQS_60S = 3
                     if rolling_fade_signal:
                         _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
@@ -1760,6 +1832,40 @@ class CollectorService:
                                     print(f"[FUEL GATE] {symbol}: deferring — price "
                                           f"{_move_bps:+.1f}bp in {_FUEL_MOMENTUM_WINDOW}s, "
                                           f"still moving in cascade direction")
+                                rolling_fade_signal = None
+
+                    # Fuel gate phase 3: bounce check.
+                    # After liqs age out of 60s window and momentum flattens, check
+                    # if price has actually BOUNCED from the cascade extreme. Without
+                    # a bounce, we're still sitting at the cascade low/high with no
+                    # reversal evidence. Zero delay on real reversals — gate opens
+                    # the instant price bounces from the extreme.
+                    _FUEL_BOUNCE_BPS = 5  # Require 5bp bounce from cascade extreme
+                    if rolling_fade_signal:
+                        _price_deq = self._price_history.get(symbol)
+                        _prices_snap = list(_price_deq) if _price_deq else []
+                        _signal_ts = rolling_fade_signal.spike_ts
+                        _since_signal = [(t, p) for t, p in _prices_snap if t >= _signal_ts]
+                        if len(_since_signal) >= 2:
+                            _cur_price = current_price or self._get_live_price(symbol)
+                            _bounce_bps = _FUEL_BOUNCE_BPS  # Default: pass check
+                            if _cur_price and rolling_fade_signal.fade_direction == "LONG":
+                                # Cascade pushed price DOWN → need bounce UP from low
+                                _cascade_extreme = min(p for _, p in _since_signal)
+                                _bounce_bps = (_cur_price - _cascade_extreme) / _cascade_extreme * 10000 if _cascade_extreme else 0
+                            elif _cur_price:
+                                # Cascade pushed price UP → need bounce DOWN from high
+                                _cascade_extreme = max(p for _, p in _since_signal)
+                                _bounce_bps = (_cascade_extreme - _cur_price) / _cascade_extreme * 10000 if _cascade_extreme else 0
+                            if _bounce_bps < _FUEL_BOUNCE_BPS:
+                                _fuel_key3 = f"_fuel_bounce_log_{symbol}"
+                                _fuel_last3 = getattr(self, _fuel_key3, 0)
+                                if timestamp - _fuel_last3 >= 30:
+                                    setattr(self, _fuel_key3, timestamp)
+                                    print(f"[FUEL GATE] {symbol}: deferring — only "
+                                          f"{_bounce_bps:+.1f}bp bounce from cascade "
+                                          f"extreme ${_cascade_extreme:,.2f} "
+                                          f"(need {_FUEL_BOUNCE_BPS}bp)")
                                 rolling_fade_signal = None
 
                     # Position guard: don't generate ENTRY when position already open.
@@ -3448,18 +3554,26 @@ class CollectorService:
             # Adverse liquidations still firing → exit.
             # LONG + LONG liqs (forced sells, price down) = adverse.
             # SHORT + SHORT liqs (forced buys, price up) = adverse.
-            # Cascade positions with DCA: skip kill while DCA has room to absorb.
-            # Once DCA exhausted, kill fast (10s grace). Non-cascade positions
-            # (no DCA state) use the original 120s grace.
-            _CASCADE_KILL_Z = 20.0
+            #
+            # Z-threshold scales DOWN with DCA level: as position grows via DCA,
+            # we become more sensitive to continuation signals. Data shows DCA+CCK
+            # trades lose 2.8x more than non-DCA CCK (avg $0.94 vs $0.30) because
+            # DCA adds 50% more size into failing trades before continuation kills.
+            # Scaling: z=20 at L0, z=15 at L4, z=10 at L8 (linear interpolation).
+            _CASCADE_KILL_Z_BASE = 20.0
+            _CASCADE_KILL_Z_MIN = 10.0
             _cascade_killed = False
             _dca = self._dca_states.get(symbol)
             if _dca is not None:
-                # Cascade position — only kill when DCA exhausted
-                _dca_exhausted = _dca.level >= self._dca_config.max_levels
+                # Scale z-threshold down with DCA level: more DCA = more exposed = more sensitive
+                _dca_frac = min(_dca.level / max(self._dca_config.max_levels, 1), 1.0)
+                _CASCADE_KILL_Z = _CASCADE_KILL_Z_BASE - (_CASCADE_KILL_Z_BASE - _CASCADE_KILL_Z_MIN) * _dca_frac
+                # DCA L4+: eligible for kill even if not fully exhausted
+                _dca_exhausted = _dca.level >= 4
                 _CASCADE_KILL_GRACE = 10
             else:
                 # Non-cascade position — original behavior
+                _CASCADE_KILL_Z = _CASCADE_KILL_Z_BASE
                 _dca_exhausted = True
                 _CASCADE_KILL_GRACE = 120
             if _rolling_z >= _CASCADE_KILL_Z and _dca_exhausted:

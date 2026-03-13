@@ -36,6 +36,8 @@ class ZoneArrivalEvent:
     arrival_ts: float
     arrival_price: float
     approach_direction: str  # "from_above" or "from_below"
+    zone_strength: int = 0      # 0=noise, 1=weak, 2=notable, 3=strong
+    zone_gravity_rank: float = 0.0  # percentile rank (0.0-1.0)
     of_imbalance_arrival: float = 0.0
     of_fills_arrival: int = 0
 
@@ -70,6 +72,7 @@ class ZoneArrivalEvent:
     mae_120s: float = 0.0
     destination_reached: Optional[str] = None
     destination_gravity: Optional[float] = None
+    destination_strength: Optional[int] = None
     destination_time_s: Optional[float] = None
     breached: bool = False
 
@@ -153,12 +156,14 @@ class GravityObserver:
 
         dest_above = json.dumps([
             {"center": round(z.center_price, 6), "gravity": round(z.gravity, 1),
-             "distance_bps": round(abs(z.center_price - price) / price * 10000, 1)}
+             "distance_bps": round(abs(z.center_price - price) / price * 10000, 1),
+             "strength": getattr(z, 'strength', 0)}
             for z in sorted(above, key=lambda x: x.center_price)[:3]
         ])
         dest_below = json.dumps([
             {"center": round(z.center_price, 6), "gravity": round(z.gravity, 1),
-             "distance_bps": round(abs(z.center_price - price) / price * 10000, 1)}
+             "distance_bps": round(abs(z.center_price - price) / price * 10000, 1),
+             "strength": getattr(z, 'strength', 0)}
             for z in sorted(below, key=lambda x: x.center_price, reverse=True)[:3]
         ])
 
@@ -189,6 +194,8 @@ class GravityObserver:
             zone_gravity=hit_zone.gravity,
             zone_persistence=hit_zone.persistence,
             zone_size_initial=hit_zone.current_size_usd,
+            zone_strength=getattr(hit_zone, 'strength', 0),
+            zone_gravity_rank=getattr(hit_zone, 'gravity_rank', 0.0),
             arrival_ts=ts,
             arrival_price=price,
             approach_direction=direction,
@@ -285,6 +292,7 @@ class GravityObserver:
                 if z.band_low <= price <= z.band_high:
                     event.destination_reached = f"{z.center_price:.6f}"
                     event.destination_gravity = z.gravity
+                    event.destination_strength = getattr(z, 'strength', 0)
                     event.destination_time_s = elapsed
                     break
 
@@ -336,6 +344,7 @@ class GravityObserver:
                         event_id, coin, arrival_ts,
                         zone_center, zone_low, zone_high, zone_side,
                         zone_gravity, zone_persistence, zone_size_initial,
+                        zone_strength, zone_gravity_rank,
                         arrival_price, approach_direction,
                         of_imbalance_arrival, of_fills_arrival,
                         dest_zones_above, dest_zones_below,
@@ -347,18 +356,20 @@ class GravityObserver:
                         exit_price, exit_direction, reversal,
                         mfe_30s, mfe_60s, mfe_120s,
                         mae_30s, mae_60s, mae_120s,
-                        destination_reached, destination_gravity, destination_time_s,
+                        destination_reached, destination_gravity,
+                        destination_strength, destination_time_s,
                         breached, finalized
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, 1
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1
                     ) ON CONFLICT (event_id) DO NOTHING
                 """, (
                     e.event_id, e.coin, e.arrival_ts,
                     e.zone_center, e.zone_low, e.zone_high, e.zone_side,
                     e.zone_gravity, e.zone_persistence, e.zone_size_initial,
+                    e.zone_strength, e.zone_gravity_rank,
                     e.arrival_price, e.approach_direction,
                     e.of_imbalance_arrival, e.of_fills_arrival,
                     e.dest_zones_above, e.dest_zones_below,
@@ -371,7 +382,8 @@ class GravityObserver:
                     1 if e.reversal else 0,
                     e.mfe_30s, e.mfe_60s, e.mfe_120s,
                     e.mae_30s, e.mae_60s, e.mae_120s,
-                    e.destination_reached, e.destination_gravity, e.destination_time_s,
+                    e.destination_reached, e.destination_gravity,
+                    e.destination_strength, e.destination_time_s,
                     1 if e.breached else 0,
                 ))
             conn.commit()

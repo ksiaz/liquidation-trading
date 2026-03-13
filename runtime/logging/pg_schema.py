@@ -1423,6 +1423,8 @@ def ensure_schema(conn):
             zone_gravity DOUBLE PRECISION NOT NULL,
             zone_persistence DOUBLE PRECISION NOT NULL,
             zone_size_initial DOUBLE PRECISION NOT NULL,
+            zone_strength SMALLINT DEFAULT 0,
+            zone_gravity_rank DOUBLE PRECISION DEFAULT 0.0,
 
             arrival_price DOUBLE PRECISION NOT NULL,
             approach_direction TEXT NOT NULL,
@@ -1453,6 +1455,7 @@ def ensure_schema(conn):
             mae_120s DOUBLE PRECISION,
             destination_reached TEXT,
             destination_gravity DOUBLE PRECISION,
+            destination_strength SMALLINT,
             destination_time_s DOUBLE PRECISION,
             breached SMALLINT,
 

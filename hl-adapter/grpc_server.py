@@ -29,7 +29,7 @@ class EventBroadcaster:
     Each subscriber gets their own queue. Events are broadcast to all.
     """
 
-    def __init__(self, name: str, max_queue_size: int = 1000):
+    def __init__(self, name: str, max_queue_size: int = 10000):
         self._name = name
         self._max_queue_size = max_queue_size
         self._subscribers: Dict[str, Queue] = {}

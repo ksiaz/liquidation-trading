@@ -323,6 +323,10 @@ class CollectorService:
         # Rolling volume tracker for ROLLING_FADE entry mode
         self._rolling_volume_tracker = RollingVolumeTracker()
 
+        # Scout tracker: fast wick-catching entries (no fuel gate, tight stops)
+        from runtime.liquidations.scout_tracker import ScoutTracker
+        self._scout_tracker = ScoutTracker()
+
         # DCA (Dollar Cost Averaging) for cascade sniper positions
         self._dca_config = DCAConfig()
         self._dca_states: Dict[str, DCAState] = {}  # symbol → DCA state
@@ -1454,6 +1458,32 @@ class CollectorService:
                         atr_30m=atr_30m,
                     )
 
+                    # ── SCOUT zone-health exit ──
+                    if self._scout_tracker.has_open(symbol):
+                        _scout_pos = self._scout_tracker.get_position(symbol)
+                        if _scout_pos:
+                            _hl_sym_sc2 = symbol.replace("USDT", "")
+                            _cur_zone_size = 0.0
+                            _sz = _scout_pos.zone
+                            _all_zones = self._liquidity_map.get_zones(_hl_sym_sc2, side=_sz.side)
+                            for _z in _all_zones:
+                                if _z.band_low <= _sz.center_price <= _z.band_high:
+                                    _cur_zone_size = _z.current_size_usd
+                                    break
+
+                            _scout_px = current_price or self._get_live_price(symbol)
+                            if _scout_px:
+                                _should_exit, _exit_reason = self._scout_tracker.check_zone_health(
+                                    symbol, _cur_zone_size, _scout_px, timestamp)
+                                if _should_exit:
+                                    _pnl = self._scout_tracker.close_position(
+                                        symbol, exit_price=_scout_px,
+                                        exit_reason=f"ZONE_HEALTH:{_exit_reason}")
+                                    self._trailing_stop_manager.unregister_stop(
+                                        _scout_pos.trade_id)
+                                    if _pnl is not None and _pnl < 0:
+                                        self._stop_exit_timestamps[symbol] = time.time()
+
                     # Recovery: register trailing stop for ghost positions surviving restart
                     # Uses ROLLING_FADE config (strategy-specific) instead of generic defaults.
                     existing_stop_symbols = {s.symbol for s in self._trailing_stop_manager.get_all_stops().values()}
@@ -1792,6 +1822,63 @@ class CollectorService:
                                   f"{rolling_fade_signal.liq_count} events)")
                             self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                             rolling_fade_signal = None
+
+                    # ── SCOUT ENTRY: immediate, no fuel gate ──
+                    # Fires on first signal detection. Catches the wick peak/valley.
+                    # 50% of notional, tight stop, zone-health exit.
+                    if rolling_fade_signal and not self._scout_tracker.has_open(symbol):
+                        if not self.ghost_tracker.has_open_position(symbol):
+                            _last_stop_scout = self._stop_exit_timestamps.get(symbol, 0)
+                            if timestamp - _last_stop_scout >= 300:  # same 5-min cooldown
+                                _hl_sym_sc = symbol.replace("USDT", "")
+                                _scout_side = rolling_fade_signal.fade_direction
+                                _scout_price = current_price or self._get_live_price(symbol)
+
+                                _zone = None
+                                if _scout_price:
+                                    if _scout_side == "LONG":
+                                        _lz = self._liquidity_map.get_heaviest_zone_below(
+                                            _hl_sym_sc, _scout_price, min_gravity=5000)
+                                    else:
+                                        _lz = self._liquidity_map.get_heaviest_zone_above(
+                                            _hl_sym_sc, _scout_price, min_gravity=5000)
+
+                                    if _lz:
+                                        from runtime.liquidations.scout_tracker import ZoneSnapshot
+                                        _zone = ZoneSnapshot(
+                                            center_price=_lz.center_price,
+                                            band_low=_lz.band_low,
+                                            band_high=_lz.band_high,
+                                            initial_size_usd=_lz.current_size_usd,
+                                            gravity=_lz.gravity,
+                                            side=_lz.side,
+                                        )
+
+                                if _scout_price and _zone:
+                                    _scout_notional = self.policy_adapter.config.default_notional_usd * 0.5
+                                    _scout_qty = _scout_notional / _scout_price
+
+                                    _scout_pos = self._scout_tracker.open_position(
+                                        symbol=symbol, side=_scout_side,
+                                        quantity=_scout_qty, entry_price=_scout_price,
+                                        timestamp=timestamp, zone=_zone,
+                                    )
+                                    if _scout_pos:
+                                        _s_config, _s_stop = self._get_scout_stop_config(
+                                            symbol, _scout_price, _scout_side)
+                                        self._trailing_stop_manager.register_trailing_stop(
+                                            entry_order_id=_scout_pos.trade_id,
+                                            symbol=symbol, direction=_scout_side,
+                                            entry_price=_scout_price,
+                                            initial_stop_price=_s_stop,
+                                            config=_s_config,
+                                            entry_timestamp=timestamp,
+                                        )
+                                        print(f"SCOUT_ENTRY: {symbol} {_scout_side} "
+                                              f"qty={_scout_qty:.6f} @ ${_scout_price:,.2f} "
+                                              f"zone={_zone.center_price:,.2f} "
+                                              f"(gravity={_zone.gravity:,.0f} "
+                                              f"size=${_zone.initial_size_usd:,.0f})")
 
                     # Fuel gate: defer entry while liquidations still flowing.
                     # Three checks: (1) liq events in 60s window, (2) price still
@@ -2192,6 +2279,13 @@ class CollectorService:
                         side = pos.direction.value
                         entry_px = float(pos.entry_price)
                         qty = float(pos.quantity) if pos.quantity else 0.0
+
+                        # Two-tier: main ROLLING_FADE entry uses 50% notional (scout has other 50%)
+                        cascade_mode = self.policy_adapter.config.cascade_sniper_entry_mode
+                        is_cascade = result.strategy_id == "EP2-CASCADE-SNIPER-V1"
+                        is_rolling_fade = is_cascade and cascade_mode == "ROLLING_FADE"
+                        if is_rolling_fade:
+                            qty = qty * 0.5
 
                         success, error, trade = self.ghost_tracker.open_position(
                             symbol=result.symbol,
@@ -3402,6 +3496,43 @@ class CollectorService:
 
         return config, initial_stop
 
+    def _get_scout_stop_config(self, symbol: str, entry_px: float, side: str):
+        """Get trailing stop config for SCOUT entries.
+
+        Returns (TrailingStopConfig, initial_stop_price).
+        Tight stops: 15bp activation, 10bp trail, 30bp hard SL.
+        Zone-health exit handles most exits — this is the backstop.
+        """
+        from external_policy.ep2_strategy_cascade_sniper import SCOUT_TRAIL_CONFIG
+        cfg = SCOUT_TRAIL_CONFIG
+        sl_pct = cfg['sl_pct']
+        trail_pct = cfg['trail_pct']
+        activation_pct = cfg['activation_pct']
+
+        if side == "LONG":
+            initial_stop = entry_px * (1 - sl_pct)
+        else:
+            initial_stop = entry_px * (1 + sl_pct)
+
+        be_trigger = cfg.get('break_even_trigger_pct', 1.0)
+        be_offset = cfg.get('break_even_offset_pct', 0.0)
+
+        config = TrailingStopConfig(
+            mode=TrailingMode.FIXED_DISTANCE,
+            trail_distance_pct=trail_pct,
+            trail_activation_pct=activation_pct,
+            break_even_trigger_pct=be_trigger,
+            break_even_offset_pct=be_offset,
+            min_move_to_update_pct=0.0002,
+            min_move_atr_fraction=0.05,
+        )
+
+        print(f"SCOUT STOP: {symbol} {side} @ ${entry_px:,.2f} "
+              f"SL={sl_pct*100:.2f}% trail={trail_pct*100:.2f}% "
+              f"act={activation_pct*100:.2f}% initial_stop=${initial_stop:,.2f}")
+
+        return config, initial_stop
+
     def _get_whale_fade_stop_config(self, symbol: str, entry_px: float, side: str):
         """Get trailing stop config for WHALE_FADE entries.
 
@@ -3716,6 +3847,13 @@ class CollectorService:
 
                     print(f"TRAILING: STOP HIT {symbol} @ ${price:,.2f} (stop was ${state.current_stop_price:,.2f})")
 
+                    # Scout trailing stop exit — separate path from ghost position
+                    if entry_id.startswith("SCOUT_"):
+                        _scout_pnl = self._scout_tracker.close_position(
+                            symbol, exit_price=price, exit_reason=exit_reason)
+                        self._trailing_stop_manager.unregister_stop(entry_id)
+                        break
+
                     success, error, trade = self.ghost_tracker.close_position(
                         symbol=symbol,
                         exit_reason=exit_reason,
@@ -3730,6 +3868,13 @@ class CollectorService:
                         self._force_position_flat(symbol)
                         self._dca_states.pop(symbol, None)
                         self._gravity_tp_targets.pop(symbol, None)
+                        # Clean up scout if main exited
+                        if self._scout_tracker.has_open(symbol):
+                            _sc_pnl = self._scout_tracker.close_position(
+                                symbol, exit_price=price, exit_reason="MAIN_EXIT_CLEANUP")
+                            for _sid, _sst in list(self._trailing_stop_manager.get_all_stops().items()):
+                                if _sst.symbol == symbol and _sid.startswith("SCOUT_"):
+                                    self._trailing_stop_manager.unregister_stop(_sid)
                     else:
                         recovered = self._recovered_exit(
                             symbol=symbol,
@@ -3745,9 +3890,9 @@ class CollectorService:
                         else:
                             print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
 
-                    # Unregister ALL stops for this symbol after exit (prevents duplicate exits)
+                    # Unregister ALL non-scout stops for this symbol after exit
                     for sid, sstate in self._trailing_stop_manager.get_all_stops().items():
-                        if sstate.symbol == symbol:
+                        if sstate.symbol == symbol and not sid.startswith("SCOUT_"):
                             self._trailing_stop_manager.unregister_stop(sid)
                     break  # Only one exit per symbol per call
 

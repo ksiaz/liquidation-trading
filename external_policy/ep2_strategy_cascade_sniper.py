@@ -235,6 +235,17 @@ ROLLING_FADE_TRAIL_CONFIG = {
     "break_even_offset_pct": 0.0,      # exact entry price (no offset)
 }
 
+# SCOUT trailing stop config — tight stops for wick-catching.
+# Scout enters immediately (no fuel gate), catches the peak/valley.
+# If the wick doesn't bounce within 30bp, cut it fast.
+# Zone-health exit handles most exits; this is the hard backstop.
+SCOUT_TRAIL_CONFIG = {
+    "activation_pct": 0.0015,          # 0.15% = 15 bps (activate quickly)
+    "trail_pct": 0.0010,               # 0.10% = 10 bps (tight trail)
+    "sl_pct": 0.003,                   # 0.30% = 30 bps (hard stop — fast cut)
+    "break_even_trigger_pct": 0.0010,  # 0.10% = 10 bps (protect gains early)
+    "break_even_offset_pct": 0.0,      # exact entry price
+}
 
 
 @dataclass(frozen=True)

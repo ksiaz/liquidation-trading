@@ -3657,6 +3657,10 @@ class CollectorService:
                             self._force_position_flat(symbol)
                             self._dca_states.pop(symbol, None)
                             self._gravity_tp_targets.pop(symbol, None)
+                            # CCK cooldown: block re-entry for 5 min (same as stop-loss).
+                            # Without this, system re-enters the same failing cascade
+                            # immediately after being killed (3 ETH SHORTs in 30min pattern).
+                            self._stop_exit_timestamps[symbol] = time.time()
                         else:
                             self._recovered_exit(
                                 symbol=symbol, price=price, entry_id=entry_id,
@@ -3666,6 +3670,7 @@ class CollectorService:
                             )
                             self._dca_states.pop(symbol, None)
                             self._gravity_tp_targets.pop(symbol, None)
+                            self._stop_exit_timestamps[symbol] = time.time()
                         for sid, sstate in self._trailing_stop_manager.get_all_stops().items():
                             if sstate.symbol == symbol:
                                 self._trailing_stop_manager.unregister_stop(sid)

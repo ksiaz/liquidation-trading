@@ -213,8 +213,6 @@ class CollectorService:
             timestamp=time.time()
         )
         
-        # Track latest stream time to drive system clock
-        self._last_stream_time = None
 
         # Ghost Trading Tracker ($1000 initial, 5% position size, all 10 symbols)
         # All writes go through PgBufferedResearchDatabase (PostgreSQL, no lock).
@@ -924,17 +922,8 @@ class CollectorService:
         """
         self._logger.info("[CLOCK] Drive clock loop started")
         while self._running:
-            # Simple clock source selection:
-            # - Node mode: use wall clock (node is synced, data is flowing)
-            # - WebSocket mode: use WS stream time
-            if self._use_node_mode:
-                current_time = time.time()
-            elif self._last_stream_time is not None:
-                current_time = self._last_stream_time
-            else:
-                # Wait for first WS stream event
-                await asyncio.sleep(0.5)
-                continue
+            # Binance data is live — wall clock is the clock source
+            current_time = time.time()
 
             try:
                 # 0. Drain governance event buffer (fills + liquidations from gRPC thread)

@@ -1455,7 +1455,7 @@ class CollectorService:
             # Trailing stops updated in regime loop above (with context) + fill handler (price-only)
             _data_breaker_open = False
             if self._data_breaker:
-                self._data_breaker.evaluate(self._node_bridge)
+                self._data_breaker.evaluate(self._binance_provider)
                 _data_breaker_open = self._data_breaker.is_open
 
             # Collect mandates from all active symbols

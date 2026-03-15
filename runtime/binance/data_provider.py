@@ -15,6 +15,7 @@ Streams used:
 import asyncio
 import json
 import sys
+import time
 from typing import Callable, Dict, List, Optional, Set
 
 try:
@@ -48,6 +49,24 @@ class BinanceDataProvider:
         self.liqs_received = 0
         self.depth_received = 0
         self.prices_received = 0
+        self._last_fill_time = 0.0
+        self._last_price_time = 0.0
+
+    @property
+    def is_connected(self) -> bool:
+        """Duck-type compatibility with NodeBridge for DataFreshnessBreaker."""
+        return self._running and len(self._ws_tasks) > 0
+
+    def get_metrics(self) -> Dict:
+        """Duck-type compatibility with NodeBridge for DataFreshnessBreaker."""
+        return {
+            'prices_ingested': self.prices_received,
+            'fills_ingested': self.fills_received,
+            'liquidations_ingested': self.liqs_received,
+            'last_price_time': self._last_price_time,
+            'last_fill_time': self._last_fill_time,
+            'errors': 0,
+        }
 
     def _to_coin(self, symbol: str) -> str:
         """BTCUSDT → BTC"""
@@ -84,6 +103,7 @@ class BinanceDataProvider:
         timestamp = msg["T"] / 1000.0
 
         self.fills_received += 1
+        self._last_fill_time = time.time()
         coin = self._to_coin(symbol)
         self.on_fill(coin, side, price, size, timestamp)
 
@@ -139,6 +159,7 @@ class BinanceDataProvider:
             return
 
         self.prices_received += 1
+        self._last_price_time = time.time()
         coin = self._to_coin(symbol)
         price = float(msg["p"])
         timestamp = msg["E"] / 1000.0

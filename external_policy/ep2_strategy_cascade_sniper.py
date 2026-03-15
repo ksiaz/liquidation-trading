@@ -210,6 +210,12 @@ EXHAUSTION_FADE_MIN_BURST_BY_COIN = {
     "TON": 2.0,         # P10=$2, 33 spikes
     "LTC": 1.0,         # P10=$1, 49 spikes
     "SEI": 1.0,         # P10=$0, 13 spikes, use floor
+    "XRP": 45.0,        # P10=$47, 349 spikes
+    "SUI": 10.0,        # P10=$11, 101 spikes
+    "OP": 20.0,         # P10=$21, 67 spikes
+    "ATOM": 40.0,       # P10=$42, 18 spikes
+    "ARB": 3.0,         # P10=$3, 56 spikes
+    "TRX": 1.0,         # P10=$0, 15 spikes, use floor
 }
 
 # Per-coin minimum liquidation COUNT for exhaustion fade quality filter.
@@ -226,7 +232,7 @@ EXHAUSTION_FADE_DEFAULT_MIN_LIQ_COUNT = 3  # Alts: fewer liqs are still meaningf
 # Coins excluded from exhaustion/rolling fade (backtest: fading doesn't work — cascade continues)
 # XRP: 40% WR, ARB: 0% WR (3 trades all losers), TRX: too few events, ATOM: single trade loser
 # OP: 0% WR in cascade (3 trades, all TRAILING_STOP_LOSS)
-EXHAUSTION_FADE_EXCLUDED_COINS = {"XRP", "SUI", "TRX", "ATOM", "ARB", "OP"}
+EXHAUSTION_FADE_EXCLUDED_COINS = set()  # Cleared 2026-03-15: exclusion limits data collection for research
 
 # Per-coin trailing stop config for exhaustion fade exits.
 # Activation-threshold trailing: price must move activation_bps in your favor,

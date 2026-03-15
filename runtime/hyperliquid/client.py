@@ -432,6 +432,9 @@ class HyperliquidClient:
         "NEAR", "FARTCOIN", "AAVE", "APT", "SEI",
         "BNB", "INJ", "PENDLE", "WLD", "TON",
     ]
+    L2_COINS_TERTIARY = [
+        "XRP", "SUI", "TRX", "ATOM", "ARB", "OP",
+    ]
 
     async def _subscribe_orderbooks(self, ws, coins: list = None):
         """Subscribe to L2 order books for specified coins.
@@ -499,6 +502,56 @@ class HyperliquidClient:
             except Exception as e:
                 self._logger.warning(
                     f"L2 overflow WS error: {e}, reconnecting in {reconnect_delay}s"
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, self.config.max_reconnect_delay)
+
+    async def run_l2_tertiary_ws(self):
+        """Third WebSocket for tertiary L2 orderbook subscriptions.
+
+        Previously excluded coins re-enabled for data collection.
+        """
+        import websockets
+
+        if not self.L2_COINS_TERTIARY:
+            return
+
+        reconnect_delay = self.config.reconnect_delay
+
+        while self._running:
+            try:
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=self.config.ping_interval,
+                    ping_timeout=60,
+                    close_timeout=10
+                ) as ws:
+                    self._ws_l2_tertiary = ws
+                    self._logger.info(
+                        f"L2 tertiary WS connected for {len(self.L2_COINS_TERTIARY)} coins"
+                    )
+                    reconnect_delay = self.config.reconnect_delay
+
+                    await self._subscribe_orderbooks(ws, self.L2_COINS_TERTIARY)
+
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            channel = data.get('channel')
+                            if channel == 'l2Book':
+                                await self._handle_orderbook(data.get('data', {}))
+                            elif channel in ('subscriptionResponse', 'pong'):
+                                pass
+                            elif channel == 'error':
+                                self._logger.error(f"L2 tertiary WS error: {data}")
+                        except json.JSONDecodeError:
+                            pass
+                        except Exception as e:
+                            self._logger.error(f"L2 tertiary message error: {e}")
+
+            except Exception as e:
+                self._logger.warning(
+                    f"L2 tertiary WS error: {e}, reconnecting in {reconnect_delay}s"
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, self.config.max_reconnect_delay)

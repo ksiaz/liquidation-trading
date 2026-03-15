@@ -69,6 +69,9 @@ try:
 except ImportError:
     NODE_ADAPTER_AVAILABLE = False
 
+# Import Binance data provider (replaces HL node + WS for data layer)
+from runtime.binance.data_provider import BinanceDataProvider
+
 # Import Cascade Sniper types for absorption analysis
 from external_policy.ep2_strategy_cascade_sniper import AbsorptionAnalysis, ProximityData
 
@@ -148,10 +151,10 @@ class DCAState:
 
 # Constants - Trading symbols (must match run_paper_trade.py)
 TOP_10_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "kPEPEUSDT", "DOGEUSDT",
-    "AVAXUSDT", "LINKUSDT", "HYPEUSDT", "PENDLEUSDT", "NEARUSDT",
-    "LTCUSDT", "ADAUSDT", "AAVEUSDT", "APTUSDT", "SEIUSDT",
-    "BNBUSDT", "INJUSDT", "FARTCOINUSDT", "WLDUSDT", "TONUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "BNBUSDT", "TRUMPUSDT", "TAOUSDT", "SUIUSDT", "ADAUSDT",
+    "LINKUSDT", "AVAXUSDT", "PEPEUSDT", "LTCUSDT", "DOTUSDT",
+    "APTUSDT", "NEARUSDT", "AAVEUSDT", "HYPEUSDT", "ZECUSDT",
 ]
 
 class CollectorService:
@@ -377,81 +380,20 @@ class CollectorService:
         self._regime_pending: Dict[str, tuple] = {}  # symbol → (pending_state, count)
         self._REGIME_DEBOUNCE_CYCLES = 50  # 50 cycles × ~200ms = ~10 seconds
 
-        # Hyperliquid Integration (optional)
-        # Two modes: Node Adapter (direct node access) or WebSocket Collector
-        # Set USE_HL_NODE=true to use node adapter (requires local hl-node running)
+        # Binance data provider — replaces NodeBridge + HyperliquidClient
+        self._node_bridge = None  # Keep attrs for compatibility checks
         self._hyperliquid_collector = None
-        self._hyperliquid_enabled = False
         self._node_integration = None
-        self._node_bridge = None
         self._node_psm = None
-        self._use_node_mode = os.environ.get("USE_HL_NODE", "false").lower() == "true"
+        self._use_node_mode = False
 
-        if self._use_node_mode and NODE_ADAPTER_AVAILABLE:
-            # Node Adapter Mode: gRPC client to out-of-process adapter
-            # Provides: real-time prices and liquidations from hl-node
-            # Requires: hl-adapter/server.py running on localhost:50051
-            try:
-                adapter_address = os.environ.get("HL_ADAPTER_ADDRESS", "localhost:50051")
-                self._logger.info(f"Initializing Hyperliquid node bridge to {adapter_address}...")
-
-                # Derive focus_symbols from TOP_10_SYMBOLS (strip USDT suffix)
-                # This ensures gRPC subscription matches trading symbols
-                focus_symbols = [s.replace('USDT', '') for s in TOP_10_SYMBOLS]
-
-                self._node_bridge = create_node_bridge(
-                    observation_system=self._obs,
-                    address=adapter_address,
-                    symbols=focus_symbols,
-                )
-
-                # Note: Bridge.start() is called in run() to ensure proper async context
-                self._hyperliquid_enabled = True
-                self._logger.info(f"Hyperliquid node bridge configured for {len(focus_symbols)} symbols")
-
-            except Exception as e:
-                self._logger.warning(f"Node bridge init failed: {e}, falling back to WebSocket mode")
-                self._use_node_mode = False
-
-        # Initialize HyperliquidCollector for proximity data (whale position tracking)
-        # Node mode: gRPC adapter handles prices/liquidations/fills, API handles proximity
-        # Non-node mode: API handles everything
-        if HYPERLIQUID_AVAILABLE:
-            try:
-                # Load whale wallet addresses from registry
-                whale_addresses = get_wallet_addresses()
-                self._logger.info(f"Loading {len(whale_addresses)} whale wallets for tracking")
-
-                # Check if indexer should be enabled via environment variable
-                # Default to True to enable blockchain indexer
-                enable_indexer = os.environ.get("ENABLE_HL_INDEXER", "true").lower() == "true"
-
-                self._logger.info(f"Indexer enabled: {enable_indexer}")
-
-                hl_config = HyperliquidCollectorConfig(
-                    use_testnet=False,
-                    proximity_threshold=0.30,  # 30% threshold (whales keep safe distances)
-                    min_position_value=100.0,  # Lower to $100 to catch more positions
-                    wallet_poll_interval=5.0,
-                    track_hlp_vault=True,  # Track liquidator vault
-                    additional_wallets=whale_addresses,  # Load known whale wallets
-                    enable_dynamic_discovery=True,  # Discover wallets from large trades
-                    discovery_min_trade_value=5_000.0,  # Lower to $5k to discover more wallets
-                    trade_discovery_interval=60.0,  # Scan every 60s instead of 15min
-                    # Blockchain indexer (requires: pip install boto3 lz4 msgpack)
-                    enable_indexer=enable_indexer,
-                    indexer_lookback_blocks=500_000,  # ~7 days
-                    indexer_db_path="indexed_wallets.db",
-                    indexer_checkpoint_path="indexer_checkpoint.json"
-                )
-                self._hyperliquid_collector = HyperliquidCollector(
-                    db=self._execution_db,
-                    config=hl_config
-                )
-                self._hyperliquid_enabled = True
-                self._logger.info("Hyperliquid WebSocket collector initialized")
-            except Exception as e:
-                self._logger.warning(f"Hyperliquid collector init failed: {e}")
+        self._binance_provider = BinanceDataProvider(TOP_10_SYMBOLS)
+        self._binance_provider.on_fill = self._handle_hl_fill
+        self._binance_provider.on_liquidation = self._handle_hl_liquidation
+        self._binance_provider.on_price = self._handle_hl_price
+        self._binance_provider.on_orderbook = self._handle_hl_orderbook
+        self._hyperliquid_enabled = True
+        self._logger.info(f"Binance data provider configured for {len(TOP_10_SYMBOLS)} symbols")
 
         # Phase 7: Validation and Manipulation Detection
         self._data_validator = DataValidator()
@@ -460,7 +402,7 @@ class CollectorService:
         self._logger.info("Validation and manipulation detection initialized")
 
         # Data freshness circuit breaker — blocks entries when node/adapter stale
-        self._data_breaker = DataFreshnessBreaker() if self._node_bridge else None
+        self._data_breaker = DataFreshnessBreaker()
 
         # Diagnostic logging configuration (P1: now opt-in via env)
         self._diag_enabled = os.environ.get('ENABLE_DIAG', '').lower() == 'true'
@@ -904,103 +846,21 @@ class CollectorService:
         # Give WS time to connect before starting heavy I/O
         await asyncio.sleep(2.0)
 
-        # 3. Start Hyperliquid Integration (Node Adapter or WebSocket Collector)
-        if self._hyperliquid_enabled:
-            if self._use_node_mode and self._node_bridge:
-                # Node Adapter Mode (gRPC to out-of-process adapter)
-                try:
-                    if self._node_bridge.start():
-                        self._logger.info("Node bridge started (streaming prices/liquidations/fills via gRPC)")
+        # 3. Start Binance data provider
+        if hasattr(self, '_binance_provider'):
+            await self._binance_provider.start()
+            self._logger.info("Binance data provider started")
 
-                        # Wire HL fills to VWAP, ATR, and Orderflow calculators
-                        # This enables regime classification from HL data alone
-                        self._node_bridge.on_organic_fill(self._handle_hl_fill)
-                        self._logger.info("HL fill callback registered (VWAP + ATR + Orderflow)")
+            # Inject capitulation tracker into cascade sniper
+            try:
+                from external_policy.ep2_strategy_cascade_sniper import set_capitulation_tracker
+                set_capitulation_tracker(self._capitulation_tracker)
+                self._logger.info("Capitulation tracker injected into cascade sniper")
+            except ImportError:
+                pass
 
-                        # Wire HL liquidations to zscore calculator and burst aggregator
-                        # This ensures liq_z and burst_vol reflect HL liquidations in node mode
-                        self._node_bridge.on_hl_liquidation(self._handle_hl_liquidation)
-                        self._logger.info("HL liquidation callback registered (zscore + burst aggregator)")
-
-                        # Wire ALL fills (including liquidation) for capitulation tracking
-                        # CapitulationTracker needs dir/startPosition/closedPnl from extended fill data
-                        self._node_bridge.on_fill_extended(self._handle_hl_fill_extended)
-                        self._logger.info("HL extended fill callback registered (capitulation tracker)")
-
-                        # Wire HL oracle prices to _mark_prices and ATR calculators
-                        # Breaks the staleness chain: oracle prices arrive every ~1s vs sparse fills
-                        # Ensures _mark_prices is always fresh (no Decimal("0") defaults)
-                        # and ATR reflects true price range (not just moments of fills)
-                        self._node_bridge.on_price_update(self._handle_hl_price)
-                        self._logger.info("HL price callback registered (mark prices + ATR)")
-
-                        # Inject capitulation tracker into cascade sniper for absorption confidence
-                        try:
-                            from external_policy.ep2_strategy_cascade_sniper import set_capitulation_tracker
-                            set_capitulation_tracker(self._capitulation_tracker)
-                            self._logger.info("Capitulation tracker injected into cascade sniper")
-                        except ImportError:
-                            pass
-
-                        # Exhaustion scorer DISABLED — anti-predictive per backtest.
-                        # EXHAUSTION_FADE uses counter-trend + liq count gates instead.
-
-                        # Verify adapter is responding (STALE is OK during warmup)
-                        await asyncio.sleep(2)  # Give adapter time to send status
-                        status = self._node_bridge.get_status()
-                        if status:
-                            self._logger.info(
-                                f"Node adapter status: {status.status.name}, "
-                                f"block={status.latest_block_height}, "
-                                f"prices={status.prices_emitted}, liqs={status.liquidations_emitted}"
-                            )
-                            if status.status.name == 'ERROR':
-                                raise RuntimeError(
-                                    f"HL adapter ERROR: {status.last_error}. "
-                                    "Start adapter with: cd hl-adapter && python server.py"
-                                )
-                        else:
-                            raise RuntimeError(
-                                "HL adapter not responding (no status received). "
-                                "Start adapter with: cd hl-adapter && python server.py"
-                            )
-
-                        # Start periodic health check
-                        asyncio.create_task(self._monitor_node_bridge_health())
-
-                        # Pre-warm ATR + VWAP from HL candles (avoids 10+ min warmup delay)
-                        # Also creates Orderflow/LiqZ calculators so they're ready for fills
-                        await self._warm_up_calculators(TOP_10_SYMBOLS)
-                    else:
-                        raise RuntimeError(
-                            "Node bridge failed to connect. "
-                            "Start adapter with: cd hl-adapter && python server.py"
-                        )
-                except Exception as e:
-                    self._logger.warning(f"Node bridge start failed: {e}")
-
-            # Start WebSocket collector for proximity data (whale position tracking)
-            # In node mode: gRPC handles prices/liqs/fills, WebSocket handles proximity
-            # In non-node mode: WebSocket handles everything
-            if self._hyperliquid_collector:
-                try:
-                    asyncio.create_task(self._hyperliquid_collector.start())
-                    self._logger.info("Hyperliquid WebSocket collector started (proximity tracking)")
-
-                    # Wire up Hyperliquid collector to observation system
-                    # This enables M4 cascade primitives to be computed from HL data
-                    self._obs.set_hyperliquid_source(self._hyperliquid_collector)
-                    self._logger.info("Hyperliquid collector wired to observation system")
-
-                    # Wire HL orderbook to observation layer for depth primitives
-                    # (resting_size, order_consumption, absorption)
-                    if hasattr(self._hyperliquid_collector, '_client'):
-                        self._hyperliquid_collector._client.set_orderbook_callback(
-                            self._handle_hl_orderbook
-                        )
-                        self._logger.info("HL orderbook callback registered (depth primitives)")
-                except Exception as e:
-                    self._logger.warning(f"Hyperliquid collector start failed: {e}")
+            # Pre-warm ATR + VWAP from HL candles API (public, no node needed)
+            await self._warm_up_calculators(TOP_10_SYMBOLS)
 
         # Keep service alive (block forever until shutdown)
         self._shutdown_event = asyncio.Event()
@@ -2815,11 +2675,11 @@ class CollectorService:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL liquidation callback error: {e}")
 
-    async def _handle_hl_orderbook(self, orderbook: Dict):
-        """Feed HL L2 orderbook to observation layer as DEPTH event.
+    def _handle_hl_orderbook(self, orderbook: Dict):
+        """Feed L2 orderbook to observation layer as DEPTH event.
 
-        Called by HyperliquidClient on every l2Book WebSocket update.
-        Converts HL format to M1 depth array format for primitive computation
+        Called by BinanceDataProvider on every depth WebSocket update.
+        Converts orderbook format to M1 depth array format for primitive computation
         (resting_size, order_consumption, absorption).
         """
         try:

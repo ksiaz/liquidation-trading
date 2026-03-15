@@ -16,6 +16,7 @@ from .collector import (
     CollectorStats,
     CollectorState,
 )
+from .data_provider import BinanceDataProvider
 
 __all__ = [
     'BinanceClient',
@@ -25,4 +26,5 @@ __all__ = [
     'CollectorConfig',
     'CollectorStats',
     'CollectorState',
+    'BinanceDataProvider',
 ]

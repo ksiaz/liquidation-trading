@@ -1471,7 +1471,7 @@ class CollectorService:
                                     _cur_zone_size = _z.current_size_usd
                                     break
 
-                            _scout_px = current_price or self._get_live_price(symbol)
+                            _scout_px = price
                             if _scout_px:
                                 _should_exit, _exit_reason = self._scout_tracker.check_zone_health(
                                     symbol, _cur_zone_size, _scout_px, timestamp)
@@ -1802,26 +1802,11 @@ class CollectorService:
                                     self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                     rolling_fade_signal = None
 
-                    # Minimum burst volume gate: high ratio + low volume = noise.
-                    # A 22x burst ratio with $39k in BTC liqs is a statistical artifact
-                    # from a quiet baseline, not a structural cascade. Real BTC cascades
-                    # involve $50k+ in forced liquidation volume.
-                    _MIN_BURST_VOLUME = {
-                        "BTCUSDT": 50_000,
-                        "ETHUSDT": 15_000,
-                        "SOLUSDT": 8_000,
-                    }
-                    _DEFAULT_MIN_BURST_VOLUME = 5_000
-                    if rolling_fade_signal:
-                        _vol_floor = _MIN_BURST_VOLUME.get(symbol, _DEFAULT_MIN_BURST_VOLUME)
-                        if rolling_fade_signal.spike_volume < _vol_floor:
-                            print(f"[VOLUME GATE] {symbol}: blocking — "
-                                  f"burst volume ${rolling_fade_signal.spike_volume:,.0f} "
-                                  f"< ${_vol_floor:,.0f} min "
-                                  f"(ratio {rolling_fade_signal.z_score:.1f}x, "
-                                  f"{rolling_fade_signal.liq_count} events)")
-                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
-                            rolling_fade_signal = None
+                    # Volume gate removed (2026-03-15): service.py gate at $50k/$15k/$8k
+                    # blocked 100% of March 1-3 profitable signals. EP2 already has
+                    # per-coin burst volume gate (EXHAUSTION_FADE_MIN_BURST_BY_COIN:
+                    # BTC $2.5k, ETH $1.5k, SOL $600) which is sufficient for HL
+                    # micro-liquidation data ($42-$7k per event).
 
                     # ── SCOUT ENTRY: immediate, no fuel gate ──
                     # Fires on first signal detection. Catches the wick peak/valley.

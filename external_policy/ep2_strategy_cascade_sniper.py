@@ -186,12 +186,30 @@ COIN_LIQUIDATION_THRESHOLDS = {
 # Default threshold for coins not in the list
 DEFAULT_LIQUIDATION_THRESHOLD = 100.0
 
-# Post-liquidation exhaustion fade requires a stronger burst than trigger-only entry.
-# These are per-coin minimum burst values (USD) calibrated for major symbols.
+# Per-coin minimum burst volume (USD) for exhaustion fade entry.
+# Calibrated from P10 of LIQ_SPIKE rolling_liq_volume (2026-02-01 to 2026-03-15).
+# P10 filters bottom 10% dust while keeping 90% of real cascades.
 EXHAUSTION_FADE_MIN_BURST_BY_COIN = {
-    "BTC": 2_500.0,
-    "ETH": 1_500.0,
-    "SOL": 600.0,
+    "BTC": 800.0,       # P10=$850, 1556 spikes, 60% WR
+    "ETH": 200.0,       # P10=$199, 894 spikes, 58% WR
+    "SOL": 100.0,       # P10=$108, 952 spikes, 58% WR
+    "HYPE": 40.0,       # P10=$43, 588 spikes, 62% WR
+    "INJ": 50.0,        # P10=$57, 13 spikes, 100% WR
+    "FARTCOIN": 35.0,   # P10=$37, 151 spikes, 44% WR
+    "LINK": 20.0,       # P10=$22, 90 spikes
+    "NEAR": 15.0,       # P10=$18, 139 spikes, 73% WR
+    "ADA": 15.0,        # P10=$18, 29 spikes
+    "AAVE": 15.0,       # P10=$17, 116 spikes
+    "DOGE": 10.0,       # P10=$13, 193 spikes, 80% WR
+    "BNB": 10.0,        # P10=$13, 83 spikes
+    "kPEPE": 10.0,      # P10=$12, 91 spikes
+    "APT": 10.0,        # P10=$12, 60 spikes
+    "AVAX": 10.0,       # P10=$11, 90 spikes
+    "WLD": 10.0,        # P10=$10, 98 spikes
+    "PENDLE": 10.0,     # 2 spikes only, use floor
+    "TON": 2.0,         # P10=$2, 33 spikes
+    "LTC": 1.0,         # P10=$1, 49 spikes
+    "SEI": 1.0,         # P10=$0, 13 spikes, use floor
 }
 
 # Per-coin minimum liquidation COUNT for exhaustion fade quality filter.
@@ -392,7 +410,7 @@ class CascadeSniperConfig:
 
     # Exhaustion fade mode: stricter burst confirmation
     # For non-overridden symbols, required_burst = max(default, trigger_threshold * multiplier)
-    exhaustion_fade_default_min_burst_value: float = 500.0
+    exhaustion_fade_default_min_burst_value: float = 10.0  # P10-calibrated floor for unlisted coins
     exhaustion_fade_burst_multiplier: float = 4.0
 
 

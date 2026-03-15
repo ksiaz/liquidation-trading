@@ -1190,18 +1190,11 @@ class CollectorService:
                     vwap_distance = vwap_calc.get_distance(price)
                     atr_5m = atr_calc.get_atr_5m()
                     atr_30m = atr_calc.get_atr_30m()
-                    # Use 60s window in node mode (HL fills are sparser)
-                    orderflow_imbalance = (
-                        orderflow_calc.get_imbalance_60s()
-                        if self._use_node_mode
-                        else orderflow_calc.get_imbalance_30s()
-                    )
+                    # Always use 60s window — more stable for regime classification.
+                    # 30s window is too volatile with Binance's high fill rate.
+                    orderflow_imbalance = orderflow_calc.get_imbalance_60s()
                     liquidation_zscore = liquidation_calc.get_zscore(timestamp)
-                    orderflow_fill_count = (
-                        orderflow_calc.get_trade_count_60s()
-                        if self._use_node_mode
-                        else orderflow_calc.get_trade_count_30s()
-                    )
+                    orderflow_fill_count = orderflow_calc.get_trade_count_60s()
 
                     # Check if all metrics available
                     if None in [vwap_distance, atr_5m, atr_30m, orderflow_imbalance, liquidation_zscore]:
@@ -3643,11 +3636,7 @@ class CollectorService:
             orderflow = None
             orderflow_calc = self._orderflow_calculators.get(symbol)
             if orderflow_calc:
-                orderflow = (
-                    orderflow_calc.get_imbalance_60s()
-                    if self._use_node_mode
-                    else orderflow_calc.get_imbalance_30s()
-                )
+                orderflow = orderflow_calc.get_imbalance_60s()
 
             # Trade-based adverse volume for trailing stop tightening
             adverse_l2_gravity = None

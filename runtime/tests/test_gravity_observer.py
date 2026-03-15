@@ -58,7 +58,7 @@ def _mock_liq_map(zones):
 def _mock_of_calc(imbalance=0.5, fills=20):
     m = MagicMock()
     m.get_imbalance_60s.return_value = imbalance
-    m.get_fill_count_60s.return_value = fills
+    m.get_trade_count_60s.return_value = fills
     return m
 
 

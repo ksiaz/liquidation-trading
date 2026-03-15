@@ -181,7 +181,7 @@ class GravityObserver:
         of_fills = 0
         if of_calc:
             of_imb = of_calc.get_imbalance_60s() or 0.0
-            of_fills = getattr(of_calc, 'get_fill_count_60s', lambda: 0)()
+            of_fills = getattr(of_calc, 'get_trade_count_60s', lambda: 0)()
 
         event = ZoneArrivalEvent(
             event_id=str(uuid.uuid4())[:12],
@@ -193,7 +193,7 @@ class GravityObserver:
             zone_side=hit_zone.side,
             zone_gravity=hit_zone.gravity,
             zone_persistence=hit_zone.persistence,
-            zone_size_initial=hit_zone.current_size_usd,
+            zone_size_initial=hit_zone.current_size_usd or hit_zone.avg_size_usd,
             zone_strength=getattr(hit_zone, 'strength', 0),
             zone_gravity_rank=getattr(hit_zone, 'gravity_rank', 0.0),
             arrival_ts=ts,

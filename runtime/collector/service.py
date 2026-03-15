@@ -96,10 +96,14 @@ class GravityTPConfig:
     """Configuration for L2 gravity-zone partial take-profit."""
     enabled: bool = True
     min_gravity: float = 10_000     # Zone gravity threshold (avg_usd * persistence)
-    min_distance_bps: float = 30    # Min 30bp from entry — avoid noise
+    min_distance_bps: float = 30    # Min 30bp from entry — avoid noise (static targeting)
     max_distance_bps: float = 300   # Max 300bp (3%) — don't target unrealistic levels
     reduce_fraction: float = 0.50   # Close 50% at TP zone
     require_warmup: bool = True     # Only target if map has 5min+ data
+    # Dynamic re-targeting: scan from current price with lower distance threshold
+    dynamic_min_distance_bps: float = 3   # Min 3bp from current price for re-target
+    dynamic_min_gravity: float = 500_000  # Only re-target on strong zones (500k+)
+    dynamic_min_strength: int = 2         # Only re-target on strength 2+ zones
 
 
 @dataclass
@@ -116,6 +120,8 @@ class GravityTPTarget:
     zone_persistence: float       # For logging
     set_at: float                 # Wall clock when target set
     fired: bool = False           # True after partial TP executed
+    zone_strength: int = 0        # LiquidityZone.strength (0-3)
+    is_dynamic: bool = False      # True if set by dynamic re-targeting
 
 
 @dataclass
@@ -1544,6 +1550,26 @@ class CollectorService:
                                         f"distance={(abs(tp_target.target_price - ghost_pos.entry_price) / ghost_pos.entry_price * 10000):.0f}bp"
                                     )
                     self._check_gravity_tp_targets(symbol, price)
+
+                    # Dynamic gravity TP re-targeting: scan from current price
+                    # Runs when: no unfired target exists AND we have an open position
+                    _gtp_existing = self._gravity_tp_targets.get(symbol)
+                    if not _gtp_existing or _gtp_existing.fired:
+                        ghost_pos = self.ghost_tracker.get_open_position(symbol)
+                        if ghost_pos:
+                            _dyn_target = self._dynamic_gravity_tp_retarget(
+                                symbol, price, ghost_pos.entry_price, ghost_pos.side)
+                            if _dyn_target:
+                                self._gravity_tp_targets[symbol] = _dyn_target
+                                _dist_entry = abs(_dyn_target.target_price - ghost_pos.entry_price) / ghost_pos.entry_price * 10_000
+                                _dist_cur = abs(_dyn_target.target_price - price) / price * 10_000
+                                print(f"GRAVITY_TP_DYNAMIC: {symbol} {ghost_pos.side} "
+                                      f"target=${_dyn_target.target_price:,.2f} "
+                                      f"str={_dyn_target.zone_strength} grav={_dyn_target.zone_gravity:.0f} "
+                                      f"dist_entry={_dist_entry:.0f}bp dist_cur={_dist_cur:.0f}bp "
+                                      f"{'(re-target after partial)' if _gtp_existing and _gtp_existing.fired else '(new)'}")
+                                # Immediately check if already at zone
+                                self._check_gravity_tp_targets(symbol, price)
 
                     # Gravity zone observer — passive data collection
                     _grav_obs_event = self._gravity_observer.get_active_event(hl_symbol)
@@ -3601,12 +3627,80 @@ class CollectorService:
                 zone_gravity=best_zone.gravity,
                 zone_persistence=best_zone.persistence,
                 set_at=time.time(),
+                zone_strength=getattr(best_zone, 'strength', 0),
+            )
+
+        return None
+
+    def _dynamic_gravity_tp_retarget(self, symbol: str, current_price: float,
+                                      entry_price: float, side: str) -> 'Optional[GravityTPTarget]':
+        """Dynamic re-targeting: scan from current price for strong zones ahead.
+
+        Unlike static targeting (from entry), this uses current price as reference
+        with lower distance threshold. Only targets strong zones (strength ≥ 2,
+        gravity ≥ 500k) to avoid false exits on noise.
+
+        For SHORT: looks for bid zones below current price (support = take profit).
+        For LONG: looks for ask zones above current price (resistance = take profit).
+        Zone must be in profit direction from entry.
+        """
+        cfg = self._gravity_tp_config
+        if not cfg.enabled:
+            return None
+
+        coin = symbol.replace('USDT', '').replace('USD', '')
+        if cfg.require_warmup and not self._liquidity_map.is_warmed_up(coin):
+            return None
+
+        if side == "LONG":
+            zones = self._liquidity_map.get_zones_above(coin, current_price, min_gravity=cfg.dynamic_min_gravity)
+        else:
+            zones = self._liquidity_map.get_zones_below(coin, current_price, min_gravity=cfg.dynamic_min_gravity)
+
+        best_zone = None
+        best_gravity = 0.0
+        for zone in zones:
+            # Must be strong enough
+            if getattr(zone, 'strength', 0) < cfg.dynamic_min_strength:
+                continue
+            # Distance from current price (not entry)
+            distance_from_current = abs(zone.center_price - current_price) / current_price * 10_000
+            if distance_from_current < cfg.dynamic_min_distance_bps:
+                continue
+            if distance_from_current > cfg.max_distance_bps:
+                continue
+            # Zone must be meaningfully in profit direction from entry (≥ 8bp)
+            profit_bps = 0.0
+            if side == "LONG":
+                profit_bps = (zone.center_price - entry_price) / entry_price * 10_000
+            else:
+                profit_bps = (entry_price - zone.center_price) / entry_price * 10_000
+            if profit_bps < 8:
+                continue
+            if zone.gravity > best_gravity:
+                best_gravity = zone.gravity
+                best_zone = zone
+
+        if best_zone:
+            return GravityTPTarget(
+                symbol=symbol,
+                target_price=best_zone.center_price,
+                zone_low=best_zone.band_low,
+                zone_high=best_zone.band_high,
+                reduce_fraction=1.0,  # Full close on dynamic TP (strong zone bounce)
+                entry_price=entry_price,
+                side=side,
+                zone_gravity=best_zone.gravity,
+                zone_persistence=best_zone.persistence,
+                set_at=time.time(),
+                zone_strength=getattr(best_zone, 'strength', 0),
+                is_dynamic=True,
             )
 
         return None
 
     def _check_gravity_tp_targets(self, symbol: str, price: float):
-        """Check if price has reached gravity TP zone. Executes partial close."""
+        """Check if price has reached gravity TP zone. Executes partial/full close."""
         target = self._gravity_tp_targets.get(symbol)
         if not target or target.fired:
             return
@@ -3629,10 +3723,11 @@ class CollectorService:
         if reduce_qty <= 0:
             return
 
+        exit_reason = "GRAVITY_TP_DYNAMIC" if target.is_dynamic else "GRAVITY_TP"
         ok, err, trade = self.ghost_tracker.close_position(
             symbol=symbol,
             quantity=reduce_qty,
-            exit_reason="GRAVITY_TP",
+            exit_reason=exit_reason,
             exit_price=price,
             timestamp=time.time()
         )
@@ -3641,11 +3736,23 @@ class CollectorService:
             target.fired = True
             pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
             remaining = position.quantity - reduce_qty
-            print(f"GRAVITY_TP: {symbol} {target.side} closed {reduce_qty:.4f} @ ${price:,.2f} "
-                  f"PnL={pnl_str} zone_gravity={target.zone_gravity:.0f} "
-                  f"persist={target.zone_persistence:.0%} remaining={remaining:.4f}")
+            tp_type = "DYNAMIC" if target.is_dynamic else "STATIC"
+            print(f"GRAVITY_TP_{tp_type}: {symbol} {target.side} closed {reduce_qty:.6f} @ ${price:,.2f} "
+                  f"PnL={pnl_str} zone_gravity={target.zone_gravity:.0f} str={target.zone_strength} "
+                  f"persist={target.zone_persistence:.0%} remaining={remaining:.6f}")
 
-            # Move trailing stop to entry + 15bp profit floor.
+            # For full close (dynamic TP), clean up trailing stop
+            if target.reduce_fraction >= 1.0:
+                for _sid in list(self._trailing_stop_manager.get_all_stops()):
+                    _st = self._trailing_stop_manager.get_stop_state(_sid)
+                    if _st and _st.symbol == symbol:
+                        self._trailing_stop_manager.unregister_stop(_sid)
+                        break
+                self._gravity_tp_targets.pop(symbol, None)
+                self._stop_exit_timestamps[symbol] = time.time()
+                return
+
+            # Move trailing stop to entry + 15bp profit floor (partial close only).
             # BE (0bp) wastes the trailing half — 13/35 trades give back all profit.
             # +15bp floor: pure improvement, no runners affected (all exit >40bp).
             _GRAV_TP_STOP_FLOOR_BPS = 15

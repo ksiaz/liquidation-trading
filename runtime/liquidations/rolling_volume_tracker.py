@@ -76,7 +76,7 @@ class RollingVolumeTracker:
     BURST_WINDOW = 30          # 30s burst detection window
     BASELINE_WINDOW = 3600     # 60m baseline rate window
     RATIO_THRESHOLD = 10.0     # Burst rate must be 10x baseline rate
-    MIN_BURST_EVENTS = 5       # Minimum events in burst window to trigger
+    MIN_BURST_EVENTS = 3       # Minimum events in burst window (Binance forceOrder lossy)
     SPIKE_COOLDOWN = 0         # No cooldown — burst quality gates handle signal filtering
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
     MAX_PENDING_AGE = 60       # Pending signal expires after 60s — prevents stale
@@ -84,8 +84,9 @@ class RollingVolumeTracker:
 
     # Warmup: need enough baseline data for rate comparison to be meaningful.
     # Without this, 5 events vs near-zero baseline → infinite ratio → triggers.
-    # Old z-score system had MIN_HISTORY=50 (~8 min). 30 events at 1/min = ~30 min.
-    MIN_BASELINE_EVENTS = 30
+    # Binance forceOrder is lossy (max 1/symbol/sec) — fewer events reach us
+    # than HL's complete liquidation stream. 10 events is ~10-20 min for active coins.
+    MIN_BASELINE_EVENTS = 10
 
     # Burst concentration: events must be clustered, not spread evenly over 30s.
     # Old system had MIN_Z_JUMP=1.0 which required sudden z-score jump.

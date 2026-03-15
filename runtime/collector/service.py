@@ -376,7 +376,7 @@ class CollectorService:
         # Regime debounce: require N consecutive cycles of new state before transitioning
         # Prevents orderflow noise from causing SIDEWAYS↔DISABLED chatter at 5Hz
         self._regime_pending: Dict[str, tuple] = {}  # symbol → (pending_state, count)
-        self._REGIME_DEBOUNCE_CYCLES = 50  # 50 cycles × ~200ms = ~10 seconds
+        self._REGIME_DEBOUNCE_CYCLES = 150  # 150 cycles × ~200ms = ~30 seconds
 
         # Binance data provider — replaces NodeBridge + HyperliquidClient
         self._node_bridge = None  # Keep attrs for compatibility checks
@@ -1498,14 +1498,7 @@ class CollectorService:
                     absorption = None
                     coin = symbol.replace('USDT', '')
 
-                    # Try node mode first (has more complete data)
-                    # Note: NodeBridge doesn't have proximity provider (requires ObservationBridge)
-                    if self._use_node_mode and self._node_bridge and hasattr(self._node_bridge, 'get_proximity_provider'):
-                        proximity_provider = self._node_bridge.get_proximity_provider()
-                        if proximity_provider:
-                            hl_proximity = proximity_provider.get_proximity(coin)
-
-                    # Fallback to WebSocket collector if no node data
+                    # WebSocket collector proximity (if available)
                     if hl_proximity is None and self._hyperliquid_enabled and self._hyperliquid_collector:
                         hl_proximity = self._hyperliquid_collector.get_proximity(coin)
 
@@ -1567,25 +1560,7 @@ class CollectorService:
                                     print(f"  ⚠️ CIRCUIT BREAKER ACTIVE: {remaining:.0f}s remaining")
 
                     # Phase 6: Get liquidation burst data
-                    # In node mode, use node bridge's aggregator (fed by node_trades liquidations)
-                    # Otherwise, use collector's aggregator (fed by WS forceOrder stream)
-                    # Note: NodeBridge doesn't have get_burst (requires ObservationBridge)
-                    liquidation_burst = None
-                    if self._use_node_mode and self._node_bridge and hasattr(self._node_bridge, 'get_burst'):
-                        node_burst = self._node_bridge.get_burst(symbol)
-                        if node_burst:
-                            # Convert node burst to policy adapter format
-                            liquidation_burst = LiquidationBurst(
-                                symbol=node_burst.symbol,
-                                total_volume=node_burst.total_volume,
-                                long_liquidations=node_burst.long_liquidations,
-                                short_liquidations=node_burst.short_liquidations,
-                                liquidation_count=node_burst.liquidation_count,
-                                window_start=node_burst.window_start,
-                                window_end=node_burst.window_end,
-                            )
-                    else:
-                        liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
+                    liquidation_burst = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
 
                     # Gate B: Get price returns for trend gate
                     # Convert symbol (BTCUSDT) to coin (BTC) for HL price lookup

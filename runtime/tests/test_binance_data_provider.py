@@ -181,3 +181,24 @@ class TestSymbolMapping:
         assert "!forceOrder@arr" in streams
         assert "btcusdt@depth20@100ms" in streams
         assert "!markPrice@arr@1s" in streams
+
+
+class TestDispatchArray:
+    """Test _dispatch handles markPrice array messages."""
+
+    def test_mark_price_array(self):
+        """markPrice@arr sends array of all mark prices at once."""
+        provider = BinanceDataProvider(SYMBOLS)
+        mock_price = MagicMock()
+        provider.on_price = mock_price
+
+        # Binance sends array of markPriceUpdate dicts
+        msg = [
+            {"e": "markPriceUpdate", "s": "BTCUSDT", "p": "71000", "E": 1773580200000},
+            {"e": "markPriceUpdate", "s": "ETHUSDT", "p": "2100", "E": 1773580200000},
+            {"e": "markPriceUpdate", "s": "SHIBUSDT", "p": "0.001", "E": 1773580200000},
+        ]
+        provider._dispatch(msg)
+
+        # Should fire for BTC and ETH (in symbol set), skip SHIB
+        assert mock_price.call_count == 2

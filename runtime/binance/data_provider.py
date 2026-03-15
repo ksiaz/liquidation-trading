@@ -145,8 +145,15 @@ class BinanceDataProvider:
 
         self.on_price(coin, price, timestamp)
 
-    def _dispatch(self, msg: Dict):
+    def _dispatch(self, msg):
         """Route a parsed message to the appropriate handler."""
+        # markPrice@arr sends an array of all mark prices
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict) and item.get("e") == "markPriceUpdate":
+                    self._handle_mark_price(item)
+            return
+
         event_type = msg.get("e")
         if event_type == "aggTrade":
             self._handle_agg_trade(msg)

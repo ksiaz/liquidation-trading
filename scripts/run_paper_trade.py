@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Paper Trading Mode with Node Integration.
+Paper Trading Mode with Binance Futures Data.
 
 Runs the full system with:
-- Node adapter for real-time liquidation data (USE_HL_NODE=true)
+- Binance Futures WebSocket data (fills, liquidations, orderbook, prices)
 - Cascade Sniper strategy enabled
 - Paper trade mode (no real orders, logged to PostgreSQL)
 
@@ -21,8 +21,6 @@ import logging
 import logging.handlers
 import signal
 
-# Enable node mode
-os.environ['USE_HL_NODE'] = 'true'
 os.environ['ENABLE_DIAG'] = 'false'  # Reduce noise
 
 # Add project root to path early
@@ -65,7 +63,6 @@ from observation.governance import ObservationSystem
 from runtime.collector.service import CollectorService
 from runtime.monitoring import ResourceMonitor, HealthStatus, CleanupCoordinator
 from runtime.stability_observer import stability_observer
-from trade_stream import BinanceTradeStream
 from external_policy.ep2_strategy_cascade_sniper import record_organic_trade, record_liquidation_event
 # UI server disabled pending node adapter redesign
 # See docs/NODE_ADAPTER_REDESIGN.md
@@ -193,18 +190,14 @@ def prune_stale_log_files(max_age_hours: int = 72) -> int:
     return deleted
 
 
-# Symbols to trade - 15 highest volume coins (must exist in HL asset map)
-# Include both Binance format (BTCUSDT) and HL format (BTC) for cross-exchange support
+# Symbols to trade — top 20 Binance Futures by sustained volume
+# Must match TOP_10_SYMBOLS in runtime/collector/service.py
 BINANCE_SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'kPEPEUSDT', 'DOGEUSDT',
-    'AVAXUSDT', 'LINKUSDT', 'HYPEUSDT', 'PENDLEUSDT', 'NEARUSDT',
-    'LTCUSDT', 'ADAUSDT', 'AAVEUSDT', 'APTUSDT', 'SEIUSDT',
-    'BNBUSDT', 'INJUSDT', 'FARTCOINUSDT', 'WLDUSDT', 'TONUSDT',
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
+    'BNBUSDT', 'TRUMPUSDT', 'TAOUSDT', 'SUIUSDT', 'ADAUSDT',
+    'LINKUSDT', 'AVAXUSDT', 'PEPEUSDT', 'LTCUSDT', 'DOTUSDT',
+    'APTUSDT', 'NEARUSDT', 'AAVEUSDT', 'HYPEUSDT', 'ZECUSDT',
 ]
-HL_SYMBOLS = [s.replace('USDT', '') for s in BINANCE_SYMBOLS]
-# Only USDT-suffixed symbols for observation — short-form HL symbols have no M1 data
-# and waste 50% of SLBRS evaluations as primitives_missing. gRPC fills are normalized
-# to USDT format in the governance event buffer.
 SYMBOLS = BINANCE_SYMBOLS
 
 
@@ -214,7 +207,7 @@ async def run_paper_trade():
     logger.info('PAPER TRADE MODE')
     logger.info('=' * 60)
     logger.info(f'Symbols: {SYMBOLS}')
-    logger.info('Node mode: USE_HL_NODE=true')
+    logger.info('Data source: Binance Futures WebSocket')
     logger.info('Dry run: True (no real orders)')
     logger.info('=' * 60)
 
@@ -251,10 +244,6 @@ async def run_paper_trade():
 
     # Register components with monitor
     monitor.register_component('collector_service', service)
-    if service._node_bridge:
-        monitor.register_component('observation_bridge', service._node_bridge)
-    if service._node_psm:
-        monitor.register_component('position_state_manager', service._node_psm)
 
     # Register cascade state machine if available
     sm = None
@@ -265,51 +254,14 @@ async def run_paper_trade():
     except Exception as e:
         logger.debug(f"Could not register cascade state machine: {e}")
 
-    # HL fills are already wired to cascade sniper's organic flow detector
-    # via service._handle_hl_fill (registered in CollectorService.__init__).
-    # That path passes price/size for RunningPivotDetector + AbsorptionConfirmationTracker.
-    # Do NOT register a duplicate callback here (causes double-counting).
-    # HL liquidations are already wired via service._handle_hl_liquidation
-    # (registered in CollectorService.__init__), which feeds:
-    # - Z-score calculator
-    # - Burst aggregator
-    # - record_liquidation_event (cascade sniper)
-    trade_stream = None  # Only used if node bridge unavailable
-    if service._node_bridge:
-        logger.info('HL fills + liquidations wired via CollectorService._handle_hl_fill/liquidation')
-    else:
-        # Fallback to Binance trade stream if node bridge unavailable
-        logger.warning('Node bridge not available, falling back to BinanceTradeStream')
-        trade_stream = BinanceTradeStream(BINANCE_SYMBOLS)
-
-        def on_organic_trade(symbol: str, trade: dict):
-            """Feed organic trades to the cascade sniper's absorption detector."""
-            value = trade['price'] * trade['quantity']
-            record_organic_trade(
-                symbol=symbol,
-                side=trade['side'],
-                value=value,
-                timestamp=trade['timestamp']
-            )
-
-        trade_stream.add_callback(on_organic_trade)
-        trade_stream.start()
-        logger.info(f'Binance trade stream started for {len(BINANCE_SYMBOLS)} symbols')
+    # Fills + liquidations wired via BinanceDataProvider → CollectorService._handle_hl_fill/liquidation
+    logger.info('Binance fills + liquidations wired via CollectorService callbacks')
 
     # Create cleanup coordinator (Phase 2: Memory Guards)
     logger.info('Creating CleanupCoordinator...')
     cleanup = CleanupCoordinator(interval_sec=300.0)  # Every 5 minutes
 
     # Register pruners for each component
-    if service._node_bridge:
-        burst_agg = getattr(service._node_bridge, '_burst_aggregator', None)
-        if burst_agg:
-            cleanup.register_pruner('burst_aggregator', burst_agg.prune_stale)
-
-    if service._node_psm:
-        cleanup.register_pruner('position_manager_wallets', service._node_psm.prune_empty_wallets)
-        cleanup.register_pruner('position_manager_prices', service._node_psm.prune_stale_prices)
-
     if sm and hasattr(sm, '_organic_detector') and sm._organic_detector:
         cleanup.register_pruner('organic_flow_detector', lambda: sm._organic_detector.cleanup(time.time()))
 
@@ -326,12 +278,6 @@ async def run_paper_trade():
     # Register M2 archived nodes pruning (prevents memory leak from old nodes)
     cleanup.register_pruner('m2_archived_nodes', obs._m2_store.prune_archived_nodes)
 
-    # Register candidate zone decay and pruning (prevents memory leak from unbounded zones)
-    # Note: Only available on ObservationBridge, not NodeBridge
-    if service._node_bridge and hasattr(service._node_bridge, 'decay_candidate_zones'):
-        cleanup.register_pruner('candidate_zone_decay', service._node_bridge.decay_candidate_zones)
-        cleanup.register_pruner('candidate_zone_prune', service._node_bridge.prune_candidate_zones)
-
     # Register execution.db pruning (48h retention to prevent unbounded growth)
     # MUST use prune_safe() to go through BRD's lock. Direct _db access
     # bypasses the lock and corrupts transaction state, losing ghost trades.
@@ -341,28 +287,11 @@ async def run_paper_trade():
             lambda: service._execution_db.prune_safe(max_age_hours=48)
         )
 
-    # Register HL node data cleanup (keeps 24h of data, cleans diagnostics)
-    # Import here to avoid circular imports
-    from scripts.cleanup_hl_data import cleanup_hl_data
-    cleanup.register_pruner(
-        'hl_node_data',
-        lambda: cleanup_hl_data(
-            data_dir='~/hl/data',
-            keep_hours=24,
-            keep_abci_states=5,
-            dry_run=False,
-            verbose=False
-        ).get('total_files', 0)
-    )
-
     # Register log file pruning (72h retention for stale logs, node.log truncation)
     cleanup.register_pruner('log_files', lambda: prune_stale_log_files(max_age_hours=72))
 
-    logger.info(f'Node mode active: {service._use_node_mode}')
-    logger.info(f'HL enabled: {service._hyperliquid_enabled}')
-
-    if service._use_node_mode and service._node_psm:
-        logger.info('Position tracking enabled')
+    logger.info(f'Data source: Binance Futures WS')
+    logger.info(f'Symbols: {len(SYMBOLS)}')
 
     # UI server disabled pending node adapter redesign
     # See docs/NODE_ADAPTER_REDESIGN.md
@@ -415,41 +344,19 @@ async def run_paper_trade():
         while not shutdown_event.is_set():
             await asyncio.sleep(60)  # Status update every minute
 
-            # Log status
-            if service._node_bridge:
-                metrics = service._node_bridge.get_metrics()
-                hl_prices = service._obs.get_all_hl_prices()
+            # Log Binance data provider stats
+            if hasattr(service, '_binance_provider'):
+                bp = service._binance_provider
                 logger.info(
-                    f'Status: prices={metrics["prices_ingested"]}, '
-                    f'liqs={metrics["liquidations_ingested"]}→{metrics.get("liquidations_forwarded", 0)}, '
-                    f'fills={metrics["fills_ingested"]}→{metrics.get("organic_fills_forwarded", 0)}, '
-                    f'errors={metrics["errors"]}, symbols={len(hl_prices)}'
-                )
-
-            if service._node_psm:
-                logger.info(
-                    f'Positions: {service._node_psm.metrics.positions_cached}, '
-                    f'Critical: {service._node_psm.metrics.critical_positions}'
+                    f'Status: fills={bp.fills_received}, '
+                    f'liqs={bp.liqs_received}, '
+                    f'depth={bp.depth_received}, '
+                    f'prices={bp.prices_received}'
                 )
 
             # Data freshness breaker status
             if hasattr(service, '_data_breaker') and service._data_breaker and service._data_breaker.is_open:
                 logger.warning(f'DATA BREAKER OPEN: {service._data_breaker._trip_reason} — entries blocked')
-
-            # Log proximity data
-            if obs._hl_collector:
-                for coin in ['BTC', 'ETH', 'HYPE']:
-                    prox = obs._hl_collector.get_proximity(coin)
-                    if prox and prox.total_positions_at_risk > 0:
-                        logger.info(
-                            f'{coin}: {prox.total_positions_at_risk} at risk, '
-                            f'${prox.total_value_at_risk:,.0f}'
-                        )
-
-            # Log trade stream stats (WebSocket mode only)
-            if trade_stream:
-                ts_stats = trade_stream.get_stats()
-                logger.info(f'Trade stream: {ts_stats["trades_received"]} trades received')
 
             if sm and sm._organic_detector:
                 for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:
@@ -478,11 +385,14 @@ async def run_paper_trade():
             except Exception as e:
                 logger.warning(f'Failed to flush execution.db: {e}')
 
-        if trade_stream:
-            trade_stream.stop()
-            logger.info('Trade stream stopped')
-        elif service._node_bridge:
-            logger.info('HL node bridge will be stopped with service')
+        # Stop Binance data provider
+        if hasattr(service, '_binance_provider'):
+            import asyncio as _asyncio
+            try:
+                _asyncio.get_event_loop().run_until_complete(service._binance_provider.stop())
+            except Exception:
+                pass
+            logger.info('Binance data provider stopped')
 
         # Phase E: Log stability observer summary
         stability_summary = stability_observer.summary()

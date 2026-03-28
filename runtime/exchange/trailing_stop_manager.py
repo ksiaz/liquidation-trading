@@ -388,12 +388,15 @@ class TrailingStopManager:
                     # above new entry price which would cause immediate stop-out
                     state.current_stop_price = new_initial_stop
 
-                # Reset MFE tracking to current price
+                # Reset MFE tracking to new entry price (not current price).
+                # DCA adds happen at adverse prices — resetting MFE to current
+                # (adverse) price prevents the stop from ever seeing favorable MFE.
+                # Using new_entry_price means MFE tracks from the averaged entry.
                 if state.direction == "LONG":
-                    state.highest_price = current_price
+                    state.highest_price = new_entry_price
                     state._candidate_high = None
                 else:
-                    state.lowest_price = current_price
+                    state.lowest_price = new_entry_price
                     state._candidate_low = None
 
                 # Reset break-even (new avg entry changes the BE level)

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from runtime.liquidations.liquidity_map import LiquidityZone
+from runtime.liquidations.wall_tracker import WallTracker
 
 
 @dataclass
@@ -95,6 +96,7 @@ class GravityObserver:
         self._last_zone: Dict[str, Optional[tuple]] = {}  # (center, side) of zone price was in
         self._recent: deque = deque(maxlen=500)
         self._pending_persist: List[ZoneArrivalEvent] = []
+        self.wall_tracker = WallTracker()
 
     def on_price_update(
         self,
@@ -318,6 +320,17 @@ class GravityObserver:
             or (event.approach_direction == "from_below" and event.exit_direction == "downward")
         )
 
+        self.wall_tracker.on_zone_finalized(
+            coin=coin,
+            zone_center=event.zone_center,
+            zone_side=event.zone_side,
+            reversal=event.reversal,
+            breached=event.breached,
+            min_size_ratio=event.min_size_ratio,
+            gravity=event.zone_gravity,
+            timestamp=event.arrival_ts,
+        )
+
         self._recent.append(event)
         self._pending_persist.append(event)
         self._active[coin] = None
@@ -396,6 +409,11 @@ class GravityObserver:
                 put_conn(conn)
 
     # ── Query API ────────────────────────────────────────────────────
+
+    def get_wall_status(self, coin: str, liquidity_map=None, price: float = None):
+        """Get current macro wall status. Returns WallStatus or None."""
+        return self.wall_tracker.get_wall_status(
+            coin, liquidity_map=liquidity_map, current_price=price)
 
     def get_active_event(self, coin: str) -> Optional[ZoneArrivalEvent]:
         return self._active.get(coin)

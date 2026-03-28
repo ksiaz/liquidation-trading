@@ -130,6 +130,7 @@ class GhostTrade:
     concurrent_positions: Optional[int] = None
     holding_duration_sec: Optional[float] = None
     exit_reason: Optional[str] = None
+    entry_context: Optional[str] = None  # JSON blob: decel_phase, dca_level, rolling_z, etc.
 
 
 # ==============================================================================
@@ -435,7 +436,8 @@ class GhostPositionTracker:
         active_primitives: Optional[List[str]] = None,
         orderbook: Optional[NormalizedOrderbook] = None,
         entry_price: Optional[float] = None,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        entry_context: Optional[str] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Open new position (simulated).
@@ -452,6 +454,7 @@ class GhostPositionTracker:
             entry_price: Optional externally-determined entry price.
                         When provided with quantity, skips adapter execution.
             timestamp: Optional entry timestamp (used with entry_price).
+            entry_context: Optional JSON string with trade context (decel phase, etc.)
 
         Returns:
             (success, error_reason, trade_record)
@@ -460,12 +463,14 @@ class GhostPositionTracker:
             return self._open_position_locked(
                 symbol=symbol, side=side, quantity=quantity, cycle_id=cycle_id,
                 policy_name=policy_name, active_primitives=active_primitives,
-                orderbook=orderbook, entry_price=entry_price, timestamp=timestamp
+                orderbook=orderbook, entry_price=entry_price, timestamp=timestamp,
+                entry_context=entry_context
             )
 
     def _open_position_locked(
         self, *, symbol, side, quantity, cycle_id, policy_name,
-        active_primitives, orderbook, entry_price, timestamp
+        active_primitives, orderbook, entry_price, timestamp,
+        entry_context=None
     ):
         # Close existing position on same symbol before opening new one
         # Prevents orphaned entries from ON CONFLICT REPLACE or state desync
@@ -561,7 +566,8 @@ class GhostPositionTracker:
             winning_policy=policy_name,
             active_primitives=primitives_json,
             spread_bps=spread_bps,
-            concurrent_positions=len(self._state.open_positions)
+            concurrent_positions=len(self._state.open_positions),
+            entry_context=entry_context
         )
 
         self._state.trade_history.append(trade)
@@ -765,7 +771,8 @@ class GhostPositionTracker:
         add_quantity: float,
         add_price: float,
         timestamp: float = None,
-        dca_level: int = None
+        dca_level: int = None,
+        entry_context: Optional[str] = None
     ) -> tuple:
         """Add to existing position (DCA). Thread-safe.
 
@@ -778,6 +785,7 @@ class GhostPositionTracker:
             add_price: Price of the DCA add
             timestamp: Optional timestamp (defaults to now)
             dca_level: DCA level (1, 2, 3...)
+            entry_context: Optional JSON string with trade context
 
         Returns:
             (success, error, trade, new_avg_entry)
@@ -785,11 +793,12 @@ class GhostPositionTracker:
         with self._position_lock:
             return self._add_to_position_locked(
                 symbol=symbol, add_quantity=add_quantity, add_price=add_price,
-                timestamp=timestamp, dca_level=dca_level
+                timestamp=timestamp, dca_level=dca_level,
+                entry_context=entry_context
             )
 
     def _add_to_position_locked(self, *, symbol, add_quantity, add_price,
-                                 timestamp, dca_level):
+                                 timestamp, dca_level, entry_context=None):
         position = self._state.open_positions.get(symbol)
         if not position:
             return (False, f"No open position for {symbol}", None, None)
@@ -849,7 +858,8 @@ class GhostPositionTracker:
             entry_trade_id=position.entry_trade_id,  # Link to original entry
             winning_policy=position.entry_policy,
             concurrent_positions=len(self._state.open_positions),
-            exit_reason=f"DCA_ADD_{level_str}"
+            exit_reason=f"DCA_ADD_{level_str}",
+            entry_context=entry_context
         )
 
         self._state.trade_history.append(trade)
@@ -857,6 +867,26 @@ class GhostPositionTracker:
         self._log_trade_to_db(trade)
 
         return (True, None, trade, new_avg)
+
+    def get_recent_entry_count(self, exclude_symbol: str = None,
+                                window_sec: float = 120, now: float = None) -> int:
+        """Count entries on OTHER coins within a time window.
+
+        Used by isolation gate: single-coin liqs are trend pauses (35% WR),
+        multi-coin cascades are genuine flushes (70-82% WR).
+        """
+        import time as _time
+        if now is None:
+            now = _time.time()
+        cutoff = now - window_sec
+        count = 0
+        with self._position_lock:
+            for symbol, pos in self._state.open_positions.items():
+                if symbol == exclude_symbol:
+                    continue
+                if pos.entry_timestamp and pos.entry_timestamp >= cutoff:
+                    count += 1
+        return count
 
     def get_account_summary(self) -> Dict:
         """
@@ -1035,8 +1065,8 @@ class GhostPositionTracker:
                         timestamp, position_side, is_entry, pnl, account_balance_after,
                         entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
                         active_primitives, spread_bps, concurrent_positions,
-                        holding_duration_sec, exit_reason
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        holding_duration_sec, exit_reason, entry_context
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
                     trade.trade_id,
                     trade.cycle_id,
@@ -1057,7 +1087,8 @@ class GhostPositionTracker:
                     trade.spread_bps,
                     trade.concurrent_positions,
                     trade.holding_duration_sec,
-                    trade.exit_reason
+                    trade.exit_reason,
+                    trade.entry_context
                 ))
 
                 # UPDATE policy_outcomes with ghost trade results (only for exits)

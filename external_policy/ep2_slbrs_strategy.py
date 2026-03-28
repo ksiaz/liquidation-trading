@@ -240,7 +240,8 @@ class SLBRSStrategy:
         directional_continuity=None,
         orderflow_imbalance: Optional[float] = None,
         orderflow_fill_count: int = 0,
-        capitulation_confidence: float = 0.0
+        capitulation_confidence: float = 0.0,
+        wall_status=None
     ) -> Optional[StrategyProposal]:
         """
         Generate SLBRS proposal based on current market structure.
@@ -473,7 +474,7 @@ class SLBRSStrategy:
             return self._check_retest_entry(
                 symbol, price, context, order_consumption, zone_penetration,
                 regime_state, directional_continuity, orderflow_imbalance,
-                orderflow_fill_count
+                orderflow_fill_count, wall_status=wall_status
             )
 
         # ======================================================================
@@ -734,7 +735,8 @@ class SLBRSStrategy:
         regime_state: RegimeState,
         directional_continuity,
         orderflow_imbalance: Optional[float],
-        orderflow_fill_count: int
+        orderflow_fill_count: int,
+        wall_status=None
     ) -> Optional[StrategyProposal]:
         """
         REJECTION_CONFIRMED state: check for retest entry.
@@ -884,6 +886,22 @@ class SLBRSStrategy:
         of_str = f"{orderflow_imbalance:.3f}" if orderflow_imbalance is not None else "None"
         rr = target_distance / stop_distance if stop_distance > 0 else 0
         vwap_z_val = regime_state.vwap_z if regime_state else 0.0
+        # Wall status shadow logging
+        _wall_info = "none"
+        _wall_gold = False
+        if wall_status:
+            _wall_info = (f"consec={wall_status.consecutive_reversals} "
+                         f"ob={wall_status.is_ob} prior={wall_status.prior_reversals} "
+                         f"gold={wall_status.gold_signal} grav={wall_status.total_gravity:,.0f}")
+            _wall_gold = wall_status.gold_signal
+
+        print(f"[SLBRS-WALL] {symbol}: {_wall_info}", flush=True)
+
+        # TODO: When ready to gate, uncomment:
+        # if not _wall_gold:
+        #     self._count_reject("wall_not_gold")
+        #     return None
+
         print(f"[SLBRS-ENTRY-DIAG] {symbol}: dir={direction} "
               f"block_edge={first_test.block_edge:.4f} "
               f"rejection={first_test.max_rejection:.6f} "
@@ -1009,7 +1027,8 @@ def generate_slbrs_proposal(
     directional_continuity=None,
     orderflow_imbalance: Optional[float] = None,
     orderflow_fill_count: int = 0,
-    capitulation_confidence: float = 0.0
+    capitulation_confidence: float = 0.0,
+    wall_status=None
 ) -> Optional[StrategyProposal]:
     """
     Generate SLBRS proposal (function interface for policy adapter).
@@ -1034,5 +1053,6 @@ def generate_slbrs_proposal(
         directional_continuity=directional_continuity,
         orderflow_imbalance=orderflow_imbalance,
         orderflow_fill_count=orderflow_fill_count,
-        capitulation_confidence=capitulation_confidence
+        capitulation_confidence=capitulation_confidence,
+        wall_status=wall_status
     )

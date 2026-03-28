@@ -22,7 +22,8 @@ class TestBracketExit:
         mgr.register("trade1", symbol="BTC", direction="LONG",
                       entry_price=70000, tp_price=70050, sl_bps=30,
                       max_hold_sec=3600, entry_ts=1000)
-        exits = mgr.check_exits("BTC", 69979, now=1100)
+        # 30bp of 70000 = 210 points, SL at 69790
+        exits = mgr.check_exits("BTC", 69789, now=1100)
         assert len(exits) == 1
         assert exits[0]['reason'] == 'BRACKET_SL'
 

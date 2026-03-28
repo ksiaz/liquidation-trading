@@ -48,6 +48,7 @@ class _LiqEvent:
     timestamp: float
     side: str       # "LONG" or "SHORT" (position side that was liquidated)
     usd_value: float
+    price: float = 0.0  # Liquidation price (for direction confirmation)
 
 
 @dataclass
@@ -76,7 +77,7 @@ class RollingVolumeTracker:
     BURST_WINDOW = 30          # 30s burst detection window
     BASELINE_WINDOW = 3600     # 60m baseline rate window
     RATIO_THRESHOLD = 10.0     # Burst rate must be 10x baseline rate
-    MIN_BURST_EVENTS = 3       # Minimum events in burst window (Binance forceOrder lossy)
+    MIN_BURST_EVENTS = 3       # Minimum events in burst window
     SPIKE_COOLDOWN = 0         # No cooldown — burst quality gates handle signal filtering
     MAX_CLUSTER_COINS = 5      # Max coins in concurrent spike cluster
     MAX_PENDING_AGE = 60       # Pending signal expires after 60s — prevents stale
@@ -84,8 +85,7 @@ class RollingVolumeTracker:
 
     # Warmup: need enough baseline data for rate comparison to be meaningful.
     # Without this, 5 events vs near-zero baseline → infinite ratio → triggers.
-    # Binance forceOrder is lossy (max 1/symbol/sec) — fewer events reach us
-    # than HL's complete liquidation stream. 10 events is ~10-20 min for active coins.
+    # 10 events is ~10-20 min for active coins.
     MIN_BASELINE_EVENTS = 10
 
     # Burst concentration: events must be clustered, not spread evenly over 30s.
@@ -101,6 +101,14 @@ class RollingVolumeTracker:
         self._pending: Dict[str, _PendingSpike] = {}
         # Per-coin: last signal emission time (cooldown)
         self._last_signal_ts: Dict[str, float] = {}
+        # Per-coin: recent market prices for fade direction confirmation
+        self._market_prices: Dict[str, Deque] = {}
+
+    def update_price(self, symbol: str, price: float, timestamp: float):
+        """Update market price for fade direction confirmation."""
+        if symbol not in self._market_prices:
+            self._market_prices[symbol] = deque(maxlen=600)  # ~5min at 200ms
+        self._market_prices[symbol].append((timestamp, price))
 
     def add_event(
         self,
@@ -115,7 +123,7 @@ class RollingVolumeTracker:
         Called from gRPC daemon thread — must be thread-safe.
         """
         usd_value = price * size
-        event = _LiqEvent(timestamp=timestamp, side=side, usd_value=usd_value)
+        event = _LiqEvent(timestamp=timestamp, side=side, usd_value=usd_value, price=price)
 
         if symbol not in self._events:
             self._events[symbol] = deque(maxlen=50000)
@@ -227,22 +235,15 @@ class RollingVolumeTracker:
         if best_in_subwindow < min_concentrated:
             return pending.signal if pending else None
 
-        # ── Cascade exhaustion gate ──
+        # Cascade exhaustion gate REMOVED — replaced by decel phase gate in service.py.
+        # Old gate required second_half <= first_half * 0.5 (events must decline in 30s window).
+        # This permanently blocked sustained cascades (BTC/ETH/SOL) where events flow evenly.
+        # The decel phase gate (REVERSED only, ratio<0.85) checks price velocity instead,
+        # which correctly detects exhaustion without requiring events to stop.
+        # Compute first/second half for logging only.
         half_cutoff = timestamp - self.BURST_WINDOW / 2
-        first_half = 0
-        second_half = 0
-        for e in events:
-            if e.timestamp >= burst_cutoff:
-                if e.timestamp < half_cutoff:
-                    first_half += 1
-                else:
-                    second_half += 1
-
-        if first_half < 3:
-            return pending.signal if pending else None
-
-        if second_half > first_half * 0.5:
-            return pending.signal if pending else None
+        first_half = sum(1 for e in events if burst_cutoff <= e.timestamp < half_cutoff)
+        second_half = sum(1 for e in events if e.timestamp >= half_cutoff)
 
         # Check cluster filter
         concurrent_spikes = sum(
@@ -335,13 +336,33 @@ class RollingVolumeTracker:
         if count == 0:
             return None
 
-        # Determine fade direction from dominant liquidation side
-        # Short liqs (forced buys, price pushed up) → fade SHORT (sell)
-        # Long liqs (forced sells, price pushed down) → fade LONG (buy)
-        if short_vol > long_vol:
-            fade_direction = "SHORT"
-        else:
-            fade_direction = "LONG"
+        # Determine fade direction from MARKET PRICE MOVEMENT in burst window.
+        # Old logic used liq side (short_vol vs long_vol), but liq side only
+        # tells you which positions were liquidated — not which direction
+        # price is moving. Shorts can be liquidated during a price DROP
+        # (bycatch of organic selling), not just squeezes.
+        # Market price direction is ground truth.
+        #
+        # Price falling in burst → fade LONG (buy the dip)
+        # Price rising in burst → fade SHORT (sell the top)
+        fade_direction = None
+        mkt_prices = self._market_prices.get(symbol)
+        if mkt_prices:
+            mkt_snap = list(mkt_prices)
+            # Get market price at burst start and now
+            burst_start_prices = [p for t, p in mkt_snap if t <= burst_cutoff]
+            burst_end_prices = [p for t, p in mkt_snap if t >= spike_ts - 5]
+            if burst_start_prices and burst_end_prices:
+                p_start = burst_start_prices[-1]  # price just before burst
+                p_end = burst_end_prices[-1]      # price at burst end
+                price_move_bps = (p_end - p_start) / p_start * 10000
+                if price_move_bps < -3:  # price falling > 3bp
+                    fade_direction = "LONG"
+                elif price_move_bps > 3:  # price rising > 3bp
+                    fade_direction = "SHORT"
+        # Fallback: use liq side if market price unavailable or flat
+        if fade_direction is None:
+            fade_direction = "SHORT" if short_vol > long_vol else "LONG"
 
         return RollingFadeSignal(
             symbol=symbol,
@@ -426,6 +447,31 @@ class RollingVolumeTracker:
     def is_warmed_up(self, symbol: str) -> bool:
         """Whether enough baseline history exists for meaningful comparisons."""
         return len(self._events.get(symbol, [])) >= self.MIN_BASELINE_EVENTS
+
+    def get_active_signal_count(self, exclude_symbol: str = None,
+                                 timestamp: float = None) -> int:
+        """Count coins with active (unconfirmed) pending signals.
+
+        Used by isolation gate: if multiple coins have signals simultaneously,
+        it's a multi-coin cascade even if none have entered yet.
+        """
+        count = 0
+        for sym, p in self._pending.items():
+            if sym == exclude_symbol:
+                continue
+            if p is not None and not p.confirmed:
+                count += 1
+        return count
+
+    def get_time_since_last_event(self, symbol: str, timestamp: float) -> float:
+        """Seconds since last liq event for this symbol. Returns inf if no events."""
+        events_deque = self._events.get(symbol)
+        if not events_deque:
+            return float('inf')
+        events = list(events_deque)
+        if not events:
+            return float('inf')
+        return timestamp - events[-1].timestamp
 
     def get_event_count_in_window(self, symbol: str, timestamp: float,
                                    window_sec: float = 60.0) -> int:

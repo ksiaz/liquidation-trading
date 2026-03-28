@@ -1408,6 +1408,11 @@ def ensure_schema(conn):
         ON ghost_trades(trade_id)
     """)
 
+    # entry_context JSONB — decel phase, DCA level, rolling_z, etc.
+    cur.execute("""
+        ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS entry_context JSONB
+    """)
+
     # ── Gravity Zone Observer (research data collection) ─────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gravity_zone_events (
@@ -1470,6 +1475,52 @@ def ensure_schema(conn):
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_gravity_zone_events_event_id
         ON gravity_zone_events(event_id)
+    """)
+
+    # ── Cascade Lifecycle Monitor (research data collection) ─────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cascade_lifecycle (
+            id              BIGSERIAL PRIMARY KEY,
+            cascade_id      TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            ts              DOUBLE PRECISION NOT NULL,
+            phase           TEXT NOT NULL,
+            liq_z           DOUBLE PRECISION,
+            peak_z          DOUBLE PRECISION,
+            time_since_peak DOUBLE PRECISION,
+            z_velocity      DOUBLE PRECISION,
+            price           DOUBLE PRECISION,
+            price_at_start  DOUBLE PRECISION,
+            move_from_start DOUBLE PRECISION,
+            vwap_distance   DOUBLE PRECISION,
+            atr_5m          DOUBLE PRECISION,
+            atr_30m         DOUBLE PRECISION,
+            orderflow       DOUBLE PRECISION,
+            burst_volume    DOUBLE PRECISION,
+            liq_rate_5s     SMALLINT,
+            liq_side        TEXT,
+            wall_consec_rev SMALLINT,
+            wall_is_ob      SMALLINT,
+            wall_gravity    DOUBLE PRECISION,
+            bid_depth_ratio DOUBLE PRECISION,
+            n_coins_active  SMALLINT,
+            fade_direction  TEXT,
+            shadow_mfe_1m   DOUBLE PRECISION,
+            shadow_mfe_2m   DOUBLE PRECISION,
+            shadow_mfe_5m   DOUBLE PRECISION,
+            shadow_mae_1m   DOUBLE PRECISION,
+            shadow_mae_2m   DOUBLE PRECISION,
+            shadow_mae_5m   DOUBLE PRECISION,
+            trade_id        TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cascade_lifecycle_cascade_id
+        ON cascade_lifecycle(cascade_id)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cascade_lifecycle_symbol_ts
+        ON cascade_lifecycle(symbol, ts)
     """)
 
     conn.commit()

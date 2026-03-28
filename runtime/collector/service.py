@@ -131,7 +131,7 @@ class GravityTPTarget:
 class DCAConfig:
     """Configuration for DCA (Dollar Cost Averaging) on cascade sniper positions."""
     enabled: bool = True
-    max_levels: int = 8              # 8 adds at 5bp spacing (40bp total range)
+    max_levels: int = 4              # 4 adds at 5bp spacing (20bp total range)
     spacing_bps: float = 5           # Add every 5bp below avg_entry
     # No interval or cascade gate — DCA levels are pre-computed limit orders
     # that fill as soon as price touches them.
@@ -353,6 +353,16 @@ class CollectorService:
         # Per-symbol stop-loss cooldown: block re-entry after stop-out
         self._stop_exit_timestamps: Dict[str, float] = {}
 
+        # MAE (Maximum Adverse Excursion) watermark per position
+        # Tracks worst price seen: highest for SHORT, lowest for LONG
+        # Used by CCK to require price breakout confirmation before killing
+        self._cck_mae: Dict[str, float] = {}  # symbol → worst adverse price
+        self._trade_entry_context: Dict[str, dict] = {}  # symbol → context at signal time
+        from runtime.liquidations.bracket_exit import BracketExitManager
+        self._bracket_exit_manager = BracketExitManager()
+        from runtime.liquidations.cascade_monitor import CascadeLifecycleMonitor
+        self._cascade_monitor = CascadeLifecycleMonitor()
+
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
 
@@ -510,20 +520,11 @@ class CollectorService:
         return len(to_remove)
 
     def _get_live_price(self, symbol: str) -> Optional[float]:
-        """Get the most reliable live price for a symbol.
+        """Get current live price for a symbol.
 
-        Priority:
-        1. WebSocket mid price (live from HL API, not from lagging node)
-        2. _current_prices fallback (from node oracle or fills)
-
-        The WS allMids subscription provides real-time prices even when the
-        HL node is bootstrapping or behind the chain tip.
+        Source: _current_prices, populated directly by Binance markPrice
+        callback (_handle_hl_price) every ~1s per symbol.
         """
-        coin = symbol.replace('USDT', '')
-        if self._hyperliquid_collector and hasattr(self._hyperliquid_collector, '_client'):
-            ws_mid = self._hyperliquid_collector._client.get_mid_price(coin)
-            if ws_mid and ws_mid > 0:
-                return ws_mid
         return self._current_prices.get(symbol)
 
     def _generate_dca_mandates(self, symbols, timestamp, existing_mandates):
@@ -554,6 +555,11 @@ class CollectorService:
                 continue
             # No DCA if EXIT mandate already present for this symbol
             if any(m.symbol == symbol and m.type == MandateType.EXIT for m in existing_mandates):
+                continue
+            # Min hold time: don't DCA until entry has had 30s to prove itself
+            _DCA_MIN_HOLD_SEC = 30
+            _pos_age = timestamp - position.entry_timestamp if position.entry_timestamp else 0
+            if _pos_age < _DCA_MIN_HOLD_SEC:
                 continue
             # Fixed limit order levels from initial entry price.
             # Level 1 = initial - 5bp, level 2 = initial - 10bp, etc.
@@ -849,6 +855,7 @@ class CollectorService:
             await self._binance_provider.start()
             self._logger.info("Binance data provider started")
 
+        if hasattr(self, '_binance_provider'):
             # Inject capitulation tracker into cascade sniper
             try:
                 from external_policy.ep2_strategy_cascade_sniper import set_capitulation_tracker
@@ -1358,26 +1365,29 @@ class CollectorService:
                     # via ghost_trades DB query). Apply the +15bp stop floor instead.
                     if symbol not in self._gravity_tp_targets:
                         if symbol in self._gravity_tp_fired_symbols:
-                            # Gravity TP already took partial — apply stop floor once
+                            # Gravity TP already took partial — apply stop floor at gravity zone
                             self._gravity_tp_fired_symbols.discard(symbol)
-                            _GRAV_TP_STOP_FLOOR_BPS = 15
-                            for _sid, _st in self._trailing_stop_manager.get_all_stops().items():
-                                if _st.symbol == symbol:
-                                    if _st.direction == "LONG":
-                                        _floor = _st.entry_price * (1 + _GRAV_TP_STOP_FLOOR_BPS / 10_000)
-                                        if _st.current_stop_price < _floor:
-                                            _old = _st.current_stop_price
-                                            _st.current_stop_price = _floor
+                            _gp_rec = self.ghost_tracker.get_open_position(symbol)
+                            if _gp_rec:
+                                _rec_target = self._compute_gravity_tp_target(
+                                    symbol, _gp_rec.entry_price, _gp_rec.side)
+                                _rec_floor_px = _rec_target.target_price if _rec_target else (
+                                    _gp_rec.entry_price * 1.0015 if _gp_rec.side == "LONG" else _gp_rec.entry_price * 0.9985)
+                                for _sid, _st in self._trailing_stop_manager.get_all_stops().items():
+                                    if _st.symbol == symbol:
+                                        _old = _st.current_stop_price
+                                        _floor_bps = abs(_rec_floor_px - _st.entry_price) / _st.entry_price * 10_000
+                                        if _st.direction == "LONG" and _old < _rec_floor_px:
+                                            _st.current_stop_price = _rec_floor_px
                                             _st.break_even_triggered = True
-                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_floor:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp, partial already fired)")
-                                    else:
-                                        _floor = _st.entry_price * (1 - _GRAV_TP_STOP_FLOOR_BPS / 10_000)
-                                        if _st.current_stop_price > _floor:
-                                            _old = _st.current_stop_price
-                                            _st.current_stop_price = _floor
+                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_rec_floor_px:,.2f} "
+                                                  f"(+{_floor_bps:.0f}bp, at gravity zone)")
+                                        elif _st.direction == "SHORT" and _old > _rec_floor_px:
+                                            _st.current_stop_price = _rec_floor_px
                                             _st.break_even_triggered = True
-                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_floor:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp, partial already fired)")
-                                    break
+                                            print(f"GRAVITY_TP_FLOOR_RECOVER: {symbol} stop {_old:,.2f} → {_rec_floor_px:,.2f} "
+                                                  f"(+{_floor_bps:.0f}bp, at gravity zone)")
+                                        break
                         else:
                             ghost_pos = self.ghost_tracker.get_open_position(symbol)
                             if ghost_pos:
@@ -1578,10 +1588,55 @@ class CollectorService:
                         )
                         cap_confidence = cap_metrics.confidence
 
+                    # Feed market price for fade direction confirmation
+                    _mkt_px = self._get_live_price(symbol)
+                    if _mkt_px:
+                        self._rolling_volume_tracker.update_price(symbol, _mkt_px, timestamp)
+
                     # Check for rolling fade signal (30m rolling liq spike)
                     rolling_fade_signal = self._rolling_volume_tracker.check_for_signal(
                         symbol, timestamp
                     )
+
+                    # Cascade lifecycle monitor — passive research data collection
+                    try:
+                        _clm_z = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+                        _clm_price = current_price or self._get_live_price(symbol)
+                        _clm_coin = symbol.replace("USDT", "")
+                        _clm_wall = self._gravity_observer.get_wall_status(
+                            _clm_coin, liquidity_map=self._liquidity_map, price=_clm_price)
+                        _clm_side = self._rolling_volume_tracker.get_burst_dominant_side(symbol, timestamp)
+                        _clm_bid_ratio = None
+                        if _clm_price and self._liquidity_map.is_warmed_up(_clm_coin):
+                            _bid_g = self._liquidity_map.get_depth_between(
+                                _clm_coin, _clm_price * 0.995, _clm_price)
+                            _ask_g = self._liquidity_map.get_depth_between(
+                                _clm_coin, _clm_price, _clm_price * 1.005)
+                            if _ask_g > 0:
+                                _clm_bid_ratio = round(_bid_g / _ask_g, 3)
+                        _clm_burst = 0
+                        _lb = self._liquidation_burst_aggregator.get_burst(symbol, timestamp)
+                        if _lb:
+                            _clm_burst = _lb.total_volume
+                        self._cascade_monitor.update(
+                            symbol=symbol, liq_z=_clm_z, price=_clm_price, ts=timestamp,
+                            vwap_distance=regime_metrics.vwap_distance if regime_metrics else None,
+                            atr_5m=regime_metrics.atr_5m if regime_metrics else None,
+                            atr_30m=regime_metrics.atr_30m if regime_metrics else None,
+                            orderflow=regime_metrics.orderflow_imbalance if regime_metrics else None,
+                            burst_volume=_clm_burst, liq_side=_clm_side,
+                            wall_consec_rev=_clm_wall.consecutive_reversals if _clm_wall else None,
+                            wall_is_ob=_clm_wall.is_ob if _clm_wall else None,
+                            wall_gravity=_clm_wall.total_gravity if _clm_wall else None,
+                            bid_depth_ratio=_clm_bid_ratio,
+                            rolling_tracker=self._rolling_volume_tracker)
+                        # Backfill shadow PnL and flush completed cascades
+                        _ph = self._price_history.get(symbol)
+                        if _ph:
+                            self._cascade_monitor.backfill_shadow_pnl(symbol, list(_ph))
+                        self._cascade_monitor.flush_to_db()
+                    except Exception as _clm_err:
+                        pass  # Don't let monitor crash the regime loop
 
                     # Feed freshness gate: block ROLLING_FADE when regime can't be computed.
                     # Regime requires VWAP + ATR + orderflow + liq_z all non-None.
@@ -1644,6 +1699,151 @@ class CollectorService:
                                           f"< required {_required_ratio:.0f}x")
                                     self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                     rolling_fade_signal = None
+
+                    # Deceleration shadow logger: measure price velocity in consecutive
+                    # windows before entry to determine if cascade is slowing down.
+                    # Pure data collection — does not block entries.
+                    _DECEL_WINDOW = 10  # seconds per velocity window
+                    _DECEL_WINDOWS = 4  # number of windows to compare
+                    if rolling_fade_signal:
+                        try:
+                            _d_deq = self._price_history.get(symbol)
+                            _d_snap = list(_d_deq) if _d_deq else []
+                            _d_vels = []
+                            for _w_i in range(_DECEL_WINDOWS):
+                                _w_end = timestamp - _w_i * _DECEL_WINDOW
+                                _w_start = _w_end - _DECEL_WINDOW
+                                _w_pts = [(t, p) for t, p in _d_snap if _w_start <= t <= _w_end]
+                                if len(_w_pts) >= 5:
+                                    _w_vel = (_w_pts[-1][1] - _w_pts[0][1]) / _w_pts[0][1] * 10000
+                                    _d_vels.append(_w_vel)
+                                else:
+                                    _d_vels.append(None)
+                            _d_recent = _d_vels[0]  # t-10→t-0
+                            _d_prior = _d_vels[1] if len(_d_vels) > 1 else None  # t-20→t-10
+                            _d_prior2 = _d_vels[2] if len(_d_vels) > 2 else None  # t-30→t-20
+                            if _d_recent is not None and _d_prior is not None:
+                                # Cascade-direction velocity:
+                                # LONG fade (buying dip): cascade = price falling = positive cd
+                                # SHORT fade (shorting top): cascade = price rising = positive cd
+                                if rolling_fade_signal.fade_direction == "LONG":
+                                    _cd_recent, _cd_prior = -_d_recent, -_d_prior
+                                else:
+                                    _cd_recent, _cd_prior = _d_recent, _d_prior
+
+                                # Classify the velocity pattern
+                                _d_ratio = abs(_d_recent) / abs(_d_prior) if abs(_d_prior) > 0.5 else 0
+                                _both_cascade = _cd_recent > 0.5 and _cd_prior > 0.5
+                                _resuming = _cd_recent > 0.5 and _cd_prior < -0.5
+                                _reversing = _cd_recent < -1  # price moving AGAINST cascade
+                                _exhausting = _both_cascade and _d_ratio < 0.7
+
+                                if _reversing:
+                                    _phase = "REVERSED"
+                                elif _exhausting:
+                                    _phase = "EXHAUSTING"
+                                elif _resuming:
+                                    _phase = "RESUMING"
+                                elif _both_cascade and _d_ratio >= 0.7:
+                                    _phase = "CASCADING"
+                                elif abs(_cd_recent) < 0.5:
+                                    _phase = "STALLED"
+                                else:
+                                    _phase = "MIXED"
+
+                                _v2_str = f"{_d_prior2:+.1f}" if _d_prior2 is not None else "?"
+                                print(f"[DECEL] {symbol} {rolling_fade_signal.fade_direction}: "
+                                      f"v0={_d_recent:+.1f}bp v1={_d_prior:+.1f}bp "
+                                      f"v2={_v2_str}bp "
+                                      f"cd0={_cd_recent:+.1f} cd1={_cd_prior:+.1f} "
+                                      f"ratio={_d_ratio:.2f} → {_phase}")
+                                # Decel gate: only enter on confirmed reversal
+                                # Research (115 trades): REVERSED/STALLED + ratio<1.0 = 70% WR, +$3.86
+                                # Bad phase or ratio>=1.0 = 38% WR, -$3.17 ($7 swing)
+                                # Phase gate: only REVERSED and STALLED allowed
+                                if _phase not in ("REVERSED", "STALLED"):
+                                    print(f"[DECEL BLOCK] {symbol}: {_phase} phase — "
+                                          f"only REVERSED/STALLED allowed, blocking entry")
+                                    self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                    rolling_fade_signal = None
+                                # Ratio gate: cascade must be decelerating (ratio < 1.0)
+                                # ratio >= 1.0 = cascade still accelerating = 46% WR, -$2.28
+                                # Sweet spot 0.5-1.0 = 86% WR, +$2.59
+                                elif _d_ratio >= 1.0:
+                                    print(f"[DECEL BLOCK] {symbol}: ratio={_d_ratio:.2f} ≥ 1.0 — "
+                                          f"cascade still accelerating, blocking entry")
+                                    self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                    rolling_fade_signal = None
+                                # Neutral orderflow block: cascade already dried up, no confirming flow
+                                # Research: NEUTRAL OF (0.45-0.55) entries had 40% WR, -$0.18 avg
+                                # CONFIRMING flow entries had 86% WR, +$0.10 avg
+                                if rolling_fade_signal and orderflow_imbalance is not None:
+                                    _of_neutral = 0.45 <= orderflow_imbalance <= 0.55
+                                    if _of_neutral:
+                                        print(f"[OF BLOCK] {symbol}: neutral orderflow "
+                                              f"({orderflow_imbalance:.3f}) — cascade exhausted, "
+                                              f"no confirming flow")
+                                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                        rolling_fade_signal = None
+                                # Z-score cap: massive cascades (z>=35) are directional moves
+                                # that don't reverse. 23% WR at z>=35 vs 85% at z<15.
+                                _Z_CAP = 35
+                                if rolling_fade_signal:
+                                    _rz_check = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+                                    if _rz_check is not None and _rz_check >= _Z_CAP:
+                                        print(f"[Z BLOCK] {symbol}: z={_rz_check:.1f} ≥ {_Z_CAP} — "
+                                              f"massive cascade, too strong to fade")
+                                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                        rolling_fade_signal = None
+                                # Isolation gate: single-coin liqs are trend pauses, not capitulation.
+                                # Require ≥1 other coin to have entered within 120s.
+                                # Isolated: 35% WR. With nearby: 70-82% WR.
+                                _NEARBY_WINDOW = 120  # seconds
+                                if rolling_fade_signal:
+                                    # Multi-coin check: is this part of a broader cascade?
+                                    # Count: (1) other coins with open positions entered recently
+                                    #        (2) other coins with active pending signals RIGHT NOW
+                                    _recent_entries = self.ghost_tracker.get_recent_entry_count(
+                                        exclude_symbol=symbol, window_sec=_NEARBY_WINDOW, now=timestamp)
+                                    _pending_signals = self._rolling_volume_tracker.get_active_signal_count(
+                                        exclude_symbol=symbol, timestamp=timestamp)
+                                    _nearby_total = _recent_entries + _pending_signals
+                                    if _nearby_total == 0:
+                                        print(f"[ISOLATION BLOCK] {symbol}: no other coins entered "
+                                              f"or signaling — single-coin event, blocking")
+                                        self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                        rolling_fade_signal = None
+                                # Persist context for PG (survives log rotation)
+                                if rolling_fade_signal:
+                                    _rz = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+                                    _hl_sym = symbol.replace("USDT", "")
+                                    _wall = self._gravity_observer.get_wall_status(
+                                        _hl_sym, liquidity_map=self._liquidity_map,
+                                        price=self._get_live_price(symbol))
+                                    self._trade_entry_context[symbol] = {
+                                        "decel_phase": _phase,
+                                        "decel_ratio": round(_d_ratio, 3),
+                                        "v_recent_bp": round(_d_recent, 2),
+                                        "v_prior_bp": round(_d_prior, 2),
+                                        "cd_recent": round(_cd_recent, 2),
+                                        "cd_prior": round(_cd_prior, 2),
+                                        "rolling_z": round(_rz, 2) if _rz else None,
+                                        "fade_dir": rolling_fade_signal.fade_direction,
+                                        "of_at_entry": round(orderflow_imbalance, 3) if orderflow_imbalance is not None else None,
+                                        "nearby_entries": _recent_entries if '_recent_entries' in dir() else None,
+                                        "wall_consec_rev": _wall.consecutive_reversals if _wall else None,
+                                        "wall_is_ob": _wall.is_ob if _wall else None,
+                                        "wall_prior_rev": _wall.prior_reversals if _wall else None,
+                                        "wall_gold": _wall.gold_signal if _wall else None,
+                                        "wall_gravity": round(_wall.total_gravity, 0) if _wall else None,
+                                    }
+                            else:
+                                print(f"[DECEL] {symbol} SKIP: pts={len(_d_snap)} "
+                                      f"vels={[f'{v:.1f}' if v is not None else 'None' for v in _d_vels]} "
+                                      f"recent={'ok' if _d_recent is not None else 'None'} "
+                                      f"prior={'ok' if _d_prior is not None else 'None'}")
+                        except Exception as _d_err:
+                            print(f"[DECEL] {symbol} ERROR: {_d_err}")
 
                     # Volume gate removed (2026-03-15): service.py gate at $50k/$15k/$8k
                     # blocked 100% of March 1-3 profitable signals. EP2 already has
@@ -1716,19 +1916,10 @@ class CollectorService:
                     # Phase 3 (bounce check) catches the case where liqs age out
                     # of the 60s window simultaneously but price is still at the
                     # cascade low with no reversal.
-                    _FUEL_GATE_MAX_LIQS_60S = 3
-                    if rolling_fade_signal:
-                        _recent_liqs = self._rolling_volume_tracker.get_event_count_in_window(
-                            symbol, timestamp, window_sec=60.0)
-                        if _recent_liqs > _FUEL_GATE_MAX_LIQS_60S:
-                            # Phase 1: liqs still flowing — defer
-                            _fuel_key = f"_fuel_log_{symbol}"
-                            _fuel_last = getattr(self, _fuel_key, 0)
-                            if timestamp - _fuel_last >= 30:
-                                setattr(self, _fuel_key, timestamp)
-                                print(f"[FUEL GATE] {symbol}: deferring — {_recent_liqs} liqs "
-                                      f"in 60s (>{_FUEL_GATE_MAX_LIQS_60S}), cascade still active")
-                            rolling_fade_signal = None
+                    # Fuel gate phase 1 REMOVED — replaced by decel gate above.
+                    # Old: blocked when >3 liqs in 60s → deadlocked with 60s signal expiry.
+                    # New: decel phase + ratio gate confirms cascade is decelerating before entry.
+                    # Phases 2 (momentum) and 3 (bounce) still active below.
 
                     # Fuel gate phase 2: current price momentum check.
                     # After liqs stop, cascade's price effect persists. Check if price
@@ -1780,7 +1971,7 @@ class CollectorService:
                     # a bounce, we're still sitting at the cascade low/high with no
                     # reversal evidence. Zero delay on real reversals — gate opens
                     # the instant price bounces from the extreme.
-                    _FUEL_BOUNCE_BPS = 5  # Require 5bp bounce from cascade extreme
+                    _FUEL_BOUNCE_BPS = 15  # Require 15bp bounce from cascade extreme
                     if rolling_fade_signal:
                         _price_deq = self._price_history.get(symbol)
                         _prices_snap = list(_price_deq) if _price_deq else []
@@ -1807,6 +1998,91 @@ class CollectorService:
                                           f"extreme ${_cascade_extreme:,.2f} "
                                           f"(need {_FUEL_BOUNCE_BPS}bp)")
                                 rolling_fade_signal = None
+
+                    # Gravity ratio gate: score L2 zone balance around entry price.
+                    # Favorable gravity = zones on the TARGET side (where price should move).
+                    # Adverse gravity = zones on the OPPOSING side (wall blocking the trade).
+                    # ratio = favorable / (favorable + adverse). Block if ratio < threshold.
+                    _GRAVITY_GATE_MIN_GRAVITY = 5000   # Ignore noise zones
+                    _GRAVITY_GATE_WINDOW_BPS = 100     # 100bp window each side
+                    _GRAVITY_GATE_THRESHOLD = 0.3      # Block below this (shadow mode: log only)
+                    _GRAVITY_GATE_SHADOW = True         # True = log only, False = hard block
+                    if rolling_fade_signal:
+                        _gg_coin = symbol.replace('USDT', '').replace('USD', '')
+                        _gg_price = current_price or self._get_live_price(symbol)
+                        if _gg_price and self._liquidity_map.is_warmed_up(_gg_coin):
+                            _gg_upper = _gg_price * (1 + _GRAVITY_GATE_WINDOW_BPS / 10000)
+                            _gg_lower = _gg_price * (1 - _GRAVITY_GATE_WINDOW_BPS / 10000)
+                            _zones_above = self._liquidity_map.get_zones_above(
+                                _gg_coin, _gg_price, min_gravity=_GRAVITY_GATE_MIN_GRAVITY)
+                            _zones_below = self._liquidity_map.get_zones_below(
+                                _gg_coin, _gg_price, min_gravity=_GRAVITY_GATE_MIN_GRAVITY)
+                            _grav_above = sum(z.gravity for z in _zones_above if z.center_price <= _gg_upper)
+                            _grav_below = sum(z.gravity for z in _zones_below if z.center_price >= _gg_lower)
+                            _grav_total = _grav_above + _grav_below
+                            if rolling_fade_signal.fade_direction == "SHORT":
+                                _grav_fav, _grav_adv = _grav_above, _grav_below
+                            else:
+                                _grav_fav, _grav_adv = _grav_below, _grav_above
+                            _grav_ratio = _grav_fav / _grav_total if _grav_total > 0 else 0.5
+                            _gg_action = "PASS" if _grav_ratio >= _GRAVITY_GATE_THRESHOLD else "WOULD_BLOCK"
+                            if not _GRAVITY_GATE_SHADOW and _grav_ratio < _GRAVITY_GATE_THRESHOLD:
+                                _gg_action = "BLOCKED"
+                                rolling_fade_signal = None
+                            print(f"[GRAVITY-GATE] {symbol} {rolling_fade_signal.fade_direction if rolling_fade_signal else 'killed'}: "
+                                  f"ratio={_grav_ratio:.2f} fav={_grav_fav:,.0f} adv={_grav_adv:,.0f} → {_gg_action}")
+
+                    # Cascade intensity gate: price action persistence (trend ratio).
+                    # During real liquidation cascades, consecutive price ticks cluster in
+                    # one direction — forced IOC orders create directional drift that doesn't
+                    # mean-revert. Measure this by comparing multi-snapshot displacement to
+                    # sum of individual displacements. Random walk ≈ 0.38, cascade ≈ 0.66.
+                    # This is independent of the forceOrder stream (pure price math).
+                    #
+                    # Data analysis (2026-03-18, 39k snapshots BTC/ETH/SOL/XRP):
+                    #   calm (liq_z<0.5):  trend_ratio=0.377, consec=38.7%, up_ticks=43.0%
+                    #   moderate (1.5-2.5): trend_ratio=0.662, consec=55.4%, up_ticks=41.9%
+                    #   strong (2.5-4):     trend_ratio=0.676, consec=51.8%, up_ticks=42.0%
+                    #   extreme (6+):       trend_ratio=0.509, consec=48.3%, up_ticks=36.9%
+                    #
+                    # Interpretation for entry quality:
+                    #   HIGH trend_ratio at entry = cascade still in progress = BAD entry
+                    #   LOW trend_ratio at entry = price stabilizing = better entry
+                    _CASCADE_INTENSITY_WINDOW = 50   # 50 snapshots (~10s at 5Hz)
+                    _CASCADE_INTENSITY_MIN_MOVE_BPS = 3  # Skip if price barely moved
+                    _CASCADE_INTENSITY_SHADOW = True  # Log only, don't block
+                    if rolling_fade_signal:
+                        _ci_deq = self._price_history.get(symbol)
+                        _ci_snap = list(_ci_deq) if _ci_deq else []
+                        if len(_ci_snap) >= _CASCADE_INTENSITY_WINDOW:
+                            _ci_recent = _ci_snap[-_CASCADE_INTENSITY_WINDOW:]
+                            _ci_prices = [p for _, p in _ci_recent]
+                            _ci_base = _ci_prices[0] if _ci_prices[0] > 0 else 1
+                            # Sum of individual absolute moves (in bps)
+                            _ci_sum_abs = sum(abs(_ci_prices[i] - _ci_prices[i-1])
+                                              for i in range(1, len(_ci_prices)))
+                            _ci_sum_bps = _ci_sum_abs / _ci_base * 10000
+                            # Net displacement (endpoint to endpoint, in bps)
+                            _ci_net = abs(_ci_prices[-1] - _ci_prices[0])
+                            _ci_net_bps = _ci_net / _ci_base * 10000
+                            if _ci_sum_bps >= _CASCADE_INTENSITY_MIN_MOVE_BPS:
+                                # Trend ratio: 0 = pure noise, 1 = perfect trend
+                                _ci_trend_ratio = _ci_net / _ci_sum_abs
+                                # Consecutive same-direction ticks
+                                _ci_dirs = [1 if _ci_prices[i] > _ci_prices[i-1] else
+                                            -1 if _ci_prices[i] < _ci_prices[i-1] else 0
+                                            for i in range(1, len(_ci_prices))]
+                                _ci_consec = sum(1 for i in range(1, len(_ci_dirs))
+                                                 if _ci_dirs[i] == _ci_dirs[i-1] and _ci_dirs[i] != 0)
+                                _ci_consec_pct = _ci_consec / max(len(_ci_dirs) - 1, 1)
+                                # Signed direction: positive = price going up
+                                _ci_signed_bps = (_ci_prices[-1] - _ci_prices[0]) / _ci_base * 10000
+                                print(f"[CASCADE-INTENSITY] {symbol} "
+                                      f"{rolling_fade_signal.fade_direction}: "
+                                      f"trend_ratio={_ci_trend_ratio:.3f} "
+                                      f"consec={_ci_consec_pct:.2f} "
+                                      f"drift={_ci_signed_bps:+.1f}bp "
+                                      f"churn={_ci_sum_bps:.1f}bp")
 
                     # Position guard: don't generate ENTRY when position already open.
                     # DCA handles adds for open positions — ENTRY would win arbitration
@@ -2091,8 +2367,11 @@ class CollectorService:
 
             # Process new execution results: register entries with ghost tracker,
             # handle exits and reduces. Single unified path.
+            # Only count GHOST stops as existing — SCOUT stops are temporary (~0.3s)
+            # and must not block cascade ghost entry registration.
             existing_stop_symbols = set(
-                s.symbol for s in self._trailing_stop_manager._stops.values()
+                s.symbol for sid, s in self._trailing_stop_manager._stops.items()
+                if not sid.startswith("SCOUT_")
             )
             for result in self.executor.get_execution_log()[self._last_execution_index:]:
                 if not result.success:
@@ -2103,6 +2382,10 @@ class CollectorService:
                         and result.state_after.name == "OPEN"
                         and result.symbol not in existing_stop_symbols):
                     pos = self.executor.state_machine.get_position(result.symbol)
+                    if not (pos and pos.direction and pos.entry_price):
+                        print(f"ENTRY_SKIP: {result.symbol} - SM position missing direction/price, reverting to FLAT")
+                        self.executor.state_machine.force_flat(result.symbol)
+                        continue
                     if pos and pos.direction and pos.entry_price:
                         side = pos.direction.value
                         entry_px = float(pos.entry_price)
@@ -2115,6 +2398,17 @@ class CollectorService:
                         if is_rolling_fade:
                             qty = qty * 0.5
 
+                        # Build entry context from decel shadow data
+                        _ctx = self._trade_entry_context.pop(result.symbol, None)
+                        if _ctx:
+                            _ctx["dca_level"] = 0
+                            _cascade_id = self._cascade_monitor.get_active_cascade_id(result.symbol)
+                            if _cascade_id:
+                                _ctx["cascade_id"] = _cascade_id
+                            _ctx_json = json.dumps(_ctx)
+                        else:
+                            _ctx_json = None
+
                         success, error, trade = self.ghost_tracker.open_position(
                             symbol=result.symbol,
                             side=side,
@@ -2122,7 +2416,8 @@ class CollectorService:
                             entry_price=entry_px,
                             timestamp=result.timestamp,
                             cycle_id=getattr(result, 'cycle_id', None),
-                            policy_name=result.strategy_id
+                            policy_name=result.strategy_id,
+                            entry_context=_ctx_json
                         )
                         if success and trade:
                             # Use custom trailing config for fade entries
@@ -2157,6 +2452,8 @@ class CollectorService:
                             )
                             existing_stop_symbols.add(result.symbol)
                             print(f"ENTRY: {result.symbol} {side} qty={qty:.4f} @ ${entry_px:,.2f} id={trade.trade_id}")
+                            # Initialize MAE watermark for CCK price confirmation
+                            self._cck_mae[result.symbol] = entry_px
                             # Initialize DCA state for cascade sniper entries
                             if is_cascade:
                                 self._dca_states[result.symbol] = DCAState(
@@ -2200,6 +2497,9 @@ class CollectorService:
                                 )
                         else:
                             print(f"ENTRY_REJECTED: {result.symbol} - {error}")
+                            # Revert state machine — executor moved to OPEN but no ghost position exists
+                            self.executor.state_machine.force_flat(result.symbol)
+                            print(f"SM_REVERT: {result.symbol} → FLAT (ghost entry rejected)")
 
                 # --- DCA_ADD: add to existing cascade sniper position ---
                 elif result.action.name == "DCA_ADD":
@@ -2212,15 +2512,32 @@ class CollectorService:
                             add_fraction = self._dca_config.add_fractions[idx]
                             add_qty = dca.initial_quantity * add_fraction
 
+                            # Build DCA context
+                            _dca_ctx = self._trade_entry_context.get(result.symbol)
+                            _dca_ctx_json = None
+                            if _dca_ctx:
+                                _dca_ctx["dca_level"] = dca.level + 1
+                                _dca_ctx_json = json.dumps(_dca_ctx)
+                            else:
+                                _rz = self._rolling_volume_tracker.get_current_z(result.symbol, time.time())
+                                _dca_ctx_json = json.dumps({
+                                    "dca_level": dca.level + 1,
+                                    "rolling_z": round(_rz, 2) if _rz else None,
+                                })
+
                             ok, err, trade, new_avg = self.ghost_tracker.add_to_position(
                                 symbol=result.symbol, add_quantity=add_qty,
                                 add_price=add_price, timestamp=time.time(),
-                                dca_level=dca.level + 1)
+                                dca_level=dca.level + 1,
+                                entry_context=_dca_ctx_json)
 
                             if ok and new_avg:
                                 # Update trailing stop with new avg entry
+                                # Use ROLLING_FADE config SL (not hardcoded 2.5%)
                                 side = position.side
-                                new_initial_stop = new_avg * (0.975 if side == "LONG" else 1.025)
+                                from external_policy.ep2_strategy_cascade_sniper import ROLLING_FADE_TRAIL_CONFIG
+                                _dca_sl_pct = ROLLING_FADE_TRAIL_CONFIG['sl_pct']
+                                new_initial_stop = new_avg * (1 - _dca_sl_pct) if side == "LONG" else new_avg * (1 + _dca_sl_pct)
                                 self._trailing_stop_manager.update_entry_price(
                                     result.symbol, new_avg, add_price, new_initial_stop)
                                 # Update DCA state
@@ -2450,23 +2767,21 @@ class CollectorService:
         price: float,     # Oracle price
         timestamp: float  # Unix timestamp in seconds
     ):
-        """Handle HL oracle price — keep ATR fresh.
+        """Handle Binance markPrice — update current prices + ATR.
 
-        Oracle prices arrive every ~1s per symbol. Feeds ATR with continuous
-        price data so it reflects true volatility even when HL fills are sparse.
-        ATR aggregates prices into 5m/30m candles internally, so frequent
-        updates just give more accurate high/low/close.
+        Binance markPrice arrives every ~1s per symbol via asyncio event loop.
+        Safe to write _current_prices directly (no threading race — all callbacks
+        run in asyncio, unlike old gRPC daemon threads).
 
-        Do NOT write to _mark_prices or _current_prices here. This callback
-        runs on a gRPC daemon thread — writing races with the asyncio event
-        loop (regime loop + mandate processing + risk monitor). When the node
-        is bootstrapping old blocks, the oracle price can be stale/wrong.
-        Stale _mark_prices causes false PnL calculations in the risk monitor,
-        triggering spurious MANDATE_EXIT (e.g. HYPE exited at $0.19 oracle
-        instead of $30 actual → 99% fake profit → take-profit EXIT).
-        The regime loop updates both dicts every ~200ms via _get_live_price().
+        This is the PRIMARY price source for the regime loop, trailing stop
+        evaluation, and all PnL calculations.
         """
         symbol = hl_symbol + 'USDT'
+
+        # Update current prices directly — Binance markPrice is authoritative
+        # and runs on the same asyncio loop as the regime loop (no race).
+        self._current_prices[symbol] = price
+        self._mark_prices[symbol] = Decimal(str(price))
 
         # Buffer ATR update for regime loop to drain (thread safety).
         # ATR candle state (dict mutation + float updates) must be single-threaded.
@@ -2845,6 +3160,7 @@ class CollectorService:
                         exit_price=exit_price,
                         timestamp=time.time()
                     )
+                    self._force_position_flat(symbol)
 
             # Case 2: Controller has OPEN position but ghost tracker empty → register
             for symbol, row in controller_open.items():
@@ -2916,6 +3232,8 @@ class CollectorService:
                         initial_quantity=pos.quantity / (1 + _db_dca_level * 0.0625) if _db_dca_level > 0 else pos.quantity,
                         initial_entry_price=_db_initial_px,
                         strategy_id=pos.entry_policy)
+                    # Initialize MAE watermark for recovered positions
+                    self._cck_mae[symbol] = pos.entry_price
                     print(f"RECONCILE: Restored DCA state for {symbol} "
                           f"(level={_db_dca_level}, qty={pos.quantity:.6f}, entry=${pos.entry_price:,.2f})")
 
@@ -2943,7 +3261,15 @@ class CollectorService:
                     except Exception as _e:
                         print(f"RECONCILE: {symbol} gravity TP check failed: {_e}")
 
-            # Case 3: Stale trailing stops for positions that no longer exist
+            # Case 3: positions table STILL says OPEN but no ghost position after reconciliation
+            # Catches stale entries from exits that didn't call _force_position_flat
+            ghost_open_after = self.ghost_tracker.get_open_positions()
+            for symbol in list(controller_open.keys()):
+                if symbol not in ghost_open_after:
+                    print(f"RECONCILE: positions table OPEN for {symbol} but no ghost position — forcing FLAT")
+                    self._force_position_flat(symbol)
+
+            # Case 4: Stale trailing stops for positions that no longer exist
             all_open_symbols = set(controller_open.keys()) | set(ghost_open.keys())
             stale_stops = []
             for entry_id, state in self._trailing_stop_manager.get_all_stops().items():
@@ -3565,29 +3891,33 @@ class CollectorService:
                     if _st and _st.symbol == symbol:
                         self._trailing_stop_manager.unregister_stop(_sid)
                         break
+                self._force_position_flat(symbol)
+                self._dca_states.pop(symbol, None)
                 self._gravity_tp_targets.pop(symbol, None)
+                self._cck_mae.pop(symbol, None)
                 self._stop_exit_timestamps[symbol] = time.time()
                 return
 
-            # Move trailing stop to entry + 15bp profit floor (partial close only).
-            # BE (0bp) wastes the trailing half — 13/35 trades give back all profit.
-            # +15bp floor: pure improvement, no runners affected (all exit >40bp).
-            _GRAV_TP_STOP_FLOOR_BPS = 15
+            # Move trailing stop floor to gravity TP price (not entry+15bp).
+            # Research (18 strategies, 91 trades): floor@gravity = +46% PnL.
+            # 76% of trades give back profit below gravity TP. This catches them.
+            # Runners unaffected (trail is already above gravity TP for runners).
             for stop_id, state in self._trailing_stop_manager.get_all_stops().items():
                 if state.symbol == symbol:
-                    if target.side == "LONG":
-                        floor_price = state.entry_price * (1 + _GRAV_TP_STOP_FLOOR_BPS / 10_000)
-                    else:
-                        floor_price = state.entry_price * (1 - _GRAV_TP_STOP_FLOOR_BPS / 10_000)
+                    # Floor = gravity TP target price (where partial just fired)
+                    floor_price = target.target_price
                     old_stop = state.current_stop_price
+                    _floor_bps = abs(floor_price - state.entry_price) / state.entry_price * 10_000
                     if target.side == "LONG" and old_stop < floor_price:
                         state.current_stop_price = floor_price
                         state.break_even_triggered = True
-                        print(f"GRAVITY_TP_FLOOR: {symbol} stop moved {old_stop:,.2f} → {floor_price:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp)")
+                        print(f"GRAVITY_TP_FLOOR: {symbol} stop {old_stop:,.2f} → {floor_price:,.2f} "
+                              f"(+{_floor_bps:.0f}bp, at gravity TP price)")
                     elif target.side == "SHORT" and old_stop > floor_price:
                         state.current_stop_price = floor_price
                         state.break_even_triggered = True
-                        print(f"GRAVITY_TP_FLOOR: {symbol} stop moved {old_stop:,.2f} → {floor_price:,.2f} (+{_GRAV_TP_STOP_FLOOR_BPS}bp)")
+                        print(f"GRAVITY_TP_FLOOR: {symbol} stop {old_stop:,.2f} → {floor_price:,.2f} "
+                              f"(+{_floor_bps:.0f}bp, at gravity TP price)")
                     break
 
     def _update_trailing_stops(self, symbol: str, price: float,
@@ -3635,6 +3965,36 @@ class CollectorService:
                 rolling_z=_rolling_z
             )
 
+            # Check bracket exits (OB-target trades)
+            _bracket_exits = self._bracket_exit_manager.check_exits(symbol, price)
+            for _bx in _bracket_exits:
+                if self.ghost_tracker.has_open_position(symbol):
+                    ok, err, trade = self.ghost_tracker.close_position(
+                        symbol=symbol,
+                        exit_reason=_bx['reason'],
+                        exit_price=price,
+                        timestamp=time.time())
+                    if ok and trade:
+                        pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+                        hold_str = f"{_bx['hold_sec']:.0f}s"
+                        print(f"BRACKET_EXIT: {symbol} {_bx['reason']} @ ${price:,.2f} "
+                              f"PNL={pnl_str} hold={hold_str} "
+                              f"tp=${_bx['tp_price']:,.2f} sl=${_bx['sl_price']:,.2f}")
+                        self._force_position_flat(symbol)
+                        for eid in list(self._trailing_stop_manager.get_all_stops().keys()):
+                            if self._trailing_stop_manager.get_all_stops().get(eid, None) and \
+                               self._trailing_stop_manager.get_all_stops()[eid].symbol == symbol:
+                                self._trailing_stop_manager.unregister_stop(eid)
+
+            # Update MAE (Maximum Adverse Excursion) watermark for CCK price confirmation
+            if symbol in self._cck_mae:
+                _gp_mae = self.ghost_tracker.get_open_position(symbol)
+                if _gp_mae:
+                    if _gp_mae.side == "SHORT":
+                        self._cck_mae[symbol] = max(self._cck_mae[symbol], price)
+                    else:
+                        self._cck_mae[symbol] = min(self._cck_mae[symbol], price)
+
             # ── Cascade continuation kill ──
             # Adverse liquidations still firing → exit.
             # LONG + LONG liqs (forced sells, price down) = adverse.
@@ -3672,13 +4032,58 @@ class CollectorService:
                         self._trailing_stop_manager.unregister_stop(entry_id)
                         continue
                     _hold = time.time() - state.entry_timestamp if state.entry_timestamp > 0 else 0
+                    # Price breakout confirmation: only kill if price is at new adverse extreme
+                    # Prevents CCK on z-spikes that don't actually push price further against us
+                    _mae = self._cck_mae.get(symbol)
+                    _at_new_extreme = True  # default: allow kill if no MAE tracked
+                    if _mae is not None:
+                        if state.direction == "SHORT":
+                            _at_new_extreme = price >= _mae
+                        else:
+                            _at_new_extreme = price <= _mae
+                    # Price-damage check: is price actually deteriorating?
+                    # Look at price movement over last 30s — if liqs are flowing
+                    # but price is absorbing them, don't kill.
+                    _CCK_DAMAGE_WINDOW = 30  # seconds
+                    _CCK_DAMAGE_MIN_BPS = 5  # must have moved 5bp adverse in window
+                    _price_damaging = True  # default: kill if no price history
+                    _damage_bps = 0.0
+                    _pd_deq = self._price_history.get(symbol)
+                    if _pd_deq:
+                        _pd_snap = list(_pd_deq)
+                        _pd_cutoff = time.time() - _CCK_DAMAGE_WINDOW
+                        _pd_pts = [(t, p) for t, p in _pd_snap if t >= _pd_cutoff]
+                        if len(_pd_pts) >= 3:
+                            _pd_start = _pd_pts[0][1]
+                            _pd_end = _pd_pts[-1][1]
+                            _damage_bps = (_pd_start - _pd_end) / _pd_start * 10000
+                            if state.direction == "SHORT":
+                                _damage_bps = -_damage_bps  # SHORT: adverse = price rising
+                            _price_damaging = _damage_bps >= _CCK_DAMAGE_MIN_BPS
+
+                    if (_hold >= _CASCADE_KILL_GRACE and
+                            _liq_side is not None and
+                            _liq_side == state.direction and
+                            (not _at_new_extreme or not _price_damaging)):
+                        _block_reason = []
+                        if not _at_new_extreme:
+                            _block_reason.append("not_at_extreme")
+                        if not _price_damaging:
+                            _block_reason.append(f"price_absorbing({_damage_bps:+.1f}bp/{_CCK_DAMAGE_MIN_BPS}bp)")
+                        print(f"[CCK-BLOCKED] {symbol}: rolling_z={_rolling_z:.1f} "
+                              f"liq_side={_liq_side} pos={state.direction} "
+                              f"px={price:.5f} mae={'%.5f' % _mae if _mae else '?'} "
+                              f"→ {', '.join(_block_reason)}")
+                        continue
                     if (_hold >= _CASCADE_KILL_GRACE and
                             _liq_side is not None and
                             _liq_side == state.direction):
                         print(f"[CASCADE-KILL] {symbol}: rolling_z={_rolling_z:.1f} "
                               f"hold={_hold:.0f}s liq_side={_liq_side} "
                               f"pos={state.direction} dca={_dca.level if _dca else 'none'}"
-                              f"/{self._dca_config.max_levels} → INSTANT EXIT")
+                              f"/{self._dca_config.max_levels} "
+                              f"mae={'%.5f' % _mae if _mae else '?'} px={price:.5f} "
+                              f"damage={_damage_bps:+.1f}bp → INSTANT EXIT")
                         success, error, trade = self.ghost_tracker.close_position(
                             symbol=symbol,
                             exit_reason="CASCADE_CONTINUATION_KILL",
@@ -3693,6 +4098,7 @@ class CollectorService:
                             self._force_position_flat(symbol)
                             self._dca_states.pop(symbol, None)
                             self._gravity_tp_targets.pop(symbol, None)
+                            self._cck_mae.pop(symbol, None)
                             # CCK cooldown: block re-entry for 5 min (same as stop-loss).
                             # Without this, system re-enters the same failing cascade
                             # immediately after being killed (3 ETH SHORTs in 30min pattern).
@@ -3727,6 +4133,57 @@ class CollectorService:
                     # Stale stop — unregister and move on
                     self._trailing_stop_manager.unregister_stop(entry_id)
                     continue
+
+                # Max hold time: cascade fades are scalps, not swing trades.
+                # After 30min, tighten SL to breakeven. After 60min, force exit.
+                _MAX_HOLD_TIGHTEN = 1800   # 30min: tighten stop to BE
+                _MAX_HOLD_FORCE = 3600     # 60min: force close
+                _hold_time = time.time() - state.entry_timestamp if state.entry_timestamp > 0 else 0
+
+                if _hold_time >= _MAX_HOLD_FORCE:
+                    # Force exit — this position is a zombie
+                    if state.direction == "LONG":
+                        pnl_pct = (price - state.entry_price) / state.entry_price
+                    else:
+                        pnl_pct = (state.entry_price - price) / state.entry_price
+                    exit_reason = "MAX_HOLD_EXIT"
+                    print(f"MAX_HOLD: {symbol} held {_hold_time/60:.0f}m — forcing exit "
+                          f"(pnl={pnl_pct*10000:+.0f}bp)")
+
+                    if entry_id.startswith("SCOUT_"):
+                        self._scout_tracker.close_position(
+                            symbol, exit_price=price, exit_reason=exit_reason)
+                        self._trailing_stop_manager.unregister_stop(entry_id)
+                        break
+
+                    success, error, trade = self.ghost_tracker.close_position(
+                        symbol=symbol, exit_reason=exit_reason,
+                        exit_price=price, timestamp=time.time())
+                    if success and trade:
+                        pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+                        print(f"EXIT: {symbol} {trade.quantity:.4f} @ ${trade.price:,.2f}, "
+                              f"PNL: {pnl_str}, Hold: {_hold_time/60:.0f}m, Reason: {exit_reason}")
+                        self._force_position_flat(symbol)
+                    self._trailing_stop_manager.unregister_stop(entry_id)
+                    self._gravity_tp_targets.pop(symbol, None)
+                    self._cck_mae.pop(symbol, None)
+                    break
+
+                elif _hold_time >= _MAX_HOLD_TIGHTEN and not state.break_even_triggered:
+                    # Force BE after 30min — don't let stale positions run wide SL
+                    state.break_even_triggered = True
+                    if state.direction == "LONG":
+                        be_stop = state.entry_price
+                        if be_stop > state.current_stop_price:
+                            state.current_stop_price = be_stop
+                            print(f"MAX_HOLD_TIGHTEN: {symbol} held {_hold_time/60:.0f}m — "
+                                  f"forcing BE stop @ ${be_stop:,.2f}")
+                    else:
+                        be_stop = state.entry_price
+                        if be_stop < state.current_stop_price:
+                            state.current_stop_price = be_stop
+                            print(f"MAX_HOLD_TIGHTEN: {symbol} held {_hold_time/60:.0f}m — "
+                                  f"forcing BE stop @ ${be_stop:,.2f}")
 
                 # Check if stop is triggered
                 stop_triggered = False
@@ -3773,6 +4230,7 @@ class CollectorService:
                         self._force_position_flat(symbol)
                         self._dca_states.pop(symbol, None)
                         self._gravity_tp_targets.pop(symbol, None)
+                        self._cck_mae.pop(symbol, None)
                         # Clean up scout if main exited
                         if self._scout_tracker.has_open(symbol):
                             _sc_pnl = self._scout_tracker.close_position(
@@ -3792,6 +4250,7 @@ class CollectorService:
                         if recovered:
                             self._dca_states.pop(symbol, None)
                             self._gravity_tp_targets.pop(symbol, None)
+                            self._cck_mae.pop(symbol, None)
                         else:
                             print(f"TRAILING: EXIT_FAILED {symbol} - {error} (entry_id={entry_id})")
 

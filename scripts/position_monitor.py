@@ -581,11 +581,13 @@ def get_exit_criteria(strategy: Optional[str], direction: str, entry_price: floa
 def format_price(price: float) -> str:
     """Format price with appropriate precision based on magnitude."""
     if price >= 1000:
-        return f"${price:,.0f}"
-    elif price >= 1:
         return f"${price:,.2f}"
-    elif price >= 0.01:
+    elif price >= 10:
+        return f"${price:,.3f}"
+    elif price >= 0.1:
         return f"${price:.4f}"
+    elif price >= 0.01:
+        return f"${price:.5f}"
     else:
         return f"${price:.6f}"
 

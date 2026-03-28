@@ -35,7 +35,7 @@ class WallStatus:
     next_wall_distance_bp: Optional[float] = None
 
 
-_WALL_BAND_BP = 25
+_WALL_BAND_BP = 100
 _WALL_TIME_WINDOW = 900
 _PRIOR_VISIT_WINDOW = 14400
 _PRIOR_VISIT_BAND_BP = 50
@@ -99,7 +99,7 @@ class WallTracker:
         if not wall or not wall.events:
             return None
         if now is None:
-            now = wall.last_ts
+            now = time.time()
         if now - wall.last_ts > _WALL_STALE_SEC:
             self._archive_wall(wall)
             self._current_wall.pop(coin, None)

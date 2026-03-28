@@ -252,9 +252,9 @@ EXHAUSTION_FADE_DEFAULT_TRAIL = {"activation_bps": 15, "trail_bps": 8, "sl_bps":
 # Wide trail: let the trade run, accept overshoot (50bp SL survives momentum).
 # Cascade bounces are 1-3% — need room to hold through initial volatility.
 ROLLING_FADE_TRAIL_CONFIG = {
-    "activation_pct": 0.008,           # 0.80% = 80 bps (let trade develop before trailing)
-    "trail_pct": 0.004,                # 0.40% = 40 bps (give room for bounce volatility)
-    "sl_pct": 0.020,                   # 2.00% = 200 bps
+    "activation_pct": 0.004,           # 0.40% = 40 bps (match BE trigger — no dead zone)
+    "trail_pct": 0.0025,              # 0.25% = 25 bps (tighter: lock more of 30-80bp moves)
+    "sl_pct": 0.008,                   # 0.80% = 80 bps (was 200bp — cascade fades don't need 2% room)
     "break_even_trigger_pct": 0.004,   # 0.40% = 40 bps (move SL to BE once +0.4% reached)
     "break_even_offset_pct": 0.0,      # exact entry price (no offset)
 }

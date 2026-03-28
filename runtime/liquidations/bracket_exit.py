@@ -37,9 +37,9 @@ class BracketExitManager:
         if entry_ts is None:
             entry_ts = time.time()
         if direction == "LONG":
-            sl_price = entry_price * (1 - sl_bps / 100000)
+            sl_price = entry_price * (1 - sl_bps / 10000)
         else:
-            sl_price = entry_price * (1 + sl_bps / 100000)
+            sl_price = entry_price * (1 + sl_bps / 10000)
         self._brackets[entry_id] = _BracketState(
             entry_id=entry_id, symbol=symbol, direction=direction,
             entry_price=entry_price, tp_price=tp_price, sl_price=sl_price,

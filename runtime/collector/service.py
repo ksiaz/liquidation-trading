@@ -11,6 +11,7 @@ Responsibility:
 """
 
 import asyncio
+import datetime
 import json
 import time
 import logging
@@ -48,6 +49,7 @@ from runtime.liquidations.rolling_volume_tracker import RollingVolumeTracker
 from runtime.liquidations.liquidity_map import LiquidityMap
 from runtime.liquidations.gravity_observer import GravityObserver
 from runtime.liquidations.trade_volume_map import TradeVolumeMap
+from runtime.liquidations.ohlc_accumulator import OHLCAccumulator
 from runtime.whale.tracker import WhaleFillTracker
 from runtime.cascade import CapitulationTracker
 from runtime.market_state.emitter import MarketStateEmitter
@@ -172,10 +174,16 @@ class CollectorService:
         # PostgreSQL backend: no _db_lock, prune doesn't block writes (MVCC)
         self._execution_db = PgBufferedResearchDatabase(
             flush_interval_sec=1.0,
-            max_buffer_size=1000,
-            enable_high_frequency_logs=False,
+            max_buffer_size=5000,
+            enable_high_frequency_logs=True,
         )
-        
+
+        # OHLC candle accumulator — builds 1-min candles from raw aggTrade stream
+        self._ohlc = OHLCAccumulator(self._execution_db)
+
+        # Retention pruner state — runs once per hour
+        self._last_raw_data_prune = 0
+
         # Inject event logger into observation system's M2 store
         if not hasattr(self._obs._m2_store, '_event_logger') or self._obs._m2_store._event_logger is None:
             self._obs._m2_store._event_logger = self._execution_db
@@ -518,6 +526,20 @@ class CollectorService:
             self._logger.debug(f"Pruned {len(to_remove)} stale calculators")
 
         return len(to_remove)
+
+    def _prune_raw_data(self):
+        """Delete raw data older than 30 days. Runs hourly via regime loop."""
+        cutoff = time.time() - (30 * 86400)
+        tables = ['trade_events', 'liquidation_events', 'orderbook_depth',
+                  'mark_prices', 'ohlc_candles']
+        for table in tables:
+            try:
+                self._execution_db.execute_sql(
+                    f"DELETE FROM {table} WHERE timestamp < %s", (cutoff,)
+                )
+            except Exception as e:
+                self._logger.warning(f"Raw data prune error ({table}): {e}")
+        self._logger.info(f"[RAW_PRUNE] Pruned data older than 30 days from {len(tables)} tables")
 
     def _get_live_price(self, symbol: str) -> Optional[float]:
         """Get current live price for a symbol.
@@ -1093,6 +1115,11 @@ class CollectorService:
                 import traceback
                 traceback.print_exc()
 
+            # Hourly: prune raw data tables (30-day retention)
+            if current_time - self._last_raw_data_prune > 3600:
+                self._last_raw_data_prune = current_time
+                self._prune_raw_data()
+
             await asyncio.sleep(0.2)  # 5Hz cycle (was 0.1s / 10Hz)
 
     def _execute_m6_cycle(self, snapshot: ObservationSnapshot, timestamp: float):
@@ -1621,6 +1648,7 @@ class CollectorService:
                         self._cascade_monitor.update(
                             symbol=symbol, liq_z=_clm_z, price=_clm_price, ts=timestamp,
                             vwap_distance=regime_metrics.vwap_distance if regime_metrics else None,
+                            vwap_z=regime_metrics.vwap_z if regime_metrics and hasattr(regime_metrics, 'vwap_z') else None,
                             atr_5m=regime_metrics.atr_5m if regime_metrics else None,
                             atr_30m=regime_metrics.atr_30m if regime_metrics else None,
                             orderflow=regime_metrics.orderflow_imbalance if regime_metrics else None,
@@ -1659,46 +1687,11 @@ class CollectorService:
                     # burst). Counter-trend fades during sustained moves are the #1
                     # loss source (5/5 losses on 2026-03-11 were SHORT fades in uptrend).
 
-                    # Asymmetric confidence: counter-trend entries need stronger burst.
-                    # Uses 15-min price return to detect sustained directional moves.
-                    # Counter-trend = fading SHORT during rising price (or LONG during falling).
-                    # These require 2x the normal burst ratio to compensate for trend headwind.
-                    #
-                    # Data analysis (2026-03-13, 364 trades): SHORT and LONG fades perform
-                    # similarly. SHORT CCK losses are small ($12 over 25 trades) and recent
-                    # entries are well-timed (8/13 had profitable MFE window, killed by 2nd
-                    # cascade wave). Asymmetric treatment (3x mult, 150bp cap) was NET
-                    # NEGATIVE: blocked $2.57 winners, saved only $2.33 losers. Reverted
-                    # to symmetric 2x. The real fix is faster cascade continuation exit.
-                    _COUNTER_TREND_WINDOW = 900  # 15 min lookback
-                    _COUNTER_TREND_RETURN_BPS = 30  # 30bp move = "trending"
-                    _COUNTER_TREND_RATIO_MULT = 2.0  # 2x normal ratio threshold
-                    if rolling_fade_signal:
-                        _price_deq = self._price_history.get(symbol)
-                        _prices_snap = list(_price_deq) if _price_deq else []
-                        _trend_cutoff = timestamp - _COUNTER_TREND_WINDOW
-                        _trend_prices = [(t, p) for t, p in _prices_snap if t >= _trend_cutoff]
-                        if len(_trend_prices) >= 10:
-                            _trend_start_price = _trend_prices[0][1]
-                            _trend_end_price = _trend_prices[-1][1]
-                            _trend_return_bps = (_trend_end_price - _trend_start_price) / _trend_start_price * 10000
-                            # Counter-trend: SHORT fade during rising price, LONG fade during falling
-                            _is_counter = False
-                            if rolling_fade_signal.fade_direction == "SHORT" and _trend_return_bps > _COUNTER_TREND_RETURN_BPS:
-                                _is_counter = True
-                            elif rolling_fade_signal.fade_direction == "LONG" and _trend_return_bps < -_COUNTER_TREND_RETURN_BPS:
-                                _is_counter = True
-
-                            if _is_counter:
-                                _required_ratio = self._rolling_volume_tracker.RATIO_THRESHOLD * _COUNTER_TREND_RATIO_MULT
-                                if rolling_fade_signal.z_score < _required_ratio:
-                                    print(f"[COUNTER-TREND GATE] {symbol}: blocking "
-                                          f"{rolling_fade_signal.fade_direction} fade — "
-                                          f"15m trend {_trend_return_bps:+.1f}bp, "
-                                          f"burst ratio {rolling_fade_signal.z_score:.1f}x "
-                                          f"< required {_required_ratio:.0f}x")
-                                    self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
-                                    rolling_fade_signal = None
+                    # Counter-trend gate REMOVED (2026-03-29).
+                    # Required 2x burst ratio for fading >30bp 15min trends.
+                    # Its own analysis said it was "NET NEGATIVE" (blocked $2.57 winners,
+                    # saved $2.33 losers). The DECEL gate (REVERSED/STALLED) already handles
+                    # trend risk by requiring price to reverse before entry.
 
                     # Deceleration shadow logger: measure price velocity in consecutive
                     # windows before entry to determine if cascade is slowing down.
@@ -1766,12 +1759,13 @@ class CollectorService:
                                           f"only REVERSED/STALLED allowed, blocking entry")
                                     self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                     rolling_fade_signal = None
-                                # Ratio gate: cascade must be decelerating (ratio < 1.0)
-                                # ratio >= 1.0 = cascade still accelerating = 46% WR, -$2.28
-                                # Sweet spot 0.5-1.0 = 86% WR, +$2.59
-                                elif _d_ratio >= 1.0:
-                                    print(f"[DECEL BLOCK] {symbol}: ratio={_d_ratio:.2f} ≥ 1.0 — "
-                                          f"cascade still accelerating, blocking entry")
+                                # Ratio gate: only for STALLED phase — cascade velocity near zero
+                                # but ratio shows residual cascade momentum.
+                                # NOT applied to REVERSED — high ratio in REVERSED means strong
+                                # bounce (v_recent >> v_prior), which is GOOD not bad.
+                                elif _phase == "STALLED" and _d_ratio >= 1.0:
+                                    print(f"[DECEL BLOCK] {symbol}: STALLED ratio={_d_ratio:.2f} ≥ 1.0 — "
+                                          f"residual cascade momentum, blocking entry")
                                     self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                     rolling_fade_signal = None
                                 # Neutral orderflow block: cascade already dried up, no confirming flow
@@ -1785,34 +1779,53 @@ class CollectorService:
                                               f"no confirming flow")
                                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                         rolling_fade_signal = None
-                                # Z-score cap: massive cascades (z>=35) are directional moves
-                                # that don't reverse. 23% WR at z>=35 vs 85% at z<15.
-                                _Z_CAP = 35
+                                # Z-band: floor only. Ceiling REMOVED — created impossible dead zone.
+                                # Signals fire at z≥10 (RATIO_THRESHOLD) but ceiling was z<4.
+                                # Z never drops from 10→4 within 60s signal expiry → zero trades.
+                                # DECEL gate (REVERSED/STALLED) handles "too hot" via price behavior.
+                                _Z_FLOOR = 1.0
                                 if rolling_fade_signal:
                                     _rz_check = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
-                                    if _rz_check is not None and _rz_check >= _Z_CAP:
-                                        print(f"[Z BLOCK] {symbol}: z={_rz_check:.1f} ≥ {_Z_CAP} — "
-                                              f"massive cascade, too strong to fade")
+                                    if _rz_check is not None and _rz_check < _Z_FLOOR:
+                                        print(f"[Z BAND] {symbol}: z={_rz_check:.1f} < {_Z_FLOOR} — "
+                                              f"no real cascade, noise")
                                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                         rolling_fade_signal = None
-                                # Isolation gate: single-coin liqs are trend pauses, not capitulation.
-                                # Require ≥1 other coin to have entered within 120s.
-                                # Isolated: 35% WR. With nearby: 70-82% WR.
-                                _NEARBY_WINDOW = 120  # seconds
+                                # Isolation gate REMOVED (2026-03-28).
+                                # Discovery: single-coin cascades are the BEST entries (+$3.25),
+                                # multi-coin (4-6 coins) are the WORST (-$1.70).
+                                # Single-coin = isolated forced selling → clean reversal.
+                                # Multi-coin = correlated market move → keeps going.
+
+                                # Cascade age gate: 30-60s cascades produce the best reversals.
+                                # <10s = too early (-9.8bp at 15m). 30-60s = +11.2bp at 1h, 64bp MFE.
+                                # >3min = exhausted, no reversal energy left.
+                                _CASCADE_MIN_AGE = 15   # seconds — wait for cascade to develop
+                                _CASCADE_MAX_AGE = 180  # seconds — too old, reversal energy gone
                                 if rolling_fade_signal:
-                                    # Multi-coin check: is this part of a broader cascade?
-                                    # Count: (1) other coins with open positions entered recently
-                                    #        (2) other coins with active pending signals RIGHT NOW
-                                    _recent_entries = self.ghost_tracker.get_recent_entry_count(
-                                        exclude_symbol=symbol, window_sec=_NEARBY_WINDOW, now=timestamp)
-                                    _pending_signals = self._rolling_volume_tracker.get_active_signal_count(
-                                        exclude_symbol=symbol, timestamp=timestamp)
-                                    _nearby_total = _recent_entries + _pending_signals
-                                    if _nearby_total == 0:
-                                        print(f"[ISOLATION BLOCK] {symbol}: no other coins entered "
-                                              f"or signaling — single-coin event, blocking")
+                                    _pending = self._rolling_volume_tracker._pending.get(symbol)
+                                    if _pending and _pending.first_detected_ts:
+                                        _cascade_age = timestamp - _pending.first_detected_ts
+                                        if _cascade_age < _CASCADE_MIN_AGE:
+                                            # Too fresh — don't confirm, retry later
+                                            rolling_fade_signal = None
+                                        elif _cascade_age > _CASCADE_MAX_AGE:
+                                            print(f"[AGE BLOCK] {symbol}: cascade age {_cascade_age:.0f}s "
+                                                  f"> {_CASCADE_MAX_AGE}s — too old")
+                                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
+                                            rolling_fade_signal = None
+
+                                # Late session block (20-24 UTC): -$1.56 on 36 trades.
+                                # Hour 23 alone: -$2.23, 27% WR. Low liquidity noise.
+                                # Asia (00-08) is the best session (+$2.16).
+                                if rolling_fade_signal:
+                                    _utc_hour = datetime.datetime.utcfromtimestamp(timestamp).hour
+                                    if 20 <= _utc_hour <= 23:
+                                        print(f"[SESSION BLOCK] {symbol}: UTC hour {_utc_hour} "
+                                              f"in late session (20-23) — low-liquidity, blocking")
                                         self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
                                         rolling_fade_signal = None
+
                                 # Persist context for PG (survives log rotation)
                                 if rolling_fade_signal:
                                     _rz = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
@@ -1830,6 +1843,9 @@ class CollectorService:
                                         "rolling_z": round(_rz, 2) if _rz else None,
                                         "fade_dir": rolling_fade_signal.fade_direction,
                                         "of_at_entry": round(orderflow_imbalance, 3) if orderflow_imbalance is not None else None,
+                                        "vwap_atr": round(regime_metrics.vwap_distance / regime_metrics.atr_30m, 2) if regime_metrics and regime_metrics.atr_30m and regime_metrics.atr_30m > 0 else None,
+                                        "vwap_dist": round(regime_metrics.vwap_distance, 4) if regime_metrics else None,
+                                        "vwap_z": round(regime_metrics.vwap_z, 2) if regime_metrics and hasattr(regime_metrics, 'vwap_z') else None,
                                         "nearby_entries": _recent_entries if '_recent_entries' in dir() else None,
                                         "wall_consec_rev": _wall.consecutive_reversals if _wall else None,
                                         "wall_is_ob": _wall.is_ob if _wall else None,
@@ -2801,6 +2817,11 @@ class CollectorService:
                 'oracle_price': price, 'mark_price': None, 'timestamp': timestamp,
             }))
 
+        # Persist every mark price update (~1/sec per symbol)
+        self._execution_db.log_mark_price(
+            symbol=symbol, timestamp=timestamp, mark_price=price,
+        )
+
     def _handle_hl_fill(
         self,
         symbol: str,      # Coin (e.g., "BTC")
@@ -2860,6 +2881,13 @@ class CollectorService:
                 'value_usd': price * size, 'timestamp': timestamp,
                 'timestamp_ms': int(timestamp * 1000),
             }))
+
+            # 8. Persist raw trade + feed OHLC accumulator
+            self._execution_db.log_trade_event(
+                symbol=normalized_symbol, timestamp=timestamp,
+                price=price, volume=size, is_buyer_maker=(side == "A"),
+            )
+            self._ohlc.on_fill(normalized_symbol, price, size, timestamp)
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
@@ -2943,6 +2971,12 @@ class CollectorService:
                 'timestamp': timestamp,
             }))
 
+            # 5. Persist raw liquidation event
+            self._execution_db.log_liquidation_event(
+                timestamp=timestamp, symbol=normalized_symbol,
+                side=side, price=price, volume=size,
+            )
+
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
             self._logger.debug(f"HL liquidation callback error: {e}")
@@ -2992,6 +3026,14 @@ class CollectorService:
 
             # Feed liquidity memory map (samples at 5s intervals internally)
             self._liquidity_map.on_orderbook_update(coin, bids, asks, ts)
+
+            # Persist full L2 snapshot (20 levels, 10/sec per symbol)
+            # bids/asks here are [{price, size}, ...] dicts from BinanceDataProvider
+            raw_bids = [[b['price'], b['size']] for b in bids[:20]]
+            raw_asks = [[a['price'], a['size']] for a in asks[:20]]
+            self._execution_db.log_orderbook_depth(
+                symbol=symbol, timestamp=ts, bids=raw_bids, asks=raw_asks,
+            )
         except Exception as e:
             self._logger.warning(f"HL orderbook ingestion error for {orderbook.get('coin', '?')}: {e}")
 
@@ -4015,7 +4057,10 @@ class CollectorService:
                 _CASCADE_KILL_Z = _CASCADE_KILL_Z_BASE - (_CASCADE_KILL_Z_BASE - _CASCADE_KILL_Z_MIN) * _dca_frac
                 # DCA L4+: eligible for kill even if not fully exhausted
                 _dca_exhausted = _dca.level >= 4
-                _CASCADE_KILL_GRACE = 10
+                # Grace: 120s for all positions. Data shows 2-5min CCK kills are the
+                # worst bucket (-$6.04/27 trades), and positions surviving 15min+ have
+                # 74% WR. Giving reversal time to develop before allowing CCK.
+                _CASCADE_KILL_GRACE = 120
             else:
                 # Non-cascade position — original behavior
                 _CASCADE_KILL_Z = _CASCADE_KILL_Z_BASE

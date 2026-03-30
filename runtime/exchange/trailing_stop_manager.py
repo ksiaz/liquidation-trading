@@ -146,7 +146,7 @@ class TrailingStopManager:
     # Context-aware trailing stop constants
     _CASCADE_ACTIVE_STATES = {"TRIGGERED", "ABSORBING"}
     _LIQ_Z_ACTIVE = 1.0
-    _VWAP_CLOSE_PCT = 0.003
+    _VWAP_CLOSE_ATR_MULT = 0.5  # within 0.5 × ATR_5m of VWAP = "approaching"
     _THIN_BOOK_FILLS = 8
     _CASCADE_QUIET_GRACE_SEC = 120
     _PHASE2_WINDOW_SEC = 300
@@ -517,8 +517,12 @@ class TrailingStopManager:
                         _hold < self._PHASE2_WINDOW_SEC and
                         not state.break_even_triggered
                     )
-                    if (_now - _last_log >= 30) and (_cascade_active or _be_suppressed or
-                            (state.last_vwap_distance is not None and abs(state.last_vwap_distance) < self._VWAP_CLOSE_PCT)):
+                    _vwap_close = (
+                        state.last_vwap_distance is not None and
+                        state.current_atr is not None and state.current_atr > 0 and
+                        abs(state.last_vwap_distance) < self._VWAP_CLOSE_ATR_MULT * state.current_atr
+                    )
+                    if (_now - _last_log >= 30) and (_cascade_active or _be_suppressed or _vwap_close):
                         self._context_log_times[symbol] = _now
                         _vwap_str = f"{state.last_vwap_distance:.4f}" if state.last_vwap_distance is not None else "N/A"
                         _l2_str = f"{state.last_adverse_l2:,.0f}" if state.last_adverse_l2 is not None else "N/A"
@@ -760,9 +764,12 @@ class TrailingStopManager:
                 context_mult = max(context_mult, 1.2)
 
             # Rule 5: Approaching VWAP (only when NOT cascade active) → tighten to lock
+            # Uses ATR-normalized distance: vwap_distance < 0.5 × ATR_5m = "close"
+            # (was comparing raw dollar distance vs 0.003 — never fired for any coin)
             if (not _cascade_active and
                     state.last_vwap_distance is not None and
-                    abs(state.last_vwap_distance) < self._VWAP_CLOSE_PCT and
+                    state.current_atr is not None and state.current_atr > 0 and
+                    abs(state.last_vwap_distance) < self._VWAP_CLOSE_ATR_MULT * state.current_atr and
                     mfe_profit_pct > config.break_even_trigger_pct):
                 context_mult = min(context_mult, 0.8)
 

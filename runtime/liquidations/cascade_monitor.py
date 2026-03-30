@@ -29,6 +29,11 @@ class _CascadeState:
     last_z_above_active_ts: float  # last time z >= 1.0
     prev_z: float           # for z_velocity
     prev_ts: float
+    # VWAP overextension tracking
+    prev_vwap_atr: float = 0.0     # previous vwap/atr ratio for velocity
+    peak_vwap_atr: float = 0.0     # max overextension seen
+    peak_vwap_atr_ts: float = 0.0  # when overextension peaked
+    vwap_peaked: bool = False       # has overextension started declining?
     buffer: List[dict] = field(default_factory=list)
 
 
@@ -51,6 +56,7 @@ class CascadeLifecycleMonitor:
         price: float,
         ts: float,
         vwap_distance: float = None,
+        vwap_z: float = None,
         atr_5m: float = None,
         atr_30m: float = None,
         orderflow: float = None,
@@ -83,7 +89,7 @@ class CascadeLifecycleMonitor:
                 )
                 self._states[symbol] = state
                 self._append_snapshot(symbol, state, liq_z, price, ts,
-                    vwap_distance, atr_5m, atr_30m, orderflow,
+                    vwap_distance, vwap_z, atr_5m, atr_30m, orderflow,
                     burst_volume, liq_side, wall_consec_rev,
                     wall_is_ob, wall_gravity, bid_depth_ratio,
                     rolling_tracker)
@@ -130,7 +136,7 @@ class CascadeLifecycleMonitor:
         state.last_z = liq_z
 
     def _append_snapshot(self, symbol, state, liq_z, price, ts,
-                         vwap_distance, atr_5m, atr_30m, orderflow,
+                         vwap_distance, vwap_z, atr_5m, atr_30m, orderflow,
                          burst_volume, liq_side, wall_consec_rev,
                          wall_is_ob, wall_gravity, bid_depth_ratio,
                          rolling_tracker=None):
@@ -145,6 +151,19 @@ class CascadeLifecycleMonitor:
             _liq_rate_5s = rolling_tracker.get_event_count_in_window(
                 symbol, time.time(), window_sec=10.0)
         z_velocity = (liq_z - state.prev_z) / dt if dt > 0 else 0
+
+        # VWAP overextension velocity and peak detection
+        _vwap_atr = abs(vwap_distance / atr_30m) if atr_30m and atr_30m > 0 and vwap_distance is not None else 0
+        _vwap_atr_velocity = (_vwap_atr - state.prev_vwap_atr) / dt if dt > 0 else 0
+        if _vwap_atr > state.peak_vwap_atr:
+            state.peak_vwap_atr = _vwap_atr
+            state.peak_vwap_atr_ts = ts
+            state.vwap_peaked = False
+        elif _vwap_atr < state.peak_vwap_atr * 0.9 and not state.vwap_peaked:
+            # Overextension dropped 10% from peak — spike is reversing
+            state.vwap_peaked = True
+        state.prev_vwap_atr = _vwap_atr
+        _time_since_vwap_peak = ts - state.peak_vwap_atr_ts if state.peak_vwap_atr_ts > 0 else 0
 
         # Count other coins in ACTIVE/FADING
         n_active = sum(1 for s, st in self._states.items()
@@ -165,6 +184,12 @@ class CascadeLifecycleMonitor:
             "price_at_start": state.start_price,
             "move_from_start": round(move_bps, 2),
             "vwap_distance": vwap_distance,
+            "vwap_z": round(vwap_z, 2) if vwap_z is not None else None,
+            "vwap_atr": round(_vwap_atr, 3),
+            "vwap_atr_velocity": round(_vwap_atr_velocity, 3),
+            "peak_vwap_atr": round(state.peak_vwap_atr, 3),
+            "time_since_vwap_peak": round(_time_since_vwap_peak, 1),
+            "vwap_peaked": state.vwap_peaked,
             "atr_5m": atr_5m,
             "atr_30m": atr_30m,
             "orderflow": orderflow,
@@ -274,7 +299,10 @@ class CascadeLifecycleMonitor:
                     "cascade_id", "symbol", "ts", "phase",
                     "liq_z", "peak_z", "time_since_peak", "z_velocity",
                     "price", "price_at_start", "move_from_start",
-                    "vwap_distance", "atr_5m", "atr_30m",
+                    "vwap_distance", "vwap_z",
+                    "vwap_atr", "vwap_atr_velocity", "peak_vwap_atr",
+                    "time_since_vwap_peak", "vwap_peaked",
+                    "atr_5m", "atr_30m",
                     "orderflow", "burst_volume", "liq_rate_5s", "liq_side",
                     "wall_consec_rev", "wall_is_ob", "wall_gravity",
                     "bid_depth_ratio", "n_coins_active",

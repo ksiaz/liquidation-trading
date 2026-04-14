@@ -34,6 +34,10 @@ class _CascadeState:
     peak_vwap_atr: float = 0.0     # max overextension seen
     peak_vwap_atr_ts: float = 0.0  # when overextension peaked
     vwap_peaked: bool = False       # has overextension started declining?
+    # Pulse tracking
+    last_pulse_number: int = 0     # last observed pulse count
+    # Depth tracking
+    start_bid_depth_ratio: float = 0.0  # bid_depth_ratio at cascade start
     buffer: List[dict] = field(default_factory=list)
 
 
@@ -44,6 +48,7 @@ class CascadeLifecycleMonitor:
     _Z_DONE = 3.0           # z threshold to end recording
     _FADING_RATIO = 0.5     # z < peak * ratio → FADING
     _TIMEOUT_SEC = 120      # end cascade if z hasn't been >= _Z_ACTIVE for this long
+    _MAX_DURATION_SEC = 300  # 5min max — no cascade lasts forever
 
     def __init__(self):
         self._states: Dict[str, _CascadeState] = {}
@@ -67,6 +72,7 @@ class CascadeLifecycleMonitor:
         wall_gravity: float = None,
         bid_depth_ratio: float = None,
         rolling_tracker=None,
+        mtf_vwap_tracker=None,
     ):
         """Called every regime cycle (~200ms) per coin."""
         state = self._states.get(symbol)
@@ -75,6 +81,7 @@ class CascadeLifecycleMonitor:
             # QUIET state
             if liq_z >= self._Z_ACTIVE:
                 # → ACTIVE
+                print(f"[CASCADE MON] {symbol}: QUIET→ACTIVE z={liq_z:.1f} price=${price:,.2f}")
                 state = _CascadeState(
                     cascade_id=str(uuid.uuid4())[:12],
                     phase="ACTIVE",
@@ -86,13 +93,14 @@ class CascadeLifecycleMonitor:
                     last_z_above_active_ts=ts,
                     prev_z=0,
                     prev_ts=ts - 0.2,
+                    start_bid_depth_ratio=bid_depth_ratio if bid_depth_ratio is not None else 0.0,
                 )
                 self._states[symbol] = state
                 self._append_snapshot(symbol, state, liq_z, price, ts,
                     vwap_distance, vwap_z, atr_5m, atr_30m, orderflow,
                     burst_volume, liq_side, wall_consec_rev,
                     wall_is_ob, wall_gravity, bid_depth_ratio,
-                    rolling_tracker)
+                    rolling_tracker, mtf_vwap_tracker)
             return
 
         # Update peak
@@ -110,26 +118,37 @@ class CascadeLifecycleMonitor:
             done = True
         elif ts - state.last_z_above_active_ts > self._TIMEOUT_SEC:
             done = True
+        elif ts - state.start_ts > self._MAX_DURATION_SEC:
+            done = True  # Max duration — prevents infinite ACTIVE when z stays elevated
 
         if done:
             # → DONE: queue for delayed flush (need 5min of future price data for shadow PnL)
+            print(f"[CASCADE MON] {symbol}: →DONE z={liq_z:.1f} snaps={len(state.buffer)} "
+                  f"peak_z={state.peak_z:.0f} pending_flush={len(self._pending_flush)}")
             self._pending_flush.append({
                 'buffer': state.buffer,
                 'done_ts': ts,
                 'symbol': symbol,
             })
             del self._states[symbol]
+            # Cap pending to prevent memory leak — drop oldest unbackfilled
+            if len(self._pending_flush) > self._MAX_PENDING_FLUSH:
+                self._pending_flush = self._pending_flush[-self._MAX_PENDING_FLUSH:]
             return
 
         if state.phase == "ACTIVE" and liq_z < state.peak_z * self._FADING_RATIO:
             state.phase = "FADING"
 
+        # Cap buffer size (200ms × 300s = 1500 max snapshots)
+        if len(state.buffer) > 1500:
+            done = True
+
         # Record snapshot
         self._append_snapshot(symbol, state, liq_z, price, ts,
-            vwap_distance, atr_5m, atr_30m, orderflow,
+            vwap_distance, vwap_z, atr_5m, atr_30m, orderflow,
             burst_volume, liq_side, wall_consec_rev,
             wall_is_ob, wall_gravity, bid_depth_ratio,
-            rolling_tracker)
+            rolling_tracker, mtf_vwap_tracker)
 
         state.prev_z = liq_z
         state.prev_ts = ts
@@ -139,7 +158,7 @@ class CascadeLifecycleMonitor:
                          vwap_distance, vwap_z, atr_5m, atr_30m, orderflow,
                          burst_volume, liq_side, wall_consec_rev,
                          wall_is_ob, wall_gravity, bid_depth_ratio,
-                         rolling_tracker=None):
+                         rolling_tracker=None, mtf_vwap_tracker=None):
         dt = ts - state.prev_ts if ts > state.prev_ts else 0.2
         # Compute short-window liq rate (5s) for real-time cascade dynamics.
         # get_current_z uses 30s window → stays flat during cascade.
@@ -165,6 +184,23 @@ class CascadeLifecycleMonitor:
         state.prev_vwap_atr = _vwap_atr
         _time_since_vwap_peak = ts - state.peak_vwap_atr_ts if state.peak_vwap_atr_ts > 0 else 0
 
+        # Pulse-level stats from rolling tracker
+        _pulse_stats = {'time_since_last_liq': 999.0, 'pulse_number': 0,
+                        'pulse_liq_count': 0, 'cumulative_liq_usd': 0.0}
+        if rolling_tracker:
+            _pulse_stats = rolling_tracker.get_pulse_stats(
+                symbol, time.time(), state.start_ts)
+
+        # Multi-TF VWAP
+        _mtf = {'vwap_5m_atr': None, 'vwap_15m_atr': None, 'vwap_30m_atr': None}
+        if mtf_vwap_tracker and atr_30m and atr_30m > 0:
+            _mtf = mtf_vwap_tracker.get_multi_tf_vwap(symbol, price, atr_30m)
+
+        # Depth change since cascade start
+        _depth_change = None
+        if bid_depth_ratio is not None and state.start_bid_depth_ratio > 0:
+            _depth_change = round(bid_depth_ratio - state.start_bid_depth_ratio, 4)
+
         # Count other coins in ACTIVE/FADING
         n_active = sum(1 for s, st in self._states.items()
                        if s != symbol and st.phase in ("ACTIVE", "FADING"))
@@ -189,7 +225,7 @@ class CascadeLifecycleMonitor:
             "vwap_atr_velocity": round(_vwap_atr_velocity, 3),
             "peak_vwap_atr": round(state.peak_vwap_atr, 3),
             "time_since_vwap_peak": round(_time_since_vwap_peak, 1),
-            "vwap_peaked": state.vwap_peaked,
+            "vwap_peaked": 1 if state.vwap_peaked else 0,
             "atr_5m": atr_5m,
             "atr_30m": atr_30m,
             "orderflow": orderflow,
@@ -201,13 +237,25 @@ class CascadeLifecycleMonitor:
             "wall_gravity": wall_gravity,
             "bid_depth_ratio": bid_depth_ratio,
             "n_coins_active": n_active,
+            "time_since_last_liq": _pulse_stats['time_since_last_liq'],
+            "pulse_number": _pulse_stats['pulse_number'],
+            "pulse_liq_count": _pulse_stats['pulse_liq_count'],
+            "cumulative_liq_usd": _pulse_stats['cumulative_liq_usd'],
+            "depth_change": _depth_change,
+            "vwap_5m_atr": _mtf.get('vwap_5m_atr'),
+            "vwap_15m_atr": _mtf.get('vwap_15m_atr'),
+            "vwap_30m_atr": _mtf.get('vwap_30m_atr'),
             "fade_direction": None,  # backfilled
             "shadow_mfe_1m": None,
             "shadow_mfe_2m": None,
             "shadow_mfe_5m": None,
+            "shadow_mfe_10m": None,
+            "shadow_mfe_15m": None,
             "shadow_mae_1m": None,
             "shadow_mae_2m": None,
             "shadow_mae_5m": None,
+            "shadow_mae_10m": None,
+            "shadow_mae_15m": None,
             "trade_id": None,
         })
 
@@ -223,8 +271,9 @@ class CascadeLifecycleMonitor:
         state = self._states.get(symbol)
         return state.cascade_id if state else None
 
-    _SHADOW_DELAY_SEC = 330  # Wait 5.5min after cascade ends before backfilling
-                              # (5min shadow window + 30s buffer for price data arrival)
+    _SHADOW_DELAY_SEC = 960  # Wait 16min after cascade ends before backfilling
+                              # (15min shadow window + 60s buffer for price data arrival)
+    _MAX_PENDING_FLUSH = 50  # Cap pending buffers — drop oldest if exceeded
 
     def backfill_shadow_pnl(self, symbol: str, price_history: list):
         """Backfill shadow MFE/MAE for pending buffers that are old enough.
@@ -265,6 +314,8 @@ class CascadeLifecycleMonitor:
                     (60, "shadow_mfe_1m", "shadow_mae_1m"),
                     (120, "shadow_mfe_2m", "shadow_mae_2m"),
                     (300, "shadow_mfe_5m", "shadow_mae_5m"),
+                    (600, "shadow_mfe_10m", "shadow_mae_10m"),
+                    (900, "shadow_mfe_15m", "shadow_mae_15m"),
                 ]:
                     future = [p for t, p in price_history
                               if snap_ts < t <= snap_ts + window_sec]
@@ -306,9 +357,14 @@ class CascadeLifecycleMonitor:
                     "orderflow", "burst_volume", "liq_rate_5s", "liq_side",
                     "wall_consec_rev", "wall_is_ob", "wall_gravity",
                     "bid_depth_ratio", "n_coins_active",
+                    "time_since_last_liq", "pulse_number",
+                    "pulse_liq_count", "cumulative_liq_usd", "depth_change",
+                    "vwap_5m_atr", "vwap_15m_atr", "vwap_30m_atr",
                     "fade_direction",
                     "shadow_mfe_1m", "shadow_mfe_2m", "shadow_mfe_5m",
+                    "shadow_mfe_10m", "shadow_mfe_15m",
                     "shadow_mae_1m", "shadow_mae_2m", "shadow_mae_5m",
+                    "shadow_mae_10m", "shadow_mae_15m",
                     "trade_id",
                 ]
                 placeholders = ", ".join(["%s"] * len(cols))
@@ -317,13 +373,32 @@ class CascadeLifecycleMonitor:
                 rows = []
                 for pending in ready:
                     for snap in pending['buffer']:
-                        rows.append(tuple(snap.get(c) for c in cols))
+                        # Sanitize: convert non-primitives to None
+                        row = []
+                        for c in cols:
+                            v = snap.get(c)
+                            if v is not None and not isinstance(v, (int, float, str)):
+                                v = int(v) if isinstance(v, bool) else None
+                            row.append(v)
+                        rows.append(tuple(row))
 
                 if rows:
-                    cur.executemany(sql, rows)
-                    conn.commit()
-                    print(f"[CASCADE MON] Flushed {len(rows)} snapshots "
-                          f"from {len(ready)} cascades")
+                    flushed = 0
+                    for row in rows:
+                        try:
+                            cur.execute(sql, row)
+                            flushed += 1
+                        except Exception as row_err:
+                            conn.rollback()
+                            # Find the bad value
+                            for i, (c, v) in enumerate(zip(cols, row)):
+                                print(f"[CASCADE MON] col={c} type={type(v).__name__} val={v!r}"[:120])
+                            print(f"[CASCADE MON] Row error: {row_err}")
+                            break
+                    if flushed > 0:
+                        conn.commit()
+                        print(f"[CASCADE MON] Flushed {flushed}/{len(rows)} snapshots "
+                              f"from {len(ready)} cascades")
 
                 # Remove flushed from pending
                 self._pending_flush = [p for p in self._pending_flush if not p.get('_backfilled')]
@@ -331,3 +406,9 @@ class CascadeLifecycleMonitor:
                 put_conn(conn)
         except Exception as e:
             print(f"[CASCADE MON] Flush error: {e}")
+            # Debug: print first row types
+            if rows:
+                first = rows[0]
+                for i, (c, v) in enumerate(zip(cols, first)):
+                    if v is not None and isinstance(v, str) and c not in ('cascade_id', 'symbol', 'phase', 'liq_side', 'fade_direction', 'trade_id'):
+                        print(f"[CASCADE MON] STRING in numeric col: {c}={v!r}")

@@ -116,6 +116,10 @@ class TrailingStopState:
     last_adverse_l2: Optional[float] = None   # Adverse L2 gravity near price
     last_rolling_z: Optional[float] = None    # Rolling burst rate ratio
 
+    # Orderflow momentum exit (OME) — tracks OF shift for smart profit-taking
+    best_of: float = 0.5                       # Most favorable OF since entry
+    of_was_favorable: bool = False             # Has OF been clearly in our direction?
+
     # Time-delayed watermark ratchet — prevents wicks from permanently ratcheting stop.
     # A new high must persist for RATCHET_DELAY_SEC before becoming the official watermark.
     _candidate_high: Optional[float] = None   # Candidate new high (LONG)
@@ -444,6 +448,17 @@ class TrailingStopManager:
                 # Update orderflow if provided
                 if orderflow_imbalance is not None:
                     state.last_orderflow = orderflow_imbalance
+                    # Track best OF for momentum exit
+                    if state.direction == "SHORT":
+                        if orderflow_imbalance < state.best_of:
+                            state.best_of = orderflow_imbalance
+                        if orderflow_imbalance < 0.45:
+                            state.of_was_favorable = True
+                    else:  # LONG
+                        if orderflow_imbalance > state.best_of:
+                            state.best_of = orderflow_imbalance
+                        if orderflow_imbalance > 0.55:
+                            state.of_was_favorable = True
 
                 # Update context fields if provided
                 if liq_z is not None:

@@ -131,6 +131,7 @@ class GhostTrade:
     holding_duration_sec: Optional[float] = None
     exit_reason: Optional[str] = None
     entry_context: Optional[str] = None  # JSON blob: decel_phase, dca_level, rolling_z, etc.
+    exit_context: Optional[str] = None   # JSON blob: of_at_exit, best_of, mfe_bps, etc.
 
 
 # ==============================================================================
@@ -587,7 +588,8 @@ class GhostPositionTracker:
         exit_reason: str = "FULL_EXIT",
         orderbook: Optional[NormalizedOrderbook] = None,
         exit_price: Optional[float] = None,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        exit_context: Optional[dict] = None
     ) -> tuple[bool, Optional[str], Optional[GhostTrade]]:
         """
         Close position (simulated). Thread-safe.
@@ -602,6 +604,7 @@ class GhostPositionTracker:
             exit_price: Optional exit price (from trailing stop trigger).
                        If provided, skips adapter snapshot + ghost order.
             timestamp: Optional exit timestamp. Defaults to current time.
+            exit_context: Optional dict with exit conditions (of_at_exit, best_of, mfe_bps, etc.)
 
         Returns:
             (success, error_reason, trade_record)
@@ -610,13 +613,14 @@ class GhostPositionTracker:
             return self._close_position_locked(
                 symbol=symbol, quantity=quantity, cycle_id=cycle_id,
                 exit_reason=exit_reason, orderbook=orderbook,
-                exit_price=exit_price, timestamp=timestamp
+                exit_price=exit_price, timestamp=timestamp,
+                exit_context=exit_context
             )
 
     def _close_position_locked(
         self, *, symbol, quantity=None, cycle_id=None,
         exit_reason="FULL_EXIT", orderbook=None,
-        exit_price=None, timestamp=None
+        exit_price=None, timestamp=None, exit_context=None
     ):
         # Check position exists
         position = self.get_open_position(symbol)
@@ -690,6 +694,8 @@ class GhostPositionTracker:
         is_partial = quantity < position.quantity
 
         # Create trade record with deterministic entry linkage
+        import json as _json
+        _exit_ctx_str = _json.dumps(exit_context) if exit_context else None
         trade = GhostTrade(
             trade_id=self._generate_trade_id(),
             symbol=symbol,
@@ -710,7 +716,8 @@ class GhostPositionTracker:
             spread_bps=spread_bps,
             concurrent_positions=len(self._state.open_positions),
             holding_duration_sec=holding_duration,
-            exit_reason=exit_reason if not is_partial else f"PARTIAL_{exit_reason}"
+            exit_reason=exit_reason if not is_partial else f"PARTIAL_{exit_reason}",
+            exit_context=_exit_ctx_str
         )
 
         self._state.trade_history.append(trade)
@@ -1065,8 +1072,8 @@ class GhostPositionTracker:
                         timestamp, position_side, is_entry, pnl, account_balance_after,
                         entry_cycle_id, exit_cycle_id, entry_trade_id, winning_policy_name,
                         active_primitives, spread_bps, concurrent_positions,
-                        holding_duration_sec, exit_reason, entry_context
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        holding_duration_sec, exit_reason, entry_context, exit_context
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
                     trade.trade_id,
                     trade.cycle_id,
@@ -1088,7 +1095,8 @@ class GhostPositionTracker:
                     trade.concurrent_positions,
                     trade.holding_duration_sec,
                     trade.exit_reason,
-                    trade.entry_context
+                    trade.entry_context,
+                    trade.exit_context
                 ))
 
                 # UPDATE policy_outcomes with ghost trade results (only for exits)

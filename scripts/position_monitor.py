@@ -460,8 +460,9 @@ def get_recent_exits(limit: int = 10) -> List[dict]:
 
 
 def get_session_stats() -> dict:
-    """Get session statistics from today's trades."""
-    stats = {'trades': 0, 'wins': 0, 'losses': 0, 'net_pnl': 0.0}
+    """Get session statistics from today's trades + all-time totals."""
+    stats = {'trades': 0, 'wins': 0, 'losses': 0, 'net_pnl': 0.0,
+             'alltime_trades': 0, 'alltime_pnl': 0.0}
 
     conn = get_conn()
     try:
@@ -469,9 +470,10 @@ def get_session_stats() -> dict:
         today_ts = today.timestamp()
 
         cur = conn.cursor()
+        # Today's session
         cur.execute('''
             SELECT pnl FROM ghost_trades
-            WHERE is_entry = 0 AND timestamp > %s
+            WHERE is_entry = 0 AND entry_trade_id IS NOT NULL AND timestamp > %s
         ''', (today_ts,))
 
         for (pnl,) in cur.fetchall():
@@ -482,6 +484,16 @@ def get_session_stats() -> dict:
                     stats['wins'] += 1
                 else:
                     stats['losses'] += 1
+
+        # All-time totals
+        cur.execute('''
+            SELECT COUNT(*), COALESCE(SUM(pnl), 0)
+            FROM ghost_trades
+            WHERE is_entry = 0 AND entry_trade_id IS NOT NULL
+        ''')
+        row = cur.fetchone()
+        stats['alltime_trades'] = row[0]
+        stats['alltime_pnl'] = float(row[1])
     except Exception:
         conn.rollback()
     finally:
@@ -810,10 +822,19 @@ def print_stats(stats: dict):
 
     net_str = format_pnl(net)
 
-    line = f"  SESSION: {trades} trades | {net_str} net | {win_rate:.0f}% win"
-    visible_len = len(f"  SESSION: {trades} trades | +$0.00 net | {win_rate:.0f}% win")
+    line = f"  TODAY:   {trades} trades | {net_str} net | {win_rate:.0f}% win"
+    visible_len = len(f"  TODAY:   {trades} trades | +$0.00 net | {win_rate:.0f}% win")
     padding = WIDTH - visible_len - 2
     print(f"{BOX_V}{line}{' ' * max(0, padding)}{BOX_V}")
+
+    # All-time line
+    at_trades = stats.get('alltime_trades', 0)
+    at_pnl = stats.get('alltime_pnl', 0.0)
+    at_pnl_str = format_pnl(at_pnl)
+    at_line = f"  ALL:     {at_trades} trades | {at_pnl_str} net"
+    at_visible = len(f"  ALL:     {at_trades} trades | +$0.00 net")
+    at_padding = WIDTH - at_visible - 2
+    print(f"{BOX_V}{at_line}{' ' * max(0, at_padding)}{BOX_V}")
 
 
 def print_footer():

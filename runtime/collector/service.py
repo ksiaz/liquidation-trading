@@ -370,6 +370,8 @@ class CollectorService:
         self._bracket_exit_manager = BracketExitManager()
         from runtime.liquidations.cascade_monitor import CascadeLifecycleMonitor
         self._cascade_monitor = CascadeLifecycleMonitor()
+        from runtime.liquidations.mtf_vwap import MTFVwapTracker
+        self._mtf_vwap = MTFVwapTracker()
 
         # Capitulation tracker (detects forced position unwinding from HL fill metadata)
         self._capitulation_tracker = CapitulationTracker(window_sec=60.0)
@@ -1120,6 +1122,24 @@ class CollectorService:
                 self._last_raw_data_prune = current_time
                 self._prune_raw_data()
 
+            # Cascade monitor: backfill + flush OUTSIDE per-symbol loop
+            # Was inside per-symbol loop — 1.75M iterations per cascade blocked the 200ms cycle
+            try:
+                for _sym in list(self._price_history.keys()):
+                    _ph = self._price_history.get(_sym)
+                    if _ph:
+                        self._cascade_monitor.backfill_shadow_pnl(_sym, list(_ph))
+                self._cascade_monitor.flush_to_db()
+            except Exception:
+                pass
+
+            # Periodic trim of MTF VWAP deques (every ~60s)
+            if not hasattr(self, '_last_mtf_trim'):
+                self._last_mtf_trim = 0
+            if current_time - self._last_mtf_trim > 60:
+                self._mtf_vwap.trim()
+                self._last_mtf_trim = current_time
+
             await asyncio.sleep(0.2)  # 5Hz cycle (was 0.1s / 10Hz)
 
     def _execute_m6_cycle(self, snapshot: ObservationSnapshot, timestamp: float):
@@ -1192,7 +1212,7 @@ class CollectorService:
                     # Record price for pre-cascade trend filter
                     # 4500 = 900s (15min) × 5Hz — matches _COUNTER_TREND_WINDOW
                     if symbol not in self._price_history:
-                        self._price_history[symbol] = deque(maxlen=4500)
+                        self._price_history[symbol] = deque(maxlen=6000)
                     self._price_history[symbol].append((timestamp, price))
 
                     # NOTE: trailing stop update moved to after regime metrics computed
@@ -1625,9 +1645,20 @@ class CollectorService:
                         symbol, timestamp
                     )
 
+                    # DEBUG: verify we reach this point
+                    if not hasattr(self, '_reach_diag'):
+                        self._reach_diag = True
+                        print(f"[REACH DIAG] regime loop reaches cascade monitor point: {symbol}", flush=True)
+
                     # Cascade lifecycle monitor — passive research data collection
                     try:
                         _clm_z = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+                        # One-shot diagnostic
+                        if not hasattr(self, '_clm_diag'):
+                            self._clm_diag = True
+                            print(f"[CLM DIAG] {symbol} z={_clm_z:.1f} phase={self._cascade_monitor.get_phase(symbol)} "
+                                  f"states={len(self._cascade_monitor._states)} "
+                                  f"pending={len(self._cascade_monitor._pending_flush)}", flush=True)
                         _clm_price = current_price or self._get_live_price(symbol)
                         _clm_coin = symbol.replace("USDT", "")
                         _clm_wall = self._gravity_observer.get_wall_status(
@@ -1657,14 +1688,16 @@ class CollectorService:
                             wall_is_ob=_clm_wall.is_ob if _clm_wall else None,
                             wall_gravity=_clm_wall.total_gravity if _clm_wall else None,
                             bid_depth_ratio=_clm_bid_ratio,
-                            rolling_tracker=self._rolling_volume_tracker)
-                        # Backfill shadow PnL and flush completed cascades
-                        _ph = self._price_history.get(symbol)
-                        if _ph:
-                            self._cascade_monitor.backfill_shadow_pnl(symbol, list(_ph))
-                        self._cascade_monitor.flush_to_db()
+                            rolling_tracker=self._rolling_volume_tracker,
+                            mtf_vwap_tracker=self._mtf_vwap)
+                        # Backfill and flush moved to periodic section (was blocking regime loop)
+                        pass
                     except Exception as _clm_err:
-                        pass  # Don't let monitor crash the regime loop
+                        if not hasattr(self, '_clm_err_count'):
+                            self._clm_err_count = 0
+                        self._clm_err_count += 1
+                        if self._clm_err_count <= 5 or self._clm_err_count % 500 == 0:
+                            print(f"[CASCADE MON ERROR] {symbol}: {_clm_err} (total: {self._clm_err_count})")
 
                     # Feed freshness gate: block ROLLING_FADE when regime can't be computed.
                     # Regime requires VWAP + ATR + orderflow + liq_z all non-None.
@@ -1797,23 +1830,11 @@ class CollectorService:
                                 # Single-coin = isolated forced selling → clean reversal.
                                 # Multi-coin = correlated market move → keeps going.
 
-                                # Cascade age gate: 30-60s cascades produce the best reversals.
-                                # <10s = too early (-9.8bp at 15m). 30-60s = +11.2bp at 1h, 64bp MFE.
-                                # >3min = exhausted, no reversal energy left.
-                                _CASCADE_MIN_AGE = 15   # seconds — wait for cascade to develop
-                                _CASCADE_MAX_AGE = 180  # seconds — too old, reversal energy gone
-                                if rolling_fade_signal:
-                                    _pending = self._rolling_volume_tracker._pending.get(symbol)
-                                    if _pending and _pending.first_detected_ts:
-                                        _cascade_age = timestamp - _pending.first_detected_ts
-                                        if _cascade_age < _CASCADE_MIN_AGE:
-                                            # Too fresh — don't confirm, retry later
-                                            rolling_fade_signal = None
-                                        elif _cascade_age > _CASCADE_MAX_AGE:
-                                            print(f"[AGE BLOCK] {symbol}: cascade age {_cascade_age:.0f}s "
-                                                  f"> {_CASCADE_MAX_AGE}s — too old")
-                                            self._rolling_volume_tracker.confirm_signal(symbol, timestamp)
-                                            rolling_fade_signal = None
+                                # Cascade age gate REMOVED (2026-03-31).
+                                # MIN_AGE=15s silently blocked most signals — cascades avg 30s,
+                                # by 15s half the move is done and phase often changed.
+                                # Decel gate (REVERSED/STALLED) already ensures cascade has
+                                # developed enough to show reversal in price velocity.
 
                                 # Late session block (20-24 UTC): -$1.56 on 36 trades.
                                 # Hour 23 alone: -$2.23, 27% WR. Low liquidity noise.
@@ -1827,6 +1848,7 @@ class CollectorService:
                                         rolling_fade_signal = None
 
                                 # Persist context for PG (survives log rotation)
+                                # Build context even when decel data is missing
                                 if rolling_fade_signal:
                                     _rz = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
                                     _hl_sym = symbol.replace("USDT", "")
@@ -1858,6 +1880,17 @@ class CollectorService:
                                       f"vels={[f'{v:.1f}' if v is not None else 'None' for v in _d_vels]} "
                                       f"recent={'ok' if _d_recent is not None else 'None'} "
                                       f"prior={'ok' if _d_prior is not None else 'None'}")
+                                # Build minimal context even without decel data
+                                if rolling_fade_signal:
+                                    _rz = self._rolling_volume_tracker.get_current_z(symbol, timestamp)
+                                    self._trade_entry_context[symbol] = {
+                                        "decel_phase": "SKIP",
+                                        "rolling_z": round(_rz, 2) if _rz else None,
+                                        "fade_dir": rolling_fade_signal.fade_direction,
+                                        "of_at_entry": round(orderflow_imbalance, 3) if orderflow_imbalance is not None else None,
+                                        "vwap_atr": round(regime_metrics.vwap_distance / regime_metrics.atr_30m, 2) if regime_metrics and regime_metrics.atr_30m and regime_metrics.atr_30m > 0 else None,
+                                        "vwap_dist": round(regime_metrics.vwap_distance, 4) if regime_metrics else None,
+                                    }
                         except Exception as _d_err:
                             print(f"[DECEL] {symbol} ERROR: {_d_err}")
 
@@ -2888,6 +2921,7 @@ class CollectorService:
                 price=price, volume=size, is_buyer_maker=(side == "A"),
             )
             self._ohlc.on_fill(normalized_symbol, price, size, timestamp)
+            self._mtf_vwap.add_trade(normalized_symbol, price, size, timestamp)
 
         except Exception as e:
             # Fail silently per constitutional rules - log but don't halt
@@ -3909,12 +3943,19 @@ class CollectorService:
             return
 
         exit_reason = "GRAVITY_TP_DYNAMIC" if target.is_dynamic else "GRAVITY_TP"
+        # Build exit_context from trailing stop state if available
+        _gtp_exit_ctx = None
+        for _sid, _st in self._trailing_stop_manager.get_all_stops().items():
+            if _st.symbol == symbol:
+                _gtp_exit_ctx = self._build_exit_context(_st, price, exit_reason)
+                break
         ok, err, trade = self.ghost_tracker.close_position(
             symbol=symbol,
             quantity=reduce_qty,
             exit_reason=exit_reason,
             exit_price=price,
-            timestamp=time.time()
+            timestamp=time.time(),
+            exit_context=_gtp_exit_ctx
         )
 
         if ok and trade:
@@ -3961,6 +4002,31 @@ class CollectorService:
                         print(f"GRAVITY_TP_FLOOR: {symbol} stop {old_stop:,.2f} → {floor_price:,.2f} "
                               f"(+{_floor_bps:.0f}bp, at gravity TP price)")
                     break
+
+    def _build_exit_context(self, state, price: float, exit_reason: str) -> dict:
+        """Build exit_context dict from trailing stop state at exit time."""
+        if state.direction == "LONG":
+            mfe_bps = (state.highest_price - state.entry_price) / state.entry_price * 10000
+            pnl_bps = (price - state.entry_price) / state.entry_price * 10000
+        else:
+            mfe_bps = (state.entry_price - state.lowest_price) / state.entry_price * 10000
+            pnl_bps = (state.entry_price - price) / state.entry_price * 10000
+        hold_sec = time.time() - state.entry_timestamp if state.entry_timestamp else 0
+        return {
+            'exit_reason': exit_reason,
+            'of_at_exit': round(state.last_orderflow, 3) if state.last_orderflow is not None else None,
+            'best_of': round(state.best_of, 3),
+            'of_was_favorable': state.of_was_favorable,
+            'mfe_bps': round(mfe_bps, 2),
+            'pnl_bps_at_exit': round(pnl_bps, 2),
+            'direction': state.direction,
+            'hold_sec': round(hold_sec, 1),
+            'liq_z_at_exit': round(state.last_liq_z, 1) if state.last_liq_z is not None else None,
+            'peak_liq_z': round(state.peak_liq_z, 1),
+            'vwap_distance_at_exit': round(state.last_vwap_distance, 4) if state.last_vwap_distance is not None else None,
+            'trail_activated': mfe_bps >= state.config.trail_activation_pct * 10000,
+            'stop_price': round(state.current_stop_price, 6),
+        }
 
     def _update_trailing_stops(self, symbol: str, price: float,
                                liq_z=None, cascade_state=None,
@@ -4129,11 +4195,13 @@ class CollectorService:
                               f"/{self._dca_config.max_levels} "
                               f"mae={'%.5f' % _mae if _mae else '?'} px={price:.5f} "
                               f"damage={_damage_bps:+.1f}bp → INSTANT EXIT")
+                        _exit_ctx = self._build_exit_context(state, price, "CASCADE_CONTINUATION_KILL")
                         success, error, trade = self.ghost_tracker.close_position(
                             symbol=symbol,
                             exit_reason="CASCADE_CONTINUATION_KILL",
                             exit_price=price,
-                            timestamp=time.time()
+                            timestamp=time.time(),
+                            exit_context=_exit_ctx
                         )
                         if success and trade:
                             pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
@@ -4230,6 +4298,44 @@ class CollectorService:
                             print(f"MAX_HOLD_TIGHTEN: {symbol} held {_hold_time/60:.0f}m — "
                                   f"forcing BE stop @ ${be_stop:,.2f}")
 
+                # Orderflow momentum exit: take profit when OF shifts against us
+                # Only fires: in profit, OF was favorable, now adverse, trail not activated
+                if state.of_was_favorable and state.last_orderflow is not None:
+                    if state.direction == "LONG":
+                        _ome_profitable = price > state.entry_price
+                        _ome_adverse = state.last_orderflow < 0.45
+                        _mfe_pct = (state.highest_price - state.entry_price) / state.entry_price
+                    else:
+                        _ome_profitable = price < state.entry_price
+                        _ome_adverse = state.last_orderflow > 0.55
+                        _mfe_pct = (state.entry_price - state.lowest_price) / state.entry_price
+                    _trail_activated = _mfe_pct >= state.config.trail_activation_pct
+                    if _ome_profitable and _ome_adverse and not _trail_activated:
+                        _ome_pnl_bps = abs(price - state.entry_price) / state.entry_price * 10000
+                        print(f"ORDERFLOW_MOMENTUM_EXIT: {symbol} {state.direction} "
+                              f"pnl={_ome_pnl_bps:+.0f}bp OF={state.last_orderflow:.2f} "
+                              f"(was {state.best_of:.2f}) — flow shifted, taking profit")
+                        if entry_id.startswith("SCOUT_"):
+                            self._scout_tracker.close_position(
+                                symbol, exit_price=price, exit_reason="ORDERFLOW_MOMENTUM_EXIT")
+                            self._trailing_stop_manager.unregister_stop(entry_id)
+                            break
+                        _exit_ctx = self._build_exit_context(state, price, "ORDERFLOW_MOMENTUM_EXIT")
+                        success, error, trade = self.ghost_tracker.close_position(
+                            symbol=symbol, exit_reason="ORDERFLOW_MOMENTUM_EXIT",
+                            exit_price=price, timestamp=time.time(),
+                            exit_context=_exit_ctx)
+                        if success and trade:
+                            pnl_str = f"${trade.pnl:+.2f}" if trade.pnl else "$0.00"
+                            hold = f"{trade.holding_duration_sec:.0f}s" if trade.holding_duration_sec else "?"
+                            print(f"EXIT: {symbol} @ ${price:,.2f}, PNL: {pnl_str}, "
+                                  f"Hold: {hold}, Reason: ORDERFLOW_MOMENTUM_EXIT")
+                            self._force_position_flat(symbol)
+                        self._trailing_stop_manager.unregister_stop(entry_id)
+                        self._gravity_tp_targets.pop(symbol, None)
+                        self._cck_mae.pop(symbol, None)
+                        break
+
                 # Check if stop is triggered
                 stop_triggered = False
                 if state.direction == "LONG" and price <= state.current_stop_price:
@@ -4261,11 +4367,13 @@ class CollectorService:
                         self._trailing_stop_manager.unregister_stop(entry_id)
                         break
 
+                    _exit_ctx = self._build_exit_context(state, price, exit_reason)
                     success, error, trade = self.ghost_tracker.close_position(
                         symbol=symbol,
                         exit_reason=exit_reason,
                         exit_price=price,
-                        timestamp=time.time()
+                        timestamp=time.time(),
+                        exit_context=_exit_ctx
                     )
 
                     if success and trade:

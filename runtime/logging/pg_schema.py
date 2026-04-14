@@ -262,7 +262,8 @@ def ensure_schema(conn):
             holding_duration_sec DOUBLE PRECISION,
             exit_reason TEXT,
             entry_trade_id TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
+            created_at TIMESTAMP DEFAULT NOW(),
+            exit_context JSONB
         )
     """)
 
@@ -1506,13 +1507,25 @@ def ensure_schema(conn):
             wall_gravity    DOUBLE PRECISION,
             bid_depth_ratio DOUBLE PRECISION,
             n_coins_active  SMALLINT,
+            time_since_last_liq DOUBLE PRECISION,
+            pulse_number    SMALLINT,
+            pulse_liq_count SMALLINT,
+            cumulative_liq_usd DOUBLE PRECISION,
+            depth_change    DOUBLE PRECISION,
+            vwap_5m_atr     DOUBLE PRECISION,
+            vwap_15m_atr    DOUBLE PRECISION,
+            vwap_30m_atr    DOUBLE PRECISION,
             fade_direction  TEXT,
             shadow_mfe_1m   DOUBLE PRECISION,
             shadow_mfe_2m   DOUBLE PRECISION,
             shadow_mfe_5m   DOUBLE PRECISION,
+            shadow_mfe_10m  DOUBLE PRECISION,
+            shadow_mfe_15m  DOUBLE PRECISION,
             shadow_mae_1m   DOUBLE PRECISION,
             shadow_mae_2m   DOUBLE PRECISION,
             shadow_mae_5m   DOUBLE PRECISION,
+            shadow_mae_10m  DOUBLE PRECISION,
+            shadow_mae_15m  DOUBLE PRECISION,
             trade_id        TEXT
         )
     """)

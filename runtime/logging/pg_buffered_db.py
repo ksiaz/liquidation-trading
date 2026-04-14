@@ -285,9 +285,13 @@ class PgBufferedResearchDatabase:
 
         NO LOCK. PostgreSQL MVCC: DELETE doesn't block INSERT.
         No manual VACUUM needed (autovacuum handles it).
-        """
-        self.flush()
 
+        Does NOT call flush() — flush is asyncio-thread-bound and must not
+        run from the executor thread. BRD buffer drains on its own schedule.
+
+        Uses batched DELETE with LIMIT to avoid long-held GIL from large
+        fetchall/delete operations that freeze the asyncio event loop.
+        """
         conn = get_conn()
         try:
             cutoff_ts = time.time() - (max_age_hours * 3600)
@@ -296,26 +300,23 @@ class PgBufferedResearchDatabase:
 
             cur = conn.cursor()
 
-            # Child tables FIRST: query old cycle_ids before deleting parent rows
+            # Child tables FIRST: delete in batches using subquery with LIMIT
+            # Avoids fetching millions of IDs into Python (GIL holder)
             try:
-                cur.execute(
-                    "SELECT id FROM execution_cycles WHERE timestamp < %s",
-                    (cutoff_ts,)
-                )
-                old_ids = [r[0] for r in cur.fetchall()]
-                if old_ids:
-                    for child in ['m2_nodes', 'primitive_values',
-                                  'policy_evaluations', 'mandates',
-                                  'arbitration_rounds']:
-                        try:
-                            cur.execute(
-                                f"DELETE FROM {child} WHERE cycle_id = ANY(%s)",
-                                (old_ids,)
-                            )
-                            total_deleted += cur.rowcount
-                        except Exception:
-                            conn.rollback()
-                            cur = conn.cursor()
+                for child in ['m2_nodes', 'primitive_values',
+                              'policy_evaluations', 'mandates',
+                              'arbitration_rounds']:
+                    try:
+                        cur.execute(
+                            f"DELETE FROM {child} WHERE cycle_id IN "
+                            f"(SELECT id FROM execution_cycles WHERE timestamp < %s LIMIT 50000)",
+                            (cutoff_ts,)
+                        )
+                        total_deleted += cur.rowcount
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        cur = conn.cursor()
             except Exception:
                 conn.rollback()
                 cur = conn.cursor()
@@ -336,15 +337,17 @@ class PgBufferedResearchDatabase:
                               'arbitration_rounds']:
                     try:
                         cur.execute(
-                            f"DELETE FROM {child} WHERE cycle_id < %s",
+                            f"DELETE FROM {child} WHERE cycle_id < %s LIMIT 50000",
                             (min_cycle_id,)
                         )
                         total_deleted += cur.rowcount
+                        conn.commit()
                     except Exception:
                         conn.rollback()
                         cur = conn.cursor()
 
             # Tables with 'timestamp' column (float seconds)
+            # Use ctid-based batched delete to avoid holding GIL on large tables
             for table in [
                 'execution_cycles', 'liquidation_events', 'ohlc_candles',
                 'orderbook_events', 'orderbook_depth', 'mark_prices',
@@ -352,13 +355,18 @@ class PgBufferedResearchDatabase:
                 'hl_positions', 'hl_liquidation_proximity', 'hl_cascade_events',
             ]:
                 try:
-                    cur.execute(f"DELETE FROM {table} WHERE timestamp < %s", (cutoff_ts,))
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE ctid IN "
+                        f"(SELECT ctid FROM {table} WHERE timestamp < %s LIMIT 100000)",
+                        (cutoff_ts,)
+                    )
                     total_deleted += cur.rowcount
+                    conn.commit()
                 except Exception:
                     conn.rollback()
                     cur = conn.cursor()
 
-            # Tables with 'ts_ns' column (nanoseconds)
+            # Tables with 'ts_ns' column (nanoseconds) — mostly empty HL legacy tables
             for table in [
                 'hl_metric_snapshots', 'hl_decay_signals',
                 'hl_catastrophe_events', 'hl_recovery_attempts',
@@ -369,6 +377,7 @@ class PgBufferedResearchDatabase:
                 try:
                     cur.execute(f"DELETE FROM {table} WHERE ts_ns < %s", (cutoff_ns,))
                     total_deleted += cur.rowcount
+                    conn.commit()
                 except Exception:
                     conn.rollback()
                     cur = conn.cursor()
@@ -383,6 +392,7 @@ class PgBufferedResearchDatabase:
                 try:
                     cur.execute(f"DELETE FROM {table} WHERE snapshot_ts < %s", (cutoff_ns,))
                     total_deleted += cur.rowcount
+                    conn.commit()
                 except Exception:
                     conn.rollback()
                     cur = conn.cursor()
@@ -399,6 +409,7 @@ class PgBufferedResearchDatabase:
                 try:
                     cur.execute(f"DELETE FROM {table} WHERE {col} < %s", (cutoff_ns,))
                     total_deleted += cur.rowcount
+                    conn.commit()
                 except Exception:
                     conn.rollback()
                     cur = conn.cursor()
@@ -416,6 +427,7 @@ class PgBufferedResearchDatabase:
                     (cutoff_30d,)
                 )
                 total_deleted += cur.rowcount
+                conn.commit()
             except Exception:
                 conn.rollback()
                 cur = conn.cursor()

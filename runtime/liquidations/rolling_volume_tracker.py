@@ -88,11 +88,11 @@ class RollingVolumeTracker:
     # 10 events is ~10-20 min for active coins.
     MIN_BASELINE_EVENTS = 10
 
-    # Burst concentration: events must be clustered, not spread evenly over 30s.
-    # Old system had MIN_Z_JUMP=1.0 which required sudden z-score jump.
-    # New equivalent: >=60% of burst events must fall within any 10s sub-window.
-    CONCENTRATION_WINDOW = 10  # Sub-window size for concentration check
-    CONCENTRATION_RATIO = 0.6  # Fraction of events that must be in densest sub-window
+    # Burst concentration: relaxed for Binance data where events arrive spread
+    # over the full 30s window. Old 60%/10s ratio blocked all sustained cascades.
+    # New: 40%/15s — still requires some clustering but allows spread-out bursts.
+    CONCENTRATION_WINDOW = 15  # Sub-window size for concentration check
+    CONCENTRATION_RATIO = 0.4  # Fraction of events that must be in densest sub-window
 
     def __init__(self):
         # Per-coin event deques (baseline window retention)
@@ -221,6 +221,14 @@ class RollingVolumeTracker:
         )
 
         if baseline_only < min_baseline and not _cold_start_bypass:
+            # Diagnostic: log rejection reason (throttled)
+            _diag_key = f"_warmup_log_{symbol}"
+            _now = timestamp
+            if not hasattr(self, _diag_key) or _now - getattr(self, _diag_key) >= 60:
+                setattr(self, _diag_key, _now)
+                print(f"[SIGNAL DIAG] {symbol}: ratio={ratio:.1f}x PASS but "
+                      f"warmup FAIL: baseline_only={baseline_only} < min={min_baseline} "
+                      f"(burst={burst_count} baseline={baseline_count})")
             return pending.signal if pending else None
 
         # ── Burst concentration gate ──
@@ -233,6 +241,13 @@ class RollingVolumeTracker:
             if count_in_sub > best_in_subwindow:
                 best_in_subwindow = count_in_sub
         if best_in_subwindow < min_concentrated:
+            _diag_key2 = f"_conc_log_{symbol}"
+            _now2 = timestamp
+            if not hasattr(self, _diag_key2) or _now2 - getattr(self, _diag_key2) >= 60:
+                setattr(self, _diag_key2, _now2)
+                print(f"[SIGNAL DIAG] {symbol}: ratio={ratio:.1f}x warmup PASS but "
+                      f"concentration FAIL: best={best_in_subwindow}/{min_concentrated} "
+                      f"in {self.CONCENTRATION_WINDOW}s (burst={burst_count} events)")
             return pending.signal if pending else None
 
         # Cascade exhaustion gate REMOVED — replaced by decel phase gate in service.py.
@@ -299,14 +314,10 @@ class RollingVolumeTracker:
             self._last_signal_ts[symbol] = timestamp
 
     def _min_baseline_for_ratio(self, ratio: float) -> int:
-        """Adaptive baseline minimum — strong signals need less context.
-
-        BTC/ETH/SOL have bursty liq patterns (long gaps then floods).
-        A 50x burst ratio is overwhelming evidence even with sparse baseline.
-        """
-        if ratio >= 50:
+        """Adaptive baseline minimum — strong signals need less context."""
+        if ratio >= 30:
             return 5
-        if ratio >= 20:
+        if ratio >= 15:
             return 10
         return 20
 
@@ -485,6 +496,49 @@ class RollingVolumeTracker:
         events = list(events_deque)
         cutoff = timestamp - window_sec
         return sum(1 for e in events if e.timestamp >= cutoff)
+
+    def get_pulse_stats(self, symbol: str, timestamp: float,
+                        cascade_start_ts: float, pulse_gap: float = 5.0):
+        """Compute pulse-level stats for cascade monitor.
+
+        Returns dict with:
+          time_since_last_liq: seconds since last liq event
+          pulse_number: which pulse in cascade (gap >pulse_gap = new pulse)
+          pulse_liq_count: events in current pulse
+          cumulative_liq_usd: total USD liquidated since cascade_start_ts
+        """
+        events_deque = self._events.get(symbol)
+        if not events_deque:
+            return {'time_since_last_liq': 999.0, 'pulse_number': 0,
+                    'pulse_liq_count': 0, 'cumulative_liq_usd': 0.0}
+        events = list(events_deque)
+
+        # Only events since cascade start
+        cascade_events = [e for e in events if e.timestamp >= cascade_start_ts]
+        if not cascade_events:
+            return {'time_since_last_liq': 999.0, 'pulse_number': 0,
+                    'pulse_liq_count': 0, 'cumulative_liq_usd': 0.0}
+
+        # Segment into pulses by inter-event gap
+        pulse_num = 1
+        current_pulse_count = 1
+        for i in range(1, len(cascade_events)):
+            gap = cascade_events[i].timestamp - cascade_events[i-1].timestamp
+            if gap > pulse_gap:
+                pulse_num += 1
+                current_pulse_count = 1
+            else:
+                current_pulse_count += 1
+
+        cumulative_usd = sum(e.usd_value for e in cascade_events)
+        time_since = timestamp - cascade_events[-1].timestamp
+
+        return {
+            'time_since_last_liq': round(time_since, 2),
+            'pulse_number': pulse_num,
+            'pulse_liq_count': current_pulse_count,
+            'cumulative_liq_usd': round(cumulative_usd, 2),
+        }
 
     def trim_windows(self, timestamp: float):
         """Trim old events from rolling windows. Call periodically."""
